@@ -1,0 +1,24 @@
+{
+  "Version": "1",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "sts:AssumeRole",
+      "Principal": {
+        "Federated": [
+          "ACK_OIDC_PROVIDER_ARN"
+        ]
+      },
+      "Condition": {
+        "StringEquals": {
+          "oidc:iss": "ACK_OIDC_ISSUER",
+          "oidc:aud": "sts.aliyuncs.com",
+          "oidc:sub": [
+            "system:serviceaccount:confidential-containers-system:cloud-api-adaptor",
+            "system:serviceaccount:confidential-containers-system:peerpodctrl-controller-manager"
+          ]
+        }
+      }
+    }
+  ]
+}

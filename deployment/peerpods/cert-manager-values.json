@@ -1,0 +1,27 @@
+{
+  "crds": {
+    "enabled": true
+  },
+  "image": {
+    "repository": "quay.io/jetstack/cert-manager-controller",
+    "digest": "sha256:1e4af57beb469cc3bb0fb48b9201caea2723819b9ffd3c3ea98568f55b4dd38b"
+  },
+  "webhook": {
+    "image": {
+      "repository": "quay.io/jetstack/cert-manager-webhook",
+      "digest": "sha256:953a97df613f7da7eda8ce4b1c8d8e6b50963db0800fab595d040db6eb5cb060"
+    }
+  },
+  "cainjector": {
+    "image": {
+      "repository": "quay.io/jetstack/cert-manager-cainjector",
+      "digest": "sha256:a2b12d27950d1603d2c8168c3ccd95d07b93ce6ec4b530316196a31db592a9c0"
+    }
+  },
+  "startupapicheck": {
+    "image": {
+      "repository": "quay.io/jetstack/cert-manager-startupapicheck",
+      "digest": "sha256:1dae953280843bd637c619597eb0d9144f3d5185b518490494a080b521a1f3c7"
+    }
+  }
+}

@@ -1,0 +1,47 @@
+[Unit]
+Description=Independent confidential Kubernetes compute driver
+After=network-online.target kbs.service
+Requires=kbs.service
+
+[Service]
+User=openshell-gateway
+Group=openshell-gateway
+Environment=HOME=/var/lib/openshell-confidential
+Environment=KUBECONFIG=/etc/openshell-confidential/kubeconfig
+Environment=OPENSHELL_K8S_WORKSPACE_STORAGE_CLASS=alicloud-disk-essd-peerpod
+Environment=OPENSHELL_TELEMETRY_ENABLED=false
+EnvironmentFile=/etc/openshell-confidential/driver.env
+ExecStart=/usr/local/bin/openshell-driver-confidential-kubernetes \
+  --confidential-runtime-class kata-remote \
+  --guest-initdata-base /etc/openshell-confidential/guest-initdata-base.toml \
+  --confidential-client-tls-ca /var/lib/openshell-confidential/tls/ca.crt \
+  --kata-policy-generator /opt/confidential-openshell/deployment/runtime/agent_policy.py \
+  --kata-policy-tools-dir /opt/openshell/kata-policy \
+  --kata-policy-registry ${HOST_IP}:5000 \
+  --kata-policy-registry-ca /etc/trustee/tls/ca.pem \
+  --kata-policy-pause-image ${PAUSE_IMAGE} \
+  --bootstrap-store-dir /opt/trustee/kbs/storage/repository \
+  --bootstrap-signing-key /opt/trustee/kbs/signing/signer.key \
+  --kbs-policy-renderer /opt/confidential-openshell/deployment/trustee/render-kbs-policy.py \
+  --kbs-policy-output /opt/trustee/kbs/storage/kbs/resource-policy.rego \
+  --as-policy-output /opt/trustee/attestation-service/storage/attestation_service_policy/default_cpu.rego \
+  --bind-socket /run/openshell-confidential/driver.sock \
+  --workspace-mode shared \
+  --gateway-id confidential-ack \
+  --sandbox-namespace openshell \
+  --sandbox-service-account openshell-sandbox \
+  --sandbox-image ${WORKLOAD_IMAGE} \
+  --sandbox-runtime-image ${SANDBOX_IMAGE} \
+  --supervisor-image ${SUPERVISOR_IMAGE} \
+  --grpc-endpoint https://${HOST_IP}:9443 \
+  --host-gateway-ip ${HOST_IP}
+Restart=on-failure
+RestartSec=2
+UMask=0077
+LimitCORE=0
+RuntimeDirectory=openshell-confidential
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=restart
+
+[Install]
+WantedBy=multi-user.target

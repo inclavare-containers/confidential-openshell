@@ -1,0 +1,58 @@
+# Replace uppercase settings in a private copy before installing.
+provider: alibabacloud
+secrets:
+  mode: reference
+  existingSecretName: ""
+image:
+  name: PRIVATE_REGISTRY/openshell/cloud-api-adaptor
+  tag: "v0.23.0@sha256:PATCHED_CAA_IMAGE_SHA256"
+daemonset:
+  podLabels:
+    pod-identity.alibabacloud.com/injection: "on"
+  serviceAccount:
+    annotations:
+      pod-identity.alibabacloud.com/role-name: CAA_RAM_ROLE_NAME
+alibabacloud:
+  rrsa:
+    enable: true
+    roleArn: CAA_RAM_ROLE_ARN
+providerConfigs:
+  alibabacloud:
+    ALIBABA_CLOUD_ROLE_ARN: CAA_RAM_ROLE_ARN
+    ALIBABA_CLOUD_OIDC_PROVIDER_ARN: ACK_OIDC_PROVIDER_ARN
+    ALIBABA_CLOUD_OIDC_TOKEN_FILE: /var/run/secrets/ack.alibabacloud.com/rrsa-tokens/token
+    IMAGEID: APPROVED_PODVM_IMAGE_ID
+    INITDATA: GZIP_BASE64_DENY_ONLY_INITDATA
+    DISABLE_IMAGE_PULL_SECRETS: "true"
+    PODVM_INSTANCE_TYPE: ecs.g9i.xlarge
+    PAUSE_IMAGE: PRIVATE_REGISTRY/openshell/mirror/pause@sha256:PAUSE_IMAGE_SHA256
+    REGION: REGION
+    VPC_ID: VPC_ID
+    VSWITCH_ID: PODVM_VSWITCH_ID
+    SECURITY_GROUP_IDS: PODVM_SECURITY_GROUP_ID
+    SYSTEM_DISK_SIZE: "40"
+    TUNNEL_TYPE: vxlan
+    USE_PUBLIC_IP: "false"
+    TAGS: "ClusterId=ACK_CLUSTER_ID,caa-csi-driver=caa-csi-block-driver"
+resourceCtrl:
+  enabled: true
+  podLabels:
+    pod-identity.alibabacloud.com/injection: "on"
+  serviceAccount:
+    annotations:
+      pod-identity.alibabacloud.com/role-name: CAA_RAM_ROLE_NAME
+  image:
+    repository: PRIVATE_REGISTRY/openshell/peerpod-ctrl
+    tag: "upstream-v0.23-alibabacloud-delete-idempotent-20261012@sha256:f3a9c12970b775b2c511f65b33867dad49cd71740db08b9e6397b03c4de23f6c"
+webhook:
+  enabled: true
+  replicas: 1
+  image:
+    repository: quay.io/confidential-containers/peer-pods-webhook
+    tag: "v0.23.0@sha256:b1b2e7bb2b880728fba68fe490914d803e810c947f1e5a2af40f8b9d7cf9b07e"
+kata-deploy:
+  image:
+    reference: PRIVATE_REGISTRY/openshell/kata-deploy-shim-nnp@sha256:PATCHED_KATA_DEPLOY_IMAGE_SHA256
+  kubectlImage:
+    reference: quay.io/kata-containers/kubectl@sha256:135dbdadb36c2c414fa86049bb2fd7ce149257a1d35771cd120203c3ea9803dc
+    tag: ""

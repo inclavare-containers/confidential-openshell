@@ -1,0 +1,5 @@
+# Replace PRIVATE_REGISTRY with the trusted host's private IPv4:5000.
+server = "https://PRIVATE_REGISTRY"
+[host."https://PRIVATE_REGISTRY"]
+capabilities = ["pull", "resolve"]
+ca = "/etc/containerd/certs.d/PRIVATE_REGISTRY/ca.crt"

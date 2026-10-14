@@ -1,0 +1,38 @@
+[openshell]
+version = 2
+
+[openshell.gateway]
+name = "confidential-ack"
+# Replace this address with the trusted host's private IPv4 address.
+# Supervisors connect directly using server TLS and their sealed sandbox JWT.
+bind_address = "10.0.0.10:9443"
+health_bind_address = "127.0.0.1:17671"
+log_level = "info"
+compute_driver = "kubernetes"
+policy_validation_failure_mode = "fail_closed"
+
+[openshell.gateway.tls]
+cert_path = "/var/lib/openshell-confidential/tls/server/tls.crt"
+key_path = "/var/lib/openshell-confidential/tls/server/tls.key"
+client_ca_path = "/var/lib/openshell-confidential/tls/ca.crt"
+
+# OpenShell v0.1.3 verifies operator client certificates independently of the
+# compute driver. The operator private key stays on the trusted host; guests
+# receive the public server CA and sandbox-scoped launch credentials only.
+[openshell.gateway.mtls_auth]
+enabled = true
+
+[openshell.gateway.auth]
+allow_unauthenticated_users = false
+
+[openshell.gateway.gateway_jwt]
+signing_key_path = "/var/lib/openshell-confidential/tls/jwt/signing.pem"
+public_key_path = "/var/lib/openshell-confidential/tls/jwt/public.pem"
+kid_path = "/var/lib/openshell-confidential/tls/jwt/kid"
+gateway_id = "confidential-ack"
+ttl_secs = 3600
+
+[openshell.drivers.kubernetes]
+namespace = "openshell"
+workspace_mode = "shared"
+gateway_id = "confidential-ack"

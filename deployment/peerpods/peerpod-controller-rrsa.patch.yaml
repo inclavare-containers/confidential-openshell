@@ -1,0 +1,18 @@
+# Strategic merge patch for the pinned PeerPod controller chart.
+spec:
+  template:
+    spec:
+      containers:
+        - name: manager
+          volumeMounts:
+            - name: rrsa-oidc-token
+              mountPath: /var/run/secrets/ack.alibabacloud.com/rrsa-tokens
+              readOnly: true
+      volumes:
+        - name: rrsa-oidc-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: sts.aliyuncs.com
+                  expirationSeconds: 3600
+                  path: token

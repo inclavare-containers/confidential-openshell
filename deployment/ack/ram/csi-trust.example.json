@@ -1,0 +1,21 @@
+{
+  "Version": "1",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "sts:AssumeRole",
+      "Principal": {
+        "Federated": [
+          "ACK_OIDC_PROVIDER_ARN"
+        ]
+      },
+      "Condition": {
+        "StringEquals": {
+          "oidc:iss": "ACK_OIDC_ISSUER",
+          "oidc:aud": "sts.aliyuncs.com",
+          "oidc:sub": "system:serviceaccount:caa-csi-block:caa-csi-block"
+        }
+      }
+    }
+  ]
+}

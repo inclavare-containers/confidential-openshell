@@ -1,0 +1,32 @@
+{
+  "Version": "1",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Resource": "acs:ecs:REGION:ACCOUNT_ID:disk/*",
+      "Action": "ecs:DescribeDisks"
+    },
+    {
+      "Effect": "Allow",
+      "Resource": "acs:ecs:REGION:ACCOUNT_ID:disk/*",
+      "Action": "ecs:CreateDisk",
+      "Condition": {
+        "StringEquals": {
+          "acs:RequestTag/ClusterId": "ACK_CLUSTER_ID",
+          "acs:RequestTag/caa-csi-driver": "caa-csi-block-driver"
+        }
+      }
+    },
+    {
+      "Effect": "Allow",
+      "Resource": "acs:ecs:REGION:ACCOUNT_ID:disk/*",
+      "Action": "ecs:DeleteDisk",
+      "Condition": {
+        "StringEquals": {
+          "acs:ResourceTag/ClusterId": "ACK_CLUSTER_ID",
+          "acs:ResourceTag/caa-csi-driver": "caa-csi-block-driver"
+        }
+      }
+    }
+  ]
+}

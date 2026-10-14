@@ -1,0 +1,33 @@
+# Replace uppercase settings in a private copy before installing.
+provider: alibabacloud
+fullnameOverride: caa-csi-block
+namespace:
+  name: caa-csi-block
+  create: false
+image:
+  repository: PRIVATE_REGISTRY/openshell/caa-csi-block-driver
+  tag: "alibaba@sha256:PATCHED_CSI_IMAGE_SHA256"
+sidecarImages:
+  provisioner: registry.k8s.io/sig-storage/csi-provisioner@sha256:6de50bacfd72627ffe4209e3db8ad7391d04ea6fb741bf51feab6c5dcfd80002
+  nodeDriverRegistrar: registry.k8s.io/sig-storage/csi-node-driver-registrar@sha256:cd21e19cd8bbd5bc56f1b4f1398a436e7897da2995d6d036c9729be3f4e456e6
+storageClass:
+  name: alicloud-disk-essd-peerpod
+  reclaimPolicy: Delete
+  volumeBindingMode: Immediate
+  allowVolumeExpansion: false
+controller:
+  state:
+    size: 20Gi
+    storageClassName: ACK_HOST_ESSD_STORAGE_CLASS
+alibabacloud:
+  region: REGION
+  zoneId: ZONE
+  clusterId: ACK_CLUSTER_ID
+  diskCategory: cloud_essd
+  performanceLevel: PL0
+  credentialsSecret: ""
+  rrsa:
+    enabled: true
+    roleArn: CSI_RAM_ROLE_ARN
+    oidcProviderArn: ACK_OIDC_PROVIDER_ARN
+    tokenFile: /var/run/secrets/ack.alibabacloud.com/rrsa-tokens/token

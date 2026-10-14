@@ -1,0 +1,56 @@
+{
+  "Version": "1",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Resource": "*",
+      "Action": [
+        "ecs:DescribeInstanceTypes",
+        "ecs:DescribeInstances",
+        "ecs:DescribeInstanceAttribute",
+        "ecs:DescribeDisks"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Resource": "acs:vpc:REGION:ACCOUNT_ID:vswitch/VSWITCH_ID",
+      "Action": "vpc:DescribeVSwitchAttributes"
+    },
+    {
+      "Effect": "Allow",
+      "Resource": "*",
+      "Action": "ecs:RunInstances",
+      "Condition": {
+        "StringEquals": {
+          "acs:RequestTag/ClusterId": "ACK_CLUSTER_ID",
+          "acs:RequestTag/caa-csi-driver": "caa-csi-block-driver"
+        }
+      }
+    },
+    {
+      "Effect": "Allow",
+      "Resource": "acs:ecs:REGION:ACCOUNT_ID:instance/*",
+      "Action": "ecs:DeleteInstance",
+      "Condition": {
+        "StringEquals": {
+          "acs:ResourceTag/ClusterId": "ACK_CLUSTER_ID",
+          "acs:ResourceTag/caa-csi-driver": "caa-csi-block-driver"
+        }
+      }
+    },
+    {
+      "Effect": "Allow",
+      "Resource": [
+        "acs:ecs:REGION:ACCOUNT_ID:instance/*",
+        "acs:ecs:REGION:ACCOUNT_ID:disk/*"
+      ],
+      "Action": "ecs:AttachDisk",
+      "Condition": {
+        "StringEquals": {
+          "acs:ResourceTag/ClusterId": "ACK_CLUSTER_ID",
+          "acs:ResourceTag/caa-csi-driver": "caa-csi-block-driver"
+        }
+      }
+    }
+  ]
+}
