@@ -1,0 +1,7 @@
+Repair clamp.py, changing only the return expression. It must bound any integer x
+in the inclusive interval [lower, upper], where lower <= upper. Use only integer
+constants, x/lower/upper, min and max in that expression; no imports or side effects.
+Read the source using your tools, edit it, and actually execute exactly
+python3 test_clamp.py
+from /sandbox/project. This creates result.json; do not fabricate that file.
+Do not change test_clamp.py. Explain the bug and test result in your final response.
