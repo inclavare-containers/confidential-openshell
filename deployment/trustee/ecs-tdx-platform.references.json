@@ -1,0 +1,14 @@
+{
+  "measurement.ecs.mr_td.sha384": [
+    "e0199499baacb2e4f4bc73046f25bedf674d42defbe4e854242bd6554a9d155edf7f3bff8e6202e63ed230e59ab2568a"
+  ],
+  "measurement.ecs.rtmr_0.event.0.sha384": [
+    "9bfdc93fea808ced4875810a0f7e755e4cd0a702202e6034f5282b4184520b1dd2b0d6e09df6b3ebd0524c334cf4c748"
+  ],
+  "measurement.ecs.rtmr_0.event.1.sha384": [
+    "5a9a6faadec79debc1d35d4ce1d2d55f1089f1db50b0ad5eaa449112f3cdf4a5d08b2f4ebb38365fde7a347470e63a89"
+  ],
+  "measurement.ecs.rtmr_0.event.2.sha384": [
+    "a517a3e386aeb8cfa67d0ff9d0d7e90119f07ac6003816826e785fa21ba6015dded835ab96ffcd77e2d48271f3920533"
+  ]
+}

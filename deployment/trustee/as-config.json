@@ -1,0 +1,27 @@
+{
+  "storage_backend": {
+    "storage_type": "LocalFs",
+    "backends": {
+      "local_fs": {
+        "dir_path": "/opt/trustee/attestation-service/storage"
+      }
+    }
+  },
+  "rvps_config": {
+    "type": "BuiltIn"
+  },
+  "attestation_token_broker": {
+    "duration_min": 5,
+    "verbose_token": true,
+    "signer": {
+      "key_path": "/etc/trustee/tls/as-token.key",
+      "cert_path": "/etc/trustee/tls/as-token-chain.pem"
+    }
+  },
+  "verifier_config": {
+    "dcap_verifier": {
+      "collateral_service": "https://api.trustedservices.intel.com/sgx/certification/v4/",
+      "use_secure_cert": true
+    }
+  }
+}

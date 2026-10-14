@@ -1,0 +1,20 @@
+[Unit]
+Description=Confidential OpenShell Trustee Key Broker Service
+After=as.service docker.service
+Requires=as.service docker.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/trustee/images.env
+ExecStartPre=-/usr/bin/docker rm -f openshell-trustee-kbs
+ExecStart=/usr/bin/docker run --name openshell-trustee-kbs --network host --read-only --security-opt no-new-privileges --tmpfs /tmp:rw,nosuid,nodev --tmpfs /run:rw,nosuid,nodev --tmpfs /root/.cache:rw,nosuid,nodev -v /etc/trustee:/etc/trustee:ro -v /opt/trustee/kbs/storage:/opt/trustee/kbs/storage:rw ${TRUSTEE_KBS_IMAGE} /usr/local/bin/kbs --config-file /etc/trustee/kbs-config.toml
+ExecStop=/usr/bin/docker stop -t 15 openshell-trustee-kbs
+ExecStopPost=-/usr/bin/docker rm -f openshell-trustee-kbs
+Restart=on-failure
+RestartSec=2
+UMask=0077
+LimitCORE=0
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
