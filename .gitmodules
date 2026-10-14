@@ -1,0 +1,12 @@
+[submodule "repos/openshell"]
+	path = repos/openshell
+	url = https://github.com/NVIDIA/OpenShell.git
+	update = checkout
+[submodule "repos/cloud-api-adaptor"]
+	path = repos/cloud-api-adaptor
+	url = https://github.com/confidential-containers/cloud-api-adaptor.git
+	update = checkout
+[submodule "repos/caa-csi-block-driver"]
+	path = repos/caa-csi-block-driver
+	url = https://github.com/confidential-devhub/caa-csi-block-driver.git
+	update = checkout

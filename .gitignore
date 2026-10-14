@@ -1,0 +1,19 @@
+# Operator state and credentials.
+/state/
+/.tmp/
+/.local/
+/confidential.toml
+/.qoder/
+
+# Source handoff archives are generated deliverables, not repository inputs.
+/confidential-openshell-source-*.tar.gz
+/confidential-openshell-source-*.tar.gz.sha256
+
+# Release and build outputs.
+/deployment/artifacts/
+/artifacts/
+**/target/
+**/node_modules/
+**/.pytest_cache/
+**/__pycache__/
+**/cover.out

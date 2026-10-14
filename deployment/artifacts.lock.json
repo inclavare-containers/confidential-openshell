@@ -1,0 +1,52 @@
+{
+  "schema": 1,
+  "platform": "linux/amd64",
+  "podvm": {
+    "source": "cloud-api-adaptor",
+    "commit": "e3e0f00480b41c08e3e4dbc6b64aba7722fb65f9",
+    "distribution": "ubuntu",
+    "release": "resolute",
+    "profile": "production",
+    "tee_platform": "tdx",
+    "systemd_stub_package_version": "259.5-0ubuntu3.4"
+  },
+  "mkosi": {
+    "version": "v26",
+    "repository": "https://github.com/systemd/mkosi.git",
+    "commit": "84af20892b61c8e177e391f997ded8b4cb5514f2",
+    "tools_base_image": "ubuntu@sha256:0d39fcc8335d6d74d5502f6df2d30119ff4790ebbb60b364818d5112d9e3e932"
+  },
+  "guest_components": {
+    "version": "0.22.0",
+    "repository": "confidential-containers/guest-components",
+    "commit": "eae0bf63a3a9db7721f86e0a2b0b9941a7fcba3a",
+    "binaries": {
+      "attestation-agent": {
+        "ref": "ghcr.io/confidential-containers/guest-components/attestation-agent@sha256:e5261dad39359af6915de5650d0bcd3657d3a8e18ff568fa3b1126acf0076d03",
+        "binary_sha256": "4efa6e8b7451c0834cd830a1e017cfdee0f4298a2ff5942f3553fe319f7012be",
+        "archive": "attestation-agent.tar.xz"
+      },
+      "confidential-data-hub": {
+        "ref": "ghcr.io/confidential-containers/guest-components/confidential-data-hub@sha256:b86a3d344a6a6a222e92a9b4a5834d75b6a835857c490693262cabfb48ff2292",
+        "binary_sha256": "6bd5ea332da7bb5e5511eb883a878702a85e19348f1d93a18f5f849c5597a177",
+        "archive": "confidential-data-hub.tar.xz"
+      },
+      "api-server-rest": {
+        "ref": "ghcr.io/confidential-containers/guest-components/api-server-rest@sha256:33bda7748968de9da58535ebcb2cd48dc32bb8575d7fcc323989581fdc3bec62",
+        "binary_sha256": "070a291153a83af73ec2e5272173b069e98e963cbaa1ec0f754c9489bbedecdb",
+        "archive": "api-server-rest.tar.xz"
+      }
+    }
+  },
+  "kata_agent": {
+    "version": "4.2.0",
+    "archive_url": "https://github.com/kata-containers/kata-containers/releases/download/4.2.0/kata-static-4.2.0-amd64.tar.zst",
+    "archive_sha256": "b828904fa3f1e49ddd7dc799c72cb1503cd1e772d354c3987c8d4189b2a623a8",
+    "binary_sha256": "f6c94d5bc5abe6492768b3d58c42e5ef02a7d5683ab547da4581d43ea0d5f6de"
+  },
+  "pause_image": {
+    "ref": "registry.k8s.io/pause@sha256:7031c1b283388d2c2e09b57badb803c05ebed362dc88d84b480cc47f72a21097",
+    "amd64_manifest": "sha256:8d4106c88ec0bd28001e34c975d65175d994072d65341f62a8ab0754b0fafe10",
+    "binary_sha256": "11f8ea63fa5b85b1b0f77c8a794f6b2f196ece6aaa1b2d2a43bd72f9a4de98ff"
+  }
+}
