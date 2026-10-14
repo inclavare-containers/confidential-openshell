@@ -1,0 +1,2 @@
+FROM quay.io/confidential-containers/peerpod-ctrl@sha256:64d463b70a708eee9912ef289f38dd4a76612561094dcc822fbfa10dd63015d4
+COPY manager /manager
