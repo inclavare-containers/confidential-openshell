@@ -1,0 +1,2 @@
+enable systemd-timesyncd.service
+disable api-server-rest.path

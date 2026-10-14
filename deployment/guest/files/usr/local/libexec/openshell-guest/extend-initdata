@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+/usr/local/libexec/openshell-guest/check-initdata
+digest="$(tr -d '\n' </run/peerpod/initdata.digest)"
+ready=false
+for _ in {1..30}; do
+    if [[ -S /run/confidential-containers/attestation-agent/attestation-agent.sock ]]; then
+        ready=true
+        break
+    fi
+    sleep 1
+done
+[[ "${ready}" == true ]]
+# AAEL is append-only. Reserve this boot's only extension attempt before the
+# RPC; an ambiguous failure requires a new boot instead of a duplicate event.
+set -C
+printf '%s\n' "${digest}" >/run/peerpod/initdata.aael-attempted
+set +C
+/usr/local/bin/process-user-data measure-initdata \
+    --initdata-path /run/peerpod/initdata \
+    --digest-path /run/peerpod/initdata.digest \
+    --aa-socket /run/confidential-containers/attestation-agent/attestation-agent.sock

@@ -1,0 +1,17 @@
+# Reuse the tools and Ubuntu base from CAA's official Dockerfile.mkosi.
+ARG BASE_IMAGE=ubuntu@sha256:0d39fcc8335d6d74d5502f6df2d30119ff4790ebbb60b364818d5112d9e3e932
+FROM ${BASE_IMAGE}
+ARG MKOSI_COMMIT=84af20892b61c8e177e391f997ded8b4cb5514f2
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bubblewrap git cpio systemd-repart kmod systemd-boot-efi libcryptsetup12 \
+    squashfs-tools systemd-ukify dosfstools mtools python3 debian-archive-keyring \
+    zstd cryptsetup-bin fdisk pesign qemu-utils ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+RUN if [ ! -d /build/mkosi/.git ]; then \
+        git init /build/mkosi && git -C /build/mkosi remote add origin https://github.com/systemd/mkosi.git \
+        && git -C /build/mkosi fetch --depth=1 origin "${MKOSI_COMMIT}" \
+        && git -C /build/mkosi checkout --detach FETCH_HEAD; \
+    fi \
+    && test "$(git -C /build/mkosi rev-parse HEAD)" = "${MKOSI_COMMIT}"
+ENV PATH=/build/mkosi/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+WORKDIR /image

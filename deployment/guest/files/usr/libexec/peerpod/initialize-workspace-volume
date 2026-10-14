@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""Initialize one measured, wholly blank workspace disk with an embedded LUKS2 header.
+
+APF supplies a CDH-released 32-byte key on stdin. Existing encrypted disks are
+opened by upstream CDH instead; this helper never repairs or reformats them.
+"""
+import array
+import fcntl
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
+import tomllib
+
+PARENT = Path('/run/peerpod')
+SYS_BLOCK = Path('/sys/class/block')
+BLKGETSIZE64 = 0x80081272
+BLKROGET = 0x125e
+
+
+def require_zero_device(fd, size):
+    if size < 64 * 1024 * 1024:
+        raise ValueError('workspace disk is too small')
+    os.lseek(fd, 0, os.SEEK_SET)
+    remaining = size
+    zeros = bytes(8 * 1024 * 1024)
+    while remaining:
+        chunk = os.read(fd, min(remaining, len(zeros)))
+        if not chunk or chunk != zeros[:len(chunk)]:
+            raise ValueError('workspace initialization requires an entirely zero-filled disk')
+        remaining -= len(chunk)
+
+
+def validate_policy(policy, disk_id, fs_type, key_uri):
+    ids = policy.get('disk_ids')
+    if (policy.get('version') != '0.1.0' or
+            policy.get('allow_initialize') is not True or
+            policy.get('encryption_type') != 'luks2' or
+            policy.get('filesystem_type') != fs_type or fs_type != 'ext4' or
+            policy.get('key_uri') != key_uri or
+            not re.fullmatch(r'kbs:///default/workspace/[a-zA-Z0-9._~-]+', key_uri) or
+            not isinstance(ids, list) or not ids or
+            not all(isinstance(item, str) and re.fullmatch(r'd-[a-z0-9]+', item) for item in ids) or
+            ids != sorted(set(ids)) or disk_id not in ids):
+        raise ValueError('workspace initialization does not match measured key and disk identities')
+
+
+def require_disk_identity(name, disk_id):
+    block = SYS_BLOCK / name
+    if (not block.is_dir() or (block / 'partition').exists() or
+            list((block / 'holders').iterdir()) or
+            any((child / 'partition').exists() for child in block.iterdir())):
+        raise ValueError('workspace source must be an unused whole disk without partitions')
+    identities = []
+    for relative in ('device/serial', 'serial', 'device/wwid', 'wwid'):
+        path = block / relative
+        if path.is_file():
+            identities.append(path.read_text().strip())
+    # Alibaba virtio serials omit the d- prefix; NVMe serials include it.
+    if not any(value in (disk_id, disk_id[2:]) for value in identities):
+        raise ValueError('workspace kernel disk identity does not match measured cloud disk')
+
+
+def run(*args, key=None, allowed=(0,)):
+    result = subprocess.run(args, input=key, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, check=False)
+    if result.returncode not in allowed:
+        raise RuntimeError('workspace disk command failed')
+    return result.returncode
+
+
+def main():
+    if len(sys.argv) != 5 or os.geteuid() != 0:
+        raise ValueError('usage: initialize-workspace-volume DEVICE DISK_ID FS_TYPE KEY_URI')
+    device, disk_id, fs_type, key_uri = sys.argv[1:]
+    if (not re.fullmatch(r'/dev/(?:nvme[0-9]+n[0-9]+|vd[a-z]+|sd[a-z]+)', device) or
+            not re.fullmatch(r'd-[a-z0-9]+', disk_id)):
+        raise ValueError('invalid workspace whole-disk path or identity')
+    key = bytearray(sys.stdin.buffer.read(33))
+    lock_fd = None
+    try:
+        if len(key) != 32:
+            raise ValueError('workspace initializer requires exactly 32 key bytes')
+        run('/usr/local/libexec/openshell-guest/check-initdata')
+        validate_policy(tomllib.loads((PARENT / 'workspace.toml').read_text()),
+                        disk_id, fs_type, key_uri)
+        lock_fd = os.open(PARENT / ('workspace-init-' + disk_id + '.lock'),
+                          os.O_WRONLY | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+        if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
+            raise ValueError('workspace initialization lock is not a regular file')
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        fd = os.open(device, os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_EXCL)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISBLK(info.st_mode):
+                raise ValueError('workspace source is not a block device')
+            require_disk_identity(Path(device).name, disk_id)
+            ro = array.array('i', [0])
+            fcntl.ioctl(fd, BLKROGET, ro, True)
+            if ro[0]:
+                raise ValueError('workspace initialization requires a writable disk')
+            size = array.array('Q', [0])
+            fcntl.ioctl(fd, BLKGETSIZE64, size, True)
+            if run('cryptsetup', 'isLuks', device, allowed=(0, 1)) == 0:
+                raise ValueError('existing LUKS disk must be opened, never initialized')
+            run('blkid', '-p', device, allowed=(2,))
+            require_zero_device(fd, size[0])
+            identity = f'{os.major(info.st_rdev)}-{os.minor(info.st_rdev)}'
+        finally:
+            os.close(fd)
+        mapper = 'workspace-init-' + identity
+        if (Path('/dev/mapper') / mapper).exists():
+            raise ValueError('workspace initialization mapper already exists')
+        # No detached --header: metadata lives on the retained encrypted disk.
+        run('cryptsetup', '--batch-mode', 'luksFormat', '--type', 'luks2',
+            '--cipher', 'aes-xts-plain64', '--sector-size', '4096',
+            '--key-file', '-', device, key=key)
+        run('cryptsetup', 'luksOpen', '--key-file', '-', device, mapper, key=key)
+        try:
+            run('mkfs.ext4', '-q', '/dev/mapper/' + mapper)
+        finally:
+            run('cryptsetup', 'luksClose', mapper)
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+        key[:] = bytes(len(key))
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, ValueError, RuntimeError, tomllib.TOMLDecodeError) as error:
+        print('workspace initialization rejected: ' + str(error), file=sys.stderr)
+        sys.exit(1)
