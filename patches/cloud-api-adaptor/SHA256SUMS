@@ -1,0 +1,11 @@
+1b85ed2913bb3d2e8e4eae415ab0f04882b060b30c4625f0ccee68ff5fef4d56  ./0001-fix-volumes-preserve-immutable-readonly-direct-volum.patch
+5d745472d56ac7452b14c77dbfb47fe75783f14d5442b9a427f8354369c58ad7  ./0002-fix-alibabacloud-accept-explicit-VPC-configuration.patch
+8c48c9a3d63625534249e7f6334d4bd149ad73eaa9dfa9bedd484173653a6a22  ./0003-feat-alibabacloud-manage-retained-ESSD-instances-saf.patch
+a4c43c284ba25083d322321bac7e452bd96fdbda2f5a99cc0c87871969562249  ./0004-feat-guest-locate-Alibaba-Cloud-data-disks-by-identi.patch
+c7fe78ca7775d7c72e001167a3eecea82ced7d9410d0881b414d6da4a324df73  ./0005-feat-guest-prepare-encrypted-volumes-with-owned-clea.patch
+a39516f7157b474a90613bd252ab833554c00984c4b2b50ef1b151c86cb6311e  ./0006-fix-security-keep-host-credentials-out-of-peer-pod-d.patch
+8447f8b3bad8f3804dd315d5216775d8f32ebd1785a85edf59db7f9b306ec764  ./0007-fix-alibabacloud-bound-compressed-instance-user-data.patch
+859613e0c20a50743b4b4bb4ba0ce813746d449e5fa563047fbe1ff39daa4ecc  ./0008-Verify-measured-sealed-volumes-before-guest-containe.patch
+314edccfb21c476947bde8366bd0ccb19bb129cc6a4dfcf4cbb09106488faacc  ./0009-Delay-CDH-connection-until-verified-descriptor-unsea.patch
+113f934ec24d7cccbd983554a93003172a60cd04988d0c3284e457cc72d3312e  ./0010-Preserve-exact-initdata-bytes-in-CAA-cloud-config.patch
+158b51f174c44a2408eee7853958a7959c33b835842125eb47ec7fd6b31ffe7c  ./0011-Preserve-on-link-worker-Pod-routes-in-guest-network.patch

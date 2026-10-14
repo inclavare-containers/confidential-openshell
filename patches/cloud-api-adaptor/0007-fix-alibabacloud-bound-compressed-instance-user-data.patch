@@ -1,0 +1,314 @@
+From 956e918021b117a908a0e7444e7aedcff8328c06 Mon Sep 17 00:00:00 2001
+From: Weidong Sun <sunweidong@linux.alibaba.com>
+Date: Wed, 26 Aug 2026 12:12:22 +0800
+Subject: [PATCH 07/10] fix(alibabacloud): bound compressed instance user data
+
+Compress Alibaba Cloud instance user data before CreateInstance and transparently decode it in the guest. Enforce the existing one MiB limit on both raw input and decompressed output so compression cannot bypass the guest boundary.
+
+Signed-off-by: Weidong Sun <sunweidong@linux.alibaba.com>
+---
+ .../pkg/userdata/alibabacloud_test.go         | 67 ++++++++++++++
+ .../pkg/userdata/provision.go                 | 36 +++++++-
+ src/cloud-providers/alibabacloud/provider.go  | 36 +++++++-
+ .../alibabacloud/userdata_test.go             | 87 +++++++++++++++++++
+ 4 files changed, 222 insertions(+), 4 deletions(-)
+ create mode 100644 src/cloud-api-adaptor/pkg/userdata/alibabacloud_test.go
+ create mode 100644 src/cloud-providers/alibabacloud/userdata_test.go
+
+diff --git a/src/cloud-api-adaptor/pkg/userdata/alibabacloud_test.go b/src/cloud-api-adaptor/pkg/userdata/alibabacloud_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..c1ea9d673b04e05924c4966a282aae30cd359f03
+--- /dev/null
++++ b/src/cloud-api-adaptor/pkg/userdata/alibabacloud_test.go
+@@ -0,0 +1,67 @@
++// (C) Copyright Confidential Containers Contributors
++// SPDX-License-Identifier: Apache-2.0
++
++package userdata
++
++import (
++	"bytes"
++	"compress/gzip"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++)
++
++func gzipData(t *testing.T, data []byte) []byte {
++	t.Helper()
++	var compressed bytes.Buffer
++	writer := gzip.NewWriter(&compressed)
++	if _, err := writer.Write(data); err != nil {
++		t.Fatal(err)
++	}
++	if err := writer.Close(); err != nil {
++		t.Fatal(err)
++	}
++	return compressed.Bytes()
++}
++
++func TestDecodeAlibabaCloudUserData(t *testing.T) {
++	raw := []byte("#cloud-config\nwrite_files: []\n")
++	decoded, err := decodeAlibabaCloudUserData(raw)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !bytes.Equal(decoded, raw) {
++		t.Fatal("uncompressed user data changed")
++	}
++
++	decoded, err = decodeAlibabaCloudUserData(gzipData(t, raw))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !bytes.Equal(decoded, raw) {
++		t.Fatal("compressed user data did not round-trip")
++	}
++}
++
++func TestDecodeAlibabaCloudUserDataLimit(t *testing.T) {
++	for _, test := range []struct {
++		name string
++		data []byte
++		ok   bool
++	}{
++		{name: "raw exact limit", data: bytes.Repeat([]byte{'x'}, maxAlibabaCloudUserDataSize), ok: true},
++		{name: "raw over limit", data: bytes.Repeat([]byte{'x'}, maxAlibabaCloudUserDataSize+1)},
++		{name: "gzip exact limit", data: gzipData(t, bytes.Repeat([]byte{'x'}, maxAlibabaCloudUserDataSize)), ok: true},
++		{name: "gzip decompressed over limit", data: gzipData(t, bytes.Repeat([]byte{'x'}, maxAlibabaCloudUserDataSize+1))},
++	} {
++		t.Run(test.name, func(t *testing.T) {
++			decoded, err := decodeAlibabaCloudUserData(test.data)
++			if test.ok {
++				require.NoError(t, err)
++				require.Len(t, decoded, maxAlibabaCloudUserDataSize)
++				return
++			}
++			require.Error(t, err)
++		})
++	}
++}
+diff --git a/src/cloud-api-adaptor/pkg/userdata/provision.go b/src/cloud-api-adaptor/pkg/userdata/provision.go
+index 2807a3cd02f488ee9f463d65afaddc36c057bc90..49dc5c8a0a4a16848886ed537e6b50b237261938 100644
+--- a/src/cloud-api-adaptor/pkg/userdata/provision.go
++++ b/src/cloud-api-adaptor/pkg/userdata/provision.go
+@@ -1,9 +1,12 @@
+ package userdata
+ 
+ import (
++	"bytes"
++	"compress/gzip"
+ 	"context"
+ 	"errors"
+ 	"fmt"
++	"io"
+ 	"log"
+ 	"os"
+ 	"path/filepath"
+@@ -35,6 +38,7 @@ const (
+ 	// Ref: https://www.alibabacloud.com/help/en/ecs/user-guide/customize-the-initialization-configuration-for-an-instance
+ 	AlibabaCloudImdsURL         = "http://100.100.100.200/latest/dynamic/instance-identity/document"
+ 	AlibabaCloudUserDataImdsURL = "http://100.100.100.200/latest/user-data"
++	maxAlibabaCloudUserDataSize = 1024 * 1024
+ )
+ 
+ var logger = log.New(log.Writer(), "[userdata/provision] ", log.LstdFlags|log.Lmsgprefix)
+@@ -124,7 +128,37 @@ type AlibabaCloudDataProvider struct{ DefaultRetry }
+ func (a AlibabaCloudDataProvider) GetUserData(ctx context.Context) ([]byte, error) {
+ 	url := AlibabaCloudUserDataImdsURL
+ 	logger.Printf("provider: AlibabaCloud, userDataUrl: %s\n", url)
+-	return imdsGet(ctx, url, false, nil)
++	data, err := imdsGet(ctx, url, false, nil)
++	if err != nil {
++		return nil, err
++	}
++	return decodeAlibabaCloudUserData(data)
++}
++
++func decodeAlibabaCloudUserData(data []byte) ([]byte, error) {
++	if len(data) > maxAlibabaCloudUserDataSize {
++		return nil, fmt.Errorf("Alibaba Cloud user data exceeds %d bytes", maxAlibabaCloudUserDataSize)
++	}
++	if len(data) < 2 || data[0] != 0x1f || data[1] != 0x8b {
++		return data, nil
++	}
++
++	reader, err := gzip.NewReader(bytes.NewReader(data))
++	if err != nil {
++		return nil, fmt.Errorf("open compressed Alibaba Cloud user data: %w", err)
++	}
++	decoded, readErr := io.ReadAll(io.LimitReader(reader, maxAlibabaCloudUserDataSize+1))
++	closeErr := reader.Close()
++	if readErr != nil {
++		return nil, fmt.Errorf("decompress Alibaba Cloud user data: %w", readErr)
++	}
++	if closeErr != nil {
++		return nil, fmt.Errorf("finish Alibaba Cloud user data decompression: %w", closeErr)
++	}
++	if len(decoded) > maxAlibabaCloudUserDataSize {
++		return nil, fmt.Errorf("decompressed Alibaba Cloud user data exceeds %d bytes", maxAlibabaCloudUserDataSize)
++	}
++	return decoded, nil
+ }
+ 
+ func newProvider(ctx context.Context) (UserDataProvider, error) {
+diff --git a/src/cloud-providers/alibabacloud/provider.go b/src/cloud-providers/alibabacloud/provider.go
+index c51f1b1df18208c6f6f178827879319956ae199b..8a2b35b7e854ff596713a0a2751330cfc07ce651 100644
+--- a/src/cloud-providers/alibabacloud/provider.go
++++ b/src/cloud-providers/alibabacloud/provider.go
+@@ -4,6 +4,8 @@
+ package alibabacloud
+ 
+ import (
++	"bytes"
++	"compress/gzip"
+ 	"context"
+ 	"encoding/base64"
+ 	"errors"
+@@ -30,13 +32,39 @@ import (
+ var logger = log.New(log.Writer(), "[adaptor/cloud/alibabacloud] ", log.LstdFlags|log.Lmsgprefix)
+ 
+ const (
+-	maxInstanceNameLen = 63
++	maxInstanceNameLen      = 63
++	maxUserDataPayloadBytes = 16 * 1024
+ 
+ 	EnvRoleArn         = "ALIBABA_CLOUD_ROLE_ARN"
+ 	EnvOidcProviderArn = "ALIBABA_CLOUD_OIDC_PROVIDER_ARN"
+ 	EnvOidcTokenFile   = "ALIBABA_CLOUD_OIDC_TOKEN_FILE"
+ )
+ 
++func encodeUserData(data string) (string, error) {
++	payload := []byte(data)
++	if len(payload) > maxUserDataPayloadBytes {
++		var compressed bytes.Buffer
++		writer, err := gzip.NewWriterLevel(&compressed, gzip.BestCompression)
++		if err != nil {
++			return "", fmt.Errorf("initialize Alibaba Cloud user data compression: %w", err)
++		}
++		if _, err := writer.Write(payload); err != nil {
++			return "", fmt.Errorf("compress Alibaba Cloud user data: %w", err)
++		}
++		if err := writer.Close(); err != nil {
++			return "", fmt.Errorf("finish Alibaba Cloud user data compression: %w", err)
++		}
++		payload = compressed.Bytes()
++	}
++	if len(payload) > maxUserDataPayloadBytes {
++		return "", fmt.Errorf(
++			"Alibaba Cloud user data is %d bytes after compression; maximum is %d bytes",
++			len(payload), maxUserDataPayloadBytes)
++	}
++
++	return base64.StdEncoding.EncodeToString(payload), nil
++}
++
+ var (
+ 	instanceCleanupTimeout      = 10 * time.Minute
+ 	instanceCleanupPollInterval = 2 * time.Second
+@@ -232,8 +260,10 @@ func (p *alibabaCloudProvider) CreateInstance(ctx context.Context, podName, sand
+ 		return nil, err
+ 	}
+ 
+-	//Convert userData to base64
+-	b64EncData := base64.StdEncoding.EncodeToString([]byte(cloudConfigData))
++	b64EncData, err := encodeUserData(cloudConfigData)
++	if err != nil {
++		return nil, err
++	}
+ 
+ 	instanceType, err := p.selectInstanceType(ctx, spec)
+ 	if err != nil {
+diff --git a/src/cloud-providers/alibabacloud/userdata_test.go b/src/cloud-providers/alibabacloud/userdata_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..5b0f1f194d3c60ef6bb0b9883824e3c9c813410e
+--- /dev/null
++++ b/src/cloud-providers/alibabacloud/userdata_test.go
+@@ -0,0 +1,87 @@
++// (C) Copyright Confidential Containers Contributors
++// SPDX-License-Identifier: Apache-2.0
++
++package alibabacloud
++
++import (
++	"bytes"
++	"compress/gzip"
++	"encoding/base64"
++	"io"
++	"math/rand"
++	"strings"
++	"testing"
++)
++
++func TestEncodeUserData(t *testing.T) {
++	tests := []struct {
++		name       string
++		data       string
++		compressed bool
++	}{
++		{
++			name:       "at compression threshold",
++			data:       strings.Repeat("x", maxUserDataPayloadBytes),
++			compressed: false,
++		},
++		{
++			name:       "over compression threshold",
++			data:       strings.Repeat("x", maxUserDataPayloadBytes+1),
++			compressed: true,
++		},
++	}
++
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			encoded, err := encodeUserData(test.data)
++			if err != nil {
++				t.Fatal(err)
++			}
++			encodedAgain, err := encodeUserData(test.data)
++			if err != nil {
++				t.Fatal(err)
++			}
++			if encodedAgain != encoded {
++				t.Fatal("user data encoding is not deterministic")
++			}
++			payload, err := base64.StdEncoding.DecodeString(encoded)
++			if err != nil {
++				t.Fatal(err)
++			}
++
++			if !test.compressed {
++				if string(payload) != test.data {
++					t.Fatal("small user data changed")
++				}
++				return
++			}
++
++			reader, err := gzip.NewReader(bytes.NewReader(payload))
++			if err != nil {
++				t.Fatal(err)
++			}
++			decoded, err := io.ReadAll(reader)
++			if err != nil {
++				t.Fatal(err)
++			}
++			if err := reader.Close(); err != nil {
++				t.Fatal(err)
++			}
++			if string(decoded) != test.data {
++				t.Fatal("compressed user data did not round-trip")
++			}
++		})
++	}
++}
++
++func TestEncodeUserDataRejectsOversizedCompressedPayload(t *testing.T) {
++	payload := make([]byte, maxUserDataPayloadBytes*2)
++	if _, err := rand.New(rand.NewSource(1)).Read(payload); err != nil {
++		t.Fatal(err)
++	}
++
++	_, err := encodeUserData(string(payload))
++	if err == nil || !strings.Contains(err.Error(), "after compression") {
++		t.Fatalf("expected compressed-size error, got %v", err)
++	}
++}

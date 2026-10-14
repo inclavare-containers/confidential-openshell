@@ -1,0 +1,11 @@
+0001-fix-volumes-preserve-immutable-readonly-direct-volum.patch
+0002-fix-alibabacloud-accept-explicit-VPC-configuration.patch
+0003-feat-alibabacloud-manage-retained-ESSD-instances-saf.patch
+0004-feat-guest-locate-Alibaba-Cloud-data-disks-by-identi.patch
+0005-feat-guest-prepare-encrypted-volumes-with-owned-clea.patch
+0006-fix-security-keep-host-credentials-out-of-peer-pod-d.patch
+0007-fix-alibabacloud-bound-compressed-instance-user-data.patch
+0008-Verify-measured-sealed-volumes-before-guest-containe.patch
+0009-Delay-CDH-connection-until-verified-descriptor-unsea.patch
+0010-Preserve-exact-initdata-bytes-in-CAA-cloud-config.patch
+0011-Preserve-on-link-worker-Pod-routes-in-guest-network.patch

@@ -1,0 +1,1037 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Wed, 14 Oct 2026 09:00:00 +0800
+Subject: [PATCH 08/11] Verify measured sealed volumes and native initdata binding
+
+Retain fail-closed sealed volume verification before the guest agent.
+Use the existing process-user-data binary to bind exact initdata with the
+released native AA ttrpc API, enforcing one canonical SHA384 TCG2 event
+and rejecting disabled measurement, digest mismatch or duplicate events.
+
+Signed-off-by: Codex <codex@openai.com>
+---
+diff --git a/src/cloud-api-adaptor/cmd/agent-protocol-forwarder/main.go b/src/cloud-api-adaptor/cmd/agent-protocol-forwarder/main.go
+index e36fccec497aae4204e0258abfe3768f2ae87462..edcae7839f31058255666b5e57482565b5cce11d 100644
+--- a/src/cloud-api-adaptor/cmd/agent-protocol-forwarder/main.go
++++ b/src/cloud-api-adaptor/cmd/agent-protocol-forwarder/main.go
+@@ -91,11 +91,21 @@ func (cfg *Config) Setup() (cmd.Starter, error) {
+ 		cfg.tlsConfig = &tlsConfig
+ 	}
+ 
+-	interceptor := interceptor.NewInterceptorWithEncryptedVolumes(cfg.kataAgentSocketPath, cfg.podNamespace, cfg.requireEncryptedVolumes)
++	var agentInterceptor interceptor.Interceptor
++	if manifestPath, enabled := os.LookupEnv("APF_SEALED_VOLUME_MANIFEST"); enabled {
++		var err error
++		agentInterceptor, err = interceptor.NewInterceptorWithSealedVolume(
++			cfg.kataAgentSocketPath, cfg.podNamespace, cfg.requireEncryptedVolumes, manifestPath)
++		if err != nil {
++			return nil, fmt.Errorf("measured sealed-volume gate: %w", err)
++		}
++	} else {
++		agentInterceptor = interceptor.NewInterceptorWithEncryptedVolumes(cfg.kataAgentSocketPath, cfg.podNamespace, cfg.requireEncryptedVolumes)
++	}
+ 
+ 	podNode := podnetwork.NewPodNode(cfg.podNamespace, cfg.HostInterface, cfg.daemonConfig.PodNetwork)
+ 
+-	services = append(services, daemon.NewDaemon(&cfg.daemonConfig, cfg.listenAddr, cfg.tlsConfig, interceptor, podNode))
++	services = append(services, daemon.NewDaemon(&cfg.daemonConfig, cfg.listenAddr, cfg.tlsConfig, agentInterceptor, podNode))
+ 
+ 	return cmd.NewStarter(services...), nil
+ }
+diff --git a/src/cloud-api-adaptor/cmd/process-user-data/main.go b/src/cloud-api-adaptor/cmd/process-user-data/main.go
+index 05fab1ee1e1aa633b26a20b921e7ccb19ddbcff5..eee09ab76596f01993cb25c753bdabc2b784ecec 100644
+--- a/src/cloud-api-adaptor/cmd/process-user-data/main.go
++++ b/src/cloud-api-adaptor/cmd/process-user-data/main.go
+@@ -45,6 +45,19 @@ func init() {
+ 	}
+ 	provisionFilesCmd.Flags().IntVarP(&fetchTimeout, "user-data-fetch-timeout", "t", 180, "Timeout (in secs) for fetching user data")
+ 	rootCmd.AddCommand(provisionFilesCmd)
++	var initdataPath, digestPath, socketPath, eventlogPath string
++	measure := &cobra.Command{
++		Use: "measure-initdata", Short: "Bind exact initdata through the native attestation-agent runtime measurement API",
++		Args: cobra.NoArgs, SilenceUsage: true,
++		RunE: func(cmd *cobra.Command, _ []string) error {
++			return userdata.MeasureInitdata(cmd.Context(), initdataPath, digestPath, socketPath, eventlogPath)
++		},
++	}
++	measure.Flags().StringVar(&initdataPath, "initdata-path", "/run/peerpod/initdata", "Exact provisioned initdata path")
++	measure.Flags().StringVar(&digestPath, "digest-path", userdata.DigestPath, "Provisioned initdata digest path")
++	measure.Flags().StringVar(&socketPath, "aa-socket", userdata.NativeAASocket, "Native attestation-agent socket")
++	measure.Flags().StringVar(&eventlogPath, "eventlog-path", userdata.NativeAAEventlog, "Native attestation-agent eventlog")
++	rootCmd.AddCommand(measure)
+ }
+ 
+ func main() {
+diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/cdh_client.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/cdh_client.go
+index 008dd7eff58ce9d81b73d7b84d2975fddcf9580a..05186fb60ec2cdb2995b0e574726597c91040278 100644
+--- a/src/cloud-api-adaptor/pkg/forwarder/interceptor/cdh_client.go
++++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/cdh_client.go
+@@ -14,7 +14,10 @@ import (
+ 	"github.com/confidential-containers/cloud-api-adaptor/src/cloud-api-adaptor/pkg/forwarder/interceptor/cdhpb"
+ )
+ 
+-const cdhServiceName = "api.SecureMountService"
++const (
++	cdhServiceName       = "api.SecureMountService"
++	cdhSealedServiceName = "api.SealedSecretService"
++)
+ 
+ type cdhClient struct {
+ 	conn   net.Conn
+@@ -82,3 +85,12 @@ func (c *cdhClient) secureMount(ctx context.Context, volumeType string, options
+ 
+ 	return nil
+ }
++
++func (c *cdhClient) unsealSecret(ctx context.Context, sealed []byte) ([]byte, error) {
++	resp := &cdhpb.UnsealSecretOutput{}
++	if err := c.client.Call(ctx, cdhSealedServiceName, "UnsealSecret",
++		&cdhpb.UnsealSecretInput{Secret: sealed}, resp); err != nil {
++		return nil, fmt.Errorf("CDH UnsealSecret RPC failed: %w", err)
++	}
++	return resp.GetPlaintext(), nil
++}
+diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
+index cec0fdd51bcc01db3be492b72fde05d44732e14c..05c99966802b0a81ee5eeb66bb4df88c085c9c74 100644
+--- a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
++++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
+@@ -52,6 +52,7 @@ type interceptor struct {
+ 	workspace               *workspacePolicy
+ 	cloudVolumeMu           sync.Mutex
+ 	cloudVolumes            []*preparedCloudVolume
++	sealedGate              *sealedVolumeGate
+ }
+ 
+ func dial(ctx context.Context, agentSocket string) (net.Conn, error) {
+@@ -100,7 +101,20 @@ func NewInterceptorWithEncryptedVolumes(agentSocket, nsPath string, required boo
+ 	}
+ }
+ 
++func NewInterceptorWithSealedVolume(agentSocket, nsPath string, required bool, manifestPath string) (Interceptor, error) {
++	gate, err := loadSealedVolumeGate(manifestPath)
++	if err != nil {
++		return nil, err
++	}
++	i := NewInterceptorWithEncryptedVolumes(agentSocket, nsPath, required).(*interceptor)
++	i.sealedGate = gate
++	return i, nil
++}
++
+ func (i *interceptor) CreateContainer(ctx context.Context, req *pb.CreateContainerRequest) (*emptypb.Empty, error) {
++	if req == nil || req.OCI == nil || req.OCI.Linux == nil {
++		return nil, errors.New("CreateContainer lacks OCI Linux specification")
++	}
+ 
+ 	logger.Printf("CreateContainer: containerID:%s", req.ContainerId)
+ 
+@@ -115,6 +129,7 @@ func (i *interceptor) CreateContainer(ctx context.Context, req *pb.CreateContain
+ 	}
+ 
+ 	var preparedVolumes []*preparedCloudVolume
++	var verifiedSecrets string
+ 	if cvJSON, ok := req.OCI.Annotations[util.CloudVolumesAnnotationKey]; ok && cvJSON != "" {
+ 		// Serialize acquisition with sandbox cleanup and other container retries.
+ 		i.cloudVolumeMu.Lock()
+@@ -126,6 +141,29 @@ func (i *interceptor) CreateContainer(ctx context.Context, req *pb.CreateContain
+ 			return nil, err
+ 		}
+ 	}
++	if i.sealedGate != nil {
++		gate := i.sealedGate
++		gate.mu.Lock()
++		defer gate.mu.Unlock()
++		name := req.OCI.Annotations["io.kubernetes.cri.container-name"]
++		if name == gate.manifest.Container {
++			client, err := newCDHClient(ctx, cdhSocketPath)
++			if err != nil {
++				return nil, err
++			}
++			defer client.close()
++			verifiedSecrets, err = gate.verifyAndUnseal(ctx, req, client.unsealSecret)
++			if err != nil {
++				return nil, err
++			}
++		} else {
++			for _, mount := range req.OCI.Mounts {
++				if mount.Destination == gate.manifest.Destination || isWithin(mount.Source, gate.privateRoot) {
++					return nil, errors.New("unmeasured container attempted verified-secret mount")
++				}
++			}
++		}
++	}
+ 
+ 	if len(req.OCI.Mounts) > 0 {
+ 		for _, m := range req.OCI.Mounts {
+@@ -142,6 +180,9 @@ func (i *interceptor) CreateContainer(ctx context.Context, req *pb.CreateContain
+ 
+ 	if err != nil {
+ 		logger.Printf("CreateContainer failed with error: %v", err)
++		if verifiedSecrets != "" {
++			_ = os.RemoveAll(verifiedSecrets)
++		}
+ 		cleanupErr := cleanupPreparedCloudVolumes(ctx, preparedVolumes)
+ 		i.trackOwnedCloudVolumes(preparedVolumes)
+ 		err = preserveOriginalError(err, cleanupErr)
+@@ -152,6 +193,20 @@ func (i *interceptor) CreateContainer(ctx context.Context, req *pb.CreateContain
+ 	return res, err
+ }
+ 
++func (i *interceptor) CopyFile(ctx context.Context, req *pb.CopyFileRequest) (*emptypb.Empty, error) {
++	if i.sealedGate != nil {
++		i.sealedGate.mu.Lock()
++		defer i.sealedGate.mu.Unlock()
++		if req == nil {
++			return nil, errors.New("CopyFile request is nil")
++		}
++		if err := i.sealedGate.checkCopyFilePath(req.Path); err != nil {
++			return nil, err
++		}
++	}
++	return i.Redirector.CopyFile(ctx, req)
++}
++
+ func normalizeBindMountOptions(options []string, readOnly bool) []string {
+ 	result := make([]string, 0, len(options)+1)
+ 	seen := make(map[string]struct{}, len(options)+1)
+@@ -189,6 +244,13 @@ func (i *interceptor) StartContainer(ctx context.Context, req *pb.StartContainer
+ }
+ 
+ func (i *interceptor) RemoveContainer(ctx context.Context, req *pb.RemoveContainerRequest) (*emptypb.Empty, error) {
++	if req == nil {
++		return nil, errors.New("RemoveContainer request is nil")
++	}
++	if i.sealedGate != nil {
++		i.sealedGate.mu.Lock()
++		defer i.sealedGate.mu.Unlock()
++	}
+ 
+ 	logger.Printf("RemoveContainer: containerID:%s", req.ContainerId)
+ 
+@@ -196,6 +258,10 @@ func (i *interceptor) RemoveContainer(ctx context.Context, req *pb.RemoveContain
+ 
+ 	if err != nil {
+ 		logger.Printf("RemoveContainer failed with error: %v", err)
++	} else if i.sealedGate != nil && sealedContainerID.MatchString(req.ContainerId) {
++		if cleanErr := os.RemoveAll(filepath.Join(i.sealedGate.privateRoot, req.ContainerId)); cleanErr != nil {
++			logger.Printf("RemoveContainer failed to erase verified secrets: %v", cleanErr)
++		}
+ 	}
+ 	return res, err
+ }
+@@ -241,6 +307,12 @@ func (i *interceptor) DestroySandbox(ctx context.Context, req *pb.DestroySandbox
+ 
+ 	if err != nil {
+ 		logger.Printf("DestroySandbox failed with error: %v", err)
++	} else if i.sealedGate != nil {
++		i.sealedGate.mu.Lock()
++		defer i.sealedGate.mu.Unlock()
++		if cleanErr := os.RemoveAll(i.sealedGate.privateRoot); cleanErr != nil {
++			logger.Printf("DestroySandbox failed to erase verified secrets: %v", cleanErr)
++		}
+ 	}
+ 
+ 	return res, err
+diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/sealed_volume.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/sealed_volume.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..a0e8be7cc9457ee2d59b0ce095babdb687f14ceb
+--- /dev/null
++++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/sealed_volume.go
+@@ -0,0 +1,281 @@
++// Copyright Confidential Containers Contributors
++// SPDX-License-Identifier: Apache-2.0
++
++package interceptor
++
++import (
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"os"
++	"path/filepath"
++	"regexp"
++	"sort"
++	"strings"
++	"sync"
++
++	pb "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/agent/protocols/grpc"
++	"golang.org/x/sys/unix"
++)
++
++const (
++	sealedVolumePrivateRoot = "/run/peerpod/verified-secrets"
++	sealedVolumeMaxManifest = 64 << 10
++	sealedVolumeMaxFile     = 1 << 20
++	sealedVolumeMaxFiles    = 16
++	sharedContainersRoot    = "/run/kata-containers/shared/containers"
++)
++
++var (
++	sealedVolumeFilename = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
++	sealedVolumeDigest   = regexp.MustCompile(`^[a-f0-9]{64}$`)
++	sealedContainerID    = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$`)
++)
++
++// The manifest is materialized by measured initdata in the guest. This layer
++// deliberately needs no knowledge of the operator's role or Secret names.
++type sealedVolumeManifest struct {
++	Schema           int               `json:"schema"`
++	Container        string            `json:"sealed_volume_container"`
++	Destination      string            `json:"sealed_volume_destination"`
++	DescriptorSHA256 map[string]string `json:"sealed_descriptor_sha256"`
++}
++
++type sealedVolumeGate struct {
++	manifest     sealedVolumeManifest
++	privateRoot  string
++	sharedRoot   string
++	requireTmpfs bool
++	mu           sync.Mutex
++}
++
++func loadSealedVolumeGate(path string) (*sealedVolumeGate, error) {
++	if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path {
++		return nil, errors.New("sealed-volume manifest path must be absolute and canonical")
++	}
++	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
++	if err != nil {
++		return nil, fmt.Errorf("open measured sealed-volume manifest: %w", err)
++	}
++	file := os.NewFile(uintptr(fd), path)
++	defer file.Close()
++	info, err := file.Stat()
++	if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > sealedVolumeMaxManifest {
++		return nil, errors.New("measured sealed-volume manifest must be a bounded regular file")
++	}
++	data, err := io.ReadAll(io.LimitReader(file, sealedVolumeMaxManifest+1))
++	if err != nil || len(data) > sealedVolumeMaxManifest {
++		return nil, errors.New("read measured sealed-volume manifest failed")
++	}
++	var manifest sealedVolumeManifest
++	if err := json.Unmarshal(data, &manifest); err != nil {
++		return nil, fmt.Errorf("parse measured sealed-volume manifest: %w", err)
++	}
++	if err := validateSealedVolumeManifest(manifest); err != nil {
++		return nil, err
++	}
++	return &sealedVolumeGate{manifest: manifest, privateRoot: sealedVolumePrivateRoot,
++		sharedRoot: sharedContainersRoot, requireTmpfs: true}, nil
++}
++
++func validateSealedVolumeManifest(m sealedVolumeManifest) error {
++	if m.Schema != 1 || !sealedContainerID.MatchString(m.Container) ||
++		!filepath.IsAbs(m.Destination) || filepath.Clean(m.Destination) != m.Destination ||
++		m.Destination == "/" || len(m.DescriptorSHA256) == 0 ||
++		len(m.DescriptorSHA256) > sealedVolumeMaxFiles {
++		return errors.New("invalid measured sealed-volume manifest shape")
++	}
++	for name, digest := range m.DescriptorSHA256 {
++		if !sealedVolumeFilename.MatchString(name) || name == "." || name == ".." ||
++			!sealedVolumeDigest.MatchString(digest) {
++			return errors.New("invalid measured sealed-volume filename or digest")
++		}
++	}
++	return nil
++}
++
++func isWithin(path, root string) bool {
++	return path == root || strings.HasPrefix(path, root+string(os.PathSeparator))
++}
++
++func (g *sealedVolumeGate) checkCopyFilePath(path string) error {
++	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
++		return errors.New("CopyFile path is not absolute and canonical")
++	}
++	if isWithin(path, "/run/peerpod") {
++		return errors.New("CopyFile cannot modify measured guest files")
++	}
++	// A host-created relative symlink elsewhere under the allowed CopyFile
++	// prefix must not alias the private tree. Check the target as well as its
++	// parent because a new file may not yet exist.
++	for _, candidate := range []string{path, filepath.Dir(path)} {
++		resolved, err := filepath.EvalSymlinks(candidate)
++		if err == nil && isWithin(resolved, "/run/peerpod") {
++			return errors.New("CopyFile path aliases measured guest files")
++		}
++	}
++	return nil
++}
++
++func (g *sealedVolumeGate) privateDirectory(containerID string) (string, error) {
++	if !sealedContainerID.MatchString(containerID) || containerID == "." || containerID == ".." {
++		return "", errors.New("invalid container ID for verified secret directory")
++	}
++	if err := os.MkdirAll(g.privateRoot, 0700); err != nil {
++		return "", fmt.Errorf("create verified-secret root: %w", err)
++	}
++	rootInfo, err := os.Lstat(g.privateRoot)
++	if err != nil || !rootInfo.IsDir() || rootInfo.Mode().Perm() != 0700 {
++		return "", errors.New("verified-secret root is not a private directory")
++	}
++	if g.requireTmpfs {
++		var stat unix.Statfs_t
++		if err := unix.Statfs(g.privateRoot, &stat); err != nil || stat.Type != unix.TMPFS_MAGIC {
++			return "", errors.New("verified-secret root must reside on tmpfs")
++		}
++	}
++	path := filepath.Join(g.privateRoot, containerID)
++	if err := os.Mkdir(path, 0750); err != nil {
++		return "", fmt.Errorf("create new verified-secret directory: %w", err)
++	}
++	return path, nil
++}
++
++func readSealedDescriptor(directory, name string) ([]byte, error) {
++	rootFD, err := unix.Open(directory, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
++	if err != nil {
++		return nil, fmt.Errorf("open bootstrap mount root: %w", err)
++	}
++	defer unix.Close(rootFD)
++	fd, err := unix.Openat2(rootFD, name, &unix.OpenHow{
++		Flags:   unix.O_RDONLY | unix.O_CLOEXEC,
++		Resolve: unix.RESOLVE_BENEATH | unix.RESOLVE_NO_MAGICLINKS,
++	})
++	if err != nil {
++		return nil, fmt.Errorf("open sealed descriptor %s beneath mount: %w", name, err)
++	}
++	file := os.NewFile(uintptr(fd), name)
++	defer file.Close()
++	info, err := file.Stat()
++	if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > sealedVolumeMaxFile {
++		return nil, fmt.Errorf("sealed descriptor %s is not a bounded regular file", name)
++	}
++	data, err := io.ReadAll(io.LimitReader(file, sealedVolumeMaxFile+1))
++	if err != nil || len(data) > sealedVolumeMaxFile {
++		return nil, fmt.Errorf("read sealed descriptor %s failed", name)
++	}
++	if !strings.HasPrefix(string(data), "sealed.") {
++		return nil, fmt.Errorf("descriptor %s is not a native sealed JWS", name)
++	}
++	return data, nil
++}
++
++func (g *sealedVolumeGate) verifyAndUnseal(ctx context.Context, req *pb.CreateContainerRequest,
++	unseal func(context.Context, []byte) ([]byte, error)) (string, error) {
++	if req == nil || req.OCI == nil || req.OCI.Process == nil || req.OCI.Process.User == nil {
++		return "", errors.New("CreateContainer lacks process identity for verified secrets")
++	}
++	if !sealedContainerID.MatchString(req.ContainerId) ||
++		req.OCI.Root == nil || req.OCI.Root.Path != filepath.Join("/run/kata-containers", req.ContainerId, "rootfs") {
++		return "", errors.New("container ID does not match OCI root bundle")
++	}
++	var target *pb.Mount
++	baseName := filepath.Base(g.manifest.Destination)
++	expectedSource := regexp.MustCompile(`^` + regexp.QuoteMeta(g.sharedRoot) + `(?:/passthrough)?/(?:watchable/)?` + regexp.QuoteMeta(req.ContainerId) + `-[a-z0-9]{16}-` + regexp.QuoteMeta(baseName) + `$`)
++	for _, mount := range req.OCI.Mounts {
++		if mount.Destination == g.manifest.Destination {
++			if target != nil || mount.Type != "bind" || !expectedSource.MatchString(mount.Source) ||
++				!hasMountOption(mount.Options, "ro") || hasMountOption(mount.Options, "rw") {
++				return "", errors.New("invalid sealed-volume bind mount")
++			}
++			target = mount
++		}
++	}
++	if target == nil {
++		return "", errors.New("expected sealed-volume bind mount is absent")
++	}
++	entries, err := os.ReadDir(target.Source)
++	if err != nil {
++		return "", fmt.Errorf("read sealed-volume source: %w", err)
++	}
++	visible := make([]string, 0, len(entries))
++	for _, entry := range entries {
++		if !strings.HasPrefix(entry.Name(), "..") {
++			visible = append(visible, entry.Name())
++		}
++	}
++	if len(visible) != len(g.manifest.DescriptorSHA256) {
++		return "", errors.New("sealed-volume filenames differ from measured manifest")
++	}
++	for _, name := range visible {
++		if _, ok := g.manifest.DescriptorSHA256[name]; !ok {
++			return "", errors.New("sealed-volume contains an unexpected filename")
++		}
++	}
++	sort.Strings(visible)
++	private, err := g.privateDirectory(req.ContainerId)
++	if err != nil {
++		return "", err
++	}
++	complete := false
++	defer func() {
++		if !complete {
++			_ = os.RemoveAll(private)
++		}
++	}()
++	if err = os.Chown(private, 0, int(req.OCI.Process.User.GID)); err != nil {
++		return "", fmt.Errorf("set verified-secret directory group: %w", err)
++	}
++	for _, name := range visible {
++		var sealed []byte
++		sealed, err = readSealedDescriptor(target.Source, name)
++		if err != nil {
++			return "", err
++		}
++		digest := sha256.Sum256(sealed)
++		if hex.EncodeToString(digest[:]) != g.manifest.DescriptorSHA256[name] {
++			return "", fmt.Errorf("sealed descriptor %s differs from measured manifest", name)
++		}
++		var plaintext []byte
++		plaintext, err = unseal(ctx, sealed)
++		if err != nil || len(plaintext) == 0 || len(plaintext) > sealedVolumeMaxFile {
++			return "", fmt.Errorf("CDH failed to unseal measured descriptor %s: %v", name, err)
++		}
++		output := filepath.Join(private, name)
++		fd, openErr := unix.Open(output, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0440)
++		err = openErr
++		if err != nil {
++			return "", fmt.Errorf("create private unsealed file: %w", err)
++		}
++		file := os.NewFile(uintptr(fd), output)
++		if _, err = file.Write(plaintext); err == nil {
++			err = file.Sync()
++		}
++		closeErr := file.Close()
++		if err == nil {
++			err = closeErr
++		}
++		if err != nil {
++			return "", fmt.Errorf("write private unsealed file: %w", err)
++		}
++		if err = os.Chown(output, 0, int(req.OCI.Process.User.GID)); err != nil {
++			return "", fmt.Errorf("set private unsealed file group: %w", err)
++		}
++	}
++	target.Source = private
++	complete = true
++	return private, nil
++}
++
++func hasMountOption(options []string, wanted string) bool {
++	for _, option := range options {
++		if option == wanted {
++			return true
++		}
++	}
++	return false
++}
+diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/sealed_volume_test.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/sealed_volume_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..4e0af6e823e2c9769506f5c5beca8deec904093b
+--- /dev/null
++++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/sealed_volume_test.go
+@@ -0,0 +1,169 @@
++package interceptor
++
++import (
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	pb "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/agent/protocols/grpc"
++)
++
++func sealedFixture(t *testing.T) (*sealedVolumeGate, *pb.CreateContainerRequest, string) {
++	t.Helper()
++	if os.Geteuid() != 0 {
++		t.Skip("private guest Secret ownership requires root")
++	}
++	base := t.TempDir()
++	shared := filepath.Join(base, "shared")
++	if err := os.Mkdir(shared, 0700); err != nil {
++		t.Fatal(err)
++	}
++	id := "abc123"
++	source := filepath.Join(shared, id+"-0123456789abcdef-bootstrap-input")
++	if err := os.Mkdir(source, 0700); err != nil {
++		t.Fatal(err)
++	}
++	sealed := []byte("sealed.test-jws")
++	if err := os.WriteFile(filepath.Join(source, "tls.key"), sealed, 0600); err != nil {
++		t.Fatal(err)
++	}
++	digest := sha256.Sum256(sealed)
++	gate := &sealedVolumeGate{
++		manifest: sealedVolumeManifest{Schema: 1, Container: "bootstrap",
++			Destination:      "/.openshell/bootstrap-input",
++			DescriptorSHA256: map[string]string{"tls.key": hex.EncodeToString(digest[:])}},
++		privateRoot: filepath.Join(base, "private"), sharedRoot: shared,
++	}
++	req := &pb.CreateContainerRequest{ContainerId: id, OCI: &pb.Spec{
++		Root:    &pb.Root{Path: "/run/kata-containers/" + id + "/rootfs"},
++		Process: &pb.Process{User: &pb.User{GID: 1000}},
++		Mounts: []*pb.Mount{{Destination: gate.manifest.Destination, Source: source,
++			Type: "bind", Options: []string{"rbind", "rprivate", "ro"}}},
++	}}
++	return gate, req, source
++}
++
++func TestSealedVolumeUnsealAndRewrite(t *testing.T) {
++	gate, req, source := sealedFixture(t)
++	private, err := gate.verifyAndUnseal(context.Background(), req,
++		func(_ context.Context, sealed []byte) ([]byte, error) {
++			if string(sealed) != "sealed.test-jws" {
++				t.Fatalf("unseal received unverified bytes: %q", sealed)
++			}
++			return []byte("plaintext"), nil
++		})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if req.OCI.Mounts[0].Source != private || req.OCI.Mounts[0].Source == source {
++		t.Fatal("verified source was not rewritten")
++	}
++	got, err := os.ReadFile(filepath.Join(private, "tls.key"))
++	if err != nil || string(got) != "plaintext" {
++		t.Fatalf("private plaintext: %q, %v", got, err)
++	}
++	info, err := os.Stat(filepath.Join(private, "tls.key"))
++	if err != nil || info.Mode().Perm() != 0440 {
++		t.Fatalf("private plaintext mode: %v, %v", info, err)
++	}
++}
++
++func TestSealedVolumeRejectsTamperingAndCleansRetry(t *testing.T) {
++	for _, mutation := range []struct {
++		name string
++		edit func(t *testing.T, req *pb.CreateContainerRequest, source string)
++	}{
++		{"plaintext", func(t *testing.T, _ *pb.CreateContainerRequest, source string) {
++			os.WriteFile(filepath.Join(source, "tls.key"), []byte("plaintext"), 0600)
++		}},
++		{"different sealed descriptor", func(t *testing.T, _ *pb.CreateContainerRequest, source string) {
++			os.WriteFile(filepath.Join(source, "tls.key"), []byte("sealed.other"), 0600)
++		}},
++		{"preseed unsealed file", func(t *testing.T, _ *pb.CreateContainerRequest, source string) {
++			os.WriteFile(filepath.Join(source, "tls.key.unsealed"), []byte("evil"), 0600)
++		}},
++		{"writable bind", func(_ *testing.T, req *pb.CreateContainerRequest, _ string) {
++			req.OCI.Mounts[0].Options = []string{"rbind", "rw"}
++		}},
++		{"different bundle", func(_ *testing.T, req *pb.CreateContainerRequest, _ string) {
++			req.OCI.Root.Path = "/run/kata-containers/other/rootfs"
++		}},
++		{"private source", func(_ *testing.T, req *pb.CreateContainerRequest, _ string) {
++			req.OCI.Mounts[0].Source = "/run/peerpod/verified-secrets/abc123"
++		}},
++	} {
++		t.Run(mutation.name, func(t *testing.T) {
++			gate, req, source := sealedFixture(t)
++			mutation.edit(t, req, source)
++			called := false
++			_, err := gate.verifyAndUnseal(context.Background(), req,
++				func(context.Context, []byte) ([]byte, error) { called = true; return []byte("secret"), nil })
++			if err == nil {
++				t.Fatal("tampered mount was accepted")
++			}
++			if called && mutation.name != "preseed unsealed file" {
++				t.Fatal("CDH received tampered descriptor")
++			}
++			if _, statErr := os.Stat(filepath.Join(gate.privateRoot, req.ContainerId)); !os.IsNotExist(statErr) {
++				t.Fatalf("failed attempt left private plaintext directory: %v", statErr)
++			}
++		})
++	}
++}
++
++func TestSealedVolumeUnsealFailurePropagates(t *testing.T) {
++	gate, req, _ := sealedFixture(t)
++	_, err := gate.verifyAndUnseal(context.Background(), req,
++		func(context.Context, []byte) ([]byte, error) { return nil, nil })
++	if err == nil || !strings.Contains(err.Error(), "CDH failed") {
++		t.Fatalf("empty CDH result was accepted: %v", err)
++	}
++	if _, statErr := os.Stat(filepath.Join(gate.privateRoot, req.ContainerId)); !os.IsNotExist(statErr) {
++		t.Fatalf("failed unseal left private directory: %v", statErr)
++	}
++}
++
++func TestSealedVolumeRejectsSymlinkEscape(t *testing.T) {
++	gate, req, source := sealedFixture(t)
++	outside := filepath.Join(t.TempDir(), "outside")
++	if err := os.WriteFile(outside, []byte("sealed.test-jws"), 0600); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.Remove(filepath.Join(source, "tls.key")); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.Symlink(outside, filepath.Join(source, "tls.key")); err != nil {
++		t.Fatal(err)
++	}
++	_, err := gate.verifyAndUnseal(context.Background(), req,
++		func(context.Context, []byte) ([]byte, error) {
++			t.Fatal("escaped descriptor reached CDH")
++			return nil, nil
++		})
++	if err == nil {
++		t.Fatal("symlink escape was accepted")
++	}
++}
++
++func TestCopyFileCannotOverwriteMeasuredOrPrivatePaths(t *testing.T) {
++	gate := &sealedVolumeGate{privateRoot: sealedVolumePrivateRoot}
++	for _, path := range []string{
++		"/run/peerpod/openshell-bootstrap.json",
++		"/run/peerpod/verified-secrets/abc123/tls.key",
++		"/run/peerpod/../peerpod/aa.toml",
++	} {
++		if err := gate.checkCopyFilePath(path); err == nil {
++			t.Fatalf("CopyFile accepted %s", path)
++		}
++	}
++	if err := gate.checkCopyFilePath("/run/kata-containers/shared/containers/abc123-file"); err != nil {
++		t.Fatal(err)
++	}
++	if !strings.HasPrefix(gate.privateRoot, "/run/peerpod/") {
++		t.Fatal("verified root escaped measured guest tmpfs")
++	}
++}
+diff --git a/src/cloud-api-adaptor/pkg/userdata/measure.go b/src/cloud-api-adaptor/pkg/userdata/measure.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..22253f08a73ae97aa379519b5b5e773dc7f92306
+--- /dev/null
++++ b/src/cloud-api-adaptor/pkg/userdata/measure.go
+@@ -0,0 +1,166 @@
++// (C) Copyright Confidential Containers Contributors
++// SPDX-License-Identifier: Apache-2.0
++
++package userdata
++
++import (
++	"bytes"
++	"context"
++	"crypto/sha512"
++	"encoding/binary"
++	"errors"
++	"fmt"
++	"io"
++	"net"
++	"os"
++	"strings"
++	"time"
++
++	"github.com/confidential-containers/cloud-api-adaptor/src/cloud-api-adaptor/pkg/initdata"
++	"github.com/containerd/ttrpc"
++	"google.golang.org/protobuf/proto"
++	"google.golang.org/protobuf/reflect/protodesc"
++	"google.golang.org/protobuf/reflect/protoreflect"
++	"google.golang.org/protobuf/types/descriptorpb"
++	"google.golang.org/protobuf/types/dynamicpb"
++)
++
++const NativeAASocket = "/run/confidential-containers/attestation-agent/attestation-agent.sock"
++const NativeAAEventlog = "/run/attestation-agent/eventlog"
++const maxMeasurementFile = 2 << 20
++
++// This is the exact published ExtendRuntimeMeasurement subset of the CoCo0.22
++// attestation-agent.proto. Dynamic messages reuse the existing protobuf/ttrpc
++// dependencies without copying another generated protocol library. Optional
++// RegisterIndex is omitted so AA uses its measured init_pcr configuration.
++func nativeAAMessages() (*dynamicpb.Message, *dynamicpb.Message, error) {
++	field := func(name string, number int32, typ descriptorpb.FieldDescriptorProto_Type) *descriptorpb.FieldDescriptorProto {
++		return &descriptorpb.FieldDescriptorProto{Name: proto.String(name), Number: proto.Int32(number), Type: &typ}
++	}
++	result := field("Result", 1, descriptorpb.FieldDescriptorProto_TYPE_ENUM)
++	result.TypeName = proto.String(".attestation_agent.RuntimeMeasurementResult")
++	file, err := protodesc.NewFile(&descriptorpb.FileDescriptorProto{
++		Name: proto.String("attestation-agent.proto"), Package: proto.String("attestation_agent"), Syntax: proto.String("proto3"),
++		EnumType: []*descriptorpb.EnumDescriptorProto{{Name: proto.String("RuntimeMeasurementResult"), Value: []*descriptorpb.EnumValueDescriptorProto{
++			{Name: proto.String("OK"), Number: proto.Int32(0)}, {Name: proto.String("NOT_SUPPORTED"), Number: proto.Int32(1)}, {Name: proto.String("NOT_ENABLED"), Number: proto.Int32(2)},
++		}}},
++		MessageType: []*descriptorpb.DescriptorProto{
++			{Name: proto.String("ExtendRuntimeMeasurementRequest"), Field: []*descriptorpb.FieldDescriptorProto{field("Domain", 1, descriptorpb.FieldDescriptorProto_TYPE_STRING), field("Operation", 2, descriptorpb.FieldDescriptorProto_TYPE_STRING), field("Content", 3, descriptorpb.FieldDescriptorProto_TYPE_STRING)}},
++			{Name: proto.String("ExtendRuntimeMeasurementResponse"), Field: []*descriptorpb.FieldDescriptorProto{result}},
++			{Name: proto.String("GetTeeTypeRequest")},
++			{Name: proto.String("GetTeeTypeResponse"), Field: []*descriptorpb.FieldDescriptorProto{field("tee", 1, descriptorpb.FieldDescriptorProto_TYPE_STRING)}},
++		},
++	}, nil)
++	if err != nil {
++		return nil, nil, err
++	}
++	return dynamicpb.NewMessage(file.Messages().Get(0)), dynamicpb.NewMessage(file.Messages().Get(1)), nil
++}
++
++func readMeasurementFile(path string) ([]byte, error) {
++	info, err := os.Lstat(path)
++	if err != nil {
++		return nil, err
++	}
++	if !info.Mode().IsRegular() || info.Size() > maxMeasurementFile {
++		return nil, fmt.Errorf("measurement file %s must be a bounded regular file", path)
++	}
++	file, err := os.Open(path)
++	if err != nil {
++		return nil, err
++	}
++	defer file.Close()
++	return io.ReadAll(io.LimitReader(file, maxMeasurementFile+1))
++}
++
++// canonicalInitdataEvent is CoCo0.22's native TCG2 EV_EVENT_TAG encoding for
++// one SHA384 event at measurement-register4 (TDX init_pcr17 -> RTMR3). It is
++// deliberately exact: stale, duplicate, malformed or unexpected events fail.
++func canonicalInitdataEvent(digest string) []byte {
++	text := []byte("confidentialcontainers.org initdata " + digest)
++	var tagged bytes.Buffer
++	_ = binary.Write(&tagged, binary.LittleEndian, uint32(0x4141454c))
++	_ = binary.Write(&tagged, binary.LittleEndian, uint32(len(text)))
++	_, _ = tagged.Write(text)
++	hash := sha512.Sum384(tagged.Bytes())
++	var event bytes.Buffer
++	for _, number := range []uint32{4, 6, 1} {
++		_ = binary.Write(&event, binary.LittleEndian, number)
++	}
++	_ = binary.Write(&event, binary.LittleEndian, uint16(0xc))
++	_, _ = event.Write(hash[:])
++	_ = binary.Write(&event, binary.LittleEndian, uint32(tagged.Len()))
++	_, _ = event.Write(tagged.Bytes())
++	return event.Bytes()
++}
++
++func MeasureInitdata(ctx context.Context, initdataPath, digestPath, socketPath, eventlogPath string) error {
++	encoded, err := readMeasurementFile(initdataPath)
++	if err != nil {
++		return err
++	}
++	parsed, err := initdata.Parse(bytes.NewReader(encoded))
++	if err != nil {
++		return err
++	}
++	if parsed.Body.Algorithm != "sha384" {
++		return errors.New("native initdata measurement requires sha384")
++	}
++	digest, err := readMeasurementFile(digestPath)
++	if err != nil {
++		return err
++	}
++	if strings.TrimSpace(string(digest)) != parsed.Digest {
++		return errors.New("provisioned initdata digest differs from exact initdata")
++	}
++	expected := canonicalInitdataEvent(parsed.Digest)
++	previous, err := readMeasurementFile(eventlogPath)
++	if err != nil && !errors.Is(err, os.ErrNotExist) {
++		return err
++	}
++	if bytes.Equal(previous, expected) {
++		return nil
++	}
++	if len(previous) != 0 {
++		return errors.New("native AA eventlog contains unexpected or duplicate initdata events")
++	}
++	request, response, err := nativeAAMessages()
++	if err != nil {
++		return err
++	}
++	for name, value := range map[protoreflect.Name]string{"Domain": "confidentialcontainers.org", "Operation": "initdata", "Content": parsed.Digest} {
++		request.Set(request.Descriptor().Fields().ByName(name), protoreflect.ValueOfString(value))
++	}
++	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
++	defer cancel()
++	connection, err := (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
++	if err != nil {
++		return fmt.Errorf("connect native AA: %w", err)
++	}
++	client := ttrpc.NewClient(connection)
++	defer client.Close()
++	file := request.Descriptor().ParentFile()
++	teeRequest := dynamicpb.NewMessage(file.Messages().ByName("GetTeeTypeRequest"))
++	teeResponse := dynamicpb.NewMessage(file.Messages().ByName("GetTeeTypeResponse"))
++	if err := client.Call(ctx, "attestation_agent.AttestationAgentService", "GetTeeType", teeRequest, teeResponse); err != nil {
++		return fmt.Errorf("query native AA tee type: %w", err)
++	}
++	if teeResponse.Get(teeResponse.Descriptor().Fields().ByName("tee")).String() != "tdx" {
++		return errors.New("native initdata measurement requires a TDX attester")
++	}
++
++	if err := client.Call(ctx, "attestation_agent.AttestationAgentService", "ExtendRuntimeMeasurement", request, response); err != nil {
++		return fmt.Errorf("native AA measurement: %w", err)
++	}
++	if result := response.Get(response.Descriptor().Fields().ByName("Result")).Enum(); result != 0 {
++		return fmt.Errorf("native AA measurement returned non-success result %d", result)
++	}
++	actual, err := readMeasurementFile(eventlogPath)
++	if err != nil {
++		return err
++	}
++	if !bytes.Equal(actual, expected) {
++		return errors.New("native AA did not record the canonical measured initdata event")
++	}
++	return nil
++}
+diff --git a/src/cloud-api-adaptor/pkg/userdata/measure_test.go b/src/cloud-api-adaptor/pkg/userdata/measure_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..dd52b71c1eccb085999ae33e042f82ad7e887748
+--- /dev/null
++++ b/src/cloud-api-adaptor/pkg/userdata/measure_test.go
+@@ -0,0 +1,164 @@
++// (C) Copyright Confidential Containers Contributors
++// SPDX-License-Identifier: Apache-2.0
++
++package userdata
++
++import (
++	"context"
++	"encoding/hex"
++	"net"
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/confidential-containers/cloud-api-adaptor/src/cloud-api-adaptor/pkg/initdata"
++	"github.com/containerd/ttrpc"
++	"github.com/stretchr/testify/require"
++	"google.golang.org/protobuf/encoding/protowire"
++	"google.golang.org/protobuf/proto"
++	"google.golang.org/protobuf/reflect/protoreflect"
++	"google.golang.org/protobuf/types/dynamicpb"
++)
++
++func measurementFixture(t *testing.T) (string, string, string, string, string) {
++	t.Helper()
++	base := t.TempDir()
++	encoded, err := initdata.Encode("version = \"0.1.0\"\nalgorithm = \"sha384\"\n[data]\n\"policy.rego\" = 'package agent_policy'\n")
++	require.NoError(t, err)
++	path := filepath.Join(base, "initdata")
++	require.NoError(t, os.WriteFile(path, []byte(encoded), 0600))
++	file, err := os.Open(path)
++	require.NoError(t, err)
++	parsed, err := initdata.Parse(file)
++	file.Close()
++	require.NoError(t, err)
++	digestPath := filepath.Join(base, "digest")
++	require.NoError(t, os.WriteFile(digestPath, []byte(parsed.Digest), 0600))
++	return path, digestPath, filepath.Join(base, "aa.sock"), filepath.Join(base, "eventlog"), parsed.Digest
++}
++
++func TestMeasureInitdataNativeRPCAndIdempotentAAEL(t *testing.T) {
++	path, digestPath, socket, eventlog, digest := measurementFixture(t)
++	listener, err := net.Listen("unix", socket)
++	require.NoError(t, err)
++	defer listener.Close()
++	server, err := ttrpc.NewServer()
++	require.NoError(t, err)
++	defer server.Close()
++	calls := 0
++	server.RegisterService("attestation_agent.AttestationAgentService", &ttrpc.ServiceDesc{Methods: map[string]ttrpc.Method{
++		"GetTeeType": nativeTeeTypeMethod("tdx"),
++		"ExtendRuntimeMeasurement": func(_ context.Context, unmarshal func(interface{}) error) (interface{}, error) {
++			request, response, err := nativeAAMessages()
++			require.NoError(t, err)
++			require.NoError(t, unmarshal(request))
++			wire, err := proto.Marshal(request)
++			require.NoError(t, err)
++			// Decode independently with protobuf wire primitives, checking the
++			// official field numbers and omitted optional RegisterIndex.
++			fields := map[protowire.Number]string{}
++			for len(wire) > 0 {
++				number, typ, n := protowire.ConsumeTag(wire)
++				require.Equal(t, protowire.BytesType, typ)
++				value, m := protowire.ConsumeString(wire[n:])
++				require.Positive(t, m)
++				fields[number] = value
++				wire = wire[n+m:]
++			}
++			require.Equal(t, map[protowire.Number]string{1: "confidentialcontainers.org", 2: "initdata", 3: digest}, fields)
++			calls++
++			require.NoError(t, os.WriteFile(eventlog, canonicalInitdataEvent(digest), 0600))
++			return response, nil
++		},
++	}})
++	go server.Serve(context.Background(), listener)
++	require.NoError(t, MeasureInitdata(context.Background(), path, digestPath, socket, eventlog))
++	require.NoError(t, MeasureInitdata(context.Background(), path, digestPath, "/no-second-rpc", eventlog))
++	require.Equal(t, 1, calls)
++}
++
++func TestMeasureInitdataRefusesChangedDigestAndExtraEvents(t *testing.T) {
++	path, digestPath, socket, eventlog, digest := measurementFixture(t)
++	require.NoError(t, os.WriteFile(digestPath, []byte("bad digest"), 0600))
++	require.ErrorContains(t, MeasureInitdata(context.Background(), path, digestPath, socket, eventlog), "digest differs")
++	require.NoError(t, os.WriteFile(digestPath, []byte(digest), 0600))
++	for _, invalid := range [][]byte{[]byte("legacy plaintext AAEL"), append(canonicalInitdataEvent(digest), canonicalInitdataEvent(digest)...), canonicalInitdataEvent("wrong digest")} {
++		require.NoError(t, os.WriteFile(eventlog, invalid, 0600))
++		require.ErrorContains(t, MeasureInitdata(context.Background(), path, digestPath, socket, eventlog), "unexpected or duplicate")
++	}
++}
++
++func TestMeasureInitdataRejectsNativeDisabledOrMissingRecord(t *testing.T) {
++	for _, result := range []protoreflect.EnumNumber{0, 1, 2} {
++		t.Run(string(rune('0'+result)), func(t *testing.T) {
++			path, digestPath, socket, eventlog, _ := measurementFixture(t)
++			listener, err := net.Listen("unix", socket)
++			require.NoError(t, err)
++			defer listener.Close()
++			server, err := ttrpc.NewServer()
++			require.NoError(t, err)
++			defer server.Close()
++			server.RegisterService("attestation_agent.AttestationAgentService", &ttrpc.ServiceDesc{Methods: map[string]ttrpc.Method{
++				"GetTeeType": nativeTeeTypeMethod("tdx"),
++				"ExtendRuntimeMeasurement": func(_ context.Context, unmarshal func(interface{}) error) (interface{}, error) {
++					request, response, err := nativeAAMessages()
++					require.NoError(t, err)
++					require.NoError(t, unmarshal(request))
++					response.Set(response.Descriptor().Fields().ByName("Result"), protoreflect.ValueOfEnum(result))
++					return response, nil
++				},
++			}})
++			go server.Serve(context.Background(), listener)
++			err = MeasureInitdata(context.Background(), path, digestPath, socket, eventlog)
++			if result == 0 {
++				require.Error(t, err, "RPC success without the native eventlog must fail")
++			} else {
++				require.ErrorContains(t, err, "non-success result")
++			}
++		})
++	}
++}
++
++func TestCanonicalInitdataEventMatchesReleasedAAEncoding(t *testing.T) {
++	// Fixed independent fixture from native AA TCG2 layout and SHA384 tagged
++	// bytes; it catches PCR, tag-endianness, length and digest changes.
++	expected, err := hex.DecodeString("0400000006000000010000000c009e62d4ff9a442178294c7ca76555f03b19d5dec935c14949342fda7262d8bbdb9c0da2d99b68087961745da31098b8062f0000004c45414127000000636f6e666964656e7469616c636f6e7461696e6572732e6f726720696e69746461746120616263")
++	require.NoError(t, err)
++	require.Equal(t, expected, canonicalInitdataEvent("abc"))
++}
++
++func nativeTeeTypeMethod(tee string) ttrpc.Method {
++	return func(_ context.Context, unmarshal func(interface{}) error) (interface{}, error) {
++		request, _, err := nativeAAMessages()
++		if err != nil {
++			return nil, err
++		}
++		file := request.Descriptor().ParentFile()
++		teeRequest := dynamicpb.NewMessage(file.Messages().ByName("GetTeeTypeRequest"))
++		if err := unmarshal(teeRequest); err != nil {
++			return nil, err
++		}
++		response := dynamicpb.NewMessage(file.Messages().ByName("GetTeeTypeResponse"))
++		response.Set(response.Descriptor().Fields().ByName("tee"), protoreflect.ValueOfString(tee))
++		return response, nil
++	}
++}
++
++func TestMeasureInitdataRejectsSampleAttesterBeforeExtension(t *testing.T) {
++	path, digestPath, socket, eventlog, _ := measurementFixture(t)
++	listener, err := net.Listen("unix", socket)
++	require.NoError(t, err)
++	defer listener.Close()
++	server, err := ttrpc.NewServer()
++	require.NoError(t, err)
++	defer server.Close()
++	server.RegisterService("attestation_agent.AttestationAgentService", &ttrpc.ServiceDesc{Methods: map[string]ttrpc.Method{
++		"GetTeeType": nativeTeeTypeMethod("sample"),
++		"ExtendRuntimeMeasurement": func(context.Context, func(interface{}) error) (interface{}, error) {
++			t.Error("extended non-TDX measurement")
++			return nil, nil
++		},
++	}})
++	go server.Serve(context.Background(), listener)
++	require.ErrorContains(t, MeasureInitdata(context.Background(), path, digestPath, socket, eventlog), "requires a TDX attester")
++}

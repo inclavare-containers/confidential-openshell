@@ -1,0 +1,2591 @@
+From 0b70ec6c988d81607f4afa2ff85ed68f23c58dd7 Mon Sep 17 00:00:00 2001
+From: Weidong Sun <sunweidong@linux.alibaba.com>
+Date: Wed, 26 Aug 2026 12:30:28 +0800
+Subject: [PATCH 2/5] fix(controller): persist resumable volume create
+ operations
+
+Serialize CreateVolume by logical name, fingerprint the complete request, and persist an operation identity before providers that support resumable creation mutate cloud state.
+
+Split controller and node services so durable state lives on the controller PVC, preserve existing providers without resumable operations, enforce capacity limits using provider-normalized sizes, and keep upstream CDH metadata compatible.
+
+Signed-off-by: Weidong Sun <sunweidong@linux.alibaba.com>
+---
+ .../templates/_helpers.tpl                    |   8 +
+ .../templates/controller.yaml                 | 127 +++++
+ .../templates/daemonset.yaml                  |  73 +--
+ .../templates/serviceaccount.yaml             |   9 +
+ charts/caa-csi-block-driver/values.yaml       |   6 +
+ cmd/main.go                                   |  24 +-
+ pkg/driver/chart_test.go                      | 100 ++++
+ pkg/driver/controller_durable_test.go         | 363 +++++++++++++
+ pkg/driver/controllerserver.go                | 325 +++++++++---
+ pkg/driver/create_request.go                  | 183 +++++++
+ pkg/driver/directvolume_test.go               |  33 ++
+ pkg/driver/driver.go                          |  59 +-
+ pkg/driver/identityserver.go                  |  11 +-
+ pkg/driver/nodeserver.go                      |  63 +--
+ pkg/driver/volumestore.go                     | 502 ++++++++++--------
+ pkg/driver/volumestore_test.go                |  60 ++-
+ 16 files changed, 1502 insertions(+), 444 deletions(-)
+ create mode 100644 charts/caa-csi-block-driver/templates/controller.yaml
+ create mode 100644 pkg/driver/chart_test.go
+ create mode 100644 pkg/driver/controller_durable_test.go
+ create mode 100644 pkg/driver/create_request.go
+
+diff --git a/charts/caa-csi-block-driver/templates/_helpers.tpl b/charts/caa-csi-block-driver/templates/_helpers.tpl
+index 93cd7998f06d789c4afe439ef29fe76ef49d07f2..f298e8a336d4ebbce443551f9707f3db91e0505d 100644
+--- a/charts/caa-csi-block-driver/templates/_helpers.tpl
++++ b/charts/caa-csi-block-driver/templates/_helpers.tpl
+@@ -47,6 +47,10 @@ app.kubernetes.io/instance: {{ .Release.Name }}
+ {{- end }}
+ {{- end }}
+ 
++{{- define "caa-csi.nodeServiceAccountName" -}}
++{{- printf "%s-node" (include "caa-csi.fullname" .) | trunc 63 | trimSuffix "-" }}
++{{- end }}
++
+ {{- define "caa-csi.namespace" -}}
+ {{- .Values.namespace.name | default .Release.Namespace }}
+ {{- end }}
+@@ -62,3 +66,7 @@ app.kubernetes.io/instance: {{ .Release.Name }}
+ {{- define "caa-csi.bootstrapConfigMapName" -}}
+ {{- printf "%s-bootstrap-params" (include "caa-csi.fullname" .) | trunc 63 | trimSuffix "-" }}
+ {{- end }}
++
++{{- define "caa-csi.controllerStateClaimName" -}}
++{{- printf "%s-controller-state" (include "caa-csi.fullname" .) | trunc 63 | trimSuffix "-" }}
++{{- end }}
+diff --git a/charts/caa-csi-block-driver/templates/controller.yaml b/charts/caa-csi-block-driver/templates/controller.yaml
+new file mode 100644
+index 0000000000000000000000000000000000000000..d102684b469cdd8ab93c8d5e06976ef27c1aa823
+--- /dev/null
++++ b/charts/caa-csi-block-driver/templates/controller.yaml
+@@ -0,0 +1,127 @@
++{{- include "caa-csi.validateValues" . }}
++apiVersion: v1
++kind: PersistentVolumeClaim
++metadata:
++  name: {{ include "caa-csi.controllerStateClaimName" . }}
++  namespace: {{ include "caa-csi.namespace" . }}
++  labels:
++    {{- include "caa-csi.labels" . | nindent 4 }}
++  annotations:
++    helm.sh/resource-policy: keep
++spec:
++  accessModes:
++    - ReadWriteOnce
++  resources:
++    requests:
++      storage: {{ .Values.controller.state.size }}
++  {{- with .Values.controller.state.storageClassName }}
++  storageClassName: {{ . | quote }}
++  {{- end }}
++---
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: {{ include "caa-csi.fullname" . }}-controller
++  namespace: {{ include "caa-csi.namespace" . }}
++  labels:
++    {{- include "caa-csi.labels" . | nindent 4 }}
++    app.kubernetes.io/component: controller
++spec:
++  replicas: 1
++  strategy:
++    type: Recreate
++  selector:
++    matchLabels:
++      {{- include "caa-csi.selectorLabels" . | nindent 6 }}
++      app.kubernetes.io/component: controller
++  template:
++    metadata:
++      labels:
++        {{- include "caa-csi.selectorLabels" . | nindent 8 }}
++        app.kubernetes.io/component: controller
++    spec:
++      serviceAccountName: {{ include "caa-csi.serviceAccountName" . }}
++      containers:
++        - name: csi-provisioner
++          image: {{ .Values.sidecarImages.provisioner }}
++          args:
++            - "-v=3"
++            - "--csi-address=/csi/csi.sock"
++            - "--worker-threads=5"
++            - "--leader-election=true"
++          {{- with .Values.resources.provisioner }}
++          resources:
++            {{- toYaml . | nindent 12 }}
++          {{- end }}
++          securityContext:
++            allowPrivilegeEscalation: false
++            capabilities:
++              drop: ["ALL"]
++          volumeMounts:
++            - mountPath: /csi
++              name: socket-dir
++
++        - name: caa-csi-block-controller
++          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
++          imagePullPolicy: {{ .Values.image.pullPolicy }}
++          args:
++            - "--drivername={{ .Values.csiDriver.name }}"
++            - "--endpoint=unix:///csi/csi.sock"
++            - "--component=controller"
++            - "--volume-store-dir=/var/lib/caa-csi-block/volumes"
++          env:
++            - name: CSI_CLOUD_PROVIDER
++              value: {{ .Values.provider | quote }}
++            - name: CSI_BOOTSTRAP_PARAMS_FILE
++              value: /etc/caa-csi-block/bootstrap-params.json
++            {{- if eq .Values.provider "aws" }}
++            - name: AWS_REGION
++              value: {{ required "aws.region is required when provider=aws" .Values.aws.region | quote }}
++            {{- if and (not .Values.aws.irsa.enabled) .Values.aws.staticCredentials.enabled }}
++            - name: AWS_ACCESS_KEY_ID
++              valueFrom:
++                secretKeyRef:
++                  name: {{ .Values.aws.staticCredentials.secretName }}
++                  key: AWS_ACCESS_KEY_ID
++            - name: AWS_SECRET_ACCESS_KEY
++              valueFrom:
++                secretKeyRef:
++                  name: {{ .Values.aws.staticCredentials.secretName }}
++                  key: AWS_SECRET_ACCESS_KEY
++            {{- end }}
++            {{- end }}
++          {{- with .Values.resources.driver }}
++          resources:
++            {{- toYaml . | nindent 12 }}
++          {{- end }}
++          securityContext:
++            allowPrivilegeEscalation: false
++            capabilities:
++              drop: ["ALL"]
++          volumeMounts:
++            - mountPath: /csi
++              name: socket-dir
++            - mountPath: /var/lib/caa-csi-block
++              name: controller-state
++            - mountPath: /etc/caa-csi-block
++              name: bootstrap-params
++              readOnly: true
++            {{- if eq .Values.provider "libvirt" }}
++            - mountPath: {{ .Values.libvirt.volumeDir }}
++              name: libvirt-pool
++            {{- end }}
++      volumes:
++        - name: socket-dir
++          emptyDir: {}
++        - name: controller-state
++          persistentVolumeClaim:
++            claimName: {{ include "caa-csi.controllerStateClaimName" . }}
++        - name: bootstrap-params
++          configMap:
++            name: {{ include "caa-csi.bootstrapConfigMapName" . }}
++        {{- if eq .Values.provider "libvirt" }}
++        - name: libvirt-pool
++          hostPath:
++            path: {{ .Values.libvirt.volumeDir }}
++            type: DirectoryOrCreate
++        {{- end }}
+diff --git a/charts/caa-csi-block-driver/templates/daemonset.yaml b/charts/caa-csi-block-driver/templates/daemonset.yaml
+index 847aa8569140560266cd886c768c1f1a57ba6376..5b669da52110c4ab8b814c51011ff49555cdfa01 100644
+--- a/charts/caa-csi-block-driver/templates/daemonset.yaml
++++ b/charts/caa-csi-block-driver/templates/daemonset.yaml
+@@ -6,46 +6,21 @@ metadata:
+   namespace: {{ include "caa-csi.namespace" . }}
+   labels:
+     {{- include "caa-csi.labels" . | nindent 4 }}
++    app.kubernetes.io/component: node
+ spec:
+   selector:
+     matchLabels:
+       {{- include "caa-csi.selectorLabels" . | nindent 6 }}
++      app.kubernetes.io/component: node
+   template:
+     metadata:
+       labels:
+         {{- include "caa-csi.selectorLabels" . | nindent 8 }}
++        app.kubernetes.io/component: node
+     spec:
+-      serviceAccountName: {{ include "caa-csi.serviceAccountName" . }}
++      serviceAccountName: {{ include "caa-csi.nodeServiceAccountName" . }}
++      automountServiceAccountToken: false
+       containers:
+-        - name: csi-provisioner
+-          image: {{ .Values.sidecarImages.provisioner }}
+-          args:
+-            - "-v=3"
+-            - "--csi-address=/csi/csi.sock"
+-            - "--worker-threads=5"
+-          env:
+-            - name: NODE_NAME
+-              valueFrom:
+-                fieldRef:
+-                  fieldPath: spec.nodeName
+-            - name: NAMESPACE
+-              valueFrom:
+-                fieldRef:
+-                  fieldPath: metadata.namespace
+-            - name: POD_NAME
+-              valueFrom:
+-                fieldRef:
+-                  fieldPath: metadata.name
+-          {{- with .Values.resources.provisioner }}
+-          resources:
+-            {{- toYaml . | nindent 12 }}
+-          {{- end }}
+-          securityContext:
+-            privileged: {{ .Values.nodePlugin.privileged }}
+-          volumeMounts:
+-            - mountPath: /csi
+-              name: socket-dir
+-
+         - name: node-driver-registrar
+           image: {{ .Values.sidecarImages.nodeDriverRegistrar }}
+           args:
+@@ -62,7 +37,9 @@ spec:
+             {{- toYaml . | nindent 12 }}
+           {{- end }}
+           securityContext:
+-            privileged: {{ .Values.nodePlugin.privileged }}
++            allowPrivilegeEscalation: false
++            capabilities:
++              drop: ["ALL"]
+           volumeMounts:
+             - mountPath: /csi
+               name: socket-dir
+@@ -75,32 +52,13 @@ spec:
+           args:
+             - "--drivername={{ .Values.csiDriver.name }}"
+             - "--endpoint=unix:///csi/csi.sock"
++            - "--component=node"
+             - "--nodeid=$(KUBE_NODE_NAME)"
+           env:
+             - name: KUBE_NODE_NAME
+               valueFrom:
+                 fieldRef:
+                   fieldPath: spec.nodeName
+-            - name: CSI_CLOUD_PROVIDER
+-              value: {{ .Values.provider | quote }}
+-            - name: CSI_BOOTSTRAP_PARAMS_FILE
+-              value: /etc/caa-csi-block/bootstrap-params.json
+-            {{- if eq .Values.provider "aws" }}
+-            - name: AWS_REGION
+-              value: {{ required "aws.region is required when provider=aws" .Values.aws.region | quote }}
+-            {{- if and (not .Values.aws.irsa.enabled) .Values.aws.staticCredentials.enabled }}
+-            - name: AWS_ACCESS_KEY_ID
+-              valueFrom:
+-                secretKeyRef:
+-                  name: {{ .Values.aws.staticCredentials.secretName }}
+-                  key: AWS_ACCESS_KEY_ID
+-            - name: AWS_SECRET_ACCESS_KEY
+-              valueFrom:
+-                secretKeyRef:
+-                  name: {{ .Values.aws.staticCredentials.secretName }}
+-                  key: AWS_SECRET_ACCESS_KEY
+-            {{- end }}
+-            {{- end }}
+           {{- with .Values.resources.driver }}
+           resources:
+             {{- toYaml . | nindent 12 }}
+@@ -118,11 +76,6 @@ spec:
+               mountPropagation: Bidirectional
+             - mountPath: /run/kata-containers/shared/direct-volumes
+               name: shared-directvols
+-            - mountPath: /var/lib/caa-csi-block
+-              name: csi-data
+-            - mountPath: /etc/caa-csi-block
+-              name: bootstrap-params
+-              readOnly: true
+             {{- if eq .Values.provider "libvirt" }}
+             - mountPath: {{ .Values.libvirt.volumeDir }}
+               name: libvirt-pool
+@@ -149,14 +102,6 @@ spec:
+           hostPath:
+             path: /run/kata-containers/shared/direct-volumes/
+             type: DirectoryOrCreate
+-        - name: csi-data
+-          hostPath:
+-            path: /var/lib/caa-csi-block
+-            type: DirectoryOrCreate
+-        - name: bootstrap-params
+-          configMap:
+-            name: {{ include "caa-csi.bootstrapConfigMapName" . }}
+-            optional: true
+         {{- if eq .Values.provider "libvirt" }}
+         - name: libvirt-pool
+           hostPath:
+diff --git a/charts/caa-csi-block-driver/templates/serviceaccount.yaml b/charts/caa-csi-block-driver/templates/serviceaccount.yaml
+index 55b56f88e6ec4ebccc5155270fa4c7ed58470b97..9181aa912e8ac791bbae88061916fefdf8379479 100644
+--- a/charts/caa-csi-block-driver/templates/serviceaccount.yaml
++++ b/charts/caa-csi-block-driver/templates/serviceaccount.yaml
+@@ -18,3 +18,12 @@ metadata:
+     {{- toYaml $annotations | nindent 4 }}
+   {{- end }}
+ {{- end }}
++---
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: {{ include "caa-csi.nodeServiceAccountName" . }}
++  namespace: {{ include "caa-csi.namespace" . }}
++  labels:
++    {{- include "caa-csi.labels" . | nindent 4 }}
++automountServiceAccountToken: false
+diff --git a/charts/caa-csi-block-driver/values.yaml b/charts/caa-csi-block-driver/values.yaml
+index 03390286a5285bd44aa962c7ba01e3bb3f10effd..0e69a127225e7cf91219fece61db00faf63cf061 100644
+--- a/charts/caa-csi-block-driver/values.yaml
++++ b/charts/caa-csi-block-driver/values.yaml
+@@ -58,6 +58,12 @@ storageClass:
+   volumeBindingMode: Immediate
+   allowVolumeExpansion: true
+ 
++controller:
++  state:
++    size: 1Gi
++    # This must be a host-cluster StorageClass, never this CSI driver itself.
++    storageClassName: ""
++
+ serviceAccount:
+   create: true
+   name: ""
+diff --git a/cmd/main.go b/cmd/main.go
+index f40994ad215ffc11dd6960bdaae4f39b87c91363..3b8724ea0f2159fab795971853b31816b416f2f6 100644
+--- a/cmd/main.go
++++ b/cmd/main.go
+@@ -18,19 +18,21 @@ import (
+ )
+ 
+ var (
+-	driverName = flag.String("drivername", "caa-csi-block.csi.confidentialcontainers.io", "CSI driver name")
+-	endpoint   = flag.String("endpoint", "unix:///csi/csi.sock", "CSI endpoint")
+-	nodeID     = flag.String("nodeid", "", "Node ID")
+-	version    = "0.2.0"
++	driverName     = flag.String("drivername", "caa-csi-block.csi.confidentialcontainers.io", "CSI driver name")
++	endpoint       = flag.String("endpoint", "unix:///csi/csi.sock", "CSI endpoint")
++	nodeID         = flag.String("nodeid", "", "Node ID")
++	component      = flag.String("component", "all", "CSI component to serve: controller, node, or all")
++	volumeStoreDir = flag.String("volume-store-dir", "", "Durable controller volume store directory")
++	version        = "0.2.0"
+ )
+ 
+ func main() {
+ 	flag.Parse()
+ 
+-	if *nodeID == "" {
++	if (*component == "all" || *component == "node") && *nodeID == "" {
+ 		*nodeID = os.Getenv("KUBE_NODE_NAME")
+ 	}
+-	if *nodeID == "" {
++	if (*component == "all" || *component == "node") && *nodeID == "" {
+ 		hostname, err := os.Hostname()
+ 		if err != nil || hostname == "" {
+ 			log.Fatal("Node ID is required (--nodeid, KUBE_NODE_NAME env, or resolvable hostname)")
+@@ -40,10 +42,12 @@ func main() {
+ 	}
+ 
+ 	d, err := driver.NewDriver(driver.Config{
+-		Endpoint:      *endpoint,
+-		DriverName:    *driverName,
+-		VendorVersion: version,
+-		NodeID:        *nodeID,
++		Endpoint:       *endpoint,
++		DriverName:     *driverName,
++		VendorVersion:  version,
++		NodeID:         *nodeID,
++		Component:      *component,
++		VolumeStoreDir: *volumeStoreDir,
+ 	})
+ 	if err != nil {
+ 		log.Fatalf("Failed to create driver: %v", err)
+diff --git a/pkg/driver/chart_test.go b/pkg/driver/chart_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..3e0bdd1398ec13cdddcbcabe4ee3fca44c5df261
+--- /dev/null
++++ b/pkg/driver/chart_test.go
+@@ -0,0 +1,100 @@
++// (C) Copyright Confidential Containers Contributors
++// SPDX-License-Identifier: Apache-2.0
++
++package driver
++
++import (
++	"os/exec"
++	"strings"
++	"testing"
++)
++
++const chartPath = "../../charts/caa-csi-block-driver"
++
++func renderChartTemplate(t *testing.T, template string, values ...string) string {
++	t.Helper()
++	if _, err := exec.LookPath("helm"); err != nil {
++		t.Skip("helm is not installed")
++	}
++	args := []string{"template", "runtime-test", chartPath, "--show-only", template}
++	for _, value := range values {
++		args = append(args, "--set", value)
++	}
++	output, err := exec.Command("helm", args...).CombinedOutput()
++	if err != nil {
++		t.Fatalf("helm template failed: %v\n%s", err, output)
++	}
++	return string(output)
++}
++
++func genericChartValues() []string {
++	return []string{
++		"provider=aws",
++		"aws.region=us-test-1",
++		"aws.availabilityZone=us-test-1a",
++		"aws.staticCredentials.enabled=true",
++		"aws.staticCredentials.secretName=aws-controller-credentials",
++		"controller.state.storageClassName=host-storage",
++	}
++}
++
++func TestHelmSeparatesControllerAndNodePrivileges(t *testing.T) {
++	values := genericChartValues()
++	controller := renderChartTemplate(t, "templates/controller.yaml", values...)
++	for _, required := range []string{
++		"kind: PersistentVolumeClaim", "helm.sh/resource-policy: keep",
++		`storageClassName: "host-storage"`, "kind: Deployment", "type: Recreate",
++		`"--component=controller"`, `"--leader-election=true"`,
++		"name: AWS_ACCESS_KEY_ID", "name: aws-controller-credentials",
++	} {
++		if !strings.Contains(controller, required) {
++			t.Fatalf("controller render does not contain %q:\n%s", required, controller)
++		}
++	}
++	for _, forbidden := range []string{"--nodeid=", "kind: DaemonSet", "/var/lib/kubelet/pods"} {
++		if strings.Contains(controller, forbidden) {
++			t.Fatalf("controller render contains node-only value %q:\n%s", forbidden, controller)
++		}
++	}
++
++	node := renderChartTemplate(t, "templates/daemonset.yaml", values...)
++	for _, required := range []string{
++		"kind: DaemonSet", "automountServiceAccountToken: false",
++		`"--component=node"`, `"--nodeid=$(KUBE_NODE_NAME)"`,
++	} {
++		if !strings.Contains(node, required) {
++			t.Fatalf("node render does not contain %q:\n%s", required, node)
++		}
++	}
++	for _, forbidden := range []string{
++		"csi-provisioner", "--component=controller", "AWS_ACCESS_KEY",
++		"aws-controller-credentials", "controller-state", "bootstrap-params",
++	} {
++		if strings.Contains(node, forbidden) {
++			t.Fatalf("node render contains controller-only value %q:\n%s", forbidden, node)
++		}
++	}
++}
++
++func TestHelmPreservesOptionalCDHParameters(t *testing.T) {
++	values := genericChartValues()
++	plain := renderChartTemplate(t, "templates/storageclass.yaml", values...)
++	if strings.Contains(plain, "encrypt-type:") || strings.Contains(plain, "kbs-key-id:") {
++		t.Fatalf("default StorageClass unexpectedly enables CDH:\n%s", plain)
++	}
++
++	values = append(values,
++		"cdh.enabled=true",
++		"cdh.encryptionType=luks2",
++		"cdh.key=default/luks-key/workspace",
++	)
++	encrypted := renderChartTemplate(t, "templates/storageclass.yaml", values...)
++	for _, required := range []string{
++		`encrypt-type: "luks2"`,
++		`kbs-key-id: "default/luks-key/workspace"`,
++	} {
++		if !strings.Contains(encrypted, required) {
++			t.Fatalf("encrypted StorageClass does not contain %q:\n%s", required, encrypted)
++		}
++	}
++}
+diff --git a/pkg/driver/controller_durable_test.go b/pkg/driver/controller_durable_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..585ecc3ae5c8b86f98e66cbf2faeb3a8718ef9bf
+--- /dev/null
++++ b/pkg/driver/controller_durable_test.go
+@@ -0,0 +1,363 @@
++// (C) Copyright Confidential Containers Contributors
++// SPDX-License-Identifier: Apache-2.0
++
++package driver
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"os"
++	"sync"
++	"sync/atomic"
++	"testing"
++
++	"github.com/container-storage-interface/spec/lib/go/csi"
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/status"
++
++	provider "github.com/confidential-devhub/caa-csi-block-driver/pkg/provider"
++)
++
++const testGiB = int64(1 << 30)
++
++var testProviderSequence atomic.Uint64
++
++type durableTestProvider struct {
++	mu               sync.Mutex
++	minimumBytes     int64
++	failFirstCreate  bool
++	terminalFailures int
++	committed        bool
++	operationID      string
++	operationIDs     []string
++	createCalls      int
++	effectiveCreates int
++	deleteCalls      int
++}
++
++type durableTerminalError struct{}
++
++func (durableTerminalError) Error() string               { return "explicit cloud API rejection" }
++func (durableTerminalError) TerminalCreateFailure() bool { return true }
++
++type genericTestProvider struct {
++	mu          sync.Mutex
++	failures    int
++	createCalls int
++}
++
++func (fake *genericTestProvider) CreateVolume(volumeID string, size int64) (*provider.VolumeInfo, error) {
++	fake.mu.Lock()
++	defer fake.mu.Unlock()
++	fake.createCalls++
++	if fake.failures > 0 {
++		fake.failures--
++		return nil, errors.New("conclusive provider failure")
++	}
++	return &provider.VolumeInfo{
++		VolumeID: volumeID, Path: "disk-" + volumeID, SizeBytes: size,
++		Provider: "generic-test", Metadata: map[string]string{"cloud-volume-path": "disk-" + volumeID},
++	}, nil
++}
++
++func (*genericTestProvider) DeleteVolume(string) error { return nil }
++func (*genericTestProvider) GetVolumeInfo(string) (*provider.VolumeInfo, error) {
++	return nil, errors.New("not implemented")
++}
++func (*genericTestProvider) VolumeExists(string) (bool, error) { return false, nil }
++
++func registerGenericTestProvider(t *testing.T, fake *genericTestProvider) string {
++	t.Helper()
++	name := fmt.Sprintf("generic-test-%d", testProviderSequence.Add(1))
++	provider.RegisterProvider(name, func(map[string]string) (provider.BlockVolumeProvider, error) {
++		return fake, nil
++	})
++	return name
++}
++
++func registerDurableTestProvider(t *testing.T, fake *durableTestProvider) string {
++	t.Helper()
++	name := fmt.Sprintf("durable-test-%d", testProviderSequence.Add(1))
++	provider.RegisterProvider(name, func(map[string]string) (provider.BlockVolumeProvider, error) {
++		return fake, nil
++	})
++	return name
++}
++
++func (fake *durableTestProvider) NormalizeCapacity(required int64) (int64, error) {
++	if required < fake.minimumBytes {
++		return fake.minimumBytes, nil
++	}
++	return required, nil
++}
++
++func (fake *durableTestProvider) CreateVolume(string, int64) (*provider.VolumeInfo, error) {
++	return nil, errors.New("persisted operation ID required")
++}
++
++func (fake *durableTestProvider) CreateVolumeWithOperation(volumeID string, size int64, operationID string) (*provider.VolumeInfo, error) {
++	fake.mu.Lock()
++	defer fake.mu.Unlock()
++	fake.createCalls++
++	fake.operationIDs = append(fake.operationIDs, operationID)
++	if fake.terminalFailures > 0 {
++		fake.terminalFailures--
++		return nil, durableTerminalError{}
++	}
++	if !fake.committed {
++		fake.committed = true
++		fake.operationID = operationID
++		fake.effectiveCreates++
++	} else if fake.operationID != operationID {
++		fake.effectiveCreates++
++	}
++	if fake.failFirstCreate {
++		fake.failFirstCreate = false
++		return nil, errors.New("client timeout after service commit")
++	}
++	return &provider.VolumeInfo{
++		VolumeID: volumeID, Path: "disk-" + volumeID, SizeBytes: size,
++		Provider: "durable-test", Metadata: map[string]string{"cloud-volume-path": "disk-" + volumeID},
++	}, nil
++}
++
++func (fake *durableTestProvider) DeleteVolume(string) error {
++	fake.mu.Lock()
++	defer fake.mu.Unlock()
++	fake.deleteCalls++
++	fake.committed = false
++	return nil
++}
++
++func (fake *durableTestProvider) GetVolumeInfo(string) (*provider.VolumeInfo, error) {
++	return nil, errors.New("not implemented")
++}
++
++func (fake *durableTestProvider) VolumeExists(string) (bool, error) {
++	fake.mu.Lock()
++	defer fake.mu.Unlock()
++	return fake.committed, nil
++}
++
++func filesystemCapability() *csi.VolumeCapability {
++	return &csi.VolumeCapability{
++		AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{FsType: "ext4"}},
++		AccessMode: &csi.VolumeCapability_AccessMode{Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER},
++	}
++}
++
++func durableCreateRequest(name, providerName string, required, limit int64) *csi.CreateVolumeRequest {
++	return &csi.CreateVolumeRequest{
++		Name: name, Parameters: map[string]string{"cloudProvider": providerName, "zoneId": "zone-a"},
++		CapacityRange:      &csi.CapacityRange{RequiredBytes: required, LimitBytes: limit},
++		VolumeCapabilities: []*csi.VolumeCapability{filesystemCapability()},
++	}
++}
++
++func newDurableController(t *testing.T, dir string) *controllerServer {
++	t.Helper()
++	store, err := newVolumeStoreAt(dir)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return &controllerServer{store: store}
++}
++
++func TestCreateVolumeSerializesConcurrentIdenticalRequests(t *testing.T) {
++	fake := &durableTestProvider{minimumBytes: 20 * testGiB}
++	providerName := registerDurableTestProvider(t, fake)
++	controller := newDurableController(t, t.TempDir())
++	request := durableCreateRequest("workspace", providerName, testGiB, 25*testGiB)
++
++	const workers = 20
++	errorsByWorker := make(chan error, workers)
++	var wait sync.WaitGroup
++	for range workers {
++		wait.Add(1)
++		go func() {
++			defer wait.Done()
++			response, err := controller.CreateVolume(context.Background(), request)
++			if err == nil && response.GetVolume().GetCapacityBytes() != 20*testGiB {
++				err = fmt.Errorf("capacity=%d", response.GetVolume().GetCapacityBytes())
++			}
++			errorsByWorker <- err
++		}()
++	}
++	wait.Wait()
++	close(errorsByWorker)
++	for err := range errorsByWorker {
++		if err != nil {
++			t.Fatal(err)
++		}
++	}
++	fake.mu.Lock()
++	defer fake.mu.Unlock()
++	if fake.createCalls != 1 || fake.effectiveCreates != 1 {
++		t.Fatalf("create calls=%d effective=%d, want 1/1", fake.createCalls, fake.effectiveCreates)
++	}
++}
++
++func TestCreateVolumeResumesPendingOperationAfterRestart(t *testing.T) {
++	fake := &durableTestProvider{minimumBytes: 20 * testGiB, failFirstCreate: true}
++	providerName := registerDurableTestProvider(t, fake)
++	dir := t.TempDir()
++	request := durableCreateRequest("workspace", providerName, testGiB, 25*testGiB)
++
++	first := newDurableController(t, dir)
++	if _, err := first.CreateVolume(context.Background(), request); status.Code(err) != codes.Internal {
++		t.Fatalf("first create status=%v, want Internal", status.Code(err))
++	}
++	pending, err := first.store.Load("workspace")
++	if err != nil || pending.State != volumeRecordStatePending {
++		t.Fatalf("pending record=(%+v, %v)", pending, err)
++	}
++
++	second := newDurableController(t, dir)
++	response, err := second.CreateVolume(context.Background(), request)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if response.GetVolume().GetCapacityBytes() != 20*testGiB {
++		t.Fatalf("capacity=%d", response.GetVolume().GetCapacityBytes())
++	}
++	fake.mu.Lock()
++	if fake.createCalls != 2 || fake.effectiveCreates != 1 || fake.operationID != pending.OperationID {
++		t.Fatalf("calls=%d effective=%d operation=(%s,%s)", fake.createCalls, fake.effectiveCreates, fake.operationID, pending.OperationID)
++	}
++	fake.mu.Unlock()
++
++	if _, err := second.DeleteVolume(context.Background(), &csi.DeleteVolumeRequest{VolumeId: "workspace"}); err != nil {
++		t.Fatal(err)
++	}
++	fake.mu.Lock()
++	defer fake.mu.Unlock()
++	if fake.deleteCalls != 1 || fake.committed {
++		t.Fatalf("delete calls=%d committed=%t", fake.deleteCalls, fake.committed)
++	}
++}
++
++func TestCreateVolumeRejectsIncompatibleSameName(t *testing.T) {
++	fake := &durableTestProvider{minimumBytes: 20 * testGiB}
++	providerName := registerDurableTestProvider(t, fake)
++	controller := newDurableController(t, t.TempDir())
++	request := durableCreateRequest("workspace", providerName, testGiB, 25*testGiB)
++	if _, err := controller.CreateVolume(context.Background(), request); err != nil {
++		t.Fatal(err)
++	}
++
++	changedZone := durableCreateRequest("workspace", providerName, testGiB, 25*testGiB)
++	changedZone.Parameters["zoneId"] = "zone-b"
++	if _, err := controller.CreateVolume(context.Background(), changedZone); status.Code(err) != codes.AlreadyExists {
++		t.Fatalf("changed zone status=%v, want AlreadyExists", status.Code(err))
++	}
++	changedSize := durableCreateRequest("workspace", providerName, 21*testGiB, 25*testGiB)
++	if _, err := controller.CreateVolume(context.Background(), changedSize); status.Code(err) != codes.AlreadyExists {
++		t.Fatalf("changed size status=%v, want AlreadyExists", status.Code(err))
++	}
++}
++
++func TestCreateVolumeRejectsProviderMinimumAboveLimit(t *testing.T) {
++	fake := &durableTestProvider{minimumBytes: 20 * testGiB}
++	providerName := registerDurableTestProvider(t, fake)
++	controller := newDurableController(t, t.TempDir())
++	request := durableCreateRequest("workspace", providerName, testGiB, 10*testGiB)
++	if _, err := controller.CreateVolume(context.Background(), request); status.Code(err) != codes.OutOfRange {
++		t.Fatalf("status=%v, want OutOfRange", status.Code(err))
++	}
++	if _, err := controller.store.Load("workspace"); !errors.Is(err, os.ErrNotExist) {
++		t.Fatal("capacity rejection persisted a pending operation")
++	}
++	fake.mu.Lock()
++	defer fake.mu.Unlock()
++	if fake.createCalls != 0 {
++		t.Fatalf("capacity rejection made %d cloud mutations", fake.createCalls)
++	}
++}
++
++func TestCreateVolumeRetiresExplicitFailureOperation(t *testing.T) {
++	fake := &durableTestProvider{minimumBytes: testGiB, terminalFailures: 1}
++	providerName := registerDurableTestProvider(t, fake)
++	controller := newDurableController(t, t.TempDir())
++	request := durableCreateRequest("workspace", providerName, testGiB, 0)
++	if _, err := controller.CreateVolume(context.Background(), request); status.Code(err) != codes.Internal {
++		t.Fatalf("first status=%v, want Internal", status.Code(err))
++	}
++	if _, err := controller.store.Load("workspace"); !errors.Is(err, os.ErrNotExist) {
++		t.Fatalf("terminal failure left pending state: %v", err)
++	}
++	if _, err := controller.CreateVolume(context.Background(), request); err != nil {
++		t.Fatal(err)
++	}
++	fake.mu.Lock()
++	defer fake.mu.Unlock()
++	if len(fake.operationIDs) != 2 || fake.operationIDs[0] == fake.operationIDs[1] || fake.effectiveCreates != 1 {
++		t.Fatalf("operations=%v effective=%d", fake.operationIDs, fake.effectiveCreates)
++	}
++}
++
++func TestCreateVolumeDoesNotPersistGenericProviderFailure(t *testing.T) {
++	fake := &genericTestProvider{failures: 1}
++	providerName := registerGenericTestProvider(t, fake)
++	controller := newDurableController(t, t.TempDir())
++	request := durableCreateRequest("workspace", providerName, testGiB, 0)
++
++	if _, err := controller.CreateVolume(context.Background(), request); status.Code(err) != codes.Internal {
++		t.Fatalf("first status=%v, want Internal", status.Code(err))
++	}
++	if _, err := controller.store.Load("workspace"); !errors.Is(err, os.ErrNotExist) {
++		t.Fatalf("generic provider failure left controller state: %v", err)
++	}
++	request.Parameters["zoneId"] = "zone-b"
++	if _, err := controller.CreateVolume(context.Background(), request); err != nil {
++		t.Fatalf("corrected retry failed: %v", err)
++	}
++	record, err := controller.store.Load("workspace")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if record.State != volumeRecordStateReady || record.OperationID != "" {
++		t.Fatalf("generic ready record=%+v", record)
++	}
++}
++
++func TestCreateVolumeValidatesCDHParameterPair(t *testing.T) {
++	fake := &genericTestProvider{}
++	providerName := registerGenericTestProvider(t, fake)
++	controller := newDurableController(t, t.TempDir())
++	for _, params := range []map[string]string{
++		{"encrypt-type": "luks2"},
++		{"kbs-key-id": "default/luks-key/workspace"},
++	} {
++		request := durableCreateRequest("workspace", providerName, testGiB, 0)
++		for key, value := range params {
++			request.Parameters[key] = value
++		}
++		if _, err := controller.CreateVolume(context.Background(), request); status.Code(err) != codes.InvalidArgument {
++			t.Fatalf("params=%v status=%v, want InvalidArgument", params, status.Code(err))
++		}
++	}
++}
++
++func TestCreateFingerprintIncludesTopologyAndPlannedCapacity(t *testing.T) {
++	request := durableCreateRequest("workspace", "fingerprint-only", testGiB, 0)
++	request.AccessibilityRequirements = &csi.TopologyRequirement{
++		Requisite: []*csi.Topology{{Segments: map[string]string{"zone": "zone-a"}}},
++	}
++	first, err := createRequestFingerprint(request, 20*testGiB)
++	if err != nil {
++		t.Fatal(err)
++	}
++	request.AccessibilityRequirements.Requisite[0].Segments["zone"] = "zone-b"
++	second, err := createRequestFingerprint(request, 20*testGiB)
++	if err != nil {
++		t.Fatal(err)
++	}
++	third, err := createRequestFingerprint(request, 21*testGiB)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if first == second || second == third {
++		t.Fatalf("fingerprints do not bind topology/capacity: %s %s %s", first, second, third)
++	}
++}
+diff --git a/pkg/driver/controllerserver.go b/pkg/driver/controllerserver.go
+index af15a90dc78e1ac98026870eb6922ebd686bb59a..159c889a26a4640a941946456ebdc3fced875071 100644
+--- a/pkg/driver/controllerserver.go
++++ b/pkg/driver/controllerserver.go
+@@ -26,11 +26,10 @@ var csLogger = log.New(log.Writer(), "[caa-csi/controller] ", log.LstdFlags|log.
+ type controllerServer struct {
+ 	csi.UnimplementedControllerServer
+ 	store *volumeStore
++	locks volumeNameLocks
+ }
+ 
+-func newControllerServer() *controllerServer {
+-	store := newVolumeStore()
+-
++func newControllerServer(store *volumeStore) *controllerServer {
+ 	if params := store.BootstrapParams(); params != nil {
+ 		if err := store.RecoverFromCloud(params); err != nil {
+ 			csLogger.Printf("cloud recovery failed (non-fatal): %v", err)
+@@ -39,9 +38,19 @@ func newControllerServer() *controllerServer {
+ 		csLogger.Printf("No bootstrap params available, skipping cloud recovery (set CSI_CLOUD_PROVIDER / CSI_BOOTSTRAP_PARAMS_FILE for empty-store recovery)")
+ 	}
+ 
+-	return &controllerServer{
+-		store: store,
+-	}
++	return &controllerServer{store: store}
++}
++
++type volumeCapacityPlanner interface {
++	NormalizeCapacity(requiredBytes int64) (int64, error)
++}
++
++type operationVolumeCreator interface {
++	CreateVolumeWithOperation(volumeID string, sizeBytes int64, operationID string) (*provider.VolumeInfo, error)
++}
++
++type terminalCreateFailure interface {
++	TerminalCreateFailure() bool
+ }
+ 
+ // loadVolumeRecord returns the local record, attempting cloud recovery first
+@@ -94,43 +103,123 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
+ 	if err := validateVolumeCapabilities(req.GetVolumeCapabilities()); err != nil {
+ 		return nil, status.Errorf(codes.InvalidArgument, "unsupported volume capability: %v", err)
+ 	}
+-
+-	params := req.GetParameters()
+-
+-	if et := params["encrypt-type"]; et != "" {
+-		if params["kbs-key-id"] == "" {
+-			return nil, status.Error(codes.InvalidArgument,
+-				"encrypt-type is set but kbs-key-id is missing: encryption requires a KBS key reference")
+-		}
++	if topology := req.GetAccessibilityRequirements(); topology != nil &&
++		(len(topology.GetRequisite()) != 0 || len(topology.GetPreferred()) != 0) {
++		return nil, status.Error(codes.InvalidArgument, "accessibility requirements are not supported")
++	}
++	if len(req.GetMutableParameters()) != 0 {
++		return nil, status.Error(codes.InvalidArgument, "mutable parameters are not supported")
+ 	}
+ 
+-	capacity := req.GetCapacityRange().GetRequiredBytes()
+-	if capacity == 0 {
+-		capacity = 1073741824 // default 1 GiB
++	params := sanitizePersistableParams(req.GetParameters())
++	encryptType, keyID := params["encrypt-type"], params["kbs-key-id"]
++	if (encryptType == "") != (keyID == "") {
++		return nil, status.Error(codes.InvalidArgument,
++			"encrypt-type and kbs-key-id must be set together")
++	}
++	required, limit, err := capacityRange(req)
++	if err != nil {
++		return nil, status.Errorf(codes.OutOfRange, "invalid capacity range: %v", err)
+ 	}
+ 
+-	if rec, err := cs.store.Load(req.GetName()); err == nil {
+-		if rec.CapacityBytes != 0 && rec.CapacityBytes != capacity {
++	unlock := cs.locks.lock(req.GetName())
++	defer unlock()
++
++	record, loadErr := cs.store.Load(req.GetName())
++	if loadErr == nil && record.State != volumeRecordStatePending {
++		if record.SchemaVersion == 0 {
++			err = legacyRecordCompatible(record, params, required, limit)
++		} else {
++			fingerprint, fingerprintErr := createRequestFingerprint(req, record.PlannedCapacityBytes)
++			if fingerprintErr != nil {
++				return nil, status.Errorf(codes.InvalidArgument, "invalid create request: %v", fingerprintErr)
++			}
++			err = requestFitsRecord(record, fingerprint, required, limit)
++		}
++		if err != nil {
+ 			return nil, status.Errorf(codes.AlreadyExists,
+-				"volume %s already exists with different capacity (%d != %d)", req.GetName(), rec.CapacityBytes, capacity)
++				"volume %s already exists incompatibly: %v", req.GetName(), err)
+ 		}
+ 		csLogger.Printf("CreateVolume: %s already exists, returning existing", req.GetName())
+-		volumeCtx := map[string]string{"cloudProvider": rec.Provider}
+-		for k, v := range rec.Params {
+-			volumeCtx[k] = v
+-		}
+-		return &csi.CreateVolumeResponse{
+-			Volume: &csi.Volume{
+-				VolumeId:      req.GetName(),
+-				CapacityBytes: rec.CapacityBytes,
+-				VolumeContext: volumeCtx,
+-			},
+-		}, nil
++		return createVolumeResponse(record, req.GetVolumeContentSource()), nil
++	}
++	if loadErr != nil && !errors.Is(loadErr, os.ErrNotExist) {
++		return nil, status.Errorf(codes.Internal, "failed to load controller state for volume %s: %v", req.GetName(), loadErr)
+ 	}
+ 
+-	p, err := provider.NewBlockVolumeProvider(params)
+-	if err != nil {
+-		return nil, status.Errorf(codes.InvalidArgument, "failed to create provider: %v", err)
++	var p provider.BlockVolumeProvider
++	pendingPersisted := loadErr == nil
++	if loadErr == nil {
++		fingerprint, fingerprintErr := createRequestFingerprint(req, record.PlannedCapacityBytes)
++		if fingerprintErr != nil {
++			return nil, status.Errorf(codes.InvalidArgument, "invalid create request: %v", fingerprintErr)
++		}
++		if err := requestFitsRecord(record, fingerprint, required, limit); err != nil {
++			return nil, status.Errorf(codes.AlreadyExists,
++				"volume %s has an incompatible pending create: %v", req.GetName(), err)
++		}
++		params = copyStringMap(record.Params)
++		p, err = provider.NewBlockVolumeProvider(params)
++		if err != nil {
++			return nil, status.Errorf(codes.Internal, "failed to resume provider operation: %v", err)
++		}
++		if err := validateVolumeContentSource(ctx, p, req.GetVolumeContentSource()); err != nil {
++			return nil, err
++		}
++		if req.GetVolumeContentSource() != nil {
++			return nil, status.Error(codes.FailedPrecondition,
++				"persisted create operation unexpectedly contains a content source")
++		}
++		if _, ok := p.(operationVolumeCreator); !ok {
++			return nil, status.Error(codes.FailedPrecondition,
++				"persisted create operation is not supported by its provider")
++		}
++	} else {
++		p, err = provider.NewBlockVolumeProvider(params)
++		if err != nil {
++			return nil, status.Errorf(codes.InvalidArgument, "failed to create provider: %v", err)
++		}
++		plannedCapacity := required
++		if planner, ok := p.(volumeCapacityPlanner); ok {
++			plannedCapacity, err = planner.NormalizeCapacity(required)
++			if err != nil {
++				return nil, status.Errorf(codes.OutOfRange, "provider cannot satisfy capacity range: %v", err)
++			}
++		}
++		if plannedCapacity < required || (limit > 0 && plannedCapacity > limit) {
++			return nil, status.Errorf(codes.OutOfRange,
++				"provider capacity %d is outside requested range [%d,%d]", plannedCapacity, required, limit)
++		}
++		if err := validateVolumeContentSource(ctx, p, req.GetVolumeContentSource()); err != nil {
++			return nil, err
++		}
++		fingerprint, err := createRequestFingerprint(req, plannedCapacity)
++		if err != nil {
++			return nil, status.Errorf(codes.InvalidArgument, "invalid create request: %v", err)
++		}
++		record = &volumeRecord{
++			SchemaVersion:        volumeRecordSchemaVersion,
++			State:                volumeRecordStatePending,
++			VolumeID:             req.GetName(),
++			Provider:             params["cloudProvider"],
++			PlannedCapacityBytes: plannedCapacity,
++			Params:               params,
++			RequestFingerprint:   fingerprint,
++		}
++		// Only providers with an explicit durable operation identity may leave
++		// pending state. Other providers retain their existing idempotency
++		// contract and are recorded only after CreateVolume succeeds.
++		if _, ok := p.(operationVolumeCreator); ok && req.GetVolumeContentSource() == nil {
++			record.OperationID, err = newVolumeOperationID()
++			if err != nil {
++				return nil, status.Errorf(codes.Internal, "%v", err)
++			}
++			if err := cs.store.Save(record); err != nil {
++				return nil, status.Errorf(codes.Internal,
++					"failed to persist create operation before cloud mutation: %v", err)
++			}
++			pendingPersisted = true
++		}
+ 	}
+ 
+ 	var volInfo *provider.VolumeInfo
+@@ -154,7 +243,7 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
+ 				return nil, status.Errorf(codes.Unimplemented, "provider does not support creating volumes from snapshot")
+ 			}
+ 			csLogger.Printf("CreateVolume: %s from snapshot %s", req.GetName(), snapID)
+-			volInfo, err = cloner.CreateVolumeFromSnapshot(req.GetName(), snapID, capacity)
++			volInfo, err = cloner.CreateVolumeFromSnapshot(req.GetName(), snapID, record.PlannedCapacityBytes)
+ 		case src.GetVolume() != nil:
+ 			srcVolID := src.GetVolume().GetVolumeId()
+ 			exists, existsErr := p.VolumeExists(srcVolID)
+@@ -169,49 +258,118 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
+ 				return nil, status.Errorf(codes.Unimplemented, "provider does not support volume cloning")
+ 			}
+ 			csLogger.Printf("CreateVolume: %s cloned from volume %s", req.GetName(), srcVolID)
+-			volInfo, err = cloner.CreateVolumeFromVolume(req.GetName(), srcVolID, capacity)
++			volInfo, err = cloner.CreateVolumeFromVolume(req.GetName(), srcVolID, record.PlannedCapacityBytes)
+ 		default:
+ 			return nil, status.Error(codes.InvalidArgument, "unsupported VolumeContentSource type")
+ 		}
+ 	} else {
+-		volInfo, err = p.CreateVolume(req.GetName(), capacity)
++		if creator, ok := p.(operationVolumeCreator); ok {
++			volInfo, err = creator.CreateVolumeWithOperation(req.GetName(), record.PlannedCapacityBytes, record.OperationID)
++		} else {
++			volInfo, err = p.CreateVolume(req.GetName(), record.PlannedCapacityBytes)
++		}
+ 	}
+ 	if err != nil {
++		var terminal terminalCreateFailure
++		if pendingPersisted && errors.As(err, &terminal) && terminal.TerminalCreateFailure() {
++			if deleteErr := cs.store.Delete(req.GetName()); deleteErr != nil {
++				return nil, status.Errorf(codes.Internal,
++					"provider rejected create and pending state cleanup failed: %v (provider error: %v)", deleteErr, err)
++			}
++		}
+ 		return nil, status.Errorf(codes.Internal, "provider.CreateVolume failed: %v", err)
+ 	}
+ 
+-	if err := cs.store.Save(&volumeRecord{
+-		VolumeID:      req.GetName(),
+-		Provider:      volInfo.Provider,
+-		Path:          volInfo.Path,
+-		CapacityBytes: capacity,
+-		Params:        params,
+-	}); err != nil {
+-		csLogger.Printf("failed to persist volume record for %s: %v (volume created in cloud but record may be lost)", req.GetName(), err)
++	if err := validateCreatedVolume(req.GetName(), volInfo); err != nil {
++		return nil, status.Error(codes.Internal, err.Error())
+ 	}
+-	csLogger.Printf("CreateVolume: %s (provider=%s, path=%s)", req.GetName(), volInfo.Provider, volInfo.Path)
+-
+-	volumeCtx := map[string]string{
+-		"cloudProvider": volInfo.Provider,
+-	}
+-	for k, v := range params {
+-		volumeCtx[k] = v
++	if volInfo.SizeBytes < required || (limit > 0 && volInfo.SizeBytes > limit) {
++		return nil, status.Errorf(codes.OutOfRange,
++			"provider allocated %d bytes outside requested range [%d,%d]", volInfo.SizeBytes, required, limit)
+ 	}
+-	for k, v := range volInfo.Metadata {
+-		volumeCtx[k] = v
++	record.State = volumeRecordStateReady
++	record.Provider = volInfo.Provider
++	record.Path = volInfo.Path
++	record.CapacityBytes = volInfo.SizeBytes
++	record.Metadata = volInfo.Metadata
++	if err := cs.store.Save(record); err != nil {
++		return nil, status.Errorf(codes.Internal,
++			"cloud volume %s exists, but ready state persistence failed; retry will resume operation: %v", req.GetName(), err)
+ 	}
++	csLogger.Printf("CreateVolume: %s created (provider=%s)", req.GetName(), volInfo.Provider)
++	return createVolumeResponse(record, req.GetVolumeContentSource()), nil
++}
+ 
+-	vol := &csi.Volume{
+-		VolumeId:      req.GetName(),
+-		CapacityBytes: capacity,
+-		VolumeContext: volumeCtx,
++func validateVolumeContentSource(ctx context.Context, p provider.BlockVolumeProvider, source *csi.VolumeContentSource) error {
++	if source == nil {
++		return nil
+ 	}
++	_, supportsClone := p.(provider.VolumeCloner)
++	switch {
++	case source.GetSnapshot() != nil:
++		snapshotID := source.GetSnapshot().GetSnapshotId()
++		snapshotter, ok := p.(provider.VolumeSnapshotter)
++		if !ok {
++			return status.Errorf(codes.NotFound, "snapshot %s not found", snapshotID)
++		}
++		snapshot, err := snapshotter.FindSnapshot(ctx, snapshotID)
++		if err != nil {
++			return status.Errorf(codes.Internal, "failed to verify snapshot %s: %v", snapshotID, err)
++		}
++		if snapshot == nil {
++			return status.Errorf(codes.NotFound, "snapshot %s not found", snapshotID)
++		}
++		if !supportsClone {
++			return status.Error(codes.Unimplemented, "provider does not support creating volumes from snapshot")
++		}
++	case source.GetVolume() != nil:
++		sourceVolumeID := source.GetVolume().GetVolumeId()
++		exists, err := p.VolumeExists(sourceVolumeID)
++		if err != nil {
++			return status.Errorf(codes.Internal, "failed to verify source volume %s: %v", sourceVolumeID, err)
++		}
++		if !exists {
++			return status.Errorf(codes.NotFound, "source volume %s not found", sourceVolumeID)
++		}
++		if !supportsClone {
++			return status.Error(codes.Unimplemented, "provider does not support volume cloning")
++		}
++	default:
++		return status.Error(codes.InvalidArgument, "unsupported VolumeContentSource type")
++	}
++	return nil
++}
+ 
+-	if src := req.GetVolumeContentSource(); src != nil {
+-		vol.ContentSource = src
++func validateCreatedVolume(volumeID string, info *provider.VolumeInfo) error {
++	if info == nil || strings.TrimSpace(info.Provider) == "" || strings.TrimSpace(info.Path) == "" || info.SizeBytes <= 0 {
++		return errors.New("provider returned incomplete cloud volume identity or capacity")
++	}
++	if info.VolumeID != "" && info.VolumeID != volumeID {
++		return fmt.Errorf("provider returned volume identity %q for request %q", info.VolumeID, volumeID)
+ 	}
++	return nil
++}
+ 
+-	return &csi.CreateVolumeResponse{Volume: vol}, nil
++func createVolumeResponse(record *volumeRecord, source *csi.VolumeContentSource) *csi.CreateVolumeResponse {
++	return &csi.CreateVolumeResponse{Volume: &csi.Volume{
++		VolumeId: record.VolumeID, CapacityBytes: record.CapacityBytes,
++		VolumeContext: volumeContextForRecord(record), ContentSource: source,
++	}}
++}
++
++func volumeContextForRecord(rec *volumeRecord) map[string]string {
++	volumeCtx := make(map[string]string, len(rec.Params)+len(rec.Metadata)+4)
++	for key, value := range rec.Params {
++		volumeCtx[key] = value
++	}
++	for key, value := range rec.Metadata {
++		volumeCtx[key] = value
++	}
++	volumeCtx["cloudProvider"] = rec.Provider
++	volumeCtx["cloud-provider"] = rec.Provider
++	volumeCtx["cloud-volume-path"] = rec.Path
++	volumeCtx["capacity_in_bytes"] = strconv.FormatInt(rec.CapacityBytes, 10)
++	return volumeCtx
+ }
+ 
+ func (cs *controllerServer) DeleteVolume(_ context.Context, req *csi.DeleteVolumeRequest) (*csi.DeleteVolumeResponse, error) {
+@@ -220,11 +378,15 @@ func (cs *controllerServer) DeleteVolume(_ context.Context, req *csi.DeleteVolum
+ 		return nil, status.Error(codes.InvalidArgument, "Volume ID missing")
+ 	}
+ 
++	unlock := cs.locks.lock(volumeID)
++	defer unlock()
++
++	record, loadErr := cs.loadVolumeRecord(volumeID)
+ 	var params map[string]string
+-	if rec, err := cs.loadVolumeRecord(volumeID); err == nil {
+-		params = rec.Params
+-	} else {
+-		params = cs.resolveProviderParams(req.GetSecrets())
++	if loadErr == nil {
++		params = record.Params
++	} else if errors.Is(loadErr, os.ErrNotExist) {
++		params = sanitizePersistableParams(cs.resolveProviderParams(req.GetSecrets()))
+ 		if params == nil {
+ 			return nil, status.Errorf(codes.FailedPrecondition,
+ 				"volume %s not found in local store and no cloud provider params available for delete; "+
+@@ -232,12 +394,40 @@ func (cs *controllerServer) DeleteVolume(_ context.Context, req *csi.DeleteVolum
+ 				volumeID)
+ 		}
+ 		csLogger.Printf("DeleteVolume: volume %s missing from store, deleting via bootstrap params", volumeID)
++	} else {
++		return nil, status.Errorf(codes.Internal, "failed to load controller state for volume %s: %v", volumeID, loadErr)
+ 	}
+ 
+ 	p, err := provider.NewBlockVolumeProvider(params)
+ 	if err != nil {
+ 		return nil, status.Errorf(codes.Internal, "failed to create provider for delete: %v", err)
+ 	}
++	if record != nil && record.State == volumeRecordStatePending {
++		creator, ok := p.(operationVolumeCreator)
++		if !ok {
++			return nil, status.Errorf(codes.Aborted,
++				"volume %s has a pending create; retry CreateVolume before delete", volumeID)
++		}
++		info, err := creator.CreateVolumeWithOperation(
++			record.VolumeID, record.PlannedCapacityBytes, record.OperationID)
++		if err != nil {
++			return nil, status.Errorf(codes.Internal,
++				"failed to complete pending create before delete; operation remains recoverable: %v", err)
++		}
++		if err := validateCreatedVolume(record.VolumeID, info); err != nil {
++			return nil, status.Errorf(codes.Internal,
++				"failed to complete pending create before delete; operation remains recoverable: %v", err)
++		}
++		record.State = volumeRecordStateReady
++		record.Provider = info.Provider
++		record.Path = info.Path
++		record.CapacityBytes = info.SizeBytes
++		record.Metadata = info.Metadata
++		if err := cs.store.Save(record); err != nil {
++			return nil, status.Errorf(codes.Internal,
++				"pending create completed, but ready state persistence failed; retry before delete: %v", err)
++		}
++	}
+ 
+ 	if err := p.DeleteVolume(volumeID); err != nil {
+ 		errMsg := err.Error()
+@@ -247,7 +437,10 @@ func (cs *controllerServer) DeleteVolume(_ context.Context, req *csi.DeleteVolum
+ 		return nil, status.Errorf(codes.Internal, "provider.DeleteVolume failed: %v", err)
+ 	}
+ 
+-	cs.store.Delete(volumeID)
++	if err := cs.store.Delete(volumeID); err != nil {
++		return nil, status.Errorf(codes.Internal,
++			"cloud volume %s was deleted, but controller state cleanup failed: %v", volumeID, err)
++	}
+ 	csLogger.Printf("DeleteVolume: %s deleted", volumeID)
+ 	return &csi.DeleteVolumeResponse{}, nil
+ }
+diff --git a/pkg/driver/create_request.go b/pkg/driver/create_request.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..84b62d1425c49a4e9f70f12b23bce655a560a3bd
+--- /dev/null
++++ b/pkg/driver/create_request.go
+@@ -0,0 +1,183 @@
++// (C) Copyright Confidential Containers Contributors
++// SPDX-License-Identifier: Apache-2.0
++
++package driver
++
++import (
++	"crypto/rand"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"fmt"
++	"reflect"
++	"sort"
++	"sync"
++
++	"github.com/container-storage-interface/spec/lib/go/csi"
++	"google.golang.org/protobuf/proto"
++	"google.golang.org/protobuf/protoadapt"
++)
++
++const (
++	defaultVolumeCapacity     = int64(1 << 30)
++	volumeRecordSchemaVersion = 1
++	volumeRecordStatePending  = "pending"
++	volumeRecordStateReady    = "ready"
++	sha256HexLength           = 64
++	operationIDHexLength      = 32
++)
++
++type volumeNameLock struct {
++	mu   sync.Mutex
++	refs int
++}
++
++type volumeNameLocks struct {
++	mu    sync.Mutex
++	locks map[string]*volumeNameLock
++}
++
++func (locks *volumeNameLocks) lock(name string) func() {
++	locks.mu.Lock()
++	if locks.locks == nil {
++		locks.locks = make(map[string]*volumeNameLock)
++	}
++	entry := locks.locks[name]
++	if entry == nil {
++		entry = &volumeNameLock{}
++		locks.locks[name] = entry
++	}
++	entry.refs++
++	locks.mu.Unlock()
++
++	entry.mu.Lock()
++	return func() {
++		entry.mu.Unlock()
++		locks.mu.Lock()
++		entry.refs--
++		if entry.refs == 0 {
++			delete(locks.locks, name)
++		}
++		locks.mu.Unlock()
++	}
++}
++
++func capacityRange(req *csi.CreateVolumeRequest) (required, limit int64, err error) {
++	required = req.GetCapacityRange().GetRequiredBytes()
++	limit = req.GetCapacityRange().GetLimitBytes()
++	if required < 0 || limit < 0 {
++		return 0, 0, fmt.Errorf("capacity values cannot be negative")
++	}
++	if required == 0 {
++		required = defaultVolumeCapacity
++	}
++	if limit > 0 && required > limit {
++		return 0, 0, fmt.Errorf("required capacity %d exceeds limit %d", required, limit)
++	}
++	return required, limit, nil
++}
++
++// createRequestFingerprint binds a durable operation to the canonical CSI
++// request and the capacity selected by the provider. The name itself is the
++// store key and therefore does not need to be repeated in the digest.
++func createRequestFingerprint(req *csi.CreateVolumeRequest, plannedCapacity int64) (string, error) {
++	capabilities := make([]string, 0, len(req.GetVolumeCapabilities()))
++	for _, capability := range req.GetVolumeCapabilities() {
++		encoded, err := (proto.MarshalOptions{Deterministic: true}).Marshal(protoadapt.MessageV2Of(capability))
++		if err != nil {
++			return "", fmt.Errorf("marshal volume capability: %w", err)
++		}
++		capabilities = append(capabilities, hex.EncodeToString(encoded))
++	}
++	sort.Strings(capabilities)
++
++	sourceType, sourceID := "", ""
++	if source := req.GetVolumeContentSource(); source != nil {
++		switch {
++		case source.GetSnapshot() != nil:
++			sourceType, sourceID = "snapshot", source.GetSnapshot().GetSnapshotId()
++		case source.GetVolume() != nil:
++			sourceType, sourceID = "volume", source.GetVolume().GetVolumeId()
++		default:
++			return "", fmt.Errorf("unsupported volume content source")
++		}
++	}
++
++	topology := ""
++	if requirements := req.GetAccessibilityRequirements(); requirements != nil {
++		encoded, err := (proto.MarshalOptions{Deterministic: true}).Marshal(protoadapt.MessageV2Of(requirements))
++		if err != nil {
++			return "", fmt.Errorf("marshal accessibility requirements: %w", err)
++		}
++		topology = hex.EncodeToString(encoded)
++	}
++
++	payload, err := json.Marshal(struct {
++		Parameters      map[string]string `json:"parameters"`
++		Capabilities    []string          `json:"capabilities"`
++		SourceType      string            `json:"sourceType,omitempty"`
++		SourceID        string            `json:"sourceID,omitempty"`
++		Topology        string            `json:"topology,omitempty"`
++		PlannedCapacity int64             `json:"plannedCapacity"`
++	}{
++		Parameters: copyStringMap(req.GetParameters()), Capabilities: capabilities,
++		SourceType: sourceType, SourceID: sourceID, Topology: topology,
++		PlannedCapacity: plannedCapacity,
++	})
++	if err != nil {
++		return "", fmt.Errorf("marshal create request: %w", err)
++	}
++	digest := sha256.Sum256(payload)
++	return hex.EncodeToString(digest[:]), nil
++}
++
++func newVolumeOperationID() (string, error) {
++	random := make([]byte, 16)
++	if _, err := rand.Read(random); err != nil {
++		return "", fmt.Errorf("generate create operation ID: %w", err)
++	}
++	return hex.EncodeToString(random), nil
++}
++
++func isHex(value string) bool {
++	_, err := hex.DecodeString(value)
++	return err == nil
++}
++
++func requestFitsRecord(rec *volumeRecord, fingerprint string, required, limit int64) error {
++	if rec.RequestFingerprint != fingerprint {
++		return fmt.Errorf("parameters, capabilities, content source, topology, or planned capacity differ")
++	}
++	capacity := rec.CapacityBytes
++	if rec.State == volumeRecordStatePending {
++		capacity = rec.PlannedCapacityBytes
++	}
++	if capacity < required {
++		return fmt.Errorf("volume capacity %d is below required %d", capacity, required)
++	}
++	if limit > 0 && capacity > limit {
++		return fmt.Errorf("volume capacity %d exceeds limit %d", capacity, limit)
++	}
++	return nil
++}
++
++func legacyRecordCompatible(rec *volumeRecord, params map[string]string, required, limit int64) error {
++	if !reflect.DeepEqual(rec.Params, params) {
++		return fmt.Errorf("parameters differ")
++	}
++	if rec.CapacityBytes < required {
++		return fmt.Errorf("volume capacity %d is below required %d", rec.CapacityBytes, required)
++	}
++	if limit > 0 && rec.CapacityBytes > limit {
++		return fmt.Errorf("volume capacity %d exceeds limit %d", rec.CapacityBytes, limit)
++	}
++	return nil
++}
++
++func copyStringMap(values map[string]string) map[string]string {
++	copy := make(map[string]string, len(values))
++	for key, value := range values {
++		copy[key] = value
++	}
++	return copy
++}
+diff --git a/pkg/driver/directvolume_test.go b/pkg/driver/directvolume_test.go
+index 39231f5c0364594fa3155155e96a0dea7dd87645..6d7c75d94899f14227d4cb02da2fe2fa4be00b4d 100644
+--- a/pkg/driver/directvolume_test.go
++++ b/pkg/driver/directvolume_test.go
+@@ -375,6 +375,39 @@ func TestNodeUnpublishVolumeIsIdempotent(t *testing.T) {
+ 	}
+ }
+ 
++func TestNodeStageUsesOnlyControllerVolumeIdentity(t *testing.T) {
++	node := newNodeServer("node-1")
++	capability := publishRequest("/unused", csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER, false).VolumeCapability
++	request := &csi.NodeStageVolumeRequest{
++		VolumeId: "workspace", StagingTargetPath: "/staging/workspace",
++		VolumeCapability: capability,
++		VolumeContext:    map[string]string{"cloud-volume-path": "d-workspace"},
++	}
++	if _, err := node.NodeStageVolume(t.Context(), request); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := node.NodeStageVolume(t.Context(), request); err != nil {
++		t.Fatalf("idempotent stage: %v", err)
++	}
++	changed := *request
++	changed.VolumeContext = map[string]string{"cloud-volume-path": "d-other"}
++	if _, err := node.NodeStageVolume(t.Context(), &changed); status.Code(err) != codes.FailedPrecondition {
++		t.Fatalf("changed identity status=%v, want FailedPrecondition", status.Code(err))
++	}
++}
++
++func TestNodeStageRequiresControllerVolumeIdentity(t *testing.T) {
++	node := newNodeServer("node-1")
++	capability := publishRequest("/unused", csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER, false).VolumeCapability
++	_, err := node.NodeStageVolume(t.Context(), &csi.NodeStageVolumeRequest{
++		VolumeId: "workspace", StagingTargetPath: "/staging/workspace",
++		VolumeCapability: capability,
++	})
++	if status.Code(err) != codes.FailedPrecondition {
++		t.Fatalf("status=%v, want FailedPrecondition", status.Code(err))
++	}
++}
++
+ func TestReadDirectVolumeMetadataRejectsUnknownAndTrailingFields(t *testing.T) {
+ 	path := filepath.Join(t.TempDir(), mountInfoFileName)
+ 	base := `{"version":1,"volume-type":"block","volume-mode":"filesystem","device":"d-1","fstype":"ext4","readonly":true,"options":["noatime","ro"],"pod-uid":"pod-1","volume-handle":"pvc-1"}`
+diff --git a/pkg/driver/driver.go b/pkg/driver/driver.go
+index 261281acdf95703c8f765fcdc84e0396bf6caa4f..8aa47ef3bdfb66b95a1f1ed5e27a03fab5fb6c46 100644
+--- a/pkg/driver/driver.go
++++ b/pkg/driver/driver.go
+@@ -17,15 +17,18 @@ import (
+ var drvLogger = log.New(log.Writer(), "[caa-csi/driver] ", log.LstdFlags|log.Lmsgprefix)
+ 
+ type Config struct {
+-	Endpoint      string
+-	DriverName    string
+-	VendorVersion string
+-	NodeID        string
++	Endpoint       string
++	DriverName     string
++	VendorVersion  string
++	NodeID         string
++	Component      string
++	VolumeStoreDir string
+ }
+ 
+ type Driver struct {
+ 	config Config
+ 	server *grpc.Server
++	store  *volumeStore
+ }
+ 
+ func NewDriver(cfg Config) (*Driver, error) {
+@@ -35,11 +38,30 @@ func NewDriver(cfg Config) (*Driver, error) {
+ 	if cfg.VendorVersion == "" {
+ 		return nil, fmt.Errorf("driver version is required")
+ 	}
+-	if cfg.NodeID == "" {
++	if cfg.Component == "" {
++		cfg.Component = "all"
++	}
++	if cfg.Component != "all" && cfg.Component != "controller" && cfg.Component != "node" {
++		return nil, fmt.Errorf("component must be all, controller, or node")
++	}
++	if (cfg.Component == "all" || cfg.Component == "node") && cfg.NodeID == "" {
+ 		return nil, fmt.Errorf("node ID is required")
+ 	}
+ 
+-	return &Driver{config: cfg}, nil
++	driver := &Driver{config: cfg}
++	if cfg.Component == "all" || cfg.Component == "controller" {
++		var err error
++		if cfg.VolumeStoreDir == "" {
++			driver.store, err = newVolumeStore()
++		} else {
++			driver.store, err = newVolumeStoreAt(cfg.VolumeStoreDir)
++		}
++		if err != nil {
++			return nil, err
++		}
++	}
++
++	return driver, nil
+ }
+ 
+ func (d *Driver) Run() error {
+@@ -58,18 +80,27 @@ func (d *Driver) Run() error {
+ 	}
+ 
+ 	d.server = grpc.NewServer()
++	d.registerServices(d.server)
+ 
+-	csi.RegisterIdentityServer(d.server, &identityServer{
++	drvLogger.Printf("Listening on %s://%s (driver=%s, version=%s, component=%s, node=%s)",
++		scheme, addr, d.config.DriverName, d.config.VendorVersion, d.config.Component, d.config.NodeID)
++
++	return d.server.Serve(listener)
++}
++
++func (d *Driver) registerServices(server *grpc.Server) {
++	controller := d.config.Component == "all" || d.config.Component == "controller"
++	csi.RegisterIdentityServer(server, &identityServer{
+ 		driverName:    d.config.DriverName,
+ 		vendorVersion: d.config.VendorVersion,
++		controller:    controller,
+ 	})
+-	csi.RegisterControllerServer(d.server, newControllerServer())
+-	csi.RegisterNodeServer(d.server, newNodeServer(d.config.NodeID))
+-
+-	drvLogger.Printf("Listening on %s://%s (driver=%s, version=%s, node=%s)",
+-		scheme, addr, d.config.DriverName, d.config.VendorVersion, d.config.NodeID)
+-
+-	return d.server.Serve(listener)
++	if controller {
++		csi.RegisterControllerServer(server, newControllerServer(d.store))
++	}
++	if d.config.Component == "all" || d.config.Component == "node" {
++		csi.RegisterNodeServer(server, newNodeServer(d.config.NodeID))
++	}
+ }
+ 
+ func (d *Driver) Stop() {
+diff --git a/pkg/driver/identityserver.go b/pkg/driver/identityserver.go
+index abfe4c82e51cc8ebe48c4e9ce6ed73fa2134f230..7e26d05c9ff0933e15c28738599003fce8704364 100644
+--- a/pkg/driver/identityserver.go
++++ b/pkg/driver/identityserver.go
+@@ -15,6 +15,7 @@ type identityServer struct {
+ 	csi.UnimplementedIdentityServer
+ 	driverName    string
+ 	vendorVersion string
++	controller    bool
+ }
+ 
+ func (ids *identityServer) GetPluginInfo(_ context.Context, _ *csi.GetPluginInfoRequest) (*csi.GetPluginInfoResponse, error) {
+@@ -31,8 +32,9 @@ func (ids *identityServer) GetPluginInfo(_ context.Context, _ *csi.GetPluginInfo
+ }
+ 
+ func (ids *identityServer) GetPluginCapabilities(_ context.Context, _ *csi.GetPluginCapabilitiesRequest) (*csi.GetPluginCapabilitiesResponse, error) {
+-	return &csi.GetPluginCapabilitiesResponse{
+-		Capabilities: []*csi.PluginCapability{
++	response := &csi.GetPluginCapabilitiesResponse{}
++	if ids.controller {
++		response.Capabilities = []*csi.PluginCapability{
+ 			{
+ 				Type: &csi.PluginCapability_Service_{
+ 					Service: &csi.PluginCapability_Service{
+@@ -47,8 +49,9 @@ func (ids *identityServer) GetPluginCapabilities(_ context.Context, _ *csi.GetPl
+ 					},
+ 				},
+ 			},
+-		},
+-	}, nil
++		}
++	}
++	return response, nil
+ }
+ 
+ func (ids *identityServer) Probe(_ context.Context, _ *csi.ProbeRequest) (*csi.ProbeResponse, error) {
+diff --git a/pkg/driver/nodeserver.go b/pkg/driver/nodeserver.go
+index 90d55e150e1e2d99262630ec294d11833f195570..ff9d55b86edf59690c1804d0a1b7d5c983f4f5a2 100644
+--- a/pkg/driver/nodeserver.go
++++ b/pkg/driver/nodeserver.go
+@@ -12,7 +12,6 @@ import (
+ 	"os"
+ 	"os/exec"
+ 	"path/filepath"
+-	"strconv"
+ 	"strings"
+ 	"sync"
+ 	"syscall"
+@@ -21,8 +20,6 @@ import (
+ 	"github.com/container-storage-interface/spec/lib/go/csi"
+ 	"google.golang.org/grpc/codes"
+ 	"google.golang.org/grpc/status"
+-
+-	provider "github.com/confidential-devhub/caa-csi-block-driver/pkg/provider"
+ )
+ 
+ var nsLogger = log.New(log.Writer(), "[caa-csi/node] ", log.LstdFlags|log.Lmsgprefix)
+@@ -84,31 +81,19 @@ func (ns *nodeServer) NodeStageVolume(_ context.Context, req *csi.NodeStageVolum
+ 		return nil, status.Error(codes.InvalidArgument, "Volume capability missing")
+ 	}
+ 
+-	params := req.GetVolumeContext()
+-
+-	p, err := provider.NewBlockVolumeProvider(params)
+-	if err != nil {
+-		return nil, status.Errorf(codes.Internal, "failed to create provider: %v", err)
+-	}
+-
+-	var sizeBytes int64 = 1073741824
+-	if capacityStr := params["capacity_in_bytes"]; capacityStr != "" {
+-		if parsed, err := strconv.ParseInt(capacityStr, 10, 64); err == nil && parsed > 0 {
+-			sizeBytes = parsed
+-		} else {
+-			nsLogger.Printf("WARNING: invalid capacity_in_bytes %q, using default 1GiB", capacityStr)
+-		}
+-	}
+-
+-	volInfo, err := p.CreateVolume(volumeID, sizeBytes)
+-	if err != nil {
+-		return nil, status.Errorf(codes.Internal, "provider.CreateVolume failed: %v", err)
++	devicePath := strings.TrimSpace(req.GetVolumeContext()["cloud-volume-path"])
++	if devicePath == "" {
++		return nil, status.Errorf(codes.FailedPrecondition,
++			"volume %s has no controller-provided cloud-volume-path", volumeID)
+ 	}
+-
+ 	ns.mu.Lock()
+-	ns.devices[volumeID] = volInfo.Path
+-	ns.mu.Unlock()
+-	nsLogger.Printf("NodeStageVolume: %s staged (provider=%s, path=%s)", volumeID, volInfo.Provider, volInfo.Path)
++	defer ns.mu.Unlock()
++	if existing := ns.devices[volumeID]; existing != "" && existing != devicePath {
++		return nil, status.Errorf(codes.FailedPrecondition,
++			"volume %s was already staged with cloud-volume-path %q, not %q", volumeID, existing, devicePath)
++	}
++	ns.devices[volumeID] = devicePath
++	nsLogger.Printf("NodeStageVolume: %s staged (path=%s)", volumeID, devicePath)
+ 
+ 	return &csi.NodeStageVolumeResponse{}, nil
+ }
+@@ -131,20 +116,20 @@ func (ns *nodeServer) NodePublishVolume(_ context.Context, req *csi.NodePublishV
+ 		return nil, status.Errorf(codes.InvalidArgument, "target path %q is not a canonical kubelet CSI mount path", targetPath)
+ 	}
+ 
++	contextPath := strings.TrimSpace(req.GetVolumeContext()["cloud-volume-path"])
++	// Kubelet may replay NodePublish after a node-plugin restart without
++	// replaying NodeStage first. The controller-provided cloud identity is
++	// sufficient to rebuild direct-volume metadata.
+ 	ns.mu.Lock()
+ 	devicePath := ns.devices[volumeID]
++	if devicePath == "" && contextPath != "" {
++		devicePath = contextPath
++		ns.devices[volumeID] = devicePath
++	}
+ 	ns.mu.Unlock()
+-
+-	if devicePath == "" {
+-		// Kubelet may replay NodePublish after a node-plugin restart without
+-		// replaying NodeStage first. The controller-provided cloud identity is
+-		// sufficient to rebuild direct-volume metadata.
+-		devicePath = strings.TrimSpace(req.GetVolumeContext()["cloud-volume-path"])
+-		if devicePath != "" {
+-			ns.mu.Lock()
+-			ns.devices[volumeID] = devicePath
+-			ns.mu.Unlock()
+-		}
++	if devicePath != "" && contextPath != "" && contextPath != devicePath {
++		return nil, status.Errorf(codes.FailedPrecondition,
++			"volume %s context has cloud-volume-path %q, staged path is %q", volumeID, contextPath, devicePath)
+ 	}
+ 	if devicePath == "" {
+ 		return nil, status.Errorf(codes.FailedPrecondition, "volume %s not staged (no device path)", volumeID)
+@@ -154,9 +139,7 @@ func (ns *nodeServer) NodePublishVolume(_ context.Context, req *csi.NodePublishV
+ 	for key, value := range req.GetVolumeContext() {
+ 		attrib[key] = value
+ 	}
+-	if attrib["cloud-volume-path"] == "" {
+-		attrib["cloud-volume-path"] = devicePath
+-	}
++	attrib["cloud-volume-path"] = devicePath
+ 	providerName := strings.TrimSpace(attrib["cloud-provider"])
+ 	if providerName == "" {
+ 		providerName = strings.TrimSpace(attrib["cloudProvider"])
+diff --git a/pkg/driver/volumestore.go b/pkg/driver/volumestore.go
+index 69647e84522af992d198c50e45b6c5ba131a317a..aca853d5e4e59cc431208034e05fe5db4e5a1838 100644
+--- a/pkg/driver/volumestore.go
++++ b/pkg/driver/volumestore.go
+@@ -5,11 +5,13 @@ package driver
+ 
+ import (
+ 	"encoding/json"
++	"errors"
+ 	"fmt"
+ 	"log"
+ 	"maps"
+ 	"os"
+ 	"path/filepath"
++	"strings"
+ 	"sync"
+ 
+ 	provider "github.com/confidential-devhub/caa-csi-block-driver/pkg/provider"
+@@ -24,16 +26,21 @@ const (
+ )
+ 
+ type volumeRecord struct {
+-	VolumeID      string            `json:"volumeID"`
+-	Provider      string            `json:"provider"`
+-	Path          string            `json:"path"`
+-	CapacityBytes int64             `json:"capacityBytes,omitempty"`
+-	Params        map[string]string `json:"params"`
++	SchemaVersion        int               `json:"schemaVersion,omitempty"`
++	State                string            `json:"state,omitempty"`
++	VolumeID             string            `json:"volumeID"`
++	Provider             string            `json:"provider"`
++	Path                 string            `json:"path,omitempty"`
++	PlannedCapacityBytes int64             `json:"plannedCapacityBytes,omitempty"`
++	CapacityBytes        int64             `json:"capacityBytes,omitempty"`
++	Params               map[string]string `json:"params"`
++	Metadata             map[string]string `json:"metadata,omitempty"`
++	RequestFingerprint   string            `json:"requestFingerprint,omitempty"`
++	OperationID          string            `json:"operationID,omitempty"`
+ }
+ 
+-// volumeManifest is a lightweight params backup used when individual volume
+-// records are missing but the store directory (or a mounted bootstrap file)
+-// still has provider configuration.
++// volumeManifest keeps only non-secret provider bootstrap parameters so a
++// controller can reconcile cloud-tagged volumes after loss of one record.
+ type volumeManifest struct {
+ 	Params    map[string]string `json:"params"`
+ 	VolumeIDs []string          `json:"volumeIDs"`
+@@ -44,342 +51,389 @@ type volumeStore struct {
+ 	dir string
+ }
+ 
+-func newVolumeStore() *volumeStore {
++func newVolumeStore() (*volumeStore, error) {
+ 	dir := os.Getenv("CSI_VOLUME_STORE_DIR")
+ 	if dir == "" {
+ 		dir = defaultVolumeStoreDir
+ 	}
+-	os.MkdirAll(dir, 0700)
+-	return &volumeStore{dir: dir}
++	return newVolumeStoreAt(dir)
++}
++
++func newVolumeStoreAt(dir string) (*volumeStore, error) {
++	if err := os.MkdirAll(dir, 0o700); err != nil {
++		return nil, fmt.Errorf("create volume store: %w", err)
++	}
++	return &volumeStore{dir: filepath.Clean(dir)}, nil
++}
++
++func validateVolumeStoreKey(volumeID string) error {
++	if volumeID == "" || strings.TrimSpace(volumeID) != volumeID || len(volumeID) > 253 ||
++		filepath.Base(volumeID) != volumeID || volumeID == "." || volumeID == ".." || strings.Contains(volumeID, `\`) {
++		return fmt.Errorf("invalid volume store key %q", volumeID)
++	}
++	return nil
++}
++
++func (vs *volumeStore) path(volumeID string) (string, error) {
++	if err := validateVolumeStoreKey(volumeID); err != nil {
++		return "", err
++	}
++	return filepath.Join(vs.dir, volumeID+".json"), nil
+ }
+ 
+ func (vs *volumeStore) manifestPath() string {
+ 	return filepath.Join(vs.dir, manifestFileName)
+ }
+ 
+-// BootstrapParams resolves cloud provider parameters for recovery and
+-// fallback operations when a specific volume record may be missing.
+-//
+-// Priority:
+-//  1. Params from any surviving volume record
+-//  2. Params from _manifest.json in the volume store
+-//  3. JSON file pointed to by CSI_BOOTSTRAP_PARAMS_FILE
+-//  4. Well-known environment variables (CSI_CLOUD_PROVIDER, etc.)
+-func (vs *volumeStore) BootstrapParams() map[string]string {
+-	if params := vs.AnyParams(); params != nil {
+-		return params
++func validateVolumeRecord(rec *volumeRecord) error {
++	if rec == nil {
++		return errors.New("volume record is nil")
+ 	}
+-	if params := vs.loadManifestParams(); params != nil {
+-		return params
++	if err := validateVolumeStoreKey(rec.VolumeID); err != nil {
++		return err
+ 	}
+-	if params := loadBootstrapParamsFile(); params != nil {
+-		return params
++	if strings.TrimSpace(rec.Provider) == "" || strings.TrimSpace(rec.Provider) != rec.Provider {
++		return errors.New("volume record has an invalid provider")
++	}
++	if rec.Params == nil {
++		return errors.New("volume record has no provider parameters")
+ 	}
+-	return paramsFromEnv()
+-}
+ 
+-// RecoverFromCloud rebuilds missing local volume records from cloud-tagged
+-// volumes. Called at startup and before operations that need a local record.
+-func (vs *volumeStore) RecoverFromCloud(params map[string]string) error {
+-	if params == nil || params["cloudProvider"] == "" {
+-		vsLogger.Printf("No cloud provider params available, skipping cloud recovery")
++	// Schema zero is the upstream recovery/legacy ready-record shape. It is
++	// readable but never used for a new cloud mutation.
++	if rec.SchemaVersion == 0 {
++		if rec.State != "" || strings.TrimSpace(rec.Path) == "" || strings.TrimSpace(rec.Path) != rec.Path {
++			return errors.New("legacy volume record has an invalid cloud volume path")
++		}
++		if rec.CapacityBytes <= 0 {
++			return errors.New("legacy volume record has an invalid capacity")
++		}
+ 		return nil
+ 	}
+-
+-	p, err := provider.NewBlockVolumeProvider(params)
+-	if err != nil {
+-		return fmt.Errorf("creating provider for recovery: %w", err)
++	if rec.SchemaVersion != volumeRecordSchemaVersion {
++		return fmt.Errorf("unsupported volume record schema version %d", rec.SchemaVersion)
+ 	}
+-
+-	lister, ok := p.(provider.VolumeRecoverer)
+-	if !ok {
+-		vsLogger.Printf("Provider %q does not support VolumeRecoverer, skipping", params["cloudProvider"])
+-		return nil
++	if len(rec.RequestFingerprint) != sha256HexLength || !isHex(rec.RequestFingerprint) {
++		return errors.New("volume record has an invalid request fingerprint")
+ 	}
+-
+-	vols, err := lister.ListManagedVolumes()
+-	if err != nil {
+-		return fmt.Errorf("listing managed volumes from cloud: %w", err)
++	if rec.PlannedCapacityBytes <= 0 {
++		return errors.New("volume record has an invalid planned capacity")
+ 	}
+ 
+-	// Never persist long-lived credentials into the node-local store.
+-	paramsCopy := sanitizePersistableParams(params)
+-
+-	vs.mu.Lock()
+-	defer vs.mu.Unlock()
+-
+-	recovered := 0
+-	for _, vol := range vols {
+-		if vol.VolumeID == "" {
+-			continue
++	switch rec.State {
++	case volumeRecordStatePending:
++		if len(rec.OperationID) != operationIDHexLength || !isHex(rec.OperationID) {
++			return errors.New("pending volume record has an invalid operation ID")
+ 		}
+-		path := filepath.Join(vs.dir, vol.VolumeID+".json")
+-		if _, err := os.Stat(path); err == nil {
+-			continue
+-		} else if err != nil && !os.IsNotExist(err) {
+-			vsLogger.Printf("skipping recovery for %s: stat %s: %v", vol.VolumeID, path, err)
+-			continue
++		if rec.Path != "" || rec.CapacityBytes != 0 {
++			return errors.New("pending volume record contains ready state")
+ 		}
+-
+-		rec := &volumeRecord{
+-			VolumeID:      vol.VolumeID,
+-			Provider:      vol.Provider,
+-			Path:          vol.Path,
+-			CapacityBytes: vol.SizeBytes,
+-			Params:        paramsCopy,
++	case volumeRecordStateReady:
++		if rec.OperationID != "" && (len(rec.OperationID) != operationIDHexLength || !isHex(rec.OperationID)) {
++			return errors.New("ready volume record has an invalid operation ID")
+ 		}
+-		data, err := json.Marshal(rec)
+-		if err != nil {
+-			vsLogger.Printf("failed to marshal recovered volume %s: %v", vol.VolumeID, err)
+-			continue
++		if strings.TrimSpace(rec.Path) == "" || strings.TrimSpace(rec.Path) != rec.Path {
++			return errors.New("ready volume record has an invalid cloud volume path")
+ 		}
+-		if err := os.WriteFile(path, data, 0600); err != nil {
+-			vsLogger.Printf("failed to write recovered volume %s: %v", vol.VolumeID, err)
+-			continue
+-		}
+-		recovered++
+-		vsLogger.Printf("Recovered volume %s from cloud (path=%s)", vol.VolumeID, vol.Path)
+-	}
+-
+-	if recovered > 0 {
+-		vsLogger.Printf("Recovered %d volume(s) from cloud provider", recovered)
+-		// Refresh manifest under the same lock so VolumeIDs stay accurate.
+-		if err := vs.writeManifestLocked(); err != nil {
+-			vsLogger.Printf("failed to write volume manifest after recovery: %v", err)
++		if rec.CapacityBytes <= 0 {
++			return errors.New("ready volume record has an invalid capacity")
+ 		}
++	default:
++		return fmt.Errorf("volume record has invalid state %q", rec.State)
+ 	}
+ 	return nil
+ }
+ 
+-// Exists checks whether a volume record exists in the store.
+-// Returns (false, nil) if the file simply doesn't exist, or (false, err)
+-// if the check failed due to a permission or I/O error.
+ func (vs *volumeStore) Exists(volumeID string) (bool, error) {
+-	vs.mu.Lock()
+-	defer vs.mu.Unlock()
+-	_, err := os.Stat(filepath.Join(vs.dir, volumeID+".json"))
+-	if err == nil {
+-		return true, nil
+-	}
+-	if os.IsNotExist(err) {
++	_, err := vs.Load(volumeID)
++	if errors.Is(err, os.ErrNotExist) {
+ 		return false, nil
+ 	}
+-	return false, err
++	return err == nil, err
+ }
+ 
+ func (vs *volumeStore) Save(rec *volumeRecord) error {
+-	vs.mu.Lock()
+-	defer vs.mu.Unlock()
+-
+-	data, err := json.Marshal(rec)
+-	if err != nil {
+-		return fmt.Errorf("failed to marshal volume record: %w", err)
++	if err := validateVolumeRecord(rec); err != nil {
++		return fmt.Errorf("refuse to persist invalid volume record: %w", err)
+ 	}
+-	if err := os.WriteFile(filepath.Join(vs.dir, rec.VolumeID+".json"), data, 0600); err != nil {
++	path, err := vs.path(rec.VolumeID)
++	if err != nil {
+ 		return err
+ 	}
++
++	vs.mu.Lock()
++	defer vs.mu.Unlock()
++	if err := writeJSONAtomic(path, rec); err != nil {
++		return fmt.Errorf("persist volume record: %w", err)
++	}
+ 	return vs.writeManifestLocked()
+ }
+ 
+ func (vs *volumeStore) Load(volumeID string) (*volumeRecord, error) {
++	path, err := vs.path(volumeID)
++	if err != nil {
++		return nil, err
++	}
+ 	vs.mu.Lock()
+ 	defer vs.mu.Unlock()
++	return loadVolumeRecord(path, volumeID)
++}
+ 
+-	data, err := os.ReadFile(filepath.Join(vs.dir, volumeID+".json"))
++func loadVolumeRecord(path, expectedVolumeID string) (*volumeRecord, error) {
++	file, err := os.Open(path)
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	defer file.Close()
++
+ 	var rec volumeRecord
+-	if err := json.Unmarshal(data, &rec); err != nil {
+-		return nil, fmt.Errorf("failed to unmarshal volume record: %w", err)
++	if err := json.NewDecoder(file).Decode(&rec); err != nil {
++		return nil, fmt.Errorf("decode volume record: %w", err)
++	}
++	if rec.VolumeID != expectedVolumeID {
++		return nil, fmt.Errorf("volume record identity %q does not match key %q", rec.VolumeID, expectedVolumeID)
++	}
++	if err := validateVolumeRecord(&rec); err != nil {
++		return nil, fmt.Errorf("invalid volume record: %w", err)
+ 	}
+ 	return &rec, nil
+ }
+ 
+-func (vs *volumeStore) Delete(volumeID string) {
++func (vs *volumeStore) Delete(volumeID string) error {
++	path, err := vs.path(volumeID)
++	if err != nil {
++		return err
++	}
+ 	vs.mu.Lock()
+ 	defer vs.mu.Unlock()
+-	os.Remove(filepath.Join(vs.dir, volumeID+".json"))
+-	if err := vs.writeManifestLocked(); err != nil {
+-		vsLogger.Printf("failed to write volume manifest after delete: %v", err)
++	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
++		return fmt.Errorf("remove volume record: %w", err)
++	}
++	if err := syncDirectory(vs.dir); err != nil {
++		return fmt.Errorf("sync volume store directory: %w", err)
+ 	}
++	return vs.writeManifestLocked()
+ }
+ 
+-// AnyParams returns the Params map from any volume in the store, or nil.
+-func (vs *volumeStore) AnyParams() map[string]string {
+-	vs.mu.Lock()
+-	defer vs.mu.Unlock()
++func writeJSONAtomic(path string, value any) error {
++	data, err := json.Marshal(value)
++	if err != nil {
++		return err
++	}
++	dir := filepath.Dir(path)
++	temporary, err := os.CreateTemp(dir, ".volume-store-*")
++	if err != nil {
++		return err
++	}
++	temporaryName := temporary.Name()
++	defer func() {
++		temporary.Close()
++		_ = os.Remove(temporaryName)
++	}()
++	if err := temporary.Chmod(0o600); err != nil {
++		return err
++	}
++	if _, err := temporary.Write(data); err != nil {
++		return err
++	}
++	if err := temporary.Sync(); err != nil {
++		return err
++	}
++	if err := temporary.Close(); err != nil {
++		return err
++	}
++	if err := os.Rename(temporaryName, path); err != nil {
++		return err
++	}
++	return syncDirectory(dir)
++}
+ 
+-	entries, err := os.ReadDir(vs.dir)
++func syncDirectory(path string) error {
++	directory, err := os.Open(path)
++	if err != nil {
++		return err
++	}
++	defer directory.Close()
++	return directory.Sync()
++}
++
++// BootstrapParams resolves non-secret provider parameters for recovery.
++func (vs *volumeStore) BootstrapParams() map[string]string {
++	if params := vs.AnyParams(); params != nil {
++		return params
++	}
++	if params := vs.loadManifestParams(); params != nil {
++		return params
++	}
++	if params := loadBootstrapParamsFile(); params != nil {
++		return params
++	}
++	return paramsFromEnv()
++}
++
++// RecoverFromCloud rebuilds legacy ready records for volumes already tagged by
++// a provider. It never starts a cloud mutation and never overwrites pending
++// operation identity.
++func (vs *volumeStore) RecoverFromCloud(params map[string]string) error {
++	if params == nil || params["cloudProvider"] == "" {
++		return nil
++	}
++	p, err := provider.NewBlockVolumeProvider(params)
+ 	if err != nil {
++		return fmt.Errorf("creating provider for recovery: %w", err)
++	}
++	lister, ok := p.(provider.VolumeRecoverer)
++	if !ok {
+ 		return nil
+ 	}
+-	for _, e := range entries {
+-		if filepath.Ext(e.Name()) != ".json" || e.Name() == manifestFileName {
++	volumes, err := lister.ListManagedVolumes()
++	if err != nil {
++		return fmt.Errorf("listing managed volumes from cloud: %w", err)
++	}
++
++	vs.mu.Lock()
++	defer vs.mu.Unlock()
++	params = sanitizePersistableParams(params)
++	for _, volume := range volumes {
++		if validateVolumeStoreKey(volume.VolumeID) != nil || volume.SizeBytes <= 0 ||
++			strings.TrimSpace(volume.Provider) == "" || strings.TrimSpace(volume.Path) == "" {
+ 			continue
+ 		}
+-		data, err := os.ReadFile(filepath.Join(vs.dir, e.Name()))
+-		if err != nil {
++		path, _ := vs.path(volume.VolumeID)
++		if _, err := os.Stat(path); err == nil {
++			continue
++		} else if !errors.Is(err, os.ErrNotExist) {
+ 			continue
+ 		}
+-		var rec volumeRecord
+-		if err := json.Unmarshal(data, &rec); err != nil {
++		record := &volumeRecord{
++			VolumeID: volume.VolumeID, Provider: volume.Provider, Path: volume.Path,
++			CapacityBytes: volume.SizeBytes, Params: maps.Clone(params),
++		}
++		if err := writeJSONAtomic(path, record); err != nil {
++			return fmt.Errorf("persist recovered volume %s: %w", volume.VolumeID, err)
++		}
++	}
++	return vs.writeManifestLocked()
++}
++
++func (vs *volumeStore) AnyParams() map[string]string {
++	vs.mu.Lock()
++	defer vs.mu.Unlock()
++	entries, err := os.ReadDir(vs.dir)
++	if err != nil {
++		return nil
++	}
++	for _, entry := range entries {
++		if filepath.Ext(entry.Name()) != ".json" || entry.Name() == manifestFileName {
+ 			continue
+ 		}
+-		if len(rec.Params) > 0 && rec.Params["cloudProvider"] != "" {
+-			return maps.Clone(rec.Params)
++		volumeID := strings.TrimSuffix(entry.Name(), ".json")
++		record, err := loadVolumeRecord(filepath.Join(vs.dir, entry.Name()), volumeID)
++		if err == nil && record.Params["cloudProvider"] != "" {
++			return maps.Clone(record.Params)
+ 		}
+ 	}
+ 	return nil
+ }
+ 
+-// listAll returns all volume records. Caller must hold vs.mu.
+-func (vs *volumeStore) listAll() ([]*volumeRecord, error) {
++func (vs *volumeStore) listAllLocked() ([]*volumeRecord, error) {
+ 	entries, err := os.ReadDir(vs.dir)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	var recs []*volumeRecord
+-	for _, e := range entries {
+-		if filepath.Ext(e.Name()) != ".json" || e.Name() == manifestFileName {
++	records := make([]*volumeRecord, 0, len(entries))
++	for _, entry := range entries {
++		if filepath.Ext(entry.Name()) != ".json" || entry.Name() == manifestFileName {
+ 			continue
+ 		}
+-		data, err := os.ReadFile(filepath.Join(vs.dir, e.Name()))
+-		if err != nil {
+-			continue
+-		}
+-		var rec volumeRecord
+-		if err := json.Unmarshal(data, &rec); err != nil {
+-			continue
++		volumeID := strings.TrimSuffix(entry.Name(), ".json")
++		record, err := loadVolumeRecord(filepath.Join(vs.dir, entry.Name()), volumeID)
++		if err == nil {
++			records = append(records, record)
+ 		}
+-		recs = append(recs, &rec)
+ 	}
+-	return recs, nil
++	return records, nil
+ }
+ 
+-// writeManifestLocked updates or removes _manifest.json. Caller must hold vs.mu.
+ func (vs *volumeStore) writeManifestLocked() error {
+-	recs, err := vs.listAll()
++	records, err := vs.listAllLocked()
+ 	if err != nil {
+ 		return err
+ 	}
+-
+-	path := vs.manifestPath()
+-	if len(recs) == 0 {
+-		// Keep a params-only manifest if one already exists so empty-store
+-		// recovery can still bootstrap after the last volume is deleted.
+-		existing, loadErr := vs.readManifestLocked()
+-		if loadErr != nil || existing == nil || len(existing.Params) == 0 || existing.Params["cloudProvider"] == "" {
+-			_ = os.Remove(path)
+-			return nil
+-		}
+-		existing.VolumeIDs = nil
+-		data, err := json.Marshal(existing)
+-		if err != nil {
+-			return err
++	manifest := volumeManifest{}
++	for _, record := range records {
++		manifest.VolumeIDs = append(manifest.VolumeIDs, record.VolumeID)
++		if manifest.Params == nil && record.Params["cloudProvider"] != "" {
++			manifest.Params = sanitizePersistableParams(record.Params)
+ 		}
+-		return os.WriteFile(path, data, 0600)
+ 	}
+-
+-	var params map[string]string
+-	for _, r := range recs {
+-		if len(r.Params) > 0 && r.Params["cloudProvider"] != "" {
+-			params = sanitizePersistableParams(r.Params)
+-			break
++	if manifest.Params == nil {
++		if existing, err := vs.readManifestLocked(); err == nil {
++			manifest.Params = sanitizePersistableParams(existing.Params)
+ 		}
+ 	}
+-	if params == nil {
+-		// Prefer keeping previously valid bootstrap params over writing an unusable manifest.
+-		if existing, loadErr := vs.readManifestLocked(); loadErr == nil && existing != nil &&
+-			len(existing.Params) > 0 && existing.Params["cloudProvider"] != "" {
+-			params = sanitizePersistableParams(existing.Params)
+-		} else {
+-			params = map[string]string{}
++	if len(manifest.Params) == 0 {
++		if err := os.Remove(vs.manifestPath()); err != nil && !errors.Is(err, os.ErrNotExist) {
++			return err
+ 		}
++		return syncDirectory(vs.dir)
+ 	}
+-
+-	m := volumeManifest{
+-		Params:    params,
+-		VolumeIDs: make([]string, 0, len(recs)),
+-	}
+-	for _, r := range recs {
+-		m.VolumeIDs = append(m.VolumeIDs, r.VolumeID)
+-	}
+-
+-	data, err := json.Marshal(m)
+-	if err != nil {
+-		return err
+-	}
+-	return os.WriteFile(path, data, 0600)
++	return writeJSONAtomic(vs.manifestPath(), &manifest)
+ }
+ 
+ func (vs *volumeStore) readManifestLocked() (*volumeManifest, error) {
+-	data, err := os.ReadFile(vs.manifestPath())
++	file, err := os.Open(vs.manifestPath())
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	var m volumeManifest
+-	if err := json.Unmarshal(data, &m); err != nil {
++	defer file.Close()
++	var manifest volumeManifest
++	if err := json.NewDecoder(file).Decode(&manifest); err != nil {
+ 		return nil, err
+ 	}
+-	return &m, nil
++	return &manifest, nil
+ }
+ 
+ func (vs *volumeStore) loadManifestParams() map[string]string {
+ 	vs.mu.Lock()
+ 	defer vs.mu.Unlock()
+-
+-	m, err := vs.readManifestLocked()
+-	if err != nil || m == nil || len(m.Params) == 0 || m.Params["cloudProvider"] == "" {
++	manifest, err := vs.readManifestLocked()
++	if err != nil || manifest.Params["cloudProvider"] == "" {
+ 		return nil
+ 	}
+-	vsLogger.Printf("Loaded bootstrap params from %s", manifestFileName)
+-	return maps.Clone(m.Params)
++	return maps.Clone(manifest.Params)
+ }
+ 
+ func loadBootstrapParamsFile() map[string]string {
+-	path := os.Getenv(bootstrapParamsEnv)
++	path := strings.TrimSpace(os.Getenv(bootstrapParamsEnv))
+ 	if path == "" {
+ 		return nil
+ 	}
+-	data, err := os.ReadFile(path)
++	file, err := os.Open(path)
+ 	if err != nil {
+-		vsLogger.Printf("failed to read %s=%s: %v", bootstrapParamsEnv, path, err)
++		vsLogger.Printf("failed to read bootstrap params: %v", err)
+ 		return nil
+ 	}
++	defer file.Close()
+ 	var params map[string]string
+-	if err := json.Unmarshal(data, &params); err != nil {
+-		vsLogger.Printf("failed to parse bootstrap params file %s: %v", path, err)
++	if err := json.NewDecoder(file).Decode(&params); err != nil || params["cloudProvider"] == "" {
++		vsLogger.Printf("invalid bootstrap params file")
+ 		return nil
+ 	}
+-	if params["cloudProvider"] == "" {
+-		vsLogger.Printf("bootstrap params file %s missing cloudProvider", path)
+-		return nil
+-	}
+-	vsLogger.Printf("Loaded bootstrap params from %s", path)
+-	return params
++	return sanitizePersistableParams(params)
+ }
+ 
+-// paramsFromEnv builds StorageClass-compatible params from environment variables
+-// so recovery/delete can work on a node whose hostPath store is empty.
+ func paramsFromEnv() map[string]string {
+-	cloudProvider := firstNonEmpty(
+-		os.Getenv("CSI_CLOUD_PROVIDER"),
+-		os.Getenv("CLOUD_PROVIDER"),
+-	)
++	cloudProvider := firstNonEmpty(os.Getenv("CSI_CLOUD_PROVIDER"), os.Getenv("CLOUD_PROVIDER"))
+ 	if cloudProvider == "" {
+ 		return nil
+ 	}
+-
+ 	params := map[string]string{"cloudProvider": cloudProvider}
+-
+ 	switch cloudProvider {
+ 	case "aws":
+ 		setIfNonEmpty(params, "awsRegion", firstNonEmpty(os.Getenv("CSI_AWS_REGION"), os.Getenv("AWS_REGION")))
+ 		setIfNonEmpty(params, "awsAvailabilityZone", firstNonEmpty(os.Getenv("CSI_AWS_AVAILABILITY_ZONE"), os.Getenv("AWS_AVAILABILITY_ZONE")))
+ 		setIfNonEmpty(params, "awsVolumeType", os.Getenv("CSI_AWS_VOLUME_TYPE"))
+-		// Intentionally omit static AWS keys — use IRSA / the AWS SDK default chain
+-		// (AWS_ACCESS_KEY_ID, instance profile, etc.) instead of persisting secrets.
+ 		setIfNonEmpty(params, "awsKmsKeyId", os.Getenv("CSI_AWS_KMS_KEY_ID"))
+ 	case "azure":
+ 		setIfNonEmpty(params, "azureSubscriptionId", firstNonEmpty(os.Getenv("CSI_AZURE_SUBSCRIPTION_ID"), os.Getenv("AZURE_SUBSCRIPTION_ID")))
+@@ -390,15 +444,13 @@ func paramsFromEnv() map[string]string {
+ 	case "libvirt":
+ 		setIfNonEmpty(params, "cloudProviderVolumePath", firstNonEmpty(os.Getenv("CSI_LIBVIRT_VOLUME_PATH"), os.Getenv("CLOUD_PROVIDER_VOLUME_PATH")))
+ 	}
+-
+-	vsLogger.Printf("Loaded bootstrap params from environment (provider=%s)", cloudProvider)
+ 	return params
+ }
+ 
+ func firstNonEmpty(values ...string) string {
+-	for _, v := range values {
+-		if v != "" {
+-			return v
++	for _, value := range values {
++		if value != "" {
++			return value
+ 		}
+ 	}
+ 	return ""
+@@ -410,14 +462,18 @@ func setIfNonEmpty(params map[string]string, key, value string) {
+ 	}
+ }
+ 
+-// sanitizePersistableParams returns a copy of params safe to write under the
+-// node-local volume store (no long-lived cloud credentials).
+ func sanitizePersistableParams(params map[string]string) map[string]string {
+ 	if params == nil {
+ 		return nil
+ 	}
+-	out := maps.Clone(params)
+-	delete(out, "awsAccessKeyId")
+-	delete(out, "awsSecretKey")
+-	return out
++	result := maps.Clone(params)
++	for key := range result {
++		normalized := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(key, "-", ""), "_", ""))
++		if strings.Contains(normalized, "accesskey") || strings.Contains(normalized, "secret") ||
++			strings.Contains(normalized, "securitytoken") || strings.Contains(normalized, "password") ||
++			strings.Contains(normalized, "credential") {
++			delete(result, key)
++		}
++	}
++	return result
+ }
+diff --git a/pkg/driver/volumestore_test.go b/pkg/driver/volumestore_test.go
+index 376aead9286dcbdcb08c531c895cdadb1c74147a..69acbaeeb8fc7f80157fc1b5766cdf728dd454f7 100644
+--- a/pkg/driver/volumestore_test.go
++++ b/pkg/driver/volumestore_test.go
+@@ -10,6 +10,15 @@ import (
+ 	"testing"
+ )
+ 
++func mustVolumeStore(t *testing.T) *volumeStore {
++	t.Helper()
++	store, err := newVolumeStore()
++	if err != nil {
++		t.Fatal(err)
++	}
++	return store
++}
++
+ func TestBootstrapParamsPriority(t *testing.T) {
+ 	dir := t.TempDir()
+ 	t.Setenv("CSI_VOLUME_STORE_DIR", dir)
+@@ -17,7 +26,7 @@ func TestBootstrapParamsPriority(t *testing.T) {
+ 	t.Setenv("CLOUD_PROVIDER", "")
+ 	t.Setenv("CSI_BOOTSTRAP_PARAMS_FILE", "")
+ 
+-	vs := newVolumeStore()
++	vs := mustVolumeStore(t)
+ 
+ 	// 4) env is used when nothing else is available
+ 	t.Setenv("CSI_CLOUD_PROVIDER", "aws")
+@@ -56,9 +65,7 @@ func TestBootstrapParamsPriority(t *testing.T) {
+ 
+ 	// 1) surviving volume record overrides manifest
+ 	rec := &volumeRecord{
+-		VolumeID: "vol-1",
+-		Provider: "aws",
+-		Path:     "vol-abc",
++		VolumeID: "vol-1", Provider: "aws", Path: "vol-abc", CapacityBytes: 1,
+ 		Params: map[string]string{
+ 			"cloudProvider": "aws",
+ 			"awsRegion":     "ap-south-1",
+@@ -79,15 +86,13 @@ func TestWriteManifestSurvivesLastDelete(t *testing.T) {
+ 	t.Setenv("CSI_CLOUD_PROVIDER", "")
+ 	t.Setenv("CSI_BOOTSTRAP_PARAMS_FILE", "")
+ 
+-	vs := newVolumeStore()
++	vs := mustVolumeStore(t)
+ 	if err := vs.Save(&volumeRecord{
+-		VolumeID: "vol-1",
+-		Provider: "aws",
+-		Path:     "vol-abc",
++		VolumeID: "vol-1", Provider: "aws", Path: "vol-abc", CapacityBytes: 1,
+ 		Params: map[string]string{
+-			"cloudProvider":        "aws",
+-			"awsRegion":            "us-east-2",
+-			"awsAvailabilityZone":  "us-east-2a",
++			"cloudProvider":       "aws",
++			"awsRegion":           "us-east-2",
++			"awsAvailabilityZone": "us-east-2a",
+ 		},
+ 	}); err != nil {
+ 		t.Fatal(err)
+@@ -114,7 +119,7 @@ func TestRecoverFromCloudSkipsExisting(t *testing.T) {
+ 	dir := t.TempDir()
+ 	t.Setenv("CSI_VOLUME_STORE_DIR", dir)
+ 
+-	vs := newVolumeStore()
++	vs := mustVolumeStore(t)
+ 	if err := vs.Save(&volumeRecord{
+ 		VolumeID:      "keep-me",
+ 		Provider:      "aws",
+@@ -148,11 +153,14 @@ func TestRecoverFromCloudSkipsExisting(t *testing.T) {
+ func TestParamsFromEnvAWSAndAzure(t *testing.T) {
+ 	t.Setenv("CSI_CLOUD_PROVIDER", "aws")
+ 	t.Setenv("AWS_REGION", "us-east-2")
+-	t.Setenv("CSI_AWS_AVAILABILITY_ZONE", "us-east-2c")
++	t.Setenv("AWS_AVAILABILITY_ZONE", "us-east-2c")
++	t.Setenv("CSI_AWS_KMS_KEY_ID", "arn:aws:kms:us-east-2:123456789012:key/test")
+ 	t.Setenv("CSI_AWS_ACCESS_KEY_ID", "AKIA_SHOULD_NOT_APPEAR")
+ 	t.Setenv("CSI_AWS_SECRET_KEY", "secret_should_not_appear")
+ 	params := paramsFromEnv()
+-	if params["cloudProvider"] != "aws" || params["awsRegion"] != "us-east-2" || params["awsAvailabilityZone"] != "us-east-2c" {
++	if params["cloudProvider"] != "aws" || params["awsRegion"] != "us-east-2" ||
++		params["awsAvailabilityZone"] != "us-east-2c" ||
++		params["awsKmsKeyId"] != "arn:aws:kms:us-east-2:123456789012:key/test" {
+ 		t.Fatalf("unexpected aws env params: %#v", params)
+ 	}
+ 	if _, ok := params["awsAccessKeyId"]; ok {
+@@ -166,10 +174,20 @@ func TestParamsFromEnvAWSAndAzure(t *testing.T) {
+ 	t.Setenv("AZURE_SUBSCRIPTION_ID", "sub-1")
+ 	t.Setenv("CSI_AZURE_RESOURCE_GROUP", "rg-1")
+ 	t.Setenv("CSI_AZURE_LOCATION", "eastus")
++	t.Setenv("CSI_AZURE_DISK_ENCRYPTION_SET_ID", "/subscriptions/sub-1/resourceGroups/rg-1/providers/Microsoft.Compute/diskEncryptionSets/test")
+ 	params = paramsFromEnv()
+-	if params["azureSubscriptionId"] != "sub-1" || params["azureResourceGroup"] != "rg-1" || params["azureLocation"] != "eastus" {
++	if params["azureSubscriptionId"] != "sub-1" || params["azureResourceGroup"] != "rg-1" ||
++		params["azureLocation"] != "eastus" ||
++		params["azureDiskEncryptionSetId"] != "/subscriptions/sub-1/resourceGroups/rg-1/providers/Microsoft.Compute/diskEncryptionSets/test" {
+ 		t.Fatalf("unexpected azure env params: %#v", params)
+ 	}
++
++	t.Setenv("CSI_CLOUD_PROVIDER", "libvirt")
++	t.Setenv("CLOUD_PROVIDER_VOLUME_PATH", "/var/lib/caa-csi")
++	params = paramsFromEnv()
++	if params["cloudProviderVolumePath"] != "/var/lib/caa-csi" {
++		t.Fatalf("unexpected libvirt env params: %#v", params)
++	}
+ }
+ 
+ func TestWriteManifestSkipsRecordWithoutCloudProvider(t *testing.T) {
+@@ -178,20 +196,16 @@ func TestWriteManifestSkipsRecordWithoutCloudProvider(t *testing.T) {
+ 	t.Setenv("CSI_CLOUD_PROVIDER", "")
+ 	t.Setenv("CSI_BOOTSTRAP_PARAMS_FILE", "")
+ 
+-	vs := newVolumeStore()
++	vs := mustVolumeStore(t)
+ 	// First on disk may be params-less; valid params should still win for the manifest.
+ 	if err := vs.Save(&volumeRecord{
+-		VolumeID: "vol-bad",
+-		Provider: "aws",
+-		Path:     "path-bad",
+-		Params:   map[string]string{},
++		VolumeID: "vol-bad", Provider: "aws", Path: "path-bad", CapacityBytes: 1,
++		Params: map[string]string{},
+ 	}); err != nil {
+ 		t.Fatal(err)
+ 	}
+ 	if err := vs.Save(&volumeRecord{
+-		VolumeID: "vol-good",
+-		Provider: "aws",
+-		Path:     "path-good",
++		VolumeID: "vol-good", Provider: "aws", Path: "path-good", CapacityBytes: 1,
+ 		Params: map[string]string{
+ 			"cloudProvider": "aws",
+ 			"awsRegion":     "eu-central-1",
+-- 
+2.43.7
+

@@ -1,0 +1,84 @@
+From ac720f3d69843399352c969d53de76ec1809fc21 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Fri, 9 Oct 2026 12:57:41 +0800
+Subject: [PATCH 09/10] Delay CDH connection until verified descriptor unseal
+
+Signed-off-by: Codex <codex@openai.com>
+---
+ .../pkg/forwarder/interceptor/interceptor.go  | 24 ++++++++++++-----
+ .../interceptor/sealed_volume_test.go         | 27 +++++++++++++++++++
+ 2 files changed, 45 insertions(+), 6 deletions(-)
+
+diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
+index 055224e1cbaace742a9a5f1f9259a2e028c83857..8502cace47b9bc1ec4fa965afec069326c82715d 100644
+--- a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
++++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
+@@ -147,12 +147,24 @@ func (i *interceptor) CreateContainer(ctx context.Context, req *pb.CreateContain
+ 		defer gate.mu.Unlock()
+ 		name := req.OCI.Annotations["io.kubernetes.cri.container-name"]
+ 		if name == gate.manifest.Container {
+-			client, err := newCDHClient(ctx, cdhSocketPath)
+-			if err != nil {
+-				return nil, err
+-			}
+-			defer client.close()
+-			verifiedSecrets, err = gate.verifyAndUnseal(ctx, req, client.unsealSecret)
++			var client *cdhClient
++			var err error
++			defer func() {
++				if client != nil {
++					client.close()
++				}
++			}()
++			verifiedSecrets, err = gate.verifyAndUnseal(ctx, req,
++				func(ctx context.Context, sealed []byte) ([]byte, error) {
++					if client == nil {
++						var dialErr error
++						client, dialErr = newCDHClient(ctx, cdhSocketPath)
++						if dialErr != nil {
++							return nil, dialErr
++						}
++					}
++					return client.unsealSecret(ctx, sealed)
++				})
+ 			if err != nil {
+ 				return nil, err
+ 			}
+diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/sealed_volume_test.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/sealed_volume_test.go
+index 4e0af6e823e2c9769506f5c5beca8deec904093b..25c62baf865f41b1b170ad4a8730b0c670dee687 100644
+--- a/src/cloud-api-adaptor/pkg/forwarder/interceptor/sealed_volume_test.go
++++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/sealed_volume_test.go
+@@ -127,6 +127,33 @@ func TestSealedVolumeUnsealFailurePropagates(t *testing.T) {
+ 	}
+ }
+ 
++func TestCreateContainerSealedGatePrecedesAgent(t *testing.T) {
++	gate, req, source := sealedFixture(t)
++	req.OCI.Linux = &pb.Linux{}
++	req.OCI.Annotations = map[string]string{"io.kubernetes.cri.container-name": "bootstrap"}
++	if err := os.WriteFile(filepath.Join(source, "tls.key"), []byte("plaintext"), 0600); err != nil {
++		t.Fatal(err)
++	}
++	mock := &mockRedirector{}
++	i := &interceptor{Redirector: mock, sealedGate: gate}
++	if _, err := i.CreateContainer(context.Background(), req); err == nil {
++		t.Fatal("plaintext reached Kata agent")
++	}
++	if mock.createContainerCalled {
++		t.Fatal("Kata agent was called before sealed-volume verification")
++	}
++
++	req.OCI.Annotations["io.kubernetes.cri.container-name"] = "other"
++	req.OCI.Mounts[0].Destination = "/different"
++	req.OCI.Mounts[0].Source = filepath.Join(gate.privateRoot, req.ContainerId)
++	if _, err := i.CreateContainer(context.Background(), req); err == nil {
++		t.Fatal("non-target container mounted private Secret tree")
++	}
++	if mock.createContainerCalled {
++		t.Fatal("Kata agent received non-target private mount")
++	}
++}
++
+ func TestSealedVolumeRejectsSymlinkEscape(t *testing.T) {
+ 	gate, req, source := sealedFixture(t)
+ 	outside := filepath.Join(t.TempDir(), "outside")

@@ -1,0 +1,166 @@
+From 13770aca00b97911dbbd588c7cd4fd5f9b526dbf Mon Sep 17 00:00:00 2001
+From: Weidong Sun <sunweidong@linux.alibaba.com>
+Date: Wed, 26 Aug 2026 12:09:41 +0800
+Subject: [PATCH 02/10] fix(alibabacloud): accept explicit VPC configuration
+
+Allow deployments to provide the VPC ID directly and use metadata discovery only when it is absent. This keeps Alibaba instance creation usable in restricted networks without changing any other provider.
+
+Signed-off-by: Weidong Sun <sunweidong@linux.alibaba.com>
+---
+ src/cloud-providers/alibabacloud/manager.go   |  3 +-
+ .../alibabacloud/manager_test.go              | 28 ++++++++
+ src/cloud-providers/alibabacloud/provider.go  |  9 ++-
+ .../alibabacloud/provider_vpc_test.go         | 68 +++++++++++++++++++
+ 4 files changed, 105 insertions(+), 3 deletions(-)
+ create mode 100644 src/cloud-providers/alibabacloud/manager_test.go
+ create mode 100644 src/cloud-providers/alibabacloud/provider_vpc_test.go
+
+diff --git a/src/cloud-providers/alibabacloud/manager.go b/src/cloud-providers/alibabacloud/manager.go
+index a3753a0299bb699bc89668e33df4e09d4b6f6178..c743b9ef60b623587f01d26da23db5dd501dee94 100644
+--- a/src/cloud-providers/alibabacloud/manager.go
++++ b/src/cloud-providers/alibabacloud/manager.go
+@@ -34,8 +34,7 @@ func (*Manager) ParseCmd(flags *flag.FlagSet) {
+ 	reg.IntWithEnv(&alibabacloudcfg.SystemDiskSize, "system-disk-size", 40, "SYSTEM_DISK_SIZE", "System Disk size (in GiB) for the Pod VMs")
+ 	reg.BoolWithEnv(&alibabacloudcfg.DisableCVM, "disable-cvm", false, "DISABLECVM", "Use non-CVMs for peer pods")
+ 
+-	// Flags without environment variable support (pass empty string for envVarName)
+-	reg.StringWithEnv(&alibabacloudcfg.VpcID, "vpc-id", "", "", "VPC ID to be used for the Pod VMs")
++	reg.StringWithEnv(&alibabacloudcfg.VpcID, "vpc-id", "", "VPC_ID", "VPC ID to be used for the Pod VMs")
+ 
+ 	// Custom flag types (comma-separated lists)
+ 	reg.CustomTypeWithEnv(&alibabacloudcfg.SecurityGroupIDs, "security-group-ids", "cn-beijing", "SECURITY_GROUP_IDS", "Security Group Ids to be used for the Pod VM, comma separated")
+diff --git a/src/cloud-providers/alibabacloud/manager_test.go b/src/cloud-providers/alibabacloud/manager_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..6cea2d65f69aaaebd1d2dcce1798c8b6bb8f6e08
+--- /dev/null
++++ b/src/cloud-providers/alibabacloud/manager_test.go
+@@ -0,0 +1,28 @@
++// (C) Copyright Confidential Containers Contributors
++// SPDX-License-Identifier: Apache-2.0
++
++package alibabacloud
++
++import (
++	"flag"
++	"testing"
++)
++
++func TestManagerVPCIDFromEnvironment(t *testing.T) {
++	alibabacloudcfg = Config{}
++	t.Cleanup(func() { alibabacloudcfg = Config{} })
++	t.Setenv("VPC_ID", "vpc-from-environment")
++
++	flags := flag.NewFlagSet("test", flag.ContinueOnError)
++	(&Manager{}).ParseCmd(flags)
++	if alibabacloudcfg.VpcID != "vpc-from-environment" {
++		t.Fatalf("VpcID = %q, want VPC_ID environment value", alibabacloudcfg.VpcID)
++	}
++
++	if err := flags.Set("vpc-id", "vpc-from-flag"); err != nil {
++		t.Fatal(err)
++	}
++	if alibabacloudcfg.VpcID != "vpc-from-flag" {
++		t.Fatalf("VpcID = %q, want flag override", alibabacloudcfg.VpcID)
++	}
++}
+diff --git a/src/cloud-providers/alibabacloud/provider.go b/src/cloud-providers/alibabacloud/provider.go
+index 389f2d112515b3661be9325f6bfba1e987c787a4..b52fc17de242bfed6da4d718f2426b7ba9df8d77 100644
+--- a/src/cloud-providers/alibabacloud/provider.go
++++ b/src/cloud-providers/alibabacloud/provider.go
+@@ -144,7 +144,7 @@ func NewProvider(config *Config) (provider.Provider, error) {
+ 		return nil, fmt.Errorf("failed to update instance type spec list: %v", err)
+ 	}
+ 
+-	if err = provider.updateVpcID(); err != nil {
++	if err = provider.ensureVpcID(); err != nil {
+ 		return nil, fmt.Errorf("failed to get vpc id: %v", err)
+ 	}
+ 
+@@ -440,6 +440,13 @@ func (p *alibabaCloudProvider) updateVpcID() error {
+ 	return nil
+ }
+ 
++func (p *alibabaCloudProvider) ensureVpcID() error {
++	if p.serviceConfig.VpcID != "" {
++		return nil
++	}
++	return p.updateVpcID()
++}
++
+ // Add SelectInstanceType method to select an instance type based on the memory and vcpu requirements
+ func (p *alibabaCloudProvider) selectInstanceType(_ context.Context, spec provider.InstanceTypeSpec) (string, error) {
+ 
+diff --git a/src/cloud-providers/alibabacloud/provider_vpc_test.go b/src/cloud-providers/alibabacloud/provider_vpc_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..222baecb030b322bd8f5810ad198d16d3a3617bd
+--- /dev/null
++++ b/src/cloud-providers/alibabacloud/provider_vpc_test.go
+@@ -0,0 +1,68 @@
++// (C) Copyright Confidential Containers Contributors
++// SPDX-License-Identifier: Apache-2.0
++
++package alibabacloud
++
++import (
++	"errors"
++	"testing"
++
++	"github.com/alibabacloud-go/tea/tea"
++	vpc "github.com/alibabacloud-go/vpc-20160428/v6/client"
++)
++
++type fakeVPCClient struct {
++	*vpc.Client
++	describeCalls int
++	describeError error
++	vpcID         string
++}
++
++func (f *fakeVPCClient) DescribeVSwitchAttributes(*vpc.DescribeVSwitchAttributesRequest) (*vpc.DescribeVSwitchAttributesResponse, error) {
++	f.describeCalls++
++	if f.describeError != nil {
++		return nil, f.describeError
++	}
++	return &vpc.DescribeVSwitchAttributesResponse{
++		Body: &vpc.DescribeVSwitchAttributesResponseBody{VpcId: tea.String(f.vpcID)},
++	}, nil
++}
++
++func TestEnsureVpcIDUsesExplicitConfiguration(t *testing.T) {
++	client := &fakeVPCClient{describeError: errors.New("DescribeVSwitchAttributes must not run")}
++	p := &alibabaCloudProvider{
++		vpcClient: client, serviceConfig: &Config{VpcID: "vpc-explicit", VswitchID: "vsw-test", Region: "cn-hangzhou"},
++	}
++	if err := p.ensureVpcID(); err != nil {
++		t.Fatal(err)
++	}
++	if client.describeCalls != 0 || p.serviceConfig.VpcID != "vpc-explicit" {
++		t.Fatalf("explicit VPC triggered discovery: calls=%d config=%+v", client.describeCalls, p.serviceConfig)
++	}
++}
++
++func TestEnsureVpcIDDiscoversMissingConfiguration(t *testing.T) {
++	client := &fakeVPCClient{vpcID: "vpc-discovered"}
++	p := &alibabaCloudProvider{
++		vpcClient: client, serviceConfig: &Config{VswitchID: "vsw-test", Region: "cn-hangzhou"},
++	}
++	if err := p.ensureVpcID(); err != nil {
++		t.Fatal(err)
++	}
++	if client.describeCalls != 1 || p.serviceConfig.VpcID != "vpc-discovered" {
++		t.Fatalf("VPC discovery result: calls=%d config=%+v", client.describeCalls, p.serviceConfig)
++	}
++}
++
++func TestEnsureVpcIDPropagatesDiscoveryFailure(t *testing.T) {
++	client := &fakeVPCClient{describeError: errors.New("VPC endpoint unavailable")}
++	p := &alibabaCloudProvider{
++		vpcClient: client, serviceConfig: &Config{VswitchID: "vsw-test", Region: "cn-hangzhou"},
++	}
++	if err := p.ensureVpcID(); err == nil {
++		t.Fatal("VPC discovery failure was ignored")
++	}
++	if client.describeCalls != 1 {
++		t.Fatalf("DescribeVSwitchAttributes calls = %d, want 1", client.describeCalls)
++	}
++}

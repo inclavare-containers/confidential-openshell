@@ -1,0 +1,224 @@
+From 890dddb0bb52832c55d792bb96f01f1a14222c5e Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Fri, 9 Oct 2026 17:25:31 +0800
+Subject: [PATCH 10/10] Preserve exact initdata bytes in CAA cloud-config
+
+Signed-off-by: Codex <codex@openai.com>
+---
+ .../pkg/adaptor/cloud/cloud.go                |  2 +-
+ .../pkg/adaptor/cloud/initdata_cloudconfig.go | 89 +++++++++++++++++
+ .../cloud/initdata_cloudconfig_test.go        | 96 +++++++++++++++++++
+ 3 files changed, 186 insertions(+), 1 deletion(-)
+ create mode 100644 src/cloud-api-adaptor/pkg/adaptor/cloud/initdata_cloudconfig.go
+ create mode 100644 src/cloud-api-adaptor/pkg/adaptor/cloud/initdata_cloudconfig_test.go
+
+diff --git a/src/cloud-api-adaptor/pkg/adaptor/cloud/cloud.go b/src/cloud-api-adaptor/pkg/adaptor/cloud/cloud.go
+index 27fa4eb8b69df98abc56abc11f08612cb67c9981..c4a4993b3b34d4c5b19b5d42dc6d2aa707378e3a 100644
+--- a/src/cloud-api-adaptor/pkg/adaptor/cloud/cloud.go
++++ b/src/cloud-api-adaptor/pkg/adaptor/cloud/cloud.go
+@@ -364,7 +364,7 @@ func (s *cloudService) StartVM(ctx context.Context, req *pb.StartVMRequest) (res
+ 		return nil, fmt.Errorf("getting sandbox: %w", err)
+ 	}
+ 
+-	instance, err := s.provider.CreateInstance(ctx, sandbox.podName, string(sid), sandbox.cloudConfig, sandbox.spec)
++	instance, err := s.provider.CreateInstance(ctx, sandbox.podName, string(sid), cloudConfigForInstance(sandbox.cloudConfig), sandbox.spec)
+ 
+ 	// Cleanup instance if it was created but an error occurred (either during creation or later)
+ 	defer func() {
+diff --git a/src/cloud-api-adaptor/pkg/adaptor/cloud/initdata_cloudconfig.go b/src/cloud-api-adaptor/pkg/adaptor/cloud/initdata_cloudconfig.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..f4f28c6e38be0cf4a0eae8d0ecea83ba1c65ad32
+--- /dev/null
++++ b/src/cloud-api-adaptor/pkg/adaptor/cloud/initdata_cloudconfig.go
+@@ -0,0 +1,89 @@
++// (C) Copyright Confidential Containers Contributors
++// SPDX-License-Identifier: Apache-2.0
++
++package cloud
++
++import (
++	"fmt"
++	"reflect"
++	"strings"
++
++	"github.com/confidential-containers/cloud-api-adaptor/src/cloud-api-adaptor/pkg/paths"
++	"github.com/confidential-containers/cloud-api-adaptor/src/cloud-providers/util/cloudinit"
++	yaml "gopkg.in/yaml.v2"
++)
++
++// cloudConfigForInstance preserves the default cloud-config format for VMs
++// without initdata. The initdata annotation is a single-line base64 value;
++// its YAML block scalar must not add a newline before the guest reads it.
++func cloudConfigForInstance(config *cloudinit.CloudConfig) cloudinit.CloudConfigGenerator {
++	for _, file := range config.WriteFiles {
++		if file.Path == paths.InitDataPath {
++			return exactInitdataCloudConfig{config: config}
++		}
++	}
++	return config
++}
++
++type exactInitdataCloudConfig struct {
++	config *cloudinit.CloudConfig
++}
++
++func (config exactInitdataCloudConfig) Generate() (string, error) {
++	var encoded string
++	count := 0
++	for _, file := range config.config.WriteFiles {
++		if file.Path == paths.InitDataPath {
++			encoded = file.Content
++			count++
++		}
++	}
++	if count != 1 || encoded == "" || strings.ContainsAny(encoded, "\r\n") {
++		return "", fmt.Errorf("cloud-config requires one single-line initdata file")
++	}
++
++	original, err := config.config.Generate()
++	if err != nil {
++		return "", err
++	}
++	var parsed cloudinit.CloudConfig
++	if err := yaml.UnmarshalStrict([]byte(original), &parsed); err != nil {
++		return "", fmt.Errorf("parse generated cloud-config: %w", err)
++	}
++	count = 0
++	changed := false
++	for index := range parsed.WriteFiles {
++		if parsed.WriteFiles[index].Path != paths.InitDataPath {
++			continue
++		}
++		count++
++		switch parsed.WriteFiles[index].Content {
++		case encoded:
++			// A future cloudinit generator may already preserve exact bytes.
++		case encoded + "\n":
++			parsed.WriteFiles[index].Content = encoded
++			changed = true
++		default:
++			return "", fmt.Errorf("generated initdata differs from exact annotation")
++		}
++	}
++	if count != 1 {
++		return "", fmt.Errorf("generated cloud-config has %d initdata files", count)
++	}
++	if !changed {
++		return original, nil
++	}
++
++	body, err := yaml.Marshal(&parsed)
++	if err != nil {
++		return "", fmt.Errorf("serialize exact initdata cloud-config: %w", err)
++	}
++	var verified cloudinit.CloudConfig
++	if err := yaml.UnmarshalStrict(body, &verified); err != nil {
++		return "", fmt.Errorf("verify exact initdata cloud-config: %w", err)
++	}
++	if !reflect.DeepEqual(parsed.WriteFiles, verified.WriteFiles) {
++		return "", fmt.Errorf("cloud-config write_files changed while preserving initdata")
++	}
++	return "#cloud-config\n" + string(body), nil
++}
+diff --git a/src/cloud-api-adaptor/pkg/adaptor/cloud/initdata_cloudconfig_test.go b/src/cloud-api-adaptor/pkg/adaptor/cloud/initdata_cloudconfig_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..5d12d5e5261ffefc77c3eac0dc9933472497793f
+--- /dev/null
++++ b/src/cloud-api-adaptor/pkg/adaptor/cloud/initdata_cloudconfig_test.go
+@@ -0,0 +1,96 @@
++// (C) Copyright Confidential Containers Contributors
++// SPDX-License-Identifier: Apache-2.0
++
++package cloud
++
++import (
++	"encoding/base64"
++	"reflect"
++	"strings"
++	"testing"
++
++	"github.com/confidential-containers/cloud-api-adaptor/src/cloud-api-adaptor/pkg/paths"
++	"github.com/confidential-containers/cloud-api-adaptor/src/cloud-providers/util/cloudinit"
++	yaml "gopkg.in/yaml.v2"
++)
++
++func TestExactInitdataCloudConfig(t *testing.T) {
++	config := &cloudinit.CloudConfig{WriteFiles: []cloudinit.WriteFile{
++		{Path: "/run/peerpod/apf.json", Content: "{\"tls\":true}"},
++		{Path: "/run/peerpod/auth.json", Content: "{\"auths\":{}}\n"},
++		{Path: paths.InitDataPath, Content: "Zg=="},
++		{Path: "/run/peerpod/scratch-space", Content: ""},
++	}}
++	original, err := config.Generate()
++	if err != nil {
++		t.Fatal(err)
++	}
++	var before cloudinit.CloudConfig
++	if err := yaml.UnmarshalStrict([]byte(original), &before); err != nil {
++		t.Fatal(err)
++	}
++	if got := before.WriteFiles[2].Content; got != "Zg==\n" {
++		t.Fatalf("fixture did not reproduce the extra newline: %q", got)
++	}
++
++	result, err := cloudConfigForInstance(config).Generate()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !strings.HasPrefix(result, "#cloud-config\n") {
++		t.Fatal("missing cloud-config header")
++	}
++	var after cloudinit.CloudConfig
++	if err := yaml.UnmarshalStrict([]byte(result), &after); err != nil {
++		t.Fatal(err)
++	}
++	if len(after.WriteFiles) != len(before.WriteFiles) {
++		t.Fatal("write_files count changed")
++	}
++	for index := range before.WriteFiles {
++		if index == 2 {
++			continue
++		}
++		if !reflect.DeepEqual(before.WriteFiles[index], after.WriteFiles[index]) {
++			t.Fatalf("non-initdata write_file %d changed", index)
++		}
++	}
++	if got := after.WriteFiles[2].Content; got != "Zg==" {
++		t.Fatalf("initdata bytes changed: %q", got)
++	}
++	if _, err := base64.StdEncoding.Strict().DecodeString(after.WriteFiles[2].Content); err != nil {
++		t.Fatalf("initdata is not strict padded base64: %v", err)
++	}
++}
++
++func TestExactInitdataCloudConfigRejectsDuplicatesAndNewlines(t *testing.T) {
++	for _, test := range []struct {
++		name  string
++		files []cloudinit.WriteFile
++	}{
++		{name: "duplicate", files: []cloudinit.WriteFile{
++			{Path: paths.InitDataPath, Content: "Zg=="},
++			{Path: paths.InitDataPath, Content: "Zg=="},
++		}},
++		{name: "newline", files: []cloudinit.WriteFile{
++			{Path: paths.InitDataPath, Content: "Zg==\n"},
++		}},
++	} {
++		t.Run(test.name, func(t *testing.T) {
++			config := &cloudinit.CloudConfig{WriteFiles: test.files}
++			if _, err := cloudConfigForInstance(config).Generate(); err == nil {
++				t.Fatal("invalid initdata cloud-config was accepted")
++			}
++		})
++	}
++}
++
++func TestCloudConfigWithoutInitdataIsUnchanged(t *testing.T) {
++	config := &cloudinit.CloudConfig{WriteFiles: []cloudinit.WriteFile{
++		{Path: "/run/peerpod/apf.json", Content: "{}"},
++	}}
++	wrapped := cloudConfigForInstance(config)
++	if wrapped != config {
++		t.Fatal("cloud-config without initdata must use upstream generator")
++	}
++}

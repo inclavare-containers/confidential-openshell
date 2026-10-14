@@ -1,0 +1,67 @@
+From 1321c92da7a615b9af902edbc1ff9405b11fc224 Mon Sep 17 00:00:00 2001
+From: Weidong Sun <sunweidong@linux.alibaba.com>
+Date: Wed, 26 Aug 2026 12:06:07 +0800
+Subject: [PATCH 4/5] fix(node): advertise delegated fsGroup support
+
+Report VOLUME_MOUNT_GROUP so kubelet passes the requested fsGroup through NodePublishVolume. This keeps the group in direct-volume metadata for the guest mount path instead of applying host-side ownership changes.
+
+Signed-off-by: Weidong Sun <sunweidong@linux.alibaba.com>
+---
+ pkg/driver/nodeserver.go      |  7 +++++++
+ pkg/driver/nodeserver_test.go | 17 +++++++++++++++++
+ 2 files changed, 24 insertions(+)
+
+diff --git a/pkg/driver/nodeserver.go b/pkg/driver/nodeserver.go
+index ff9d55b86edf59690c1804d0a1b7d5c983f4f5a2..0a04c0a3ce166ff405355719cd0cb08b17d47f16 100644
+--- a/pkg/driver/nodeserver.go
++++ b/pkg/driver/nodeserver.go
+@@ -499,6 +499,13 @@ func (ns *nodeServer) NodeGetCapabilities(_ context.Context, _ *csi.NodeGetCapab
+ 					},
+ 				},
+ 			},
++			{
++				Type: &csi.NodeServiceCapability_Rpc{
++					Rpc: &csi.NodeServiceCapability_RPC{
++						Type: csi.NodeServiceCapability_RPC_VOLUME_MOUNT_GROUP,
++					},
++				},
++			},
+ 		},
+ 	}, nil
+ }
+diff --git a/pkg/driver/nodeserver_test.go b/pkg/driver/nodeserver_test.go
+index 2e6cc8d3138b73e8bccbe2bf9dd3e296809811f1..3ba0108e697c24c2923e2b357eb8481bc37ac42d 100644
+--- a/pkg/driver/nodeserver_test.go
++++ b/pkg/driver/nodeserver_test.go
+@@ -4,11 +4,28 @@
+ package driver
+ 
+ import (
++	"context"
+ 	"testing"
+ 
+ 	"github.com/container-storage-interface/spec/lib/go/csi"
+ )
+ 
++func TestNodeGetCapabilitiesAdvertisesVolumeMountGroup(t *testing.T) {
++	t.Parallel()
++
++	response, err := (&nodeServer{}).NodeGetCapabilities(context.Background(), &csi.NodeGetCapabilitiesRequest{})
++	if err != nil {
++		t.Fatalf("NodeGetCapabilities failed: %v", err)
++	}
++
++	for _, capability := range response.GetCapabilities() {
++		if capability.GetRpc().GetType() == csi.NodeServiceCapability_RPC_VOLUME_MOUNT_GROUP {
++			return
++		}
++	}
++	t.Fatal("VOLUME_MOUNT_GROUP capability is not advertised")
++}
++
+ func TestParseKataVolumeStats(t *testing.T) {
+ 	t.Parallel()
+ 
+-- 
+2.43.7
+

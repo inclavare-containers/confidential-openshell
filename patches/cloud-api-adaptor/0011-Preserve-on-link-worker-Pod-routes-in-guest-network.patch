@@ -1,0 +1,141 @@
+From 9133b06b6f680d16ea3860c44c61c17d742f5611 Mon Sep 17 00:00:00 2001
+From: Weidong Sun <sunweidong@linux.alibaba.com>
+Date: Fri, 9 Oct 2026 20:54:58 +0800
+Subject: [PATCH] Preserve on-link worker Pod routes in guest network setup
+
+Signed-off-by: Weidong Sun <sunweidong@linux.alibaba.com>
+---
+ .../pkg/podnetwork/podnetwork_test.go         | 71 +++++++++++++++++++
+ .../pkg/podnetwork/podnode.go                 |  1 +
+ .../pkg/podnetwork/tunneler/tunneler.go       |  1 +
+ .../pkg/podnetwork/workernode.go              |  1 +
+ 4 files changed, 74 insertions(+)
+
+diff --git a/src/cloud-api-adaptor/pkg/podnetwork/podnetwork_test.go b/src/cloud-api-adaptor/pkg/podnetwork/podnetwork_test.go
+index 580edbb8..655d0a08 100644
+--- a/src/cloud-api-adaptor/pkg/podnetwork/podnetwork_test.go
++++ b/src/cloud-api-adaptor/pkg/podnetwork/podnetwork_test.go
+@@ -4,6 +4,7 @@
+ package podnetwork
+ 
+ import (
++	"encoding/json"
+ 	"fmt"
+ 	"net/netip"
+ 	"os"
+@@ -203,6 +204,76 @@ func TestPodNode(t *testing.T) {
+ 	}
+ }
+ 
++func TestOnlinkRouteReplay(t *testing.T) {
++	testutils.SkipTestIfNotRoot(t)
++
++	const mockTunnelType = "mock-onlink"
++	tunneler.Register(mockTunnelType, newMockWorkerNodeTunneler, newMockPodNodeTunneler)
++
++	workerNS, _ := tuntest.NewNamedNS(t, "test-onlink-worker")
++	defer tuntest.DeleteNamedNS(t, workerNS)
++	tuntest.BridgeAdd(t, workerNS, "ens0")
++	tuntest.AddrAdd(t, workerNS, "ens0", "192.168.0.2/24")
++	tuntest.RouteAdd(t, workerNS, "", "192.168.0.1", "ens0")
++
++	workerPodNS, _ := tuntest.NewNamedNS(t, "test-onlink-source")
++	defer tuntest.DeleteNamedNS(t, workerPodNS)
++	tuntest.BridgeAdd(t, workerPodNS, "eth0")
++	tuntest.AddrAdd(t, workerPodNS, "eth0", "10.0.0.2/32")
++	defaultRoute := &netops.Route{
++		Destination: netip.MustParsePrefix("0.0.0.0/0"),
++		Gateway:     netip.MustParseAddr("169.254.1.1"),
++		Device:      "eth0",
++		Onlink:      true,
++	}
++	require.NoError(t, workerPodNS.RouteAdd(defaultRoute))
++
++	guestPodNS, _ := tuntest.NewNamedNS(t, "test-onlink-target")
++	defer tuntest.DeleteNamedNS(t, guestPodNS)
++	tuntest.BridgeAdd(t, guestPodNS, "eth0")
++	tuntest.AddrAdd(t, guestPodNS, "eth0", "10.0.0.2/32")
++
++	require.NoError(t, workerNS.Run(func() error {
++		workerNode, err := NewWorkerNode(&tunneler.NetworkConfig{TunnelType: mockTunnelType})
++		if err != nil {
++			return err
++		}
++		config, err := workerNode.Inspect(workerPodNS.Path())
++		if err != nil {
++			return err
++		}
++		require.Len(t, config.Routes, 1)
++		require.True(t, config.Routes[0].Onlink)
++
++		// Inspect's JSON is the actual worker-to-guest transport for PodNode.Setup.
++		encoded, err := json.Marshal(config)
++		if err != nil {
++			return err
++		}
++		var guestConfig tunneler.Config
++		if err := json.Unmarshal(encoded, &guestConfig); err != nil {
++			return err
++		}
++		require.True(t, guestConfig.Routes[0].Onlink)
++
++		// A /32 Pod IP cannot reach this link-local gateway without RTNH_F_ONLINK.
++		withoutOnlink := guestConfig
++		withoutOnlink.Routes = []*tunneler.Route{{
++			Dst: guestConfig.Routes[0].Dst, GW: guestConfig.Routes[0].GW,
++			Dev: guestConfig.Routes[0].Dev,
++		}}
++		require.Error(t, NewPodNode(guestPodNS.Path(), "", &withoutOnlink).Setup())
++		require.NoError(t, NewPodNode(guestPodNS.Path(), "", &guestConfig).Setup())
++		routes, err := guestPodNS.RouteList()
++		if err != nil {
++			return err
++		}
++		require.Len(t, routes, 1)
++		require.True(t, routes[0].Onlink)
++		return nil
++	}))
++}
++
+ func TestPluginDetectHostInterface(t *testing.T) {
+ 	testutils.SkipTestIfNotRoot(t)
+ 
+diff --git a/src/cloud-api-adaptor/pkg/podnetwork/podnode.go b/src/cloud-api-adaptor/pkg/podnetwork/podnode.go
+index 50c4d898..3a5a8a09 100644
+--- a/src/cloud-api-adaptor/pkg/podnetwork/podnode.go
++++ b/src/cloud-api-adaptor/pkg/podnetwork/podnode.go
+@@ -132,6 +132,7 @@ func (n *podNode) Setup() error {
+ 			Device:      route.Dev,
+ 			Protocol:    route.Protocol,
+ 			Scope:       route.Scope,
++			Onlink:      route.Onlink,
+ 		}
+ 		if err := podNS.RouteAdd(&nRoute); err != nil {
+ 			return fmt.Errorf("failed to add a route to %s via %s on pod network namespace %s: %w", route.Dst, route.GW, podNS.Path(), err)
+diff --git a/src/cloud-api-adaptor/pkg/podnetwork/tunneler/tunneler.go b/src/cloud-api-adaptor/pkg/podnetwork/tunneler/tunneler.go
+index 0a6ce5b4..7d41d04e 100644
+--- a/src/cloud-api-adaptor/pkg/podnetwork/tunneler/tunneler.go
++++ b/src/cloud-api-adaptor/pkg/podnetwork/tunneler/tunneler.go
+@@ -37,6 +37,7 @@ type Route struct {
+ 	Dev      string               `json:"dev,omitempty"`
+ 	Protocol netops.RouteProtocol `json:"protocol,omitempty"`
+ 	Scope    netops.RouteScope    `json:"scope,omitempty"`
++	Onlink   bool                 `json:"onlink,omitempty"`
+ }
+ 
+ type Neighbor struct {
+diff --git a/src/cloud-api-adaptor/pkg/podnetwork/workernode.go b/src/cloud-api-adaptor/pkg/podnetwork/workernode.go
+index fedebe84..198e3c77 100644
+--- a/src/cloud-api-adaptor/pkg/podnetwork/workernode.go
++++ b/src/cloud-api-adaptor/pkg/podnetwork/workernode.go
+@@ -286,6 +286,7 @@ func (n *workerNode) Inspect(nsPath string) (*tunneler.Config, error) {
+ 			GW:       route.Gateway,
+ 			Protocol: route.Protocol,
+ 			Scope:    route.Scope,
++			Onlink:   route.Onlink,
+ 		}
+ 		config.Routes = append(config.Routes, r)
+ 	}
+-- 
+2.43.7
+
