@@ -1,0 +1,83 @@
+# Confidential Kubernetes compute driver
+
+This standalone binary implements the OpenShell v0.1.3 `ComputeDriver` contract for a
+supervisor/workload pair running in attested Pod VMs. It is a controlled derivative of
+NVIDIA's Kubernetes driver, with project-owned bootstrap publication and lifecycle
+integration. See [source provenance](UPSTREAM.md), the
+[pinned upstream README](../../repos/openshell/crates/openshell-driver-kubernetes/README.md),
+and the [deployment runbook](../../docs/deployment.md).
+
+| Code | Responsibility |
+|---|---|
+| Imported `config`, `grpc`, `lifecycle`, `otel_tracing`, `resource_admission` | Unchanged pinned upstream modules and their tests. |
+| `sandbox_runtime.rs`, `isolation.rs` | Upstream builders and tests, with thin wrappers for guest-memory state, strict process groups, disabled service links, and supervisor ingress denial. |
+| `driver.rs`, `main.rs` | Local derivation integrating confidential admission, scheduling gates, Secret sealing, UID checks and lifecycle recovery. |
+| `confidential.rs`, private `bootstrap.rs` | Project-owned measured initdata, signed resource descriptors, KBS publication, authorization bindings, workspace keys and durable journals. |
+
+Both Pods require the configured confidential RuntimeClass and immutable image digests. The
+driver generates Kata policy from each actual gated Pod, binds the policy and resource
+descriptors into SHA-384 of the raw initdata TOML, and checks the Pod UID, spec and annotation
+again before gate release. Initdata includes role, namespace, Sandbox CR UID, bootstrap
+generation and fresh attempt, resource URIs, descriptor hashes and the expected mount
+destination/container. These fields are authorized through the measured document digest; a
+host-supplied role field alone grants no access.
+
+## Bootstrap resources
+
+Each original bootstrap Secret value becomes a signed CDH vault descriptor before any
+Kubernetes Secret write. The Secret names, keys and mounts remain compatible with native
+runtime binaries. Released CoCo CDH 0.22 accepts the `sealed.<ES256 JWS>` vault descriptor;
+its persistent host P-256 signer publishes the verification JWK at
+`kbs:///default/bootstrap-signer/key`. The local publisher renders AS/KBS authorization under
+its store lock before exposing the corresponding raw bytes through KBS. Its storage adapter
+writes Trustee 0.22's flat KV resource namespace; logical `kbs:///default/...` URIs and
+private journal identities stay stable. This publication and recovery code is part of this
+project, not an upstream bootstrap-store implementation.
+
+The supervisor connects directly to the native Gateway HTTPS endpoint with the trusted host's
+public CA and gateway-minted sandbox JWT released through its sealed bootstrap. User client
+certificates and private keys stay outside both guests. The native
+`supports_sandbox_authentication=true` capability is retained because Gateway also uses it to
+persist the Kubernetes runtime identity needed by stop/start. In a confidential deployment,
+`AuthenticateSandbox` rejects host-controlled ServiceAccount credentials before TokenReview or
+any Kubernetes API access; the sealed launch JWT uses native refresh.
+
+The Kubernetes runtime identity binds namespace, CR UID and supervisor Pod UID. Restart keeps
+the original CR/PVC ownership, requires that persisted binding, and creates a fresh bootstrap
+attempt and new role Pods. Native JWT `runtime_generation` remains stable across stop/start
+while `auth_epoch` and token identity rotate. The driver bootstrap-generation field in
+initdata is separate from that JWT identity; it must not be treated as a guarantee of
+credential rotation.
+
+Persistent workspaces use one private 32-byte key for the namespace and Sandbox CR UID. Owner
+and PVC/PV/cloud-disk journals are recorded before release and support recovery after CR
+deletion. A measured initializer formats a new LUKS volume with stock cryptsetup; released CDH
+SecureMount reopens it. Ephemeral workloads receive no workspace key or encrypted-volume
+manifest. Delete records a durable UID-specific marker, withdraws KBS resources, issues
+UID-preconditioned deletion, and succeeds only after the CR and both role Pods are absent. A
+replaced CR or Secret is not adopted for cleanup. Failed revocation remains retryable.
+
+Stop/delete remove serving copies and authorization while retaining the private workspace key
+and volume journal. This is access withdrawal, not automatic cryptographic erasure of retained
+disks or host recovery material. KBS revocation also cannot erase secrets already delivered to
+a running guest. Stop/delete terminate the role Pods; native epoch/token checks reject later
+authentication, while already-open streams require runtime termination.
+
+Supervisor sockets, TLS state and logs use guest-memory EmptyDir volumes, with empty `Strict`
+supplemental groups and no service-link environment injection. Kata 4.2 does not forward
+EmptyDir `sizeLimit` into guest tmpfs, so those volumes consume guest memory without a
+per-volume bound. The generated policy profile expects OCI spec version `1.3.0`; other
+runtimes require a compatible policy profile. Registry trust is pinned into measured AA/CDH
+configuration before image pulls.
+
+The [driver service](../../deployment/openshell/openshell-confidential-driver.service) shows
+the required operator paths and configuration. `OPENSHELL_COMPUTE_DRIVER_SOCKET` carries the
+private Gateway/driver connection, and `OPENSHELL_GRPC_ENDPOINT` selects the direct HTTPS
+endpoint verified using `OPENSHELL_CONFIDENTIAL_CLIENT_TLS_CA`. Upgrade with one driver writer
+and preserve the store signer and journals; see
+[upgrade and retention](../../docs/upgrade.md).
+
+Run `cargo test -p openshell-driver-confidential-kubernetes` for driver, imported upstream and
+bootstrap tests. Use the
+[deployment checks](../../docs/deployment.md#10-verify-both-confidential-roles) for hardware
+attestation, CDH unseal, KBS release and lifecycle behavior.

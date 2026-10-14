@@ -11,9 +11,10 @@ use tracing::info;
 use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_driver_confidential_kubernetes::{
-    ComputeDriverService, DEFAULT_GATEWAY_ID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
-    KubernetesComputeConfig, KubernetesComputeDriver, KubernetesImagePullPolicy,
-    KubernetesSandboxRuntimeConfig, ManagedSshIngressConfig, WorkspaceMode,
+    ComputeDriverService, ConfidentialDriverSettings, DEFAULT_GATEWAY_ID,
+    DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, KubernetesComputeConfig, KubernetesComputeDriver,
+    KubernetesImagePullPolicy, KubernetesSandboxRuntimeConfig, ManagedSshIngressConfig,
+    WorkspaceMode,
 };
 
 #[derive(Parser, Debug)]
@@ -21,6 +22,51 @@ use openshell_driver_confidential_kubernetes::{
 #[command(version = VERSION)]
 #[allow(clippy::struct_excessive_bools)]
 struct Args {
+    /// `RuntimeClass` backed by an attested confidential guest for both Pods.
+    #[arg(long, env = "OPENSHELL_CONFIDENTIAL_RUNTIME_CLASS")]
+    confidential_runtime_class: String,
+
+    /// Base Kata initdata TOML; role and generation binding is added per Pod.
+    #[arg(long, env = "OPENSHELL_GUEST_INITDATA_BASE")]
+    guest_initdata_base: PathBuf,
+
+    /// Trusted host gateway CA, sealed into the supervisor bootstrap Secret.
+    #[arg(long, env = "OPENSHELL_CONFIDENTIAL_CLIENT_TLS_CA")]
+    confidential_client_tls_ca: PathBuf,
+
+    /// Trusted policy generator that derives Rego from each gated Pod's actual spec.
+    #[arg(long, env = "OPENSHELL_KATA_POLICY_GENERATOR")]
+    kata_policy_generator: PathBuf,
+
+    #[arg(long, env = "OPENSHELL_KATA_POLICY_TOOLS_DIR")]
+    kata_policy_tools_dir: PathBuf,
+
+    #[arg(long, env = "OPENSHELL_KATA_POLICY_REGISTRY")]
+    kata_policy_registry: String,
+
+    #[arg(long, env = "OPENSHELL_KATA_POLICY_REGISTRY_CA")]
+    kata_policy_registry_ca: PathBuf,
+
+    /// Immutable pause image used by Kata policy generation.
+    #[arg(long, env = "OPENSHELL_KATA_POLICY_PAUSE_IMAGE")]
+    kata_policy_pause_image: String,
+
+    /// Trustee local-fs repository, shared with the KBS process.
+    #[arg(long, env = "OPENSHELL_BOOTSTRAP_STORE_DIR")]
+    bootstrap_store_dir: PathBuf,
+
+    #[arg(long, env = "OPENSHELL_BOOTSTRAP_SIGNING_KEY")]
+    bootstrap_signing_key: PathBuf,
+
+    #[arg(long, env = "OPENSHELL_KBS_POLICY_RENDERER")]
+    kbs_policy_renderer: PathBuf,
+
+    #[arg(long, env = "OPENSHELL_KBS_POLICY_OUTPUT")]
+    kbs_policy_output: PathBuf,
+
+    #[arg(long, env = "OPENSHELL_AS_POLICY_OUTPUT")]
+    as_policy_output: PathBuf,
+
     /// Operator-owned JSON policy; omitted means driver config disabled and labels required.
     #[arg(
         long,
@@ -110,9 +156,6 @@ struct Args {
     )]
     sandbox_ssh_socket_path: String,
 
-    #[arg(long, env = "OPENSHELL_CLIENT_TLS_SECRET_NAME")]
-    client_tls_secret_name: Option<String>,
-
     #[arg(long, env = "OPENSHELL_HOST_GATEWAY_IP")]
     host_gateway_ip: Option<String>,
 
@@ -142,18 +185,6 @@ struct Args {
     /// Comma-separated destinations that bypass the corporate proxy.
     #[arg(long, env = "OPENSHELL_UPSTREAM_NO_PROXY")]
     no_proxy: Option<String>,
-
-    /// Kubernetes Secret name containing the upstream proxy credential.
-    #[arg(long, env = "OPENSHELL_UPSTREAM_PROXY_AUTH_SECRET_NAME")]
-    proxy_auth_secret_name: Option<String>,
-
-    /// Kubernetes Secret key containing the upstream proxy credential.
-    #[arg(long, env = "OPENSHELL_UPSTREAM_PROXY_AUTH_SECRET_KEY")]
-    proxy_auth_secret_key: Option<String>,
-
-    /// Acknowledge cleartext Basic auth to an http:// upstream proxy.
-    #[arg(long, env = "OPENSHELL_UPSTREAM_PROXY_AUTH_ALLOW_INSECURE", action = ArgAction::SetTrue)]
-    proxy_auth_allow_insecure: bool,
 
     /// Send destination hostnames rather than validated IPs in CONNECT.
     #[arg(long, env = "OPENSHELL_UPSTREAM_PROXY_CONNECT_BY_HOSTNAME", action = ArgAction::SetTrue)]
@@ -267,15 +298,15 @@ async fn main() -> Result<()> {
             },
             https_proxy: args.https_proxy,
             no_proxy: args.no_proxy,
-            proxy_auth_secret_name: args.proxy_auth_secret_name,
-            proxy_auth_secret_key: args.proxy_auth_secret_key,
-            proxy_auth_allow_insecure: args.proxy_auth_allow_insecure.then_some(true),
+            proxy_auth_secret_name: None,
+            proxy_auth_secret_key: None,
+            proxy_auth_allow_insecure: None,
             proxy_connect_by_hostname: args.proxy_connect_by_hostname.then_some(true),
             proxy_ca_bundle: args.proxy_ca_bundle,
             grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
             supervisor_otlp_endpoint: args.otlp_endpoint.clone(),
             ssh_socket_path: args.sandbox_ssh_socket_path,
-            client_tls_secret_name: args.client_tls_secret_name.unwrap_or_default(),
+            client_tls_secret_name: String::new(),
             host_gateway_ip: args.host_gateway_ip.unwrap_or_default(),
             enable_user_namespaces: args.enable_user_namespaces,
             workspace_default_storage_size: std::env::var(
@@ -286,8 +317,7 @@ async fn main() -> Result<()> {
             }),
             workspace_storage_class: std::env::var("OPENSHELL_K8S_WORKSPACE_STORAGE_CLASS")
                 .unwrap_or_default(),
-            default_runtime_class_name: std::env::var("OPENSHELL_K8S_DEFAULT_RUNTIME_CLASS_NAME")
-                .unwrap_or_default(),
+            default_runtime_class_name: args.confidential_runtime_class,
             sa_token_ttl_secs: args.sa_token_ttl_secs,
             provider_spiffe_workload_api_socket_path: args
                 .provider_spiffe_workload_api_socket_path
@@ -296,6 +326,20 @@ async fn main() -> Result<()> {
             sandbox_gid: args.sandbox_gid,
         },
         shutdown_rx,
+        ConfidentialDriverSettings {
+            initdata_base: args.guest_initdata_base,
+            client_tls_ca: args.confidential_client_tls_ca,
+            policy_generator: args.kata_policy_generator,
+            policy_tools_dir: args.kata_policy_tools_dir,
+            policy_registry: args.kata_policy_registry,
+            policy_registry_ca: args.kata_policy_registry_ca,
+            policy_pause_image: args.kata_policy_pause_image,
+            bootstrap_store_dir: args.bootstrap_store_dir,
+            bootstrap_signing_key: args.bootstrap_signing_key,
+            kbs_policy_renderer: args.kbs_policy_renderer,
+            kbs_policy_output: args.kbs_policy_output,
+            as_policy_output: args.as_policy_output,
+        },
     )
     .await
     .into_diagnostic()?;
@@ -338,7 +382,33 @@ mod tests {
     #[test]
     fn accepts_gateway_otlp_configuration() {
         let args = Args::try_parse_from([
-            "openshell-driver-kubernetes",
+            "openshell-driver-confidential-kubernetes",
+            "--confidential-runtime-class",
+            "kata-confidential",
+            "--guest-initdata-base",
+            "/tmp/initdata.toml",
+            "--confidential-client-tls-ca",
+            "/tmp/ca.pem",
+            "--kata-policy-generator",
+            "/tmp/agent_policy.py",
+            "--kata-policy-tools-dir",
+            "/tmp/kata-policy",
+            "--kata-policy-registry",
+            "registry.internal:5000",
+            "--kata-policy-registry-ca",
+            "/tmp/registry-ca.pem",
+            "--kata-policy-pause-image",
+            "registry.internal/pause@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--bootstrap-store-dir",
+            "/tmp/repository",
+            "--bootstrap-signing-key",
+            "/tmp/bootstrap-signer.pem",
+            "--kbs-policy-renderer",
+            "/tmp/render.py",
+            "--kbs-policy-output",
+            "/tmp/policy.rego",
+            "--as-policy-output",
+            "/tmp/as-policy.rego",
             "--otlp-endpoint",
             "http://collector.example:4317",
             "--gateway-name",
