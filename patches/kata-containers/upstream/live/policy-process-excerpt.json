@@ -1,0 +1,42 @@
+{
+  "source": "excerpt of unchanged generated policy; full policy was used by guest",
+  "Process": {
+    "Terminal": false,
+    "User": {
+      "UID": 10001,
+      "GID": 10001,
+      "AdditionalGids": [
+        0,
+        10001
+      ],
+      "Username": ""
+    },
+    "Args": [
+      "/bin/sleep",
+      "3600"
+    ],
+    "Env": [
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+      "HOSTNAME=$(host-name)"
+    ],
+    "Cwd": "/",
+    "Capabilities": {
+      "Ambient": [],
+      "Bounding": [],
+      "Effective": [],
+      "Inheritable": [],
+      "Permitted": []
+    },
+    "NoNewPrivileges": true
+  },
+  "exec_commands": [
+    [
+      "/bin/true"
+    ],
+    [
+      "/bin/sh",
+      "-c",
+      "grep '^NoNewPrivs:' /proc/self/status"
+    ]
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "metadata": {
+    "name": "kata-nnp-probe",
+    "namespace": "default",
+    "uid": "77e6bb94-3a59-4d9b-a465-363082647cf8",
+    "attempt": 0
+  },
+  "log_directory": "/var/log/pods/default_kata-nnp-probe_77e6bb94-3a59-4d9b-a465-363082647cf8",
+  "annotations": {},
+  "linux": {
+    "security_context": {
+      "namespace_options": {
+        "network": 2,
+        "pid": 0,
+        "ipc": 0
+      }
+    }
+  }
+}

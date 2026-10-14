@@ -1,0 +1,27 @@
+{
+  "Terminal": false,
+  "ConsoleSize": null,
+  "User": {
+    "UID": 10001,
+    "GID": 10001,
+    "AdditionalGids": [
+      0,
+      10001
+    ],
+    "Username": ""
+  },
+  "Args": [
+    "/bin/true"
+  ],
+  "Env": [
+    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    "HOSTNAME=dev-vm2"
+  ],
+  "Cwd": "/",
+  "Capabilities": null,
+  "Rlimits": [],
+  "NoNewPrivileges": true,
+  "ApparmorProfile": "",
+  "OOMScoreAdj": 0,
+  "SelinuxLabel": ""
+}
