@@ -33,7 +33,7 @@ diff -qr "$OVERLAY_DIR/original" "$OVERLAY_DIR/modified" > "$OVERLAY_DIR/content
 test "$(wc -l < "$OVERLAY_DIR/content.diff")" -eq 1
 grep -Fx "Files $OVERLAY_DIR/original/opt/kata/bin/containerd-shim-kata-v2 and $OVERLAY_DIR/modified/opt/kata/bin/containerd-shim-kata-v2 differ" "$OVERLAY_DIR/content.diff"
 tar --sort=name --numeric-owner --owner=0 --group=0 -cf - -C "$OVERLAY_DIR/modified" . \
-  | zstd -T0 -10 -o "$OVERLAY_DIR/kata-static-shim-v2-go.tar.zst"
+  | zstd -f -T0 -10 -o "$OVERLAY_DIR/kata-static-shim-v2-go.tar.zst"
 zstd -dc "$OVERLAY_DIR/kata-static-shim-v2-go.tar.zst" \
   | tar -tf - | grep -Fx './opt/kata/bin/containerd-shim-kata-v2'
 install -d -m 0700 "$OVERLAY_DIR/layer/opt/kata-artifacts/tarballs"

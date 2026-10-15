@@ -12,7 +12,7 @@ You need:
 - A compatible TDX PodVM image and its approved reference file.
 - Administrator access to ACK, ECS, VPC, RAM and the image registry.
 
-Each numbered step is independent. Commands run as root on the trusted service
+Run the numbered steps in order. Commands run as root on the trusted service
 host unless a worker is named. Keep edited configuration and credentials under
 `/var/lib/openshell-confidential/operator/`, outside the source checkout.
 
@@ -49,7 +49,8 @@ The [architecture](architecture.md) explains the trusted host boundary.
 Follow the [ACK creation guide](https://www.alibabacloud.com/help/en/ack/ack-managed-and-ack-dedicated/user-guide/create-an-ack-managed-cluster)
 and use Terway shared ENI, RRSA, and enforced ingress/egress NetworkPolicy.
 Workers need containerd and `supplementalGroupsPolicy` support. The tested profile
-uses Kubernetes 1.36 and containerd 2.3.4 with configuration version 3.
+uses Kubernetes 1.36 and containerd 2.3.4. Its version 3 input configuration is
+normalized to version 4 by `containerd config dump`.
 
 Download the administrator kubeconfig from ACK's connection page into
 `$OPERATOR_DIR/administrator-kubeconfig`, then check cluster access:
@@ -194,7 +195,8 @@ Install them as:
 | `/etc/containerd/certs.d/HOST_IP:5000/hosts.toml` | Edited registry hosts template |
 | `/etc/containerd/certs.d/HOST_IP:5000/ca.crt` | Trustee public CA |
 
-Keep containerd's effective CRI registry `config_path=/etc/containerd/certs.d`.
+Keep `/etc/containerd/certs.d` in containerd's effective CRI registry `config_path`.
+ACK can already include it alongside `/etc/containerd/cert.d`; preserve that list.
 Only the public CA goes to workers.
 
 ### Publish the images
@@ -205,7 +207,9 @@ bash deployment/build/package-kata-shim.sh
 ```
 
 The first command loads the authenticated handoff archives and mirrors the pinned
-runtime images. The second adds the host-shim replacement to kata-deploy.
+runtime and cluster dependency images. Workers pull these from the private
+registry, so only this host needs access to upstream registries.
+The second adds the host-shim replacement to kata-deploy.
 Both write destination digest references to `$OPERATOR_DIR/*-image.txt`.
 Use those exact references in the next step. No insecure registry flags are needed.
 
@@ -217,16 +221,15 @@ Use those exact references in the next step. No insecure registry flags are need
 bash deployment/peerpods/fetch-prerequisites.sh
 ```
 
-In `$OPERATOR_DIR/agent-sandbox-pinned.yaml`, set only the controller image to
-`images.agent_sandbox_controller` from the runtime lock, or its recorded mirror.
-Then install:
+This prepares the Agent Sandbox manifest and cert-manager values using the
+published image records. Install them:
 
 ```bash
 kubectl apply --server-side -f "$OPERATOR_DIR/agent-sandbox-pinned.yaml"
 kubectl -n agent-sandbox-system rollout status deployment/agent-sandbox-controller --timeout=10m
 helm upgrade --install cert-manager "$OPERATOR_DIR/cert_manager_chart" \
   --namespace cert-manager --create-namespace \
-  --values deployment/peerpods/cert-manager-values.json --wait --timeout=15m
+  --values "$OPERATOR_DIR/cert-manager-values.json" --wait --timeout=15m
 ```
 
 A compatible existing cert-manager installation can be used instead.
@@ -243,6 +246,7 @@ Fill in these deployment-specific values:
 | Values | Source |
 | --- | --- |
 | CAA, controller, kata-deploy and pause images | Digest records from step 6 |
+| Webhook, kubectl and CSI sidecar images | Their mirror digest records from step 6 |
 | ImageID, region, VPC, vSwitch, security group and TDX instance type | Step 3 |
 | RRSA role/OIDC and ownership tags | Step 3; match RAM restrictions |
 | `INITDATA` | `gzip -n -c /etc/openshell-confidential/guest-initdata-base.toml \| base64 -w0` |

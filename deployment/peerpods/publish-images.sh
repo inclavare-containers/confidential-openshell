@@ -8,7 +8,9 @@ verify_handoff
 load_selection
 REGISTRY_ADDR="$HOST_IP:5000"
 install -d -m 0700 "$OPERATOR_DIR"
-for name in pause supervisor sandbox workload_python; do
+for name in pause supervisor sandbox workload_python agent_sandbox_controller \
+  kata_kubectl peerpod_webhook cert_manager_controller cert_manager_webhook \
+  cert_manager_cainjector cert_manager_startup csi_provisioner csi_node_registrar; do
   ref=$(jq -er --arg name "$name" '.images[$name]' deployment/runtime/artifacts.lock.json)
   dest="$REGISTRY_ADDR/openshell/mirror/$name:locked"
   crane copy --platform linux/amd64 "$ref" "$dest"

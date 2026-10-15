@@ -33,7 +33,7 @@ import pathlib, sys, tomllib
 area, expected = pathlib.Path(sys.argv[1]), sys.argv[2]
 with (area/'containerd.effective.after.toml').open('rb') as f:
     merged = tomllib.load(f)
-assert merged['version'] == 3
+assert merged['version'] in (3, 4)
 handler = merged['plugins']['io.containerd.cri.v1.runtime']['containerd']['runtimes']['kata-remote']
 assert handler['options']['ConfigPath'] == expected
 with (area/'kata.after.toml').open('rb') as f:
