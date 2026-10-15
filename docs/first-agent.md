@@ -138,4 +138,5 @@ The final get must return explicit NotFound; an authentication or transport erro
 does not prove deletion. The administrator confirms controller/cloud cleanup of
 the original owner IDs as described in the [deployment checks](deployment.md#10-verify-both-confidential-roles).
 Normal delete withdraws serving copies and authorization while retaining private
-workspace recovery keys/journals on T; see [upgrade and retention](upgrade.md).
+workspace recovery keys/journals on T; see the
+[driver resource contract](../components/confidential-driver/README.md#bootstrap-resources).

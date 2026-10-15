@@ -29,4 +29,3 @@ only its own queue, rather than the CAA adapter queue.
 Generic fixes can be removed after the selected upstream version supplies their
 behavior and the corresponding acceptance checks pass. When guest inputs change,
 rebuild the image and extract its references together.
-See [upgrade and retention](../docs/upgrade.md).

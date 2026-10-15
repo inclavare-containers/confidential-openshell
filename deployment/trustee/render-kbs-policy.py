@@ -46,13 +46,11 @@ def read_binding(path: Path) -> Tuple[str, Dict[str, str]]:
         record = json.load(source)
     if not isinstance(record, dict):
         raise ValueError(f"binding must be an object: {path}")
-    legacy = {
+    required = {
         "resource_path", "initdata_sha384", "role", "generation",
-        "sandbox_id", "attempt_id", "key", "resource_sha256", "identity_sha256",
+        "sandbox_id", "sandbox_cr_uid", "attempt_id", "key", "resource_sha256", "identity_sha256",
     }
-    # Existing private bindings predate CR-UID ownership. They remain
-    # renderable while the store retires them; new publications carry the UID.
-    if set(record) not in (legacy, legacy | {"sandbox_cr_uid"}) or any(not isinstance(v, str) for v in record.values()):
+    if set(record) != required or any(not isinstance(v, str) for v in record.values()):
         raise ValueError(f"binding schema mismatch: {path}")
     opaque = path.stem
     if not HEX64.fullmatch(opaque) or path.suffix != ".json":
@@ -67,7 +65,7 @@ def read_binding(path: Path) -> Tuple[str, Dict[str, str]]:
         raise ValueError(f"invalid generation: {path}")
     if not record["sandbox_id"] or len(record["sandbox_id"]) > 253 or any(ord(c) < 33 for c in record["sandbox_id"]):
         raise ValueError(f"invalid sandbox ID: {path}")
-    if "sandbox_cr_uid" in record and (len(record["sandbox_cr_uid"]) > 253 or not KEY.fullmatch(record["sandbox_cr_uid"])):
+    if len(record["sandbox_cr_uid"]) > 253 or not KEY.fullmatch(record["sandbox_cr_uid"]):
         raise ValueError(f"invalid Sandbox CR UID: {path}")
     if not HEX64.fullmatch(record["attempt_id"]):
         raise ValueError(f"invalid attempt ID: {path}")

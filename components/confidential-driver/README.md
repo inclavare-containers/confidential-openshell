@@ -46,8 +46,7 @@ rejects user env or `envFrom` reintroduced into a role Pod.
 The trusted store retains a mode-0600 environment record under `workload-environments/`,
 bound to namespace and CR UID. Stop retains it; start uses it for the next sealed bootstrap
 and fails if it is missing or invalid, rather than reading values from Kubernetes. Final
-delete removes the matching environment record. Preserve this private state for restart;
-see [upgrade and retention](../../docs/upgrade.md#sealed-workload-environment).
+delete removes the matching environment record. Preserve this private state for restart.
 
 The supervisor connects directly to the native Gateway HTTPS endpoint with the trusted host's
 public CA and gateway-minted sandbox JWT released through its sealed bootstrap. User client
@@ -88,9 +87,8 @@ configuration before image pulls.
 The [driver service](../../deployment/openshell/openshell-confidential-driver.service) shows
 the required operator paths and configuration. `OPENSHELL_COMPUTE_DRIVER_SOCKET` carries the
 private Gateway/driver connection, and `OPENSHELL_GRPC_ENDPOINT` selects the direct HTTPS
-endpoint verified using `OPENSHELL_CONFIDENTIAL_CLIENT_TLS_CA`. Upgrade with one driver writer
-and preserve the store signer and journals; see
-[upgrade and retention](../../docs/upgrade.md).
+endpoint verified using `OPENSHELL_CONFIDENTIAL_CLIENT_TLS_CA`. Run one driver writer
+and keep its signer, private environment records and journals on T.
 
 Run `cargo test -p openshell-driver-confidential-kubernetes` for driver, imported upstream and
 bootstrap tests. Use the

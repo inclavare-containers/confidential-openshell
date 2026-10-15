@@ -1692,7 +1692,7 @@ impl KubernetesComputeDriver {
             None
         };
 
-        let driver = Self {
+        Ok(Self {
             client,
             watch_client,
             sandbox_api_version: Arc::new(OnceCell::new()),
@@ -1700,13 +1700,7 @@ impl KubernetesComputeDriver {
             operator_allowlist,
             confidential: Some(confidential),
             lifecycle_gates: Arc::default(),
-        };
-
-        if driver.workspace_mode() == WorkspaceMode::Shared {
-            driver.backfill_gateway_id_labels().await?;
-        }
-
-        Ok(driver)
+        })
     }
 
     pub fn capabilities(&self) -> Result<GetCapabilitiesResponse, String> {
@@ -1786,71 +1780,6 @@ impl KubernetesComputeDriver {
             validate_managed_namespace_name(&self.config.gateway_id, workspace)
                 .map_err(KubernetesDriverError::InvalidArgument)?;
         }
-        Ok(())
-    }
-
-    /// Backfill the `openshell.ai/gateway-id` label on Sandbox CRs that
-    /// predate its introduction. Runs once at startup in shared mode so that
-    /// label-selector based lookups continue to find legacy resources.
-    async fn backfill_gateway_id_labels(&self) -> Result<(), KubernetesDriverError> {
-        let sandbox_api = self
-            .supported_sandbox_api_for_lookup(self.client.clone())
-            .await
-            .map_err(KubernetesDriverError::Message)?;
-
-        let selector = openshell_sandbox_label_selector();
-        let list = match tokio::time::timeout(
-            KUBE_API_TIMEOUT,
-            sandbox_api
-                .api
-                .list(&ListParams::default().labels(&selector)),
-        )
-        .await
-        {
-            Ok(Ok(list)) => list,
-            Ok(Err(e)) => return Err(KubernetesDriverError::from_kube(e)),
-            Err(_) => {
-                return Err(KubernetesDriverError::Message(
-                    "timeout listing Sandbox resources for gateway-id label backfill".to_string(),
-                ));
-            }
-        };
-
-        let gateway_id = &self.config.gateway_id;
-        for obj in &list {
-            if !gateway_id_label_needs_backfill(obj.metadata.labels.as_ref(), gateway_id) {
-                continue;
-            }
-            let Some(name) = obj.metadata.name.as_deref() else {
-                continue;
-            };
-            let patch = serde_json::json!({
-                "metadata": {
-                    "labels": {
-                        LABEL_GATEWAY_ID: gateway_id
-                    }
-                }
-            });
-            match tokio::time::timeout(
-                KUBE_API_TIMEOUT,
-                sandbox_api
-                    .api
-                    .patch(name, &PatchParams::default(), &Patch::Merge(&patch)),
-            )
-            .await
-            {
-                Ok(Ok(_)) => {
-                    info!(sandbox = %name, gateway_id, "backfilled gateway-id label");
-                }
-                Ok(Err(e)) => return Err(KubernetesDriverError::from_kube(e)),
-                Err(_) => {
-                    return Err(KubernetesDriverError::Message(format!(
-                        "timeout backfilling gateway-id label on Sandbox {name}"
-                    )));
-                }
-            }
-        }
-
         Ok(())
     }
 
@@ -4400,9 +4329,11 @@ impl KubernetesComputeDriver {
             .confidential_profile()?
             .store
             .load_workload_environment(sandbox_id, &namespace, cr_uid)
-            .map_err(|_| KubernetesDriverError::Precondition(
-                "trusted workload environment is missing or invalid; restore its private state before restarting".to_string(),
-            ))?;
+            .map_err(|_| {
+                KubernetesDriverError::Precondition(
+                    "trusted workload environment is missing or invalid".to_string(),
+                )
+            })?;
         let workspace_key_uri = if persistent_workspace {
             Some(
                 self.confidential_profile()?
@@ -5160,21 +5091,11 @@ impl KubernetesComputeDriver {
                                     );
                                 }
                             }
-                            if markers.is_empty() {
-                                // Legacy CRs may predate the owner index. No
-                                // UID is available to construct a safe marker.
-                                if let Err(error) = profile.store.revoke_sandbox(sandbox_id) {
-                                    cleanup_errors.push(format!(
-                                        "revoke confidential sandbox {sandbox_id}: {error}"
-                                    ));
-                                }
-                            } else {
-                                for marker in &markers {
-                                    if let Err(error) =
-                                        self.withdraw_sandbox_authorization_for_delete(marker)
-                                    {
-                                        cleanup_errors.push(error);
-                                    }
+                            for marker in &markers {
+                                if let Err(error) =
+                                    self.withdraw_sandbox_authorization_for_delete(marker)
+                                {
+                                    cleanup_errors.push(error);
                                 }
                             }
                         }
@@ -6724,15 +6645,6 @@ fn is_namespace_owned_by_gateway(
         && labels
             .and_then(|l| l.get(LABEL_GATEWAY_ID))
             .is_some_and(|v| v == gateway_id)
-}
-
-fn gateway_id_label_needs_backfill(
-    labels: Option<&BTreeMap<String, String>>,
-    gateway_id: &str,
-) -> bool {
-    labels
-        .and_then(|labels| labels.get(LABEL_GATEWAY_ID))
-        .is_none_or(|value| value != gateway_id)
 }
 
 fn namespace_delete_params(uid: String) -> DeleteParams {
@@ -13613,36 +13525,6 @@ mod tests {
     }
 
     #[test]
-    fn user_namespaces_ignores_legacy_host_users_encoding() {
-        let template = SandboxTemplate {
-            platform_config: Some(Struct {
-                fields: std::iter::once((
-                    "host_users".to_string(),
-                    Value {
-                        kind: Some(Kind::BoolValue(false)),
-                    },
-                ))
-                .collect(),
-            }),
-            ..SandboxTemplate::default()
-        };
-
-        let params = SandboxPodParams::default();
-        let pod_template = sandbox_template_to_k8s(
-            &template,
-            false,
-            &std::collections::HashMap::new(),
-            true,
-            &params,
-        );
-
-        assert!(
-            pod_template["spec"]["hostUsers"].is_null(),
-            "legacy host_users must not enable user namespaces"
-        );
-    }
-
-    #[test]
     fn automount_service_account_token_is_disabled() {
         let pod_template = {
             let params = SandboxPodParams::default();
@@ -13893,24 +13775,6 @@ mod tests {
                 assert_eq!(telemetry_entries[0]["value"], serde_json::json!("false"));
             },
         );
-    }
-
-    #[test]
-    fn sandbox_pod_drops_legacy_network_capability_environment() {
-        let spec = SandboxSpec {
-            environment: std::collections::HashMap::from([(
-                openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES.to_string(),
-                openshell_core::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY.to_string(),
-            )]),
-            ..SandboxSpec::default()
-        };
-        let cr = sandbox_to_k8s_spec_for_test(Some(&spec), &SandboxPodParams::default());
-        let env = cr["spec"]["podTemplate"]["spec"]["containers"][0]["env"]
-            .as_array()
-            .unwrap();
-        assert!(!env.iter().any(|entry| {
-            entry["name"] == openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES
-        }));
     }
 
     #[test]
@@ -14399,27 +14263,6 @@ mod tests {
             sel.contains(&format!("{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE}")),
             "selector must include managed-by: {sel}"
         );
-    }
-
-    #[test]
-    fn gateway_id_backfill_adopts_unlabelled_sandbox() {
-        let labels = BTreeMap::from([(
-            LABEL_MANAGED_BY.to_string(),
-            LABEL_MANAGED_BY_VALUE.to_string(),
-        )]);
-        assert!(gateway_id_label_needs_backfill(Some(&labels), "gw-1"));
-    }
-
-    #[test]
-    fn gateway_id_backfill_adopts_sandbox_from_previous_gateway() {
-        let labels = BTreeMap::from([(LABEL_GATEWAY_ID.to_string(), "gw-old".to_string())]);
-        assert!(gateway_id_label_needs_backfill(Some(&labels), "gw-1"));
-    }
-
-    #[test]
-    fn gateway_id_backfill_skips_sandbox_already_owned_by_gateway() {
-        let labels = BTreeMap::from([(LABEL_GATEWAY_ID.to_string(), "gw-1".to_string())]);
-        assert!(!gateway_id_label_needs_backfill(Some(&labels), "gw-1"));
     }
 
     #[test]

@@ -90,7 +90,6 @@ pub(super) struct Binding {
     pub(super) role: String,
     pub(super) generation: String,
     pub(super) sandbox_id: String,
-    #[serde(default)]
     pub(super) sandbox_cr_uid: String,
     pub(super) attempt_id: String,
     pub(super) key: String,
@@ -180,7 +179,6 @@ impl BootstrapStore {
         ensure_private_dir(&state.join("revoking"))?;
         ensure_private_dir(&state.join("workspace-keys"))?;
         ensure_private_dir(&state.join("workspace-bindings"))?;
-        ensure_private_dir(&state.join("workspace-revoked"))?;
         ensure_private_dir(&state.join("workspace-journal"))?;
         ensure_private_dir(&state.join("workspace-owners"))?;
         ensure_private_dir(&state.join("pending-deletes"))?;
@@ -423,12 +421,7 @@ impl BootstrapStore {
             }
             for item in fs::read_dir(self.binding_directory())? {
                 let binding: Binding = serde_json::from_slice(&read_regular(&item?.path())?)?;
-                if binding.sandbox_id == sandbox_id
-                    && (binding.sandbox_cr_uid == sandbox_cr_uid
-                        || binding.sandbox_cr_uid.is_empty())
-                {
-                    // Legacy records lack UID; all new publication records
-                    // carry one, so a replacement's new binding is excluded.
+                if binding.sandbox_id == sandbox_id && binding.sandbox_cr_uid == sandbox_cr_uid {
                     identities.insert(binding.identity_sha256);
                 }
             }
@@ -562,9 +555,6 @@ impl BootstrapStore {
         }
         let id = workspace_hash(namespace, sandbox_cr_uid);
         self.with_lock(|| {
-            if self.workspace_revoked(&id).exists() {
-                return Err(StoreError::Revoked);
-            }
             for item in fs::read_dir(self.state.join("pending-deletes"))? {
                 let pending = self.read_pending_delete(&item?.path())?;
                 if pending.namespace == namespace && pending.sandbox_cr_uid == sandbox_cr_uid {
@@ -690,9 +680,6 @@ impl BootstrapStore {
                 if pending.namespace == namespace && pending.sandbox_cr_uid == sandbox_cr_uid {
                     return Err(StoreError::Revoked);
                 }
-            }
-            if self.workspace_revoked(&id).exists() {
-                return Err(StoreError::Revoked);
             }
             if !self.has_workspace_owner(namespace, sandbox_cr_uid, &id)? {
                 return Err(StoreError::Invalid("workspace owner not recorded"));
@@ -839,12 +826,7 @@ impl BootstrapStore {
             if !new_binding {
                 let prior: Binding = serde_json::from_slice(&read_regular(&binding_path)?)?;
                 if prior != binding {
-                    let mut legacy = binding.clone();
-                    legacy.sandbox_cr_uid.clear();
-                    if prior != legacy {
-                        return Err(StoreError::Conflict);
-                    }
-                    atomic_replace(&binding_path, &serde_json::to_vec(&binding)?)?;
+                    return Err(StoreError::Conflict);
                 }
             } else {
                 atomic_new(&binding_path, &serde_json::to_vec(&binding)?)?;
@@ -954,33 +936,8 @@ impl BootstrapStore {
         self.with_lock(|| self.revoke_identity(&identity))
     }
 
-    /// Revoke all recorded generations and roles for a sandbox. This supports
-    /// cleanup retries after the Kubernetes object carrying its generation is
-    /// gone. Repeated calls are safe.
-    pub(super) fn revoke_sandbox(&self, sandbox_id: &str) -> Result<()> {
-        validate_sandbox(sandbox_id)?;
-        if self.policy.is_none() {
-            return Err(StoreError::Policy);
-        }
-        self.with_lock(|| {
-            self.finish_revocations()?;
-            let mut identities = std::collections::BTreeSet::new();
-            for item in fs::read_dir(self.state.join("bindings"))? {
-                let record: Binding = serde_json::from_slice(&read_regular(&item?.path())?)?;
-                if record.sandbox_id == sandbox_id {
-                    identities.insert(record.identity_sha256);
-                }
-            }
-            for identity in identities {
-                self.revoke_identity(&identity)?;
-            }
-            Ok(())
-        })
-    }
-
     /// Withdraw a CR's bootstrap identities without touching a replacement
-    /// CR that reused the Sandbox ID. UID-less legacy bindings predate this
-    /// ownership field and are retired during the single-writer migration.
+    /// CR that reused the Sandbox ID.
     pub(super) fn revoke_sandbox_uid(&self, sandbox_id: &str, sandbox_cr_uid: &str) -> Result<()> {
         validate_sandbox(sandbox_id)?;
         validate_workspace_identity("bootstrap", sandbox_cr_uid)?;
@@ -995,9 +952,7 @@ impl BootstrapStore {
             let mut identities = std::collections::BTreeSet::new();
             for item in fs::read_dir(self.state.join("bindings"))? {
                 let record: Binding = serde_json::from_slice(&read_regular(&item?.path())?)?;
-                if record.sandbox_id == sandbox_id
-                    && (record.sandbox_cr_uid == sandbox_cr_uid || record.sandbox_cr_uid.is_empty())
-                {
+                if record.sandbox_id == sandbox_id && record.sandbox_cr_uid == sandbox_cr_uid {
                     identities.insert(record.identity_sha256);
                 }
             }
@@ -1137,9 +1092,6 @@ impl BootstrapStore {
         self.repository.join(local_fs_resource_key(&format!(
             "default/workspace/{identity}"
         )))
-    }
-    fn workspace_revoked(&self, identity: &str) -> PathBuf {
-        self.state.join("workspace-revoked").join(identity)
     }
     fn workspace_journal(&self, identity: &str) -> PathBuf {
         self.state
@@ -1292,7 +1244,6 @@ impl BootstrapStore {
             self.state.join("revoking"),
             self.state.join("workspace-keys"),
             self.state.join("workspace-bindings"),
-            self.state.join("workspace-revoked"),
             self.state.join("workspace-journal"),
             self.state.join("workspace-owners"),
             self.state.join("pending-deletes"),
@@ -2110,51 +2061,6 @@ pathlib.Path(args[args.index('--output') + 1]).write_text('package policy\ndefau
     }
 
     #[test]
-    fn delete_marker_retires_legacy_binding_left_by_attempt_cas_crash() {
-        let (_tmp, store) = fixture();
-        let old = store
-            .publish_file(
-                BootstrapRole::Workload,
-                GENERATION,
-                "sandbox-legacy",
-                "old-uid",
-                ATTEMPT,
-                "old-token",
-                b"old-private-token",
-                INITDATA,
-            )
-            .unwrap();
-        let mut legacy: serde_json::Value =
-            serde_json::from_slice(&read_regular(&old.binding_path).unwrap()).unwrap();
-        legacy.as_object_mut().unwrap().remove("sandbox_cr_uid");
-        atomic_replace(&old.binding_path, &serde_json::to_vec(&legacy).unwrap()).unwrap();
-        let new_attempt = "b".repeat(64);
-        let marker = store
-            .begin_delete(
-                "sandbox-legacy",
-                "namespace",
-                "old-uid",
-                Some((GENERATION, &new_attempt)),
-            )
-            .unwrap();
-        assert!(marker.bootstrap_identities.contains(&identity_hash(
-            BootstrapRole::Workload,
-            GENERATION,
-            "sandbox-legacy",
-            ATTEMPT
-        )));
-        store.revoke_pending_delete(&marker).unwrap();
-        assert!(
-            !store
-                .repository
-                .join(local_fs_resource_key(
-                    old.resource_path.strip_prefix("resource/").unwrap()
-                ))
-                .exists()
-        );
-    }
-
-    #[test]
     fn uid_scoped_revoke_withdraws_every_old_file_even_if_policy_render_fails() {
         let (tmp, store) = fixture();
         let old_a = store
@@ -2436,8 +2342,8 @@ pathlib.Path(args[args.index('--output') + 1]).write_text('package policy\ndefau
             Err(StoreError::Revoked)
         ));
         fs::remove_file(tmp.path().join("fail")).unwrap();
-        store.revoke_sandbox("sandbox-2").unwrap();
-        store.revoke_sandbox("sandbox-2").unwrap();
+        store.revoke_sandbox_uid("sandbox-2", "cr-uid").unwrap();
+        store.revoke_sandbox_uid("sandbox-2", "cr-uid").unwrap();
         assert!(!store.resource(id).exists());
         assert!(!store.revoking(&identity).exists());
         assert!(matches!(
@@ -2531,15 +2437,6 @@ pathlib.Path(args[args.index('--output') + 1]).write_text('package policy\ndefau
         store
             .deauthorize_workspace_key("workspace", "cr-uid-1")
             .unwrap();
-        // Retain compatibility with a destruction fence written by an older
-        // store. The driver does not expose a separate key-destruction API.
-        atomic_new(&store.workspace_revoked(id), b"destroyed\n").unwrap();
-        assert!(private.exists());
-        assert!(!store.workspace_resource(id).exists());
-        assert!(matches!(
-            store.ensure_workspace_key("workspace", "cr-uid-1", INITDATA),
-            Err(StoreError::Revoked)
-        ));
     }
 
     #[test]

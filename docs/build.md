@@ -352,8 +352,7 @@ scp -r "$HANDOFF/". "$TRUSTED_SSH":/var/lib/openshell-confidential/operator/hand
 ### Verify and extract on T
 
 Verify `SHA256SUMS` against its hash received through the authenticated
-administrative channel before trusting package contents. This is an initial
-installation into an empty destination; existing installs follow [upgrade](upgrade.md).
+administrative channel before trusting package contents. Extract into an empty destination.
 T needs Bash, SSH, tar, coreutils and jq. The source snapshot is for deployment,
 not a Git build checkout; CSI is installed from the separate patched chart.
 

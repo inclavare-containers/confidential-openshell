@@ -210,48 +210,50 @@ func TestBindingRendererRejectsForgedIdentity(t *testing.T) {
 	}
 }
 
-func TestBindingRendererCRUIDSchemaMigration(t *testing.T) {
+func TestBindingRendererRejectsInvalidCRUID(t *testing.T) {
 	dir := t.TempDir()
-	path := writeBinding(t, dir, "workload", "g000000000000002a", "sandbox-1", "API_KEY", digest("6"))
-	filename := filepath.Join(dir, strings.TrimPrefix(path, "resource/default/bootstrap/")+".json")
-	encoded, err := os.ReadFile(filename)
+	resource := writeBinding(t, dir, "workload", "g000000000000002a", "sandbox-1", "API_KEY", digest("6"))
+	filename := filepath.Join(dir, strings.TrimPrefix(resource, "resource/default/bootstrap/")+".json")
+	original, err := os.ReadFile(filename)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var binding map[string]string
-	if err := json.Unmarshal(encoded, &binding); err != nil {
-		t.Fatal(err)
-	}
-	newKBS, newAS := renderSealedPolicies(t, dir)
-	newKBSBytes, _ := os.ReadFile(newKBS)
-	newASBytes, _ := os.ReadFile(newAS)
-	delete(binding, "sandbox_cr_uid")
-	encoded, err = json.Marshal(binding)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filename, encoded, 0600); err != nil {
-		t.Fatal(err)
-	}
-	oldKBS, oldAS := renderSealedPolicies(t, dir)
-	oldKBSBytes, _ := os.ReadFile(oldKBS)
-	oldASBytes, _ := os.ReadFile(oldAS)
-	if string(oldKBSBytes) != string(newKBSBytes) || string(oldASBytes) != string(newASBytes) {
-		t.Fatal("CR UID changed Trustee authorization projection")
-	}
-	binding["sandbox_cr_uid"] = "../replacement"
-	encoded, err = json.Marshal(binding)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filename, encoded, 0600); err != nil {
-		t.Fatal(err)
-	}
-	command := exec.Command("python3.11", "../../deployment/trustee/render-kbs-policy.py", "--bindings-dir", dir,
-		"--as-policy-output", filepath.Join(t.TempDir(), "as.rego"),
-		"--output", filepath.Join(t.TempDir(), "kbs.rego"))
-	if output, err := command.CombinedOutput(); err == nil || !strings.Contains(string(output), "invalid Sandbox CR UID") {
-		t.Fatalf("renderer accepted unsafe CR UID: err=%v output=%s", err, output)
+	for _, tc := range []struct {
+		name, uid, errorText string
+		missing              bool
+	}{
+		{name: "missing", missing: true, errorText: "binding schema mismatch"},
+		{name: "empty", uid: "", errorText: "invalid Sandbox CR UID"},
+		{name: "unsafe", uid: "../replacement", errorText: "invalid Sandbox CR UID"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var binding map[string]string
+			if err := json.Unmarshal(original, &binding); err != nil {
+				t.Fatal(err)
+			}
+			if tc.missing {
+				delete(binding, "sandbox_cr_uid")
+			} else {
+				binding["sandbox_cr_uid"] = tc.uid
+			}
+			encoded, err := json.Marshal(binding)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filename, encoded, 0600); err != nil {
+				t.Fatal(err)
+			}
+			outputDir := t.TempDir()
+			policy := filepath.Join(outputDir, "kbs.rego")
+			command := exec.Command("python3.11", "../../deployment/trustee/render-kbs-policy.py", "--bindings-dir", dir,
+				"--as-policy-output", filepath.Join(outputDir, "as.rego"), "--output", policy)
+			if output, err := command.CombinedOutput(); err == nil || !strings.Contains(string(output), tc.errorText) {
+				t.Fatalf("renderer accepted invalid CR UID: err=%v output=%s", err, output)
+			}
+			if _, err := os.Stat(policy); !os.IsNotExist(err) {
+				t.Fatal("invalid binding left active policy")
+			}
+		})
 	}
 }
 

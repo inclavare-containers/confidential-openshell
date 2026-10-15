@@ -2,7 +2,6 @@
 
 This installs the main Ubuntu UKI / CoCo 0.22 profile with native OpenShell 0.1.3.
 Build and package using [build.md](build.md), then follow the ten steps below.
-For an existing installation, use [upgrade and retention](upgrade.md) first.
 Users of a provisioned Gateway start at [first agent](first-agent.md).
 
 **B** is the trusted build role; **T** hosts Gateway, driver, Trustee and private
@@ -178,8 +177,7 @@ Use RRSA projected tokens, not access keys in Helm values.
 **On T:** official `trustee_as` and `trustee_kbs` images come from the runtime lock.
 AS includes BuiltIn RVPS on loopback 50004; KBS exposes private HTTPS 8443. Use the
 maintained [configs and units](../deployment/trustee/README.md), with one local
-driver/policy writer. Initial setup follows; upgrades preserve PKI, signer,
-resources, bindings and key journals.
+driver/policy writer.
 
 ```bash
 for image in trustee_as trustee_kbs; do
@@ -310,8 +308,8 @@ MRTD and three static RTMR0 events. Policy requires exactly six RTMR0 events in
 order, with dynamic ACPI contents explicitly accepted as untrusted VMM input
 handled by approved TDVF/kernel. All four RTMRs still require signed-quote replay.
 Do not enroll measurements from a live quote. The registrar queries back active
-reference names; unexpected values block admission. Inactive retained legacy RVPS
-names are not authorization inputs. See [the policy contract](../deployment/trustee/README.md).
+reference names; unexpected values block admission.
+See [the policy contract](../deployment/trustee/README.md).
 The anonymous HTTPS probe above proves listener/trust/denial, not attestation.
 
 ## 5. Generate measured base initdata

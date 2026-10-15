@@ -7,13 +7,14 @@ UKI image flow on ACK/PeerPods/Intel TDX. The driver and required PeerPods
 integration remain local changes; this repository does not fork OpenShell's
 protocol or user interface.
 
+Deployment instructions target a fresh development environment with the pinned components.
+
 Start with [architecture and trust boundaries](docs/architecture.md).
 Developers prepare [fixed sources and build inputs](docs/build.md), then follow
 one **[sequential deployment runbook](docs/deployment.md)**. An approved compatible
 PodVM ImageID and matching references need no rebuild. Users of an installed
 Gateway follow [the native agent walkthrough](docs/first-agent.md).
-[Upgrade and retention](docs/upgrade.md) covers existing state; the
-[test guide](tests/README.md) distinguishes offline checks from live acceptance.
+The [test guide](tests/README.md) distinguishes offline checks from live acceptance.
 Component READMEs are references, not additional deployment routes.
 
 | Component | Source and integration |
