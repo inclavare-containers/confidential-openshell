@@ -1,21 +1,27 @@
 # Confidential OpenShell
 
-Run the unmodified OpenShell v0.1.3 Gateway/CLI/supervisor with an external
-confidential Kubernetes ComputeDriver and separate attested supervisor/workload
-guests. Main uses official CoCo 0.22 AA/CDH and Trustee with the upstream Ubuntu
-UKI image flow on ACK/PeerPods/Intel TDX. The driver and required PeerPods
-integration remain local changes; this repository does not fork OpenShell's
-protocol or user interface.
+Run OpenShell coding agents in Alibaba Cloud Intel TDX guests, with attestation-gated
+credentials and encrypted persistent workspaces.
+
+The main profile uses native OpenShell v0.1.3, official CoCo 0.22 AA/CDH and Trustee,
+and the upstream Ubuntu UKI image flow on ACK/PeerPods. A local confidential
+Kubernetes driver connects these components; OpenShell keeps its native protocol
+and user commands.
 
 Deployment instructions target a fresh development environment with the pinned components.
 
-Start with [architecture and trust boundaries](docs/architecture.md).
-On a fresh Ubuntu host, start with [host tools, fixed sources and builds](docs/build.md#prepare-an-ubuntu-2404-host), then follow
-one **[sequential deployment runbook](docs/deployment.md)**. An approved compatible
-PodVM ImageID and matching references need no rebuild. Users of an installed
-Gateway follow [the native agent walkthrough](docs/first-agent.md).
-The [test guide](tests/README.md) distinguishes offline checks from live acceptance.
-Component READMEs are references, not additional deployment routes.
+To install, follow these guides in order:
+
+1. [Build](docs/build.md): prepare Ubuntu, build each component and package the outputs.
+2. [Deploy](docs/deployment.md): configure ACK, Trustee, PeerPods and the native Gateway.
+3. [First agent](docs/first-agent.md): connect, run a coding task and check persistent Stop/Start.
+
+Each installation step has its own command and expected result. The build and
+service roles can share one machine. An approved compatible PodVM ImageID and
+matching references can be reused without rebuilding the guest.
+
+See [architecture](docs/architecture.md) for trust boundaries and [tests](tests/README.md)
+for verification coverage. Component READMEs describe internals.
 
 | Component | Source and integration |
 | --- | --- |

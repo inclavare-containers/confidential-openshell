@@ -7,5 +7,5 @@ certificates and rejects anonymous user requests. Operator private keys stay on
 the trusted host; the driver seals launch credentials for attested guests.
 
 Follow the [sequential deployment runbook](../../docs/deployment.md) for
-installation, checks and failure recovery. Edit private operator copies outside
+installation and checks. Edit private operator copies outside
 the checkout; keep credentials and runtime state out of this directory.
