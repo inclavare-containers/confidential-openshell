@@ -36,8 +36,9 @@ project, not an upstream bootstrap-store implementation.
 
 User environment from the template and `--env` travels only in the workload's sealed
 `boundary.json.child_env`. Native OpenShell applies it to workload child processes after
-CDH unseals the file. Template values are overridden by sandbox values; empty and multiline
-values are preserved. Kubernetes receives no user environment values in Pod env, the CR,
+CDH unseals the file. Template values are overridden by sandbox values; accepted values,
+including empty strings, are preserved. Native OpenShell API validation rejects newline
+and carriage-return values. Kubernetes receives no user environment values in Pod env, the CR,
 Secrets or generated policy. Only public driver-controlled `OPENSHELL_` runtime settings
 remain in Pod env; reserved `OPENSHELL_` keys cannot set child environment. Policy admission
 rejects user env or `envFrom` reintroduced into a role Pod.
