@@ -85,6 +85,12 @@ epochs/revisions. `--no-auto-providers` can skip a missing provider; creation al
 does not prove attachment. A timeout can leave resources allocated, so delete
 before retrying. Ctrl-P then Ctrl-Q detaches without stopping the main process.
 
+Ordinary `--env` values, including `OPENCODE_CONFIG_CONTENT`, are delivered through the
+sealed workload configuration after attestation. They stay out of Kubernetes Pod env,
+CRs and Secrets. Template environment follows the same path; `--env` overrides matching
+template keys. The trusted host retains a private copy for stop/start. Reserved
+`OPENSHELL_` settings remain driver-managed.
+
 ## 4. Work with files
 
 Upload after creation: `create --upload` cannot accompany an explicit main command.

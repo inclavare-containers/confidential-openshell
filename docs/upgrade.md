@@ -50,6 +50,21 @@ outside source and release packages. The current test policy accepts `UpToDate`
 and `OutOfDate`; all other quote, boot, initdata and authorization checks remain
 required. See [trust boundaries](architecture.md).
 
+## Sealed workload environment
+
+Back up the driver's private `workload-environments/` directory with the store signer
+and journals. Records are bound to namespace and Sandbox CR UID, with directory mode
+0700 and file mode 0600. Stop retains them; final delete removes the matching record.
+The Gateway's private state and KBS resource repository also contain sensitive values
+and remain within the trusted host.
+
+Sandboxes created before sealed environment persistence have no such record. Before
+upgrading, export any needed files and recreate those sandboxes through the Gateway
+from trusted configuration. Do not reconstruct environment state from Kubernetes.
+For a newer sandbox, restore its original private record from a trusted backup if it
+is missing or invalid. Start fails until that state is available; creating a replacement
+Sandbox UID does not transfer ownership of the old encrypted workspace.
+
 ## Native authentication and existing TLS state
 
 Upgrade Gateway, CLI and both runtime images to the locked v0.1.3 artifacts together.

@@ -131,6 +131,16 @@ pub(super) struct WorkspaceOwner {
     pub(super) workspace_identity_sha256: String,
 }
 
+// Original values stay on T so a restart never has to trust Kubernetes env.
+// Deliberately omit Debug: this record can contain user credentials.
+#[derive(Serialize, Deserialize, Eq, PartialEq)]
+struct WorkloadEnvironment {
+    sandbox_id: String,
+    namespace: String,
+    sandbox_cr_uid: String,
+    environment: std::collections::HashMap<String, String>,
+}
+
 /// Durable deletion fence. Identities are captured while the old CR UID is
 /// still known, so retries cannot revoke a replacement CR's new attempt.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -174,6 +184,7 @@ impl BootstrapStore {
         ensure_private_dir(&state.join("workspace-journal"))?;
         ensure_private_dir(&state.join("workspace-owners"))?;
         ensure_private_dir(&state.join("pending-deletes"))?;
+        ensure_private_dir(&state.join("workload-environments"))?;
         let store = Self {
             repository,
             state,
@@ -277,9 +288,78 @@ impl BootstrapStore {
         })
     }
 
+    pub(super) fn record_workload_environment(
+        &self,
+        sandbox_id: &str,
+        namespace: &str,
+        sandbox_cr_uid: &str,
+        environment: &std::collections::HashMap<String, String>,
+    ) -> Result<()> {
+        validate_sandbox(sandbox_id)?;
+        validate_workspace_identity(namespace, sandbox_cr_uid)?;
+        let record = WorkloadEnvironment {
+            sandbox_id: sandbox_id.to_owned(),
+            namespace: namespace.to_owned(),
+            sandbox_cr_uid: sandbox_cr_uid.to_owned(),
+            environment: environment.clone(),
+        };
+        let path = self.workload_environment(namespace, sandbox_cr_uid);
+        self.with_lock(|| {
+            if self.has_pending_delete_for_sandbox(sandbox_id)? {
+                return Err(StoreError::Revoked);
+            }
+            // Keep cleanup discovery and env publication under one lock. A
+            // crash or concurrent delete must not leave an unindexed secret.
+            self.record_workspace_owner_locked(sandbox_id, namespace, sandbox_cr_uid)?;
+            if path.try_exists()? {
+                let prior: WorkloadEnvironment = serde_json::from_slice(&read_private(&path)?)?;
+                if prior != record {
+                    return Err(StoreError::Conflict);
+                }
+            } else {
+                atomic_new(&path, &serde_json::to_vec(&record)?)?;
+            }
+            Ok(())
+        })
+    }
+
+    pub(super) fn load_workload_environment(
+        &self,
+        sandbox_id: &str,
+        namespace: &str,
+        sandbox_cr_uid: &str,
+    ) -> Result<std::collections::HashMap<String, String>> {
+        validate_sandbox(sandbox_id)?;
+        validate_workspace_identity(namespace, sandbox_cr_uid)?;
+        self.with_lock(|| {
+            if self.has_pending_delete_for_sandbox(sandbox_id)? {
+                return Err(StoreError::Revoked);
+            }
+            let record: WorkloadEnvironment = serde_json::from_slice(&read_private(
+                &self.workload_environment(namespace, sandbox_cr_uid),
+            )?)?;
+            if record.sandbox_id != sandbox_id
+                || record.namespace != namespace
+                || record.sandbox_cr_uid != sandbox_cr_uid
+            {
+                return Err(StoreError::Conflict);
+            }
+            Ok(record.environment)
+        })
+    }
+
     /// Persist the lookup needed to withdraw workspace access after the
     /// Kubernetes CR is gone. Call before any workspace authorization.
     pub(super) fn record_workspace_owner(
+        &self,
+        sandbox_id: &str,
+        namespace: &str,
+        sandbox_cr_uid: &str,
+    ) -> Result<()> {
+        self.with_lock(|| self.record_workspace_owner_locked(sandbox_id, namespace, sandbox_cr_uid))
+    }
+
+    fn record_workspace_owner_locked(
         &self,
         sandbox_id: &str,
         namespace: &str,
@@ -295,22 +375,20 @@ impl BootstrapStore {
             workspace_identity_sha256: workspace_id.clone(),
         };
         let path = self.workspace_owner(sandbox_id, &workspace_id);
-        self.with_lock(|| {
-            for item in fs::read_dir(self.state.join("workspace-owners"))? {
-                let existing = self.read_workspace_owner(&item?.path())?;
-                if existing.workspace_identity_sha256 == workspace_id && existing != owner {
-                    return Err(StoreError::Conflict);
-                }
+        for item in fs::read_dir(self.state.join("workspace-owners"))? {
+            let existing = self.read_workspace_owner(&item?.path())?;
+            if existing.workspace_identity_sha256 == workspace_id && existing != owner {
+                return Err(StoreError::Conflict);
             }
-            if path.exists() {
-                if self.read_workspace_owner(&path)? != owner {
-                    return Err(StoreError::Conflict);
-                }
-            } else {
-                atomic_new(&path, &serde_json::to_vec(&owner)?)?;
+        }
+        if path.exists() {
+            if self.read_workspace_owner(&path)? != owner {
+                return Err(StoreError::Conflict);
             }
-            Ok(())
-        })
+        } else {
+            atomic_new(&path, &serde_json::to_vec(&owner)?)?;
+        }
+        Ok(())
     }
 
     /// Fence new publication and snapshot only identities belonging to the
@@ -434,6 +512,19 @@ impl BootstrapStore {
             }
             if self.read_pending_delete(&path)? != *marker {
                 return Err(StoreError::Conflict);
+            }
+            let environment = self.workload_environment(&marker.namespace, &marker.sandbox_cr_uid);
+            if environment.try_exists()? {
+                let record: WorkloadEnvironment =
+                    serde_json::from_slice(&read_private(&environment)?)?;
+                if record.sandbox_id != marker.sandbox_id
+                    || record.namespace != marker.namespace
+                    || record.sandbox_cr_uid != marker.sandbox_cr_uid
+                {
+                    return Err(StoreError::Conflict);
+                }
+                fs::remove_file(&environment)?;
+                sync_dir(environment.parent().unwrap())?;
             }
             fs::remove_file(&path)?;
             sync_dir(&self.state.join("pending-deletes"))?;
@@ -1032,6 +1123,11 @@ impl BootstrapStore {
     fn workspace_key(&self, identity: &str) -> PathBuf {
         self.state.join("workspace-keys").join(identity)
     }
+    fn workload_environment(&self, namespace: &str, uid: &str) -> PathBuf {
+        self.state
+            .join("workload-environments")
+            .join(format!("{}.json", workspace_hash(namespace, uid)))
+    }
     fn workspace_binding(&self, identity: &str) -> PathBuf {
         self.state
             .join("workspace-bindings")
@@ -1200,6 +1296,7 @@ impl BootstrapStore {
             self.state.join("workspace-journal"),
             self.state.join("workspace-owners"),
             self.state.join("pending-deletes"),
+            self.state.join("workload-environments"),
             self.repository.clone(),
         ] {
             let mut changed = false;
@@ -1546,6 +1643,157 @@ pathlib.Path(args[args.index('--output') + 1]).write_text('package policy\ndefau
         )
         .unwrap();
         (tmp, store)
+    }
+
+    #[test]
+    fn sealed_environment_survives_stop_and_store_restart_without_kubernetes() {
+        let (tmp, store) = fixture();
+        let environment = std::collections::HashMap::from([
+            (
+                "TOKEN".to_string(),
+                "test-secret=含空格\nsecond line".to_string(),
+            ),
+            ("EMPTY".to_string(), String::new()),
+        ]);
+        store
+            .record_workload_environment("sandbox-env", "ns", "uid", &environment)
+            .unwrap();
+        store
+            .record_workload_environment("sandbox-env", "ns", "uid", &environment)
+            .unwrap();
+        let path = store.workload_environment("ns", "uid");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        let bytes = serde_json::to_vec(&serde_json::json!({"child_env": environment})).unwrap();
+        let old = store
+            .publish_file(
+                BootstrapRole::Workload,
+                GENERATION,
+                "sandbox-env",
+                "uid",
+                ATTEMPT,
+                "boundary.json",
+                &bytes,
+                INITDATA,
+            )
+            .unwrap();
+        let opaque = old.resource_uri.rsplit('/').next().unwrap();
+        assert_eq!(fs::read(store.resource(opaque)).unwrap(), bytes);
+        assert!(!old.sealed_descriptor.contains("test-secret"));
+        store
+            .revoke_attempt(BootstrapRole::Workload, GENERATION, "sandbox-env", ATTEMPT)
+            .unwrap();
+        assert!(!store.resource(opaque).exists());
+        drop(store);
+        let store = BootstrapStore::open_with_policies(
+            tmp.path().join("repo"),
+            tmp.path().join("state/signer.pk8"),
+            tmp.path().join("renderer.py"),
+            tmp.path().join("policy.rego"),
+            tmp.path().join("as.rego"),
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .load_workload_environment("sandbox-env", "ns", "uid")
+                .unwrap(),
+            environment
+        );
+        let new = store
+            .publish_file(
+                BootstrapRole::Workload,
+                RESTART_GENERATION,
+                "sandbox-env",
+                "uid",
+                &"1".repeat(64),
+                "boundary.json",
+                &bytes,
+                &"b".repeat(96),
+            )
+            .unwrap();
+        assert_ne!(new.sealed_descriptor, old.sealed_descriptor);
+        assert!(
+            store
+                .load_workload_environment("another-sandbox", "ns", "uid")
+                .is_err()
+        );
+        assert!(
+            store
+                .load_workload_environment("sandbox-env", "other-ns", "uid")
+                .is_err()
+        );
+        assert!(
+            store
+                .load_workload_environment("sandbox-env", "ns", "another-uid")
+                .is_err()
+        );
+        let mut changed = environment.clone();
+        changed.insert("TOKEN".into(), "replaced".into());
+        assert!(matches!(
+            store.record_workload_environment("sandbox-env", "ns", "uid", &changed),
+            Err(StoreError::Conflict)
+        ));
+    }
+
+    #[test]
+    fn environment_delete_is_uid_scoped_and_invalid_private_state_fails_closed() {
+        let (_tmp, store) = fixture();
+        let env = std::collections::HashMap::from([("TOKEN".into(), "secret".into())]);
+        store
+            .record_workload_environment("sandbox-env", "ns", "old-uid", &env)
+            .unwrap();
+        store
+            .record_workload_environment("sandbox-env", "ns", "new-uid", &env)
+            .unwrap();
+        let marker = store
+            .begin_delete("sandbox-env", "ns", "old-uid", None)
+            .unwrap();
+        assert!(matches!(
+            store.load_workload_environment("sandbox-env", "ns", "old-uid"),
+            Err(StoreError::Revoked)
+        ));
+        store.revoke_pending_delete(&marker).unwrap();
+        store.finish_delete(&marker).unwrap();
+        store.finish_delete(&marker).unwrap();
+        assert!(!store.workload_environment("ns", "old-uid").exists());
+        assert_eq!(
+            store
+                .load_workload_environment("sandbox-env", "ns", "new-uid")
+                .unwrap(),
+            env
+        );
+        let path = store.workload_environment("ns", "new-uid");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            store
+                .load_workload_environment("sandbox-env", "ns", "new-uid")
+                .is_err()
+        );
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut record: WorkloadEnvironment =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        record.sandbox_cr_uid = "old-uid".into();
+        fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        assert!(matches!(
+            store.load_workload_environment("sandbox-env", "ns", "new-uid"),
+            Err(StoreError::Conflict)
+        ));
+        fs::remove_file(&path).unwrap();
+        assert!(
+            store
+                .load_workload_environment("sandbox-env", "ns", "new-uid")
+                .is_err()
+        );
     }
 
     #[test]

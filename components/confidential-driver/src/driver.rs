@@ -1003,6 +1003,11 @@ impl KubernetesComputeDriver {
         Self::validate_actual_pod_image_refs(pod)?;
         if role == BootstrapRole::Supervisor {
             self.validate_confidential_supervisor_pod(pod, cr_uid, sandbox_id)?;
+        } else if !workload_environment_is_private(pod) {
+            return Err(KubernetesDriverError::Precondition(
+                "workload Pod must receive user environment only through sealed bootstrap"
+                    .to_string(),
+            ));
         }
         let name = pod.metadata.name.as_deref().ok_or_else(|| {
             KubernetesDriverError::Precondition("gated Pod lacks name".to_string())
@@ -3164,6 +3169,15 @@ impl KubernetesComputeDriver {
         let cr_uid = sandbox_cr.metadata.uid.as_deref().ok_or_else(|| {
             KubernetesDriverError::Message("created Sandbox CR has no UID".to_string())
         })?;
+        let child_env = workload_environment_from_spec(sandbox.spec.as_ref());
+        self.confidential_profile()?
+            .store
+            .record_workload_environment(&sandbox.id, namespace, cr_uid, &child_env)
+            .map_err(|_| {
+                KubernetesDriverError::Precondition(
+                    "cannot persist the trusted workload environment".to_string(),
+                )
+            })?;
         let workspace_key_uri = if sandbox_uses_persistent_volume(sandbox_cr) {
             Some(
                 self.confidential_profile()?
@@ -3444,17 +3458,6 @@ impl KubernetesComputeDriver {
                 )
             })
             .and_then(|spec| decode_launch_authentication(&spec.launch_authentication))?;
-        let mut child_env = sandbox
-            .spec
-            .as_ref()
-            .and_then(|spec| spec.template.as_ref())
-            .map_or_else(std::collections::HashMap::new, |template| {
-                template.environment.clone()
-            });
-        if let Some(spec) = sandbox.spec.as_ref() {
-            child_env.extend(spec.environment.clone());
-        }
-        child_env.retain(|name, _| !name.starts_with("OPENSHELL_"));
         let host_gateway_ip = self.config.host_gateway_ip.parse().ok();
         let session_id = launch_authentication.supervisor.session_id;
         let tls = generate_sandbox_tls_material(session_id)
@@ -4393,6 +4396,13 @@ impl KubernetesComputeDriver {
         let names = SandboxRuntimeNames::for_generation(sandbox_id, generation.as_str());
         let bootstrap_attempt = random_sandbox_runtime_token();
         let persistent_workspace = sandbox_uses_persistent_volume(&object);
+        let child_env = self
+            .confidential_profile()?
+            .store
+            .load_workload_environment(sandbox_id, &namespace, cr_uid)
+            .map_err(|_| KubernetesDriverError::Precondition(
+                "trusted workload environment is missing or invalid; restore its private state before restarting".to_string(),
+            ))?;
         let workspace_key_uri = if persistent_workspace {
             Some(
                 self.confidential_profile()?
@@ -4620,6 +4630,34 @@ impl KubernetesComputeDriver {
                 )
             })?;
         sandbox_secret["secretName"] = serde_json::json!(names.sandbox_secret);
+        let mut containers = object
+            .data
+            .pointer("/spec/podTemplate/spec/containers")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .ok_or_else(|| {
+                KubernetesDriverError::Precondition(
+                    "Sandbox pod template has no containers".to_string(),
+                )
+            })?;
+        let agent = containers
+            .iter_mut()
+            .find(|container| container["name"] == "agent")
+            .ok_or_else(|| {
+                KubernetesDriverError::Precondition(
+                    "Sandbox pod template has no workload container".to_string(),
+                )
+            })?;
+        let mut public_env = build_sandbox_env(
+            &Default::default(),
+            &std::collections::HashMap::from([(
+                openshell_core::sandbox_env::LOG_LEVEL.to_string(),
+                log_level.clone(),
+            )]),
+        );
+        apply_resolved_identity_env(&mut public_env, agent_uid, agent_gid);
+        agent["env"] = serde_json::json!(public_env);
+        agent.as_object_mut().unwrap().remove("envFrom");
         let image_pull_secrets = self.generation_image_pull_secret_names(&names);
         let restart = async {
             patch_dynamic_object_with_uid_retry(
@@ -4641,6 +4679,8 @@ impl KubernetesComputeDriver {
                     });
                     running_patch["spec"]["podTemplate"]["spec"] =
                         restart_pod_template_spec(&volumes, &image_pull_secrets);
+                    running_patch["spec"]["podTemplate"]["spec"]["containers"] =
+                        serde_json::json!(containers);
                     running_patch["spec"]["podTemplate"]["metadata"]["annotations"]
                         [INITDATA_ANNOTATION] = serde_json::json!(workload_initdata.annotation);
                     running_patch
@@ -4648,7 +4688,6 @@ impl KubernetesComputeDriver {
             )
             .await?;
 
-            let child_env = child_environment_from_sandbox_object(&object);
             self.install_sandbox_runtime_generation(
                 &namespace,
                 cr_name,
@@ -8362,7 +8401,9 @@ fn build_sandbox_env(
 ) -> Vec<serde_json::Value> {
     let mut env = Vec::new();
     for (name, value) in template_environment.iter().chain(spec_environment) {
-        if !name.starts_with("OPENSHELL_") || name == openshell_core::sandbox_env::LOG_LEVEL {
+        // User values travel only in the sealed boundary.json child_env.
+        // Even non-secret-looking variables can contain arbitrary credentials.
+        if name == openshell_core::sandbox_env::LOG_LEVEL {
             upsert_env(&mut env, name, value);
         }
     }
@@ -8432,21 +8473,43 @@ fn platform_config_struct(template: &SandboxTemplate, key: &str) -> Option<serde
     }
 }
 
-fn child_environment_from_sandbox_object(
-    object: &DynamicObject,
+fn workload_environment_from_spec(
+    spec: Option<&SandboxSpec>,
 ) -> std::collections::HashMap<String, String> {
-    object
-        .data
-        .pointer("/spec/podTemplate/spec/containers/0/env")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|entry| {
-            let name = entry.get("name")?.as_str()?;
-            let value = entry.get("value")?.as_str()?;
-            (!name.starts_with("OPENSHELL_")).then(|| (name.to_string(), value.to_string()))
-        })
-        .collect()
+    let mut environment = spec
+        .and_then(|spec| spec.template.as_ref())
+        .map_or_else(std::collections::HashMap::new, |template| {
+            template.environment.clone()
+        });
+    if let Some(spec) = spec {
+        environment.extend(spec.environment.clone());
+    }
+    environment.retain(|name, _| !name.starts_with("OPENSHELL_"));
+    environment
+}
+
+// A mutated CR/Pod must not reintroduce host-visible user env before policy
+// generation. Image defaults are public inputs pinned by the image digest.
+fn workload_environment_is_private(pod: &Pod) -> bool {
+    pod.spec.as_ref().is_some_and(|spec| {
+        spec.containers
+            .iter()
+            .chain(spec.init_containers.iter().flatten())
+            .all(|container| {
+                container.env_from.as_deref().is_none_or(<[_]>::is_empty)
+                    && container.env.iter().flatten().all(|entry| {
+                        entry.value_from.is_none()
+                            && matches!(
+                                entry.name.as_str(),
+                                openshell_core::sandbox_env::LOG_LEVEL
+                                    | openshell_core::sandbox_env::TELEMETRY_ENABLED
+                                    | openshell_core::sandbox_env::OCI_IMAGE_USER
+                                    | openshell_core::sandbox_env::SANDBOX_UID
+                                    | openshell_core::sandbox_env::SANDBOX_GID
+                            )
+                    })
+            })
+    })
 }
 
 fn required_sandbox_annotation(
@@ -10852,11 +10915,18 @@ mod tests {
         ]);
         let (temp, serving, bindings) = attach_delete_test_workspace(&mut driver);
         let store = &driver.confidential.as_ref().unwrap().store;
+        // Simulate a crash immediately after saving env: no CR, Pod, volume
+        // journal, or separately recorded owner is needed to recover cleanup.
         store
-            .begin_delete("sandbox-id", "openshell", "old-uid", None)
+            .record_workload_environment(
+                "sandbox-id",
+                "openshell",
+                "replacement-uid",
+                &std::collections::HashMap::from([("TOKEN".into(), "secret".into())]),
+            )
             .unwrap();
         store
-            .record_workspace_owner("sandbox-id", "openshell", "replacement-uid")
+            .begin_delete("sandbox-id", "openshell", "old-uid", None)
             .unwrap();
         store
             .record_workspace_volume(
@@ -10885,6 +10955,12 @@ mod tests {
         let store = &driver.confidential.as_ref().unwrap().store;
         assert!(store.pending_deletes().unwrap().is_empty());
         assert!(store.workspace_owners().unwrap().is_empty());
+        assert_eq!(
+            std::fs::read_dir(temp.join("workload-environments"))
+                .unwrap()
+                .count(),
+            0,
+        );
         assert!(steps.lock().unwrap().is_empty());
         std::fs::remove_dir_all(temp).unwrap();
     }
@@ -13684,6 +13760,91 @@ mod tests {
             pod_template["spec"]["imagePullSecrets"],
             serde_json::json!([{ "name": "regcred" }])
         );
+    }
+
+    #[test]
+    fn user_environment_is_preserved_for_sealing_and_absent_from_kubernetes() {
+        let spec = SandboxSpec {
+            template: Some(SandboxTemplate {
+                environment: std::collections::HashMap::from([
+                    ("TEMPLATE_TOKEN".into(), "template-secret-marker".into()),
+                    ("OVERRIDE".into(), "template-value".into()),
+                    ("OPENSHELL_LOG_LEVEL".into(), "info".into()),
+                ]),
+                ..Default::default()
+            }),
+            environment: std::collections::HashMap::from([
+                (
+                    "OVERRIDE".into(),
+                    "spec-secret-marker=含空格\nsecond line".into(),
+                ),
+                ("EMPTY".into(), String::new()),
+                ("OPENSHELL_SANDBOX_UID".into(), "0".into()),
+            ]),
+            ..Default::default()
+        };
+        let environment = workload_environment_from_spec(Some(&spec));
+        assert_eq!(environment.len(), 3);
+        assert_eq!(environment["TEMPLATE_TOKEN"], "template-secret-marker");
+        assert_eq!(
+            environment["OVERRIDE"],
+            "spec-secret-marker=含空格\nsecond line"
+        );
+        assert_eq!(environment["EMPTY"], "");
+        let cr = sandbox_to_k8s_spec_for_test(Some(&spec), &SandboxPodParams::default());
+        let serialized = serde_json::to_string(&cr).unwrap();
+        for forbidden in [
+            "TEMPLATE_TOKEN",
+            "OVERRIDE",
+            "EMPTY",
+            "template-secret-marker",
+            "spec-secret-marker",
+            "template-value",
+        ] {
+            assert!(
+                !serialized.contains(forbidden),
+                "user environment leaked to Kubernetes"
+            );
+        }
+        let pod: Pod = serde_json::from_value(serde_json::json!({
+            "metadata": cr["spec"]["podTemplate"]["metadata"],
+            "spec": cr["spec"]["podTemplate"]["spec"],
+        }))
+        .unwrap();
+        assert!(workload_environment_is_private(&pod));
+    }
+
+    #[test]
+    fn policy_admission_rejects_reintroduced_user_env_and_env_sources() {
+        let cr = sandbox_to_k8s_spec_for_test(None, &SandboxPodParams::default());
+        let clean: Pod = serde_json::from_value(serde_json::json!({
+            "metadata": cr["spec"]["podTemplate"]["metadata"],
+            "spec": cr["spec"]["podTemplate"]["spec"],
+        }))
+        .unwrap();
+        assert!(workload_environment_is_private(&clean));
+        for entry in [
+            serde_json::json!({"name": "TOKEN", "value": "host-injected"}),
+            serde_json::json!({"name": "OPENSHELL_LOG_LEVEL", "valueFrom": {"secretKeyRef": {"name": "host-secret", "key": "value"}}}),
+        ] {
+            let mut pod = clean.clone();
+            pod.spec.as_mut().unwrap().containers[0]
+                .env
+                .get_or_insert_default()
+                .push(serde_json::from_value(entry).unwrap());
+            assert!(!workload_environment_is_private(&pod));
+        }
+        let mut pod = clean.clone();
+        pod.spec.as_mut().unwrap().containers[0].env_from = Some(vec![
+            serde_json::from_value(serde_json::json!({"configMapRef": {"name": "host-env"}}))
+                .unwrap(),
+        ]);
+        assert!(!workload_environment_is_private(&pod));
+        let mut pod = clean;
+        pod.spec.as_mut().unwrap().init_containers = Some(vec![
+            serde_json::from_value(serde_json::json!({"name": "injected", "image": "test", "env": [{"name": "TOKEN", "value": "host-injected"}]})).unwrap(),
+        ]);
+        assert!(!workload_environment_is_private(&pod));
     }
 
     #[test]

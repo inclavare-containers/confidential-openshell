@@ -34,6 +34,20 @@ writes Trustee 0.22's flat KV resource namespace; logical `kbs:///default/...` U
 private journal identities stay stable. This publication and recovery code is part of this
 project, not an upstream bootstrap-store implementation.
 
+User environment from the template and `--env` travels only in the workload's sealed
+`boundary.json.child_env`. Native OpenShell applies it to workload child processes after
+CDH unseals the file. Template values are overridden by sandbox values; empty and multiline
+values are preserved. Kubernetes receives no user environment values in Pod env, the CR,
+Secrets or generated policy. Only public driver-controlled `OPENSHELL_` runtime settings
+remain in Pod env; reserved `OPENSHELL_` keys cannot set child environment. Policy admission
+rejects user env or `envFrom` reintroduced into a role Pod.
+
+The trusted store retains a mode-0600 environment record under `workload-environments/`,
+bound to namespace and CR UID. Stop retains it; start uses it for the next sealed bootstrap
+and fails if it is missing or invalid, rather than reading values from Kubernetes. Final
+delete removes the matching environment record. Preserve this private state for restart;
+see [upgrade and retention](../../docs/upgrade.md#sealed-workload-environment).
+
 The supervisor connects directly to the native Gateway HTTPS endpoint with the trusted host's
 public CA and gateway-minted sandbox JWT released through its sealed bootstrap. User client
 certificates and private keys stay outside both guests. The native
