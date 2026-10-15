@@ -47,6 +47,8 @@ def rpc(address, method, value):
         request.write_bytes(b"\x00" + struct.pack(">I", len(message)) + message)
         subprocess.run([
             "curl", "--fail", "--silent", "--show-error", "--http2-prior-knowledge",
+            "--retry", "10", "--retry-connrefused", "--retry-delay", "1",
+            "--retry-max-time", "30",
             "--max-time", "30", "--dump-header", str(headers),
             "--header", "Content-Type: application/grpc", "--header", "TE: trailers",
             "--data-binary", "@" + str(request), "--output", str(response),
