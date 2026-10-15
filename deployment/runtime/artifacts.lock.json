@@ -22,6 +22,10 @@
     "oras": {
       "version": "1.2.0",
       "sha256": "b146d14bf7e6e0373200ad278e1f93432648468e51fc200bc7c939f0c4778a11"
+    },
+    "yq": {
+      "version": "4.35.1",
+      "sha256": "bd695a6513f1196aeda17b174a15e9c351843fb1cef5f9be0af170f2dd744f08"
     }
   },
   "charts": {

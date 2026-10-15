@@ -13,17 +13,7 @@ and [fixed source inputs](../docs/build.md#obtain-complete-fixed-sources).
 Populate dependency caches while network access is available, then run the suite:
 
 ```bash
-cargo fetch --locked
-for component in cloud-api-adaptor peerpod-ctrl caa-csi-block-driver; do
-  test -d ".local/build-sources/$component" || bash deployment/build/prepare-sources.sh "$component"
-done
-for module in \
-  .local/build-sources/cloud-api-adaptor/src/cloud-api-adaptor \
-  .local/build-sources/peerpod-ctrl/src/cloud-providers \
-  .local/build-sources/peerpod-ctrl/src/peerpod-ctrl \
-  .local/build-sources/caa-csi-block-driver tests; do
-  (cd "$module" && go mod download)
-done
+bash deployment/build/cache-test-dependencies.sh
 bash tests/run.sh
 ```
 

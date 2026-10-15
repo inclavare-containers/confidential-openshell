@@ -16,7 +16,13 @@ fi
 base="$(jq -er --arg c "$component" '.[$c].base' deployment/build/sources.lock.json)"
 expected="$(jq -er --arg c "$component" '.[$c].result_tree' deployment/build/sources.lock.json)"
 destination="$root/.local/build-sources/$component"
-[[ ! -e "$destination" ]] || { echo "refusing to overwrite $destination" >&2; exit 1; }
+if [[ -e "$destination" ]]; then
+  test "$(git -C "$destination" rev-parse HEAD)" = "$base"
+  test "$(git -C "$destination" write-tree)" = "$expected"
+  git -C "$destination" diff --quiet
+  printf '%s verified existing result tree %s\n' "$component" "$expected"
+  exit 0
+fi
 git -C "$source" cat-file -e "$base^{commit}"
 mkdir -p "$root/.local/build-sources"
 GIT_LFS_SKIP_SMUDGE=1 git clone --no-hardlinks --dissociate --no-checkout "$source" "$destination"
