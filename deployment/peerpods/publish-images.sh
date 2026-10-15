@@ -31,5 +31,5 @@ docker push "$AGENT_DEST"
 AGENT_DIGEST=$(SSL_CERT_FILE=/etc/trustee/tls/ca.pem crane digest --platform=linux/amd64 "$AGENT_DEST")
 AGENT_IMAGE="${AGENT_DEST%:*}@$AGENT_DIGEST"
 SSL_CERT_FILE=/etc/trustee/tls/ca.pem crane manifest --platform=linux/amd64 "$AGENT_IMAGE" | \
-  jq -e --arg id "$AGENT_IMAGE_ID" '.config.digest == $id'
+  jq -e --arg id "$AGENT_CONFIG_DIGEST" '.config.digest == $id'
 printf '%s\n' "$AGENT_IMAGE" > "$OPERATOR_DIR/agent-image.txt"

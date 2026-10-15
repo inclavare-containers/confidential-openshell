@@ -19,6 +19,19 @@ mkdir -p "$HANDOFF/source" "$HANDOFF/outputs" "$HANDOFF/charts" artifacts/images
 docker save -o artifacts/images/caa.tar "openshell/cloud-api-adaptor:$CAA_TAG"
 docker save -o artifacts/images/csi.tar "openshell/caa-csi-block-driver:$CSI_TAG"
 docker save -o artifacts/images/agent.tar "$AGENT_IMAGE_ID"
+AGENT_CONFIG_DIGEST=$(python3 - artifacts/images/agent.tar <<'PYCONFIG'
+import hashlib, json, sys, tarfile
+with tarfile.open(sys.argv[1]) as archive:
+    matches = []
+    for image in json.load(archive.extractfile('manifest.json')):
+        raw = archive.extractfile(image['Config']).read()
+        config = json.loads(raw)
+        if config['os'] == 'linux' and config['architecture'] == 'amd64':
+            matches.append('sha256:' + hashlib.sha256(raw).hexdigest())
+    assert len(matches) == 1, 'expected one Linux/amd64 agent image'
+    print(matches[0])
+PYCONFIG
+)
 GUEST_ARTIFACTS=(--artifact "guest-references=$PODVM_REFERENCE_VALUES")
 if [[ "$PODVM_MODE" == import ]]; then
   GUEST_ARTIFACTS+=(--artifact "guest-image=$PODVM_QCOW2")
@@ -52,10 +65,10 @@ while IFS=$'\t' read -r name digest; do
   cp "artifacts/cache/helm/$name" "$HANDOFF/charts/$name"
 done < <(jq -r '.charts | to_entries[] | [.key,.value] | @tsv' deployment/runtime/artifacts.lock.json)
 jq -n --arg caa "$CAA_TAG" --arg csi "$CSI_TAG" --arg peerpod_ctrl "$PEERPOD_CTRL_TAG" \
-  --arg agent "$AGENT_TAG" --arg agent_image_id "$AGENT_IMAGE_ID" \
+  --arg agent "$AGENT_TAG" --arg agent_image_id "$AGENT_IMAGE_ID" --arg agent_config_digest "$AGENT_CONFIG_DIGEST" \
   --arg mode "$PODVM_MODE" --arg region "$PODVM_REGION" --arg image_id "$PODVM_IMAGE_ID" \
   --arg guest "${PODVM_QCOW2##*/}" --arg refs "$(basename "$PODVM_REFERENCE_VALUES")" \
-  '{caa_tag:$caa,csi_tag:$csi,peerpod_ctrl_tag:$peerpod_ctrl,agent_tag:$agent,agent_image_id:$agent_image_id,
+  '{caa_tag:$caa,csi_tag:$csi,peerpod_ctrl_tag:$peerpod_ctrl,agent_tag:$agent,agent_image_id:$agent_image_id,agent_config_digest:$agent_config_digest,
     podvm_mode:$mode,podvm_region:$region,podvm_image_id:$image_id,
     guest:(if $mode == "import" then $guest else null end),references:$refs}' > "$HANDOFF/selection.json"
 (cd "$HANDOFF" && sha256sum source/*.tar outputs/* charts/* \

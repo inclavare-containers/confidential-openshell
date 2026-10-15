@@ -64,4 +64,5 @@ load_selection() {
     PEERPOD_CTRL_TAG=$(jq -er .peerpod_ctrl_tag "$selection")
     AGENT_TAG=$(jq -er .agent_tag "$selection")
     AGENT_IMAGE_ID=$(jq -er .agent_image_id "$selection")
+    AGENT_CONFIG_DIGEST=$(jq -er .agent_config_digest "$selection")
 }
