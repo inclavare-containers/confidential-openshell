@@ -24,7 +24,8 @@ Keep cloud values, credentials, private keys and live state outside the checkout
 
 ## 1. Pin sources and build integration binaries/images
 
-**On B:** follow [build preparation and outputs](build.md#obtain-complete-fixed-sources).
+**On B:** follow [host preparation, fixed sources and builds](build.md#prepare-an-ubuntu-2404-host)
+in order.
 The source lock fixes upstream commits and separate patch result trees. Build the
 driver, Kata host shim, CAA/CSI images, Alibaba-enabled PeerPod controller, agent
 image and patched CSI chart. Run the offline suite and record actual output hashes.
@@ -46,16 +47,14 @@ build does not establish real TDX acceptance. If reusing an approved compatible
 ImageID and matching reference file, skip the build and import.
 
 **On T:** after verifying/extracting the handoff, initialize these variables in
-one root shell (repeat when opening a new shell). Supply `HOST_IP` and administrator
-`KUBECONFIG` from the existing host/cluster inventory, not from sample addresses:
+one root shell (repeat when opening a new shell). Supply `HOST_IP` from the trusted
+host inventory. Step 3 creates the cluster and obtains its administrator kubeconfig:
 
 ```bash
 set -euo pipefail
 umask 077
 HOST_IP=REPLACE_WITH_APPROVED_TRUSTED_PRIVATE_IPV4
-KUBECONFIG=/absolute/path/to/approved-administrator-kubeconfig
-export HOST_IP KUBECONFIG
-test -r "$KUBECONFIG"
+export HOST_IP
 SOURCE_ROOT=/opt/confidential-openshell
 HANDOFF=/var/lib/openshell-confidential/operator/handoff
 OPERATOR_DIR=/var/lib/openshell-confidential/operator/cluster-config
@@ -83,27 +82,10 @@ Keep edited values in `OPERATOR_DIR`; do not edit the checked-in examples.
 
 ## 3. Prepare cluster, select the cloud image and configure identities
 
-**On T administering U:** install Docker, jq, Git, curl, tar, zstd, OpenSSL,
-CA certificates, Python 3.11/cryptography and the tools below using approved host
-packages/downloads. Verify the pinned tool hashes before the first cluster command:
-
-```bash
-LOCK=deployment/runtime/artifacts.lock.json
-for tool in docker zstd jq git python3.11 openssl curl tar; do command -v "$tool"; done
-systemctl enable --now docker.service
-HELM_VERSION=$(jq -er .tools.helm.version "$LOCK")
-KUBECTL_VERSION=$(jq -er .tools.kubectl.version "$LOCK")
-CRANE_VERSION=$(jq -er .tools.crane.version "$LOCK")
-curl -fL "https://get.helm.sh/helm-v${HELM_VERSION}-linux-amd64.tar.gz" -o "$OPERATOR_DIR/helm.tgz"
-tar -xOf "$OPERATOR_DIR/helm.tgz" linux-amd64/helm > "$OPERATOR_DIR/helm"
-curl -fL "https://dl.k8s.io/release/v${KUBECTL_VERSION}/bin/linux/amd64/kubectl" -o "$OPERATOR_DIR/kubectl"
-curl -fL "https://github.com/google/go-containerregistry/releases/download/v${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz" -o "$OPERATOR_DIR/crane.tgz"
-tar -xOf "$OPERATOR_DIR/crane.tgz" crane > "$OPERATOR_DIR/crane"
-for tool in helm kubectl crane; do
-  printf '%s  %s\n' "$(jq -er --arg tool "$tool" '.tools[$tool].sha256' "$LOCK")" "$OPERATOR_DIR/$tool" | sha256sum -c -
-  install -m 0755 "$OPERATOR_DIR/$tool" /usr/local/bin/
-done
-```
+**On T administering U:** complete the [host packages](build.md#host-packages)
+and [release command-line tools](build.md#release-command-line-tools) sections.
+If B and T share a machine, these are already installed. Keep using `python3`
+(Python 3.11 or newer) for every command below.
 
 ### Prepare the infrastructure
 
@@ -113,8 +95,15 @@ real traffic denial, not just successful policy creation. Select containerd work
 with `supplementalGroupsPolicy` support. The tested profile uses Kubernetes 1.36,
 containerd 2.3.4/configuration version 3 and OCI policy version 1.3.0; another
 runtime needs its actual OCI requests checked against generated guest policy.
+After ACK is created, download its administrator kubeconfig from the cluster's
+connection page into the private operator directory. Then select it before the
+first `kubectl` command:
 
 ```bash
+KUBECONFIG="$OPERATOR_DIR/administrator-kubeconfig"
+export KUBECONFIG
+test -s "$KUBECONFIG"
+chmod 0600 "$KUBECONFIG"
 kubectl get nodes -o wide
 kubectl get nodes -o json | jq -e '.items | length > 0'
 kubectl get nodes -o json | jq -e 'all(.items[];
@@ -260,7 +249,7 @@ for source in deployment/runtime/agent_policy.py deployment/trustee/render-kbs-p
   chmod 0640 "$source"
   runuser -u openshell-gateway -- test -r "$source"
 done
-runuser -u openshell-gateway -- python3.11 deployment/trustee/render-kbs-policy.py \
+runuser -u openshell-gateway -- python3 deployment/trustee/render-kbs-policy.py \
   --bindings-dir /opt/trustee/kbs/signing/bindings \
   --workspace-bindings-dir /opt/trustee/kbs/signing/workspace-bindings \
   --as-policy-output /opt/trustee/attestation-service/storage/attestation_service_policy/default_cpu.rego \
@@ -291,7 +280,7 @@ systemctl enable --now as.service
 : "${PODVM_PLATFORM_REFERENCES:?reviewed platform map required}"
 : "${PODVM_PLATFORM_REFERENCE_SHA256:?approved platform map checksum required}"
 printf '%s  %s\n' "$PODVM_PLATFORM_REFERENCE_SHA256" "$PODVM_PLATFORM_REFERENCES" | sha256sum -c -
-python3.11 deployment/trustee/register-references.py \
+python3 deployment/trustee/register-references.py \
   --address http://127.0.0.1:50004 \
   --references "$PODVM_REFERENCE_VALUES" --references "$PODVM_PLATFORM_REFERENCES"
 systemctl enable --now kbs.service
@@ -322,7 +311,7 @@ role/attempt/resource before scheduling. CAA's fallback uses this exact file:
 test -f /etc/trustee/tls/ca.pem
 install -d -o root -g openshell-gateway -m 0750 /etc/openshell-confidential
 initdata_file="$(mktemp)"
-python3.11 deployment/guest/render-guest-initdata.py \
+python3 deployment/guest/render-guest-initdata.py \
   "$HOST_IP" /etc/trustee/tls/ca.pem > "$initdata_file"
 install -o root -g openshell-gateway -m 0640 "$initdata_file" \
   /etc/openshell-confidential/guest-initdata-base.toml
@@ -536,7 +525,7 @@ WORKER_EVIDENCE="$OPERATOR_DIR/worker-profile/$WORKER_SSH"
 install -d -m 0700 "$WORKER_EVIDENCE"
 ssh "$WORKER_SSH" "sudo containerd --config '$CONTAINERD_CONFIG' config dump" \
   > "$WORKER_EVIDENCE/containerd.effective.before.toml"
-KATA_REMOTE_CONFIG=$(python3.11 - "$WORKER_EVIDENCE/containerd.effective.before.toml" <<'PYCONFIG'
+KATA_REMOTE_CONFIG=$(python3 - "$WORKER_EVIDENCE/containerd.effective.before.toml" <<'PYCONFIG'
 import pathlib, re, sys, tomllib
 with open(sys.argv[1], 'rb') as f:
     merged = tomllib.load(f)
@@ -555,7 +544,7 @@ ssh "$WORKER_SSH" 'sudo systemctl is-active --quiet containerd.service'
 ssh "$WORKER_SSH" "sudo containerd --config '$CONTAINERD_CONFIG' config dump" \
   > "$WORKER_EVIDENCE/containerd.effective.after.toml"
 ssh "$WORKER_SSH" "sudo cat '$KATA_REMOTE_CONFIG'" > "$WORKER_EVIDENCE/kata.after.toml"
-python3.11 - "$WORKER_EVIDENCE" "$KATA_REMOTE_CONFIG" <<'PYCONFIG'
+python3 - "$WORKER_EVIDENCE" "$KATA_REMOTE_CONFIG" <<'PYCONFIG'
 import pathlib, sys, tomllib
 area, expected = pathlib.Path(sys.argv[1]), sys.argv[2]
 with (area/'containerd.effective.after.toml').open('rb') as f:
@@ -676,7 +665,7 @@ done
 rm "$DOWNLOADS/kata-tools.tar"
 chmod 0755 "$POLICY_TOOLS/genpolicy"
 chmod 0644 "$POLICY_TOOLS/rules.rego" "$POLICY_TOOLS/genpolicy-settings.json"
-python3.11 - "$POLICY_TOOLS" <<'PYTOOLS'
+python3 - "$POLICY_TOOLS" <<'PYTOOLS'
 import importlib.util, pathlib, sys
 spec = importlib.util.spec_from_file_location("agent_policy", "deployment/runtime/agent_policy.py")
 policy = importlib.util.module_from_spec(spec)
@@ -714,7 +703,7 @@ chmod 0644 "$TLS_ROOT/ca.crt" "$TLS_ROOT/server/tls.crt" "$TLS_ROOT/client/tls.c
 chmod 0700 "$TLS_ROOT/client"
 install -o root -g openshell-gateway -m 0640 \
   deployment/openshell/gateway.toml /etc/openshell-confidential/gateway.toml
-python3.11 - "$HOST_IP" <<'PYCONFIG'
+python3 - "$HOST_IP" <<'PYCONFIG'
 from pathlib import Path
 import ipaddress, sys
 address = str(ipaddress.IPv4Address(sys.argv[1]))

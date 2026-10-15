@@ -10,7 +10,7 @@ protocol or user interface.
 Deployment instructions target a fresh development environment with the pinned components.
 
 Start with [architecture and trust boundaries](docs/architecture.md).
-Developers prepare [fixed sources and build inputs](docs/build.md), then follow
+On a fresh Ubuntu host, start with [host tools, fixed sources and builds](docs/build.md#prepare-an-ubuntu-2404-host), then follow
 one **[sequential deployment runbook](docs/deployment.md)**. An approved compatible
 PodVM ImageID and matching references need no rebuild. Users of an installed
 Gateway follow [the native agent walkthrough](docs/first-agent.md).

@@ -1040,7 +1040,7 @@ impl KubernetesComputeDriver {
                 "serialize actual gated Pod for Kata policy: {error}"
             ))
         })?;
-        let mut child = tokio::process::Command::new("/usr/bin/python3.11")
+        let mut child = tokio::process::Command::new("/usr/bin/python3")
             .arg(&profile.policy_generator)
             .arg("--role")
             .arg(role.as_str())

@@ -5,8 +5,8 @@ with synthetic signed claims and resources. They check policy loading and resour
 decisions; they do not contact deployed KBS or establish hardware attestation.
 
 ```sh
-python3.11 tests/acceptance/check-policy-denials.py --help
-python3.11 tests/acceptance/test-renderer-release.py --help
+python3 tests/acceptance/check-policy-denials.py --help
+python3 tests/acceptance/test-renderer-release.py --help
 ```
 
 `check-policy-denials.py` accepts `--kbs-binary` or an extracted official image via
@@ -17,7 +17,7 @@ actual `PolicyDeny` witness; an unrelated HTTP 500 is a failure.
 To check both official services:
 
 ```sh
-python3.11 tests/acceptance/test-renderer-release.py \
+python3 tests/acceptance/test-renderer-release.py \
   --kbs-rootfs /absolute/path/to/kbs-rootfs \
   --grpc-as-rootfs /absolute/path/to/as-rootfs
 ```

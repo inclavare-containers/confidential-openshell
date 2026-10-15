@@ -21,6 +21,107 @@ package operator credentials, private keys, live state, `.git` or `.local`.
 Prior output digests identify a released build; record the actual hashes of a new
 build rather than assuming byte-identical binaries, OCI archives or disk images.
 
+## Prepare an Ubuntu 24.04 host
+
+Start here on a fresh Linux/amd64 machine, as root, from the repository checkout.
+Complete this section before checking inputs or running any build. B and T may
+share this installation. These commands use the standard Ubuntu repositories and
+upstream release tools; cloud credentials are configured later during deployment.
+
+### Host packages
+
+Ubuntu 24.04 provides [Python 3.12](https://ubuntu.com/developers/docs/reference/availability/python/).
+The maintained scripts require **Python 3.11 or newer**, invoked as `python3`;
+do not install a separate `python3.11` package or replace the system interpreter.
+Use Ubuntu's `python3-cryptography` package for the trusted service helpers.
+
+```bash
+set -euo pipefail
+umask 077
+apt-get update
+apt-get install -y --no-install-recommends \
+  ca-certificates curl git git-lfs jq openssl python3 python3-cryptography \
+  tar gzip xz-utils zstd file binutils ripgrep rsync \
+  docker.io docker-buildx runc cryptsetup-bin util-linux
+systemctl enable --now docker
+python3 -c 'import sys, tomllib, hashlib, cryptography; assert sys.version_info >= (3, 11); print(sys.version)'
+docker version
+```
+
+### Build toolchains
+
+On B, install the native compiler dependencies, the Rust toolchain from
+`rust-toolchain.toml`, and the Go version recorded in the runtime lock:
+
+```bash
+apt-get install -y --no-install-recommends \
+  build-essential cmake pkg-config clang libclang-dev libssl-dev
+TOOL_CACHE="$PWD/artifacts/cache/host-tools"
+mkdir -p "$TOOL_CACHE"
+GO_VERSION=$(jq -er .build_outputs.caa.go_version deployment/runtime/artifacts.lock.json)
+curl -fL --retry 3 'https://go.dev/dl/?mode=json&include=all' -o "$TOOL_CACHE/go-releases.json"
+GO_SHA256=$(jq -er --arg version "go$GO_VERSION" \
+  '.[] | select(.version == $version) | .files[] |
+   select(.os == "linux" and .arch == "amd64" and .kind == "archive") | .sha256' \
+  "$TOOL_CACHE/go-releases.json")
+curl -fL --retry 3 "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -o "$TOOL_CACHE/go.tgz"
+printf '%s  %s\n' "$GO_SHA256" "$TOOL_CACHE/go.tgz" | sha256sum -c -
+test ! -e /usr/local/go
+tar -xzf "$TOOL_CACHE/go.tgz" -C /usr/local
+printf '\nexport PATH=/usr/local/go/bin:$PATH\n' >> "$HOME/.profile"
+export PATH="/usr/local/go/bin:$PATH"
+curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs -o "$TOOL_CACHE/rustup.sh"
+sh "$TOOL_CACHE/rustup.sh" -y --profile minimal --default-toolchain 1.95.0
+. "$HOME/.cargo/env"
+rustup component add --toolchain 1.95.0 rustfmt rust-src rust-analyzer clippy
+rustc --version
+go version
+```
+
+Cargo and Go fetch the dependencies selected by `Cargo.lock` and the pinned
+modules during builds. Before the offline test suite, also populate its module
+caches as described in [the test guide](../tests/README.md).
+
+### Release command-line tools
+
+Install the lock-pinned Helm, kubectl, crane, yq, GitHub CLI and ORAS releases.
+The lock's tool hashes identify **extracted executables**, not their tarballs.
+`yq` is Mike Farah's v4 command, not Ubuntu's Python wrapper. GitHub CLI must
+provide `gh attestation verify`; ORAS/GitHub CLI are used when fetching the guest
+release binaries. Already verified cached guest binaries can be reused.
+
+```bash
+LOCK=deployment/runtime/artifacts.lock.json
+TOOL_CACHE="$PWD/artifacts/cache/host-tools"
+mkdir -p "$TOOL_CACHE"
+for tool in helm kubectl crane yq gh oras; do
+  version=$(jq -er --arg tool "$tool" '.tools[$tool].version' "$LOCK")
+  member=
+  case "$tool" in
+    helm) url="https://get.helm.sh/helm-v${version}-linux-amd64.tar.gz"; member=linux-amd64/helm ;;
+    kubectl) url="https://dl.k8s.io/release/v${version}/bin/linux/amd64/kubectl" ;;
+    crane) url="https://github.com/google/go-containerregistry/releases/download/v${version}/go-containerregistry_Linux_x86_64.tar.gz"; member=crane ;;
+    yq) url="https://github.com/mikefarah/yq/releases/download/v${version}/yq_linux_amd64" ;;
+    gh) url="https://github.com/cli/cli/releases/download/v${version}/gh_${version}_linux_amd64.tar.gz"; member="gh_${version}_linux_amd64/bin/gh" ;;
+    oras) url="https://github.com/oras-project/oras/releases/download/v${version}/oras_${version}_linux_amd64.tar.gz"; member=oras ;;
+  esac
+  curl -fL --retry 3 "$url" -o "$TOOL_CACHE/$tool.download"
+  if [[ -n "$member" ]]; then
+    tar -xzOf "$TOOL_CACHE/$tool.download" "$member" > "$TOOL_CACHE/$tool"
+  else
+    cp "$TOOL_CACHE/$tool.download" "$TOOL_CACHE/$tool"
+  fi
+  printf '%s  %s\n' "$(jq -er --arg tool "$tool" '.tools[$tool].sha256' "$LOCK")" \
+    "$TOOL_CACHE/$tool" | sha256sum -c -
+  install -m 0755 "$TOOL_CACHE/$tool" /usr/local/bin/
+done
+helm version --short
+kubectl version --client
+yq --version
+gh attestation verify --help >/dev/null
+oras version
+```
+
 ## Capacity before any build
 
 Check free disk/inodes, Docker cache and competing compiler jobs; reserve room
@@ -52,25 +153,40 @@ git -C .local/dependencies/kata-containers checkout --detach "$KATA_COMMIT"
 git -C .local/dependencies/kata-containers fsck --connectivity-only
 ```
 
-An authenticated Git bundle containing the exact commit can replace the network
-clone. Check its checksum and `git bundle verify` before cloning. Offline suppliers
-also provide module/package caches and these exact Helm archives under
-`artifacts/cache/helm/`, with the hashes from the runtime lock:
+A verified Git bundle containing the exact commit can replace the network clone.
+Check its checksum and `git bundle verify` before cloning. A supplied checkout
+with initialized submodules can be used directly; neither requires GitHub login.
+The remaining public downloads need outbound access to GitHub, GHCR, the distro
+repositories and the OCI registries named in the locks.
 
-- `kata-deploy-4.2.0.tgz`
-- `peerpodctrl-0.5.0.tgz`
-- `peerpods-webhook-0.5.0.tgz`
-
-Keep the original archive bytes; a fresh `helm package` need not reproduce them.
-The Kata chart originates at `oci://ghcr.io/kata-containers/kata-deploy-charts/kata-deploy`;
-the PeerPods dependency charts originate in the pinned CAA source.
+Fetch the published Kata chart. Generate the two unpublished local dependency
+charts from their unchanged, pinned CAA Git trees, using the commit timestamp
+and fixed file modes. These commands are reproducible and do not require a previously supplied cache:
 
 ```bash
-python3.11 deployment/build/check-inputs.py
+CHART_CACHE="$BUILD_ROOT/artifacts/cache/helm"
+mkdir -p "$CHART_CACHE"
+helm pull oci://ghcr.io/kata-containers/kata-deploy-charts/kata-deploy \
+  --version 4.2.0 --destination "$CHART_CACHE"
+CAA_BASE=$(jq -er '.["cloud-api-adaptor"].base' deployment/build/sources.lock.json)
+CAA_MTIME=$(git -C repos/cloud-api-adaptor show -s --format=%cI "$CAA_BASE")
+git -c tar.umask=0022 -C repos/cloud-api-adaptor archive --format=tar --mtime="$CAA_MTIME" --prefix=peerpodctrl/ \
+  "$CAA_BASE:src/peerpod-ctrl/chart" | gzip -n > "$CHART_CACHE/peerpodctrl-0.5.0.tgz"
+git -c tar.umask=0022 -C repos/cloud-api-adaptor archive --format=tar --mtime="$CAA_MTIME" --prefix=peerpods-webhook/ \
+  "$CAA_BASE:src/webhook/chart" | gzip -n > "$CHART_CACHE/peerpods-webhook-0.5.0.tgz"
+while IFS=$'\t' read -r name digest; do
+  printf '%s  %s\n' "$digest" "$CHART_CACHE/$name" | sha256sum -c -
+done < <(jq -r '.charts | to_entries[] | [.key,.value] | @tsv' deployment/runtime/artifacts.lock.json)
+```
+
+Now verify the inputs, then prepare the patched build copies:
+
+```bash
+python3 deployment/build/check-inputs.py
 bash deployment/build/prepare-sources.sh cloud-api-adaptor
 bash deployment/build/prepare-sources.sh caa-csi-block-driver
 bash deployment/build/prepare-sources.sh kata-containers .local/dependencies/kata-containers
-python3.11 deployment/build/package-csi-chart.py
+python3 deployment/build/package-csi-chart.py
 ```
 
 The checker requires complete source bytes/modes and chart checksums. The helper
@@ -84,8 +200,9 @@ build; the driver alone does not require the Kata/chart subset.
 ### Driver and Kata host shim
 
 The confidential driver is compiled locally. The released Kata guest agent and
-genpolicy remain unchanged; the host Go shim patch propagates the existing
-`NoNewPrivileges` exec field so its request matches guest policy.
+genpolicy remain unchanged. The pinned host shim needs the exec `NoNewPrivileges`
+backport; [upstream PR #14025](https://github.com/kata-containers/kata-containers/pull/14025)
+is merged on main, but that does not add the fix to the pinned 4.2.0 release.
 
 ```bash
 cargo build --release --locked -p openshell-driver-confidential-kubernetes
@@ -176,7 +293,7 @@ sha256sum "$CONTROLLER_BUILD/context/manager"
 ```
 
 ```bash
-python3.11 - "$CONTROLLER_BUILD" <<'PY'
+python3 - "$CONTROLLER_BUILD" <<'PY'
 from pathlib import Path
 import sys, tarfile
 work = Path(sys.argv[1])
@@ -257,7 +374,7 @@ PODVM_QCOW2=
 
 [The guest builder](../deployment/guest/README.md) uses upstream CAA production
 mkosi definitions, released AA/CDH/Kata binaries and small measured hooks. It
-builds APF/PUD from the verified CAA tree. B needs privileged Docker, Python 3.11,
+builds APF/PUD from the verified CAA tree. B needs privileged Docker, Python 3.11 or newer,
 jq, crane, runc, curl, tar, zstd, readelf, Go/make and the release/package inputs;
 fetching missing CoCo binaries also needs oras and gh for upstream provenance
 verification. The maintained tools Dockerfile installs the required mkosi and
@@ -306,7 +423,7 @@ GUEST_ARTIFACTS=(--artifact "guest-references=$PODVM_REFERENCE_VALUES")
 if [[ "$PODVM_MODE" == import ]]; then
   GUEST_ARTIFACTS+=(--artifact "guest-image=$PODVM_QCOW2")
 fi
-python3.11 deployment/build/manifest.py --profile release \
+python3 deployment/build/manifest.py --profile release \
   --artifact driver=artifacts/openshell-driver-confidential-kubernetes \
   --artifact kata-shim=artifacts/containerd-shim-kata-v2 \
   "${GUEST_ARTIFACTS[@]}" \
@@ -329,7 +446,7 @@ if [[ "$PODVM_MODE" == import ]]; then
   cp "$(dirname "$GUEST_BUILD_RECEIPT")/source-manifest.json" "$HANDOFF/guest-manifest.json"
 fi
 cp artifacts/charts/caa-csi-block-driver.tgz "$HANDOFF/charts/"
-# Use the exact offline delivery archives verified in docs/build.md; do not repackage.
+# Use the exact published/reproducible archives verified above.
 while IFS=$'\t' read -r name digest; do
   printf '%s  %s\n' "$digest" "artifacts/cache/helm/$name" | sha256sum -c -
   cp "artifacts/cache/helm/$name" "$HANDOFF/charts/$name"
@@ -344,7 +461,19 @@ jq -n --arg caa "$CAA_TAG" --arg csi "$CSI_TAG" --arg peerpod_ctrl "$PEERPOD_CTR
 (cd "$HANDOFF" && sha256sum source/*.tar outputs/* charts/* \
   *.json > SHA256SUMS)
 sha256sum "$HANDOFF/SHA256SUMS" # Retain through the authenticated administrative channel.
-TRUSTED_SSH=trusted-control-host # Existing authenticated administrator alias.
+```
+
+If **B and T are the same host**, copy the public handoff locally:
+
+```bash
+install -d -m 0700 /var/lib/openshell-confidential/operator/handoff
+cp -a "$HANDOFF/". /var/lib/openshell-confidential/operator/handoff/
+```
+
+For **separate B and T hosts**, transfer over the existing administrator connection:
+
+```bash
+TRUSTED_SSH=trusted-control-host # Replace with the authenticated T host alias.
 ssh "$TRUSTED_SSH" 'install -d -m 0700 /var/lib/openshell-confidential/operator/handoff'
 scp -r "$HANDOFF/". "$TRUSTED_SSH":/var/lib/openshell-confidential/operator/handoff/
 ```
@@ -353,7 +482,8 @@ scp -r "$HANDOFF/". "$TRUSTED_SSH":/var/lib/openshell-confidential/operator/hand
 
 Verify `SHA256SUMS` against its hash received through the authenticated
 administrative channel before trusting package contents. Extract into an empty destination.
-T needs Bash, SSH, tar, coreutils and jq. The source snapshot is for deployment,
+On a separate fresh Ubuntu T, first run the [host package](#host-packages)
+commands. The source snapshot is for deployment,
 not a Git build checkout; CSI is installed from the separate patched chart.
 
 ```bash

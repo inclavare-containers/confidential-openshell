@@ -206,7 +206,7 @@ class StrictTestSourceChecks(unittest.TestCase):
             yield root
 
     def check(self, root):
-        return subprocess.run(['python3.11', str(root / 'deployment/build/manifest.py'),
+        return subprocess.run(['python3', str(root / 'deployment/build/manifest.py'),
                                '--check-test-sources'], capture_output=True, text=True)
 
     def damage(self, target, case):
@@ -296,8 +296,8 @@ class StrictTestSourceChecks(unittest.TestCase):
         import tarfile
         with self.sources() as root:
             script = self.prepare_chart_packager(root)
-            first = json.loads(subprocess.check_output(['python3.11', str(script)], text=True))
-            second = json.loads(subprocess.check_output(['python3.11', str(script)], text=True))
+            first = json.loads(subprocess.check_output(['python3', str(script)], text=True))
+            second = json.loads(subprocess.check_output(['python3', str(script)], text=True))
             self.assertEqual(first, second)
             self.assertEqual(first['path'], 'artifacts/charts/caa-csi-block-driver.tgz')
             expected = json.loads((root / 'deployment/build/sources.lock.json').read_text())['caa-csi-block-driver']
@@ -316,7 +316,7 @@ class StrictTestSourceChecks(unittest.TestCase):
                     self.damage(root / 'repos/caa-csi-block-driver', case.removeprefix('upstream-'))
                 else:
                     self.damage(root / '.local/build-sources/caa-csi-block-driver', case)
-                result = subprocess.run(['python3.11', str(script)], capture_output=True, text=True)
+                result = subprocess.run(['python3', str(script)], capture_output=True, text=True)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn('CSI packaging requires the pinned clean upstream and exact patched base/tree', result.stderr)
                 self.assertFalse((root / 'artifacts/charts/caa-csi-block-driver.tgz').exists())
@@ -324,7 +324,7 @@ class StrictTestSourceChecks(unittest.TestCase):
     def test_chart_manifest_rejects_payload_tampering_with_correct_provenance(self):
         with self.sources() as root:
             script = self.prepare_chart_packager(root)
-            report = json.loads(subprocess.check_output(['python3.11', str(script)], text=True))
+            report = json.loads(subprocess.check_output(['python3', str(script)], text=True))
             path = root / report['path']
             with tarfile.open(path) as archive:
                 original = [(member, archive.extractfile(member).read() if member.isfile() else None)
@@ -363,12 +363,12 @@ class StrictTestSourceChecks(unittest.TestCase):
     def test_manifest_requires_verified_csi_input_for_chart_output(self):
         with self.sources() as root:
             script = self.prepare_chart_packager(root)
-            subprocess.check_output(['python3.11', str(script)], text=True)
+            subprocess.check_output(['python3', str(script)], text=True)
             (root / '.gitignore').write_text('/.local/\n/repos/\n/artifacts/\n')
             self.run_git(root, 'add', '.gitignore', 'deployment')
             self.run_git(root, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'build fixture')
             self.damage(root / '.local/build-sources/caa-csi-block-driver', 'dirty')
-            result = subprocess.run(['python3.11', str(root / 'deployment/build/manifest.py'), '--profile', 'release',
+            result = subprocess.run(['python3', str(root / 'deployment/build/manifest.py'), '--profile', 'release',
                                      '--artifact', 'csi-chart=artifacts/charts/caa-csi-block-driver.tgz'], capture_output=True, text=True)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn('missing or mismatched patched input: caa-csi-block-driver', result.stderr)

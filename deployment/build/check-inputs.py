@@ -1,4 +1,4 @@
-#!/usr/bin/env python3.11
+#!/usr/bin/env python3
 """Read-only offline checks for Kata source and exact Helm dependency archives."""
 import argparse
 import hashlib

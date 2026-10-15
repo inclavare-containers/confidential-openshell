@@ -1,4 +1,4 @@
-#!/usr/bin/env python3.11
+#!/usr/bin/env python3
 """Pass actual Rust-rendered role fixtures through the guest validator offline."""
 import base64
 import gzip

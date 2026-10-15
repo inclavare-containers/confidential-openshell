@@ -1,4 +1,4 @@
-#!/usr/bin/env python3.11
+#!/usr/bin/env python3
 """Generate a Kata 4.2 policy for the actual, still-gated OpenShell Pod.
 
 The confidential driver calls this program before it adds initdata to a Pod.

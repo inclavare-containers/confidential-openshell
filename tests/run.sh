@@ -11,15 +11,15 @@ trap 'rm -rf -- "$fixture" "$test_tmp"' EXIT
 for component in cloud-api-adaptor peerpod-ctrl caa-csi-block-driver; do
   test -d ".local/build-sources/$component" || bash deployment/build/prepare-sources.sh "$component"
 done
-python3.11 deployment/build/manifest.py --check-test-sources > "$fixture/source-manifest.json"
-python3.11 tests/check-layout.py
+python3 deployment/build/manifest.py --check-test-sources > "$fixture/source-manifest.json"
+python3 tests/check-layout.py
 components/confidential-driver/controlled-diff.sh
 cargo fmt --all -- --check
 OPENSHELL_INITDATA_FIXTURE_OUT="$fixture/initdata" cargo test --offline --locked -p openshell-driver-confidential-kubernetes
-python3.11 tests/check-driver-initdata.py "$fixture/initdata"
+python3 tests/check-driver-initdata.py "$fixture/initdata"
 (cd tests && go test -mod=readonly ./policy -count=1)
-PYTHONPATH=deployment/runtime python3.11 -m unittest discover -s tests/contracts -v
-python3.11 -m unittest discover -s tests/e2e -v
+PYTHONPATH=deployment/runtime python3 -m unittest discover -s tests/contracts -v
+python3 -m unittest discover -s tests/e2e -v
 (umask 022; cd .local/build-sources/cloud-api-adaptor/src/cloud-api-adaptor && go test -mod=readonly ./pkg/forwarder/interceptor ./cmd/agent-protocol-forwarder ./pkg/adaptor/cloud ./pkg/podnetwork)
 (cd .local/build-sources/peerpod-ctrl/src/cloud-providers && go test -mod=readonly -tags=alibabacloud ./alibabacloud)
 # The upstream controller suite needs envtest's API server and etcd. Compile its

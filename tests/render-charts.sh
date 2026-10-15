@@ -13,6 +13,6 @@ while IFS=$'\t' read -r name digest; do
   cp "$cache/$name" "$chart/charts/$name"
 done < <(jq -r '.charts | to_entries[] | [.key,.value] | @tsv' "$root/deployment/runtime/artifacts.lock.json")
 helm template peerpods "$chart" --namespace confidential-containers-system --values "$root/deployment/peerpods/peerpods-values.example.yaml" >/dev/null
-python3.11 "$root/deployment/build/package-csi-chart.py"
-python3.11 "$root/tests/check-chart-handoff.py"
+python3 "$root/deployment/build/package-csi-chart.py"
+python3 "$root/tests/check-chart-handoff.py"
 printf 'PeerPods rendered and packaged CSI handoff resource assertions passed offline\n'

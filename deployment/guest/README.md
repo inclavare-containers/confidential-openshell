@@ -24,7 +24,7 @@ bash deployment/guest/build-image.sh
 ```
 
 Host prerequisites: Docker with privileged native containers, Go, make, jq,
-Python 3.11, curl, tar, zstd, readelf, crane and runc. Fetching missing CoCo
+Python 3.11 or newer, curl, tar, zstd, readelf, crane and runc. Fetching missing CoCo
 release binaries also needs oras and gh for the upstream provenance verifier.
 Checksum-verified official binaries may be reused from `artifacts/cache`.
 `build-payload.sh` runs automatically, and builds new APF/PUD outputs from the

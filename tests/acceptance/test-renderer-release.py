@@ -1,4 +1,4 @@
-#!/usr/bin/env python3.11
+#!/usr/bin/env python3
 """Stress the renderer with official Trustee 0.22 AS/KBS policy engines.
 
 This runs loopback AS/KBS with synthetic sample evidence/tokens and a fixture
@@ -87,7 +87,7 @@ def run(binary, kbs_rootfs, as_binary, as_rootfs):
             raise RuntimeError("stress fixture lacks required binding or digest diversity")
         kbs = area / "kbs.rego"
         attestation = area / "as.rego"
-        subprocess.run(["python3.11", str(HERE.parents[1] / "deployment/trustee/render-kbs-policy.py"),
+        subprocess.run(["python3", str(HERE.parents[1] / "deployment/trustee/render-kbs-policy.py"),
                         "--bindings-dir", str(bindings), "--workspace-bindings-dir", str(workspace),
                         "--as-policy-output", str(attestation), "--output", str(kbs)],
                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -165,7 +165,7 @@ def check_released_as(binary, rootfs, policy, area):
             raise RuntimeError("isolated released AS did not bind loopback")
         public_reference = area / "fixture.references.json"
         public_reference.write_text(json.dumps({"measurement.fixture.sha384": ["a" * 96]}))
-        subprocess.run(["python3.11", str(HERE.parents[1] / "deployment/trustee/register-references.py"),
+        subprocess.run(["python3", str(HERE.parents[1] / "deployment/trustee/register-references.py"),
                         "--address", address, "--references", str(public_reference)],
                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         raw_policy = policy.read_bytes()

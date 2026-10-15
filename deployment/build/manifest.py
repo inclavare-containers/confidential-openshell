@@ -1,4 +1,4 @@
-#!/usr/bin/env python3.11
+#!/usr/bin/env python3
 """Inventory pinned sources and explicitly selected public outputs (not build attestation)."""
 import argparse
 import hashlib

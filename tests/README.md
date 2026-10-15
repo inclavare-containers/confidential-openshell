@@ -6,6 +6,27 @@ The runner prepares missing CAA/CSI/controller build copies, checks their source
 identities and leaves the pinned `repos/` checkouts unchanged. Missing Kata sources
 are reported as `not_run`; they do not block the remaining integration checks.
 
+## Cache dependencies and run
+
+First complete the [Ubuntu host tools](../docs/build.md#prepare-an-ubuntu-2404-host)
+and [fixed source inputs](../docs/build.md#obtain-complete-fixed-sources).
+Populate dependency caches while network access is available, then run the suite:
+
+```bash
+cargo fetch --locked
+for component in cloud-api-adaptor peerpod-ctrl caa-csi-block-driver; do
+  test -d ".local/build-sources/$component" || bash deployment/build/prepare-sources.sh "$component"
+done
+for module in \
+  .local/build-sources/cloud-api-adaptor/src/cloud-api-adaptor \
+  .local/build-sources/peerpod-ctrl/src/cloud-providers \
+  .local/build-sources/peerpod-ctrl/src/peerpod-ctrl \
+  .local/build-sources/caa-csi-block-driver tests; do
+  (cd "$module" && go mod download)
+done
+bash tests/run.sh
+```
+
 | Suite | Coverage |
 | --- | --- |
 | Driver Rust and imported upstream tests | Admission, sealed resources, UID/attempt bindings, workspace identity, lifecycle and recovery |

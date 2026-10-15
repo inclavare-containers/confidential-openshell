@@ -45,7 +45,7 @@ func renderSealedPolicies(t *testing.T, dir string) (string, string) {
 	t.Helper()
 	policy := filepath.Join(t.TempDir(), "policy.rego")
 	asPolicy := filepath.Join(t.TempDir(), "as.rego")
-	command := exec.Command("python3.11", "../../deployment/trustee/render-kbs-policy.py", "--bindings-dir", dir,
+	command := exec.Command("python3", "../../deployment/trustee/render-kbs-policy.py", "--bindings-dir", dir,
 		"--as-policy-output", asPolicy, "--output", policy)
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("render KBS policy: %v: %s", err, output)
@@ -198,7 +198,7 @@ func TestBindingRendererRejectsForgedIdentity(t *testing.T) {
 	}
 	policy := filepath.Join(t.TempDir(), "policy.rego")
 	asPolicy := filepath.Join(t.TempDir(), "as.rego")
-	command := exec.Command("python3.11", "../../deployment/trustee/render-kbs-policy.py", "--bindings-dir", dir,
+	command := exec.Command("python3", "../../deployment/trustee/render-kbs-policy.py", "--bindings-dir", dir,
 		"--as-policy-output", asPolicy, "--output", policy)
 	if output, err := command.CombinedOutput(); err == nil {
 		t.Fatal("renderer accepted forged identity")
@@ -245,7 +245,7 @@ func TestBindingRendererRejectsInvalidCRUID(t *testing.T) {
 			}
 			outputDir := t.TempDir()
 			policy := filepath.Join(outputDir, "kbs.rego")
-			command := exec.Command("python3.11", "../../deployment/trustee/render-kbs-policy.py", "--bindings-dir", dir,
+			command := exec.Command("python3", "../../deployment/trustee/render-kbs-policy.py", "--bindings-dir", dir,
 				"--as-policy-output", filepath.Join(outputDir, "as.rego"), "--output", policy)
 			if output, err := command.CombinedOutput(); err == nil || !strings.Contains(string(output), tc.errorText) {
 				t.Fatalf("renderer accepted invalid CR UID: err=%v output=%s", err, output)
@@ -315,7 +315,7 @@ func TestWorkspaceBindingTracksCurrentWorkload(t *testing.T) {
 	}
 	policy := filepath.Join(t.TempDir(), "policy.rego")
 	asPolicy := filepath.Join(t.TempDir(), "as.rego")
-	command := exec.Command("python3.11", "../../deployment/trustee/render-kbs-policy.py", "--bindings-dir", bindings,
+	command := exec.Command("python3", "../../deployment/trustee/render-kbs-policy.py", "--bindings-dir", bindings,
 		"--workspace-bindings-dir", workspaceBindings, "--as-policy-output", asPolicy, "--output", policy)
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("render workspace policy: %v: %s", err, output)

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3.11
+#!/usr/bin/env python3
 """Exercise a copy of the active KBS policy with the released KBS binary.
 
 This is synthetic policy-engine evidence. Live TDX quote verification and EAR

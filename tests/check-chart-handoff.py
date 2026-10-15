@@ -1,4 +1,4 @@
-#!/usr/bin/env python3.11
+#!/usr/bin/env python3
 """Offline CSI handoff test: the T subprocess receives only a bundle and test tools."""
 import argparse
 import hashlib

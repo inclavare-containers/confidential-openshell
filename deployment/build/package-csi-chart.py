@@ -1,4 +1,4 @@
-#!/usr/bin/env python3.11
+#!/usr/bin/env python3
 """Package only the CSI chart from the verified patched Git tree, without Helm/network."""
 import gzip
 import io

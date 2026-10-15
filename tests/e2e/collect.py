@@ -1,4 +1,4 @@
-#!/usr/bin/env python3.11
+#!/usr/bin/env python3
 """Check OpenCode task events or repaired workspace without executing guest code."""
 import argparse
 import ast

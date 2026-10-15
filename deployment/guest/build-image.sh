@@ -17,7 +17,7 @@ guest_inputs_sha256() {
     ) | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1
 }
 input_sources_sha256="$(guest_inputs_sha256)"
-for command in docker jq python3.11 sha256sum tar git; do command -v "${command}" >/dev/null; done
+for command in docker jq python3 sha256sum tar git; do command -v "${command}" >/dev/null; done
 jq -e '.schema == 1 and .platform == "linux/amd64" and .podvm.distribution == "ubuntu" and .podvm.tee_platform == "tdx"' "${lock}" >/dev/null
 test "$(git -C "${source_root}" write-tree)" = "$(jq -r '.["cloud-api-adaptor"].result_tree' "${root}/deployment/build/sources.lock.json")"
 git -C "${source_root}" diff --quiet
@@ -114,7 +114,7 @@ refs="${final%.qcow2}.references.json"
 install -m 0600 "${work}/guest.qcow2" "${final}"
 install -m 0600 "${evidence}/references.json" "${refs}"
 printf '%s  %s\n' "${qcow_sha}" "${final}" >"${final}.sha256"
-python3.11 - "${root}" "${evidence}" "${image_id}" "${payload_sha}" "${recipe_sha}" "${final}" "${refs}" "${input_sources_sha256}" <<'PY'
+python3 - "${root}" "${evidence}" "${image_id}" "${payload_sha}" "${recipe_sha}" "${final}" "${refs}" "${input_sources_sha256}" <<'PY'
 import hashlib, json, pathlib, subprocess, sys
 root, evidence, image, payload_sha, recipe_sha, qcow, refs, inputs_sha = sys.argv[1:]
 e = pathlib.Path(evidence)
@@ -131,9 +131,9 @@ receipt = {'schema':1, 'integration_commit':subprocess.check_output(['git','-C',
 PY
 profile="${OPENSHELL_GUEST_MANIFEST_PROFILE:-release}"
 if [[ "${profile}" == source-only ]]; then
-    python3.11 "${root}/deployment/build/manifest.py" --profile source-only >"${evidence}/source-manifest.json"
+    python3 "${root}/deployment/build/manifest.py" --profile source-only >"${evidence}/source-manifest.json"
 else
-    python3.11 "${root}/deployment/build/manifest.py" --profile "${profile}" \
+    python3 "${root}/deployment/build/manifest.py" --profile "${profile}" \
         --artifact "guest-payload=${payload}" --artifact "guest-image=${final}" \
         --artifact "guest-references=${refs}" >"${evidence}/source-manifest.json"
 fi

@@ -13,10 +13,10 @@ The small collector has two independent checks:
 
 ```sh
 # Read an OpenCode 1.2.27 JSON event stream from stdin.
-python3.11 tests/e2e/collect.py --output /path/to/agent-events.json
+python3 tests/e2e/collect.py --output /path/to/agent-events.json
 
 # Read the downloaded clamp.py, test_clamp.py and result.json.
-python3.11 tests/e2e/collect.py --work /path/to/downloaded-work --output /path/to/work-check.json
+python3 tests/e2e/collect.py --work /path/to/downloaded-work --output /path/to/work-check.json
 ```
 
 The event check requires model text, a completed edit, a successful
@@ -35,7 +35,7 @@ for attestation, resource release and lifecycle requirements.
 Run the oracle regressions offline with:
 
 ```sh
-python3.11 -m unittest discover -s tests/e2e -v
+python3 -m unittest discover -s tests/e2e -v
 ```
 
 Synthetic events exercise rejection behavior without model calls or hardware

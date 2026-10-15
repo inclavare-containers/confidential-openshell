@@ -14,12 +14,24 @@
     "crane": {
       "version": "0.21.6",
       "sha256": "f093582da0ef1130f64b063b66063b57282ba585049de3e32f7e4f2007791b1a"
+    },
+    "yq": {
+      "version": "4.35.1",
+      "sha256": "bd695a6513f1196aeda17b174a15e9c351843fb1cef5f9be0af170f2dd744f08"
+    },
+    "gh": {
+      "version": "2.98.0",
+      "sha256": "62885b97de6a0cd85e616cdd94bcda908bf5cf1018094385892b05cea3537163"
+    },
+    "oras": {
+      "version": "1.2.0",
+      "sha256": "b146d14bf7e6e0373200ad278e1f93432648468e51fc200bc7c939f0c4778a11"
     }
   },
   "charts": {
     "kata-deploy-4.2.0.tgz": "52a3e9139e810d58867a7676fb38957870dd09e8b2033e54cebdda7c97598e8c",
-    "peerpodctrl-0.5.0.tgz": "8ae916d279433b1ad8a80cb099f6714d7642fee1467a7f24f110cd5bad8b9d7b",
-    "peerpods-webhook-0.5.0.tgz": "7f019035ef655d31bdcd6290089495a675bc16e371ca3c0484724d87e32e605c"
+    "peerpodctrl-0.5.0.tgz": "c5596b121a36b37068cd13d37f6baed808b7f371e68580af79fd1316a375c2a8",
+    "peerpods-webhook-0.5.0.tgz": "328235dc4f913fa64bad41ca1710e43edc7c118671b231a3f6640b8b7a9c3a5e"
   },
   "downloads": {
     "gateway": {
