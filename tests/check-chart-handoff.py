@@ -14,6 +14,8 @@ import tarfile
 import tempfile
 import unittest
 
+import yaml
+
 COMPONENT = 'caa-csi-block-driver'
 ARCHIVE = 'charts/caa-csi-block-driver.tgz'
 
@@ -82,8 +84,7 @@ def consume(bundle, expected_checksums):
     unpacked = subprocess.check_output([*args, str(extracted / COMPONENT)], text=True)
     require(rendered == unpacked, 'archive and extracted chart renders differ')
     (bundle / 'rendered.yaml').write_text(rendered)
-    documents = subprocess.check_output(['yq', 'eval', '-o=json', '-I=0', '.', '-'], input=rendered, text=True)
-    resources = [json.loads(line) for line in documents.splitlines() if line.strip() and line != 'null']
+    resources = [document for document in yaml.safe_load_all(rendered) if document is not None]
     assert_resources(resources)
     print(json.dumps({'result': 'passed', 'resources': len(resources), 'source': provenance,
                       'chart_sha256': artifact['sha256'], 'rendered_sha256': sha256(bundle / 'rendered.yaml')}, sort_keys=True))
@@ -184,10 +185,9 @@ class HandoffTests(unittest.TestCase):
         shutil.copyfile(__file__, self.trusted / 'consumer.py')
         tools = self.trusted / 'tools'
         tools.mkdir()
-        for tool in ['helm', 'yq']:
-            executable = shutil.which(tool)
-            self.assertIsNotNone(executable, f'existing trusted {tool} is required')
-            (tools / tool).symlink_to(executable)
+        executable = shutil.which('helm')
+        self.assertIsNotNone(executable, 'existing trusted Helm is required')
+        (tools / 'helm').symlink_to(executable)
         self.env = {**os.environ, 'PATH': str(tools), 'HELM_CACHE_HOME': str(self.trusted / 'helm-cache'),
                     'HELM_CONFIG_HOME': str(self.trusted / 'helm-config'), 'HELM_DATA_HOME': str(self.trusted / 'helm-data'),
                     'HELM_PLUGINS': str(self.trusted / 'no-plugins'), 'KUBECONFIG': str(self.trusted / 'no-kubeconfig')}

@@ -28,6 +28,25 @@ Complete this section before checking inputs or running any build. B and T may
 share this installation. These commands use the standard Ubuntu repositories and
 upstream release tools; cloud credentials are configured later during deployment.
 
+Use **apt for the host environment**. Only tools that the configured Ubuntu
+repositories cannot supply at the required version use upstream downloads:
+
+| Tools | Installation and constraint |
+| --- | --- |
+| Python, cryptography, YAML parser, Docker, Git, jq, compiler packages | Ubuntu apt packages below |
+| Rustup manager | Ubuntu `rustup` package; the compiler is installed through Rustup |
+| Rust compiler | OpenShell requires Rust ≥1.94; this checkout selects 1.95.0. Noble's `rustc` candidate is 1.75 |
+| Go compiler | Pinned CAA declares Go 1.26.7; Noble's `golang-go` defaults to 1.22 |
+| GitHub CLI | The guest provenance verifier needs `gh attestation verify`, absent from Noble's 2.45 package |
+| Helm, kubectl, crane, ORAS | This profile's release tools are not supplied at the required versions by the configured Noble repositories |
+
+Ubuntu's [Go package matrix](https://ubuntu.com/developers/docs/reference/availability/go/)
+and the local `apt-cache policy` output identify available versions. The Rust and
+Go requirements come from the pinned upstream sources, not extra integration
+requirements. Apt's `rustup` avoids downloading an installer script, but Rustup
+still downloads compiler components. The release downloads below retry connection
+failures and reuse checksum-verified cache entries before installation.
+
 ### Host packages
 
 Ubuntu 24.04 provides [Python 3.12](https://ubuntu.com/developers/docs/reference/availability/python/).
@@ -40,11 +59,11 @@ set -euo pipefail
 umask 077
 apt-get update
 apt-get install -y --no-install-recommends \
-  ca-certificates curl git git-lfs jq openssl python3 python3-cryptography \
+  ca-certificates curl git git-lfs jq openssl python3 python3-cryptography python3-yaml \
   tar gzip xz-utils zstd file binutils ripgrep rsync \
   docker.io docker-buildx runc cryptsetup-bin util-linux
 systemctl enable --now docker
-python3 -c 'import sys, tomllib, hashlib, cryptography; assert sys.version_info >= (3, 11); print(sys.version)'
+python3 -c 'import sys, tomllib, hashlib, cryptography, yaml; assert sys.version_info >= (3, 11); print(sys.version)'
 docker version
 ```
 
@@ -55,7 +74,7 @@ On B, install the native compiler dependencies, the Rust toolchain from
 
 ```bash
 apt-get install -y --no-install-recommends \
-  build-essential cmake pkg-config clang libclang-dev libssl-dev
+  build-essential cmake pkg-config clang libclang-dev libssl-dev rustup
 TOOL_CACHE="$PWD/artifacts/cache/host-tools"
 mkdir -p "$TOOL_CACHE"
 GO_VERSION=$(jq -er .build_outputs.caa.go_version deployment/runtime/artifacts.lock.json)
@@ -64,15 +83,17 @@ GO_SHA256=$(jq -er --arg version "go$GO_VERSION" \
   '.[] | select(.version == $version) | .files[] |
    select(.os == "linux" and .arch == "amd64" and .kind == "archive") | .sha256' \
   "$TOOL_CACHE/go-releases.json")
-curl -fL --retry 3 "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -o "$TOOL_CACHE/go.tgz"
+if ! printf '%s  %s\n' "$GO_SHA256" "$TOOL_CACHE/go.tgz" | sha256sum -c - >/dev/null 2>&1; then
+  curl -fL --connect-timeout 15 --retry 5 --retry-all-errors \
+    "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -o "$TOOL_CACHE/go.tgz"
+fi
 printf '%s  %s\n' "$GO_SHA256" "$TOOL_CACHE/go.tgz" | sha256sum -c -
 test ! -e /usr/local/go
 tar -xzf "$TOOL_CACHE/go.tgz" -C /usr/local
 printf '\nexport PATH=/usr/local/go/bin:$PATH\n' >> "$HOME/.profile"
 export PATH="/usr/local/go/bin:$PATH"
-curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs -o "$TOOL_CACHE/rustup.sh"
-sh "$TOOL_CACHE/rustup.sh" -y --profile minimal --default-toolchain 1.95.0
-. "$HOME/.cargo/env"
+rustup toolchain install 1.95.0 --profile minimal
+rustup default 1.95.0
 rustup component add --toolchain 1.95.0 rustfmt rust-src rust-analyzer clippy
 rustc --version
 go version
@@ -84,40 +105,41 @@ caches as described in [the test guide](../tests/README.md).
 
 ### Release command-line tools
 
-Install the lock-pinned Helm, kubectl, crane, yq, GitHub CLI and ORAS releases.
+Install the lock-pinned Helm, kubectl, crane, GitHub CLI and ORAS releases.
 The lock's tool hashes identify **extracted executables**, not their tarballs.
-`yq` is Mike Farah's v4 command, not Ubuntu's Python wrapper. GitHub CLI must
-provide `gh attestation verify`; ORAS/GitHub CLI are used when fetching the guest
-release binaries. Already verified cached guest binaries can be reused.
+The YAML parser comes from `python3-yaml`; no separate `yq` is required.
+GitHub CLI must provide `gh attestation verify`; ORAS/GitHub CLI are used when
+fetching the guest release binaries. Already verified cached guest binaries can be reused.
 
 ```bash
 LOCK=deployment/runtime/artifacts.lock.json
 TOOL_CACHE="$PWD/artifacts/cache/host-tools"
 mkdir -p "$TOOL_CACHE"
-for tool in helm kubectl crane yq gh oras; do
+for tool in helm kubectl crane gh oras; do
   version=$(jq -er --arg tool "$tool" '.tools[$tool].version' "$LOCK")
   member=
   case "$tool" in
     helm) url="https://get.helm.sh/helm-v${version}-linux-amd64.tar.gz"; member=linux-amd64/helm ;;
     kubectl) url="https://dl.k8s.io/release/v${version}/bin/linux/amd64/kubectl" ;;
     crane) url="https://github.com/google/go-containerregistry/releases/download/v${version}/go-containerregistry_Linux_x86_64.tar.gz"; member=crane ;;
-    yq) url="https://github.com/mikefarah/yq/releases/download/v${version}/yq_linux_amd64" ;;
     gh) url="https://github.com/cli/cli/releases/download/v${version}/gh_${version}_linux_amd64.tar.gz"; member="gh_${version}_linux_amd64/bin/gh" ;;
     oras) url="https://github.com/oras-project/oras/releases/download/v${version}/oras_${version}_linux_amd64.tar.gz"; member=oras ;;
   esac
-  curl -fL --retry 3 "$url" -o "$TOOL_CACHE/$tool.download"
-  if [[ -n "$member" ]]; then
-    tar -xzOf "$TOOL_CACHE/$tool.download" "$member" > "$TOOL_CACHE/$tool"
-  else
-    cp "$TOOL_CACHE/$tool.download" "$TOOL_CACHE/$tool"
+  expected=$(jq -er --arg tool "$tool" '.tools[$tool].sha256' "$LOCK")
+  if ! printf '%s  %s\n' "$expected" "$TOOL_CACHE/$tool" | sha256sum -c - >/dev/null 2>&1; then
+    curl -fL --connect-timeout 15 --retry 5 --retry-all-errors \
+      "$url" -o "$TOOL_CACHE/$tool.download"
+    if [[ -n "$member" ]]; then
+      tar -xzOf "$TOOL_CACHE/$tool.download" "$member" > "$TOOL_CACHE/$tool"
+    else
+      cp "$TOOL_CACHE/$tool.download" "$TOOL_CACHE/$tool"
+    fi
   fi
-  printf '%s  %s\n' "$(jq -er --arg tool "$tool" '.tools[$tool].sha256' "$LOCK")" \
-    "$TOOL_CACHE/$tool" | sha256sum -c -
+  printf '%s  %s\n' "$expected" "$TOOL_CACHE/$tool" | sha256sum -c -
   install -m 0755 "$TOOL_CACHE/$tool" /usr/local/bin/
 done
 helm version --short
 kubectl version --client
-yq --version
 gh attestation verify --help >/dev/null
 oras version
 ```

@@ -15,10 +15,6 @@
       "version": "0.21.6",
       "sha256": "f093582da0ef1130f64b063b66063b57282ba585049de3e32f7e4f2007791b1a"
     },
-    "yq": {
-      "version": "4.35.1",
-      "sha256": "bd695a6513f1196aeda17b174a15e9c351843fb1cef5f9be0af170f2dd744f08"
-    },
     "gh": {
       "version": "2.98.0",
       "sha256": "62885b97de6a0cd85e616cdd94bcda908bf5cf1018094385892b05cea3537163"
