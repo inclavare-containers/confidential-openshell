@@ -40,8 +40,11 @@
   },
   "kata_agent": {
     "version": "4.2.0",
-    "archive_url": "https://github.com/kata-containers/kata-containers/releases/download/4.2.0/kata-static-4.2.0-amd64.tar.zst",
-    "archive_sha256": "b828904fa3f1e49ddd7dc799c72cb1503cd1e772d354c3987c8d4189b2a623a8",
+    "repository": "kata-containers/kata-containers",
+    "commit": "c7351e797efff8bfc6bd73da0eb1909be12e2cfe",
+    "ref": "ghcr.io/kata-containers/cached-artefacts/agent@sha256:b47c171ea6ba896bde6d51dbbd3c6fd320b9199955956918680283b589e5c93d",
+    "archive": "kata-static-agent.tar.zst",
+    "binary_member": "./usr/bin/kata-agent",
     "binary_sha256": "f6c94d5bc5abe6492768b3d58c42e5ef02a7d5683ab547da4581d43ea0d5f6de"
   },
   "pause_image": {

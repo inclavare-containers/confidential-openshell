@@ -33,18 +33,6 @@ payload_inputs_sha256() {
 }
 input_sources_sha256="$(payload_inputs_sha256)"
 
-download() {
-    local url="$1" digest="$2" out="$3"
-    if [[ -f "${out}" && ! -L "${out}" ]] &&
-        printf '%s  %s\n' "${digest}" "${out}" | sha256sum -c - >/dev/null 2>&1; then
-        return
-    fi
-    rm -f -- "${out}.part"
-    curl -fL --retry 5 --retry-connrefused "${url}" -o "${out}.part"
-    printf '%s  %s\n' "${digest}" "${out}.part" | sha256sum -c -
-    mv -- "${out}.part" "${out}"
-}
-
 work="$(mktemp -d "${artifacts}/.guest-payload.XXXXXX")"
 trap 'rm -rf -- "${work}"' EXIT
 tree="${work}/root"
@@ -89,19 +77,24 @@ done
 agent="${KATA_AGENT_BIN:-${artifacts}/cache/kata-agent-4.2.0}"
 expected_agent="$(jq -r '.kata_agent.binary_sha256' "${lock}")"
 if [[ ! -f "${agent}" ]]; then
-    release="${artifacts}/cache/kata-static-4.2.0-amd64.tar.zst"
-    download "$(jq -r '.kata_agent.archive_url' "${lock}")" \
-        "$(jq -r '.kata_agent.archive_sha256' "${lock}")" "${release}"
+    # Follow CAA: fetch the standalone, provenance-verified official OCI agent.
+    command -v oras >/dev/null
+    command -v gh >/dev/null
+    reference="$(jq -r '.kata_agent.ref' "${lock}")"
+    test "$(jq -r '.kata_agent.commit' "${lock}")" = \
+        "$(jq -r '."kata-containers".base' "${root}/deployment/build/sources.lock.json")"
     mkdir -p "${work}/kata"
-    tar -I zstd -xf "${release}" -C "${work}/kata"
-    matches=()
-    while IFS= read -r -d '' candidate; do
-        if printf '%s  %s\n' "${expected_agent}" "${candidate}" | sha256sum -c - >/dev/null 2>&1; then
-            matches+=("${candidate}")
-        fi
-    done < <(find "${work}/kata" -type f -name kata-agent -print0)
-    (( ${#matches[@]} == 1 )) || { echo 'Kata release contains no unique matching agent' >&2; exit 1; }
-    install -m 0755 "${matches[0]}" "${artifacts}/cache/kata-agent-4.2.0"
+    (
+        cd "${work}/kata"
+        "${source_dir}/hack/verify-provenance.sh" -s -a "${reference}" \
+            -r "$(jq -r '.kata_agent.repository' "${lock}")" \
+            -d "$(jq -r '.kata_agent.commit' "${lock}")"
+        oras pull "${reference}"
+        tar -I zstd -xOf "$(jq -r '.kata_agent.archive' "${lock}")" \
+            "$(jq -r '.kata_agent.binary_member' "${lock}")" > kata-agent
+        printf '%s  %s\n' "${expected_agent}" kata-agent | sha256sum -c -
+        install -m 0755 kata-agent "${artifacts}/cache/kata-agent-4.2.0"
+    )
     agent="${artifacts}/cache/kata-agent-4.2.0"
 fi
 printf '%s  %s\n' "${expected_agent}" "${agent}" | sha256sum -c -
