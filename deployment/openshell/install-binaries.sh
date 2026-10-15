@@ -8,11 +8,12 @@ install -d -m 0700 /var/lib/openshell-confidential/downloads
 for release in gateway cli; do
   release_download "$release" "/var/lib/openshell-confidential/downloads/$release.tar.gz"
 done
-tar -xzf /var/lib/openshell-confidential/downloads/gateway.tar.gz \
+tar --no-same-owner -xzf /var/lib/openshell-confidential/downloads/gateway.tar.gz \
   -C /usr/local/bin openshell-gateway
-tar -xzf /var/lib/openshell-confidential/downloads/cli.tar.gz \
+tar --no-same-owner -xzf /var/lib/openshell-confidential/downloads/cli.tar.gz \
   -C /usr/local/bin openshell
 chmod 0755 /usr/local/bin/openshell-gateway /usr/local/bin/openshell
+chown root:root /usr/local/bin/openshell-gateway /usr/local/bin/openshell
 (cd "$HANDOFF" && sha256sum -c SHA256SUMS)
 install -m 0755 "$HANDOFF/outputs/openshell-driver-confidential-kubernetes" \
   /usr/local/bin/openshell-driver-confidential-kubernetes
