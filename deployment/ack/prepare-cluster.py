@@ -1,10 +1,31 @@
 #!/usr/bin/env python3
-"""Create/select ACK, download private kubeconfig and check the worker profile."""
+"""Create/select ACK, obtain kubeconfig and check the worker profile."""
 import argparse
 import json
 import os
+import subprocess
 
 from cloud import Cloud, OPERATOR, require, run, write
+
+
+def kubectl(env, *args):
+    command = ['kubectl', '--request-timeout=10s', *args]
+    try:
+        return run(command, env=env, capture_output=True, timeout=30).stdout
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or '').strip() or f'kubectl exited with status {exc.returncode}.'
+    except subprocess.TimeoutExpired as exc:
+        stderr = exc.stderr or ''
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode(errors='replace')
+        detail = 'kubectl did not complete within 30 seconds.\n' + stderr.strip()
+    raise SystemExit(
+        f'ACK Kubernetes API request failed (kubeconfig: {env["KUBECONFIG"]}):\n{detail}\n'
+        'For public API timeouts, check TCP 6443 and the API load balancer ACL/security group '
+        'against the operator network egress IP. Private API access requires a routed connection.\n'
+        'See deployment/ack/README.md#api-connectivity. Keep ack.json and ack-state.json; '
+        'repeat this step after fixing access to resume the existing cluster.'
+    ) from None
 
 
 def cluster_request(config, region, vpc, pod_switch):
@@ -128,19 +149,16 @@ def main():
     path = OPERATOR / 'administrator-kubeconfig'
     write(path, kubeconfig['config'])
     env = {**os.environ, 'KUBECONFIG': str(path)}
-    cloud.wait('Ready ACK workers', lambda: json.loads(run(['kubectl', 'get', 'nodes', '-o', 'json'],
-               env=env, capture_output=True).stdout),
+    nodes = cloud.wait('Ready ACK workers', lambda: json.loads(kubectl(env, 'get', 'nodes', '-o', 'json')),
                lambda d: bool(d['items']) and all(any(c['type'] == 'Ready' and c['status'] == 'True'
                for c in n['status'].get('conditions', [])) for n in d['items']))
-    nodes = json.loads(run(['kubectl', 'get', 'nodes', '-o', 'json'], env=env, capture_output=True).stdout)
     validate_nodes(nodes)
-    network = json.loads(run(['kubectl', '-n', 'kube-system', 'get', 'configmap', 'eni-config', '-o', 'json'],
-                             env=env, capture_output=True).stdout)
+    network = json.loads(kubectl(env, '-n', 'kube-system', 'get', 'configmap', 'eni-config', '-o', 'json'))
     eni = json.loads(network['data']['eni_conf'])
     require(str(eni.get('disable_network_policy', False)).lower() == 'false',
             'Terway NetworkPolicy is disabled. See deployment/ack/README.md.')
     cloud.save(zone_id=nodes['items'][0]['metadata']['labels']['topology.kubernetes.io/zone'])
-    run(['kubectl', 'get', 'nodes', '-o', 'wide'], env=env)
+    print(kubectl(env, 'get', 'nodes', '-o', 'wide'), end='')
     print(f'ACK ready: {cluster} ({config["ack_api_access"]} API). Kubeconfig is valid for up to 3 days; repeat to renew it.')
 
 

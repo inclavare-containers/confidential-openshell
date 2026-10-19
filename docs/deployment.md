@@ -110,6 +110,9 @@ To reuse a private bucket, add `--oss-bucket NAME_FROM_OSS`.
 
 The [input reference](../deployment/ack/README.md) explains every field and its
 source. `--replace` regenerates an input file only before cloud setup starts.
+The selected API endpoint must allow the operator's connection. For public access,
+check any API load balancer whitelist against the operator's actual NAT/proxy
+egress IP; this can differ from `HOST_IP`. See [API connectivity](../deployment/ack/README.md#api-connectivity).
 
 ### Prepare the selected ACK cluster
 
@@ -140,6 +143,9 @@ Cluster creation enables deletion protection. The default is one worker.
 Both paths save resources in `$OPERATOR_DIR/ack-state.json`. Keep this state when
 retrying. The kubeconfig lasts up to three days; repeat the cluster step
 to renew it. Use a separate operator directory/name for a different deployment.
+If a Kubernetes API request fails, the script prints the error and exits. Fix
+connectivity or credentials, then repeat the same command to resume. A running
+control plane alone does not establish API reachability from the operator host.
 
 ### Prepare the PodVM network
 

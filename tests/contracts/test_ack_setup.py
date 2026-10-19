@@ -148,8 +148,8 @@ class CloudFixture:
             data = self.nodes
         return subprocess.CompletedProcess(args, 0, json.dumps(data), '')
 
-    def prepare(self, *args):
-        with patch.object(sys, 'argv', ['prepare-cluster.py', *args]), patch.object(cluster, 'run', self.kubectl):
+    def prepare(self, *args, runner=None):
+        with patch.object(sys, 'argv', ['prepare-cluster.py', *args]), patch.object(cluster, 'run', runner or self.kubectl):
             cluster.main()
 
     def state(self):
@@ -192,7 +192,12 @@ class Setup(CloudFixture, unittest.TestCase):
         self.assertEqual(self.calls, [])
         cloud.write(self.operator / 'worker-key', 'private key fixture')
         cloud.write(self.operator / 'worker-key.pub', 'public key fixture')
-        self.prepare('--create')
+        def blocked_api(args, **kwargs):
+            raise subprocess.CalledProcessError(1, args, stderr='Unable to connect to the server: context deadline exceeded')
+        with self.assertRaisesRegex(SystemExit, 'context deadline exceeded') as failure:
+            self.prepare('--create', runner=blocked_api)
+        self.assertIn('TCP 6443', str(failure.exception))
+        self.assertEqual(self.state()['nodepool_id'], 'np-test')
         self.prepare('--create')
         creates = [args['body'] for op, args in self.calls if op == 'CreateCluster']
         self.assertEqual(len(creates), 1)
@@ -202,6 +207,17 @@ class Setup(CloudFixture, unittest.TestCase):
         pools = [args['body'] for op, args in self.calls if op == 'CreateClusterNodePool']
         self.assertEqual(len(pools), 1)
         self.assertEqual(pools[0]['scaling_group']['image_id'], 'ubuntu-ack')
+
+    def test_kubectl_deadline_is_bounded_and_reports_how_to_resume(self):
+        env = {'KUBECONFIG': str(self.operator / 'administrator-kubeconfig')}
+        error = subprocess.TimeoutExpired(['kubectl'], 30, stderr=b'dial tcp: i/o timeout')
+        with patch.object(cluster, 'run', side_effect=error) as command:
+            with self.assertRaisesRegex(SystemExit, 'within 30 seconds') as failure:
+                cluster.kubectl(env, 'get', 'nodes', '-o', 'json')
+        self.assertIn('ack-state.json', str(failure.exception))
+        self.assertIn('dial tcp: i/o timeout', str(failure.exception))
+        self.assertEqual(command.call_args.kwargs['timeout'], 30)
+        self.assertIn('--request-timeout=10s', command.call_args.args[0])
 
     def test_rrsa_enable_requires_explicit_flag(self):
         self.detail['rrsa_config']['enabled'] = False
