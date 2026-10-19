@@ -48,9 +48,11 @@ def main():
     require(image_id, 'Missing ImageID in the selected handoff.')
 
     def get_image():
-        rows = cloud.api('ecs', 'DescribeImages', RegionId=cloud.region, ImageId=image_id)['Images']['Image']
+        rows = cloud.api('ecs', 'DescribeImages', RegionId=cloud.region, ImageId=image_id,
+                         Status='ALL')['Images']['Image']
         require(len(rows) == 1, 'ImageID not found in the selected region.')
-        require(rows[0]['Status'] not in ('ImportFailed', 'UnAvailable'), 'ECS image import failed; inspect its task in ECS.')
+        require(rows[0]['Status'] not in ('ImportFailed', 'CreateFailed', 'UnAvailable'),
+                'ECS image import failed; inspect its task in ECS.')
         return rows[0]
 
     image = cloud.wait('ECS image import', get_image, lambda d: d['Status'] == 'Available')

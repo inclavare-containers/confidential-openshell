@@ -322,7 +322,16 @@ class Setup(CloudFixture, unittest.TestCase):
         cloud.write(self.handoff / 'outputs/guest.qcow2', 'qcow fixture')
         self.inputs()
         cloud.Cloud().save(oss_bucket='private-test', image_import_role_arn='arn-import')
-        with patch.object(sys, 'argv', ['prepare-image.py']), patch.object(cloud.Cloud, 'oss', return_value='') as upload:
+        original_api = self.api
+        states = iter(('Creating', 'Available', 'Available'))
+        def importing_api(client, product, operation, **args):
+            response = original_api(product, operation, **args)
+            if operation == 'DescribeImages':
+                self.assertEqual(args['Status'], 'ALL')
+                response['Images']['Image'][0]['Status'] = next(states)
+            return response
+        with patch.object(sys, 'argv', ['prepare-image.py']), patch.object(cloud.Cloud, 'oss', return_value='') as upload, \
+                patch.object(cloud.Cloud, 'api', importing_api), patch.object(cloud.time, 'sleep'):
             image.main()
             image.main()
         upload.assert_called_once()
@@ -334,6 +343,13 @@ class Setup(CloudFixture, unittest.TestCase):
         binding = cloud.read(self.operator / 'podvm-image.json')
         self.assertEqual(binding['image_id'], 'm-imported')
         self.assertEqual(binding['references_sha256'], cloud.sha256(self.handoff / 'outputs/refs.json'))
+
+    def test_failed_image_import_does_not_produce_a_ready_binding(self):
+        self.ecs_image['Status'] = 'CreateFailed'
+        with patch.object(sys, 'argv', ['prepare-image.py']):
+            with self.assertRaisesRegex(SystemExit, 'image import failed'):
+                image.main()
+        self.assertFalse((self.operator / 'podvm-image.json').exists())
 
     def test_existing_image_rejects_bad_metadata_and_tampered_handoff(self):
         with patch.object(sys, 'argv', ['prepare-image.py']):
