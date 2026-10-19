@@ -37,6 +37,7 @@ name = "cc_kbc"
 url = "{endpoint}"
 kbs_cert = """\n{ca}\n"""
 [image]
+work_dir = "/var/lib/confidential-containers/image"
 extra_root_certificates = ["""\n{ca}\n"""]
 '''
     policy = "package agent_policy\nimport rego.v1\ndefault allow := false\n"

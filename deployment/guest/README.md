@@ -14,6 +14,10 @@ workspace initializer; `systemd-timesyncd` with Alibaba NTP corrects the ECS RTC
 before KBS authentication. AA/CDH daemon sources are unchanged. The upstream
 container-facing REST path is disabled because this profile uses native ttRPC.
 
+CDH's native `image.work_dir` points to `/var/lib/confidential-containers/image`.
+The verified UKI's `systemd.volatile=state` keeps `/var` in guest memory. This gives
+the Community image room to unpack without filling the smaller `/run` tmpfs.
+
 Prepare the locked sources as described in [build preparation](../../docs/build.md),
 then run:
 
