@@ -3,6 +3,10 @@
   "platform": "linux/amd64",
   "openshell_version": "0.1.3",
   "tools": {
+    "aliyun": {
+      "version": "3.5.1",
+      "sha256": "471dd70d8242d877a92358390a19ceda55c0903cac4cc9a742b2fe3726dc5f95"
+    },
     "helm": {
       "version": "3.18.4",
       "sha256": "84d06a0f5ba17fd9c4d9912613453cdaa95a4f59c8baf20c195b74310b009ea6"

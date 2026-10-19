@@ -44,70 +44,105 @@ The [architecture](architecture.md) explains the trusted host boundary.
 
 ## 3. Prepare cluster, select the cloud image and configure identities
 
-### Create or select ACK
-
-Follow the [ACK creation guide](https://www.alibabacloud.com/help/en/ack/ack-managed-and-ack-dedicated/user-guide/create-an-ack-managed-cluster)
-and use Terway shared ENI, RRSA, and enforced ingress/egress NetworkPolicy.
-Workers need containerd and `supplementalGroupsPolicy` support. The tested profile
-uses Kubernetes 1.36 and containerd 2.3.4. Its version 3 input configuration is
-normalized to version 4 by `containerd config dump`.
-
-Download the administrator kubeconfig from ACK's connection page into
-`$OPERATOR_DIR/administrator-kubeconfig`, then check cluster access:
+### Install cloud tools and set the deployment inputs
 
 ```bash
-export KUBECONFIG="$OPERATOR_DIR/administrator-kubeconfig"
-chmod 0600 "$KUBECONFIG"
-kubectl get nodes -o wide
-kubectl get nodes -o json | jq -e '.items | length > 0'
-kubectl get nodes -o json | jq -e 'all(.items[];
-  .status.features.supplementalGroupsPolicy == true and
-  (.status.nodeInfo.containerRuntimeVersion | startswith("containerd://")) and
-  any(.status.conditions[]; .type == "Ready" and .status == "True"))'
+bash deployment/ack/install-tools.sh
+aliyun configure
+install -d -m 0700 "$OPERATOR_DIR"
+cp deployment/ack/ack.example.json "$OPERATOR_DIR/ack.json"
+chmod 0600 "$OPERATOR_DIR/ack.json"
+${EDITOR:-vi} "$OPERATOR_DIR/ack.json"
 ```
 
-Create a dedicated PodVM vSwitch and security group in the cluster VPC. Select a
-TDX instance type, such as `ecs.g9i.xlarge`, in a zone with available capacity.
-Configure worker–PodVM VXLAN connectivity using the
-[Alibaba PeerPods guide](https://confidentialcontainers.org/docs/examples/alibaba-cloud-simple/).
-Allow the approved private clients to reach this host on registry 5000, KBS 8443
-and Gateway 9443. Restrict SSH separately.
+The installer downloads checksum-pinned Alibaba Cloud CLI from the official China
+CDN. `aliyun configure` sets the operator's cloud credentials; an existing profile
+or instance role can be used instead. Set `ALIBABA_CLOUD_PROFILE` to select a named
+profile. These credentials stay on this host and are never placed in Helm values.
+
+Choose a unique deployment `name`, the service host's security group, and a private
+OSS bucket in the handoff's region if importing QCOW2. Choose unused PodVM and Pod
+vSwitch CIDRs within the VPC, or supply existing vSwitch IDs. Region comes from
+`$HANDOFF/selection.json`. See the [input reference](../deployment/ack/README.md)
+for the few fields that differ between existing and new clusters.
+
+### Select an existing ACK cluster
+
+Set `cluster_id` in `ack.json`, then run:
+
+```bash
+python3 deployment/ack/prepare-cluster.py
+export KUBECONFIG="$OPERATOR_DIR/administrator-kubeconfig"
+```
+
+The script reads the VPC, worker security group and RRSA OIDC identity, obtains a
+private administrator kubeconfig, and checks Ready workers, containerd,
+`supplementalGroupsPolicy` and Terway's NetworkPolicy configuration. Existing
+workers must already meet these requirements. If RRSA is disabled, run the same
+command with `--enable-rrsa`; that explicitly updates the existing cluster.
+
+### Or create a new ACK cluster
+
+Leave `cluster_id` empty and set `worker_vswitch_id`. Review the Kubernetes and
+containerd versions, worker instance type/count and non-overlapping service/Pod
+CIDRs. The default is one Ubuntu 24.04 worker. Run:
+
+```bash
+python3 deployment/ack/prepare-cluster.py --create
+export KUBECONFIG="$OPERATOR_DIR/administrator-kubeconfig"
+```
+
+This creates a **paid ACK Pro cluster and pay-as-you-go workers**, with a private
+API endpoint, Terway shared ENI, NetworkPolicy and RRSA. It selects the matching
+Ubuntu worker image from ACK metadata and creates an operator SSH key under
+`$OPERATOR_DIR/worker-key`. It waits for workers and runs the same checks as the
+existing-cluster path. The kubeconfig lasts up to three days; repeat this step to
+renew it. Cluster creation enables deletion protection.
+
+Both paths record resources in `$OPERATOR_DIR/ack-state.json`. Keep that file when
+retrying. Complete `ack.json` before the first command; use a separate operator
+directory and deployment name for a different deployment.
+
+### Prepare the PodVM network
+
+```bash
+python3 deployment/ack/prepare-network.py
+```
+
+Creates or selects the dedicated PodVM vSwitch in the worker VPC/zone and creates
+a dedicated security group. It permits worker–PodVM tunnel traffic between their
+security groups, SSH from this host to workers, and private registry 5000, KBS 8443
+and Gateway 9443 access from the worker/PodVM groups. The service host must be in
+the same VPC. Operator-to-host SSH access is managed separately.
 
 ### Confirm or import the PodVM image
 
-Read the selected region and image from `$HANDOFF/selection.json`. For an existing
-image, check its release identity and references. For a new QCOW2, upload the
-verified handoff output to private OSS and follow
-[ECS custom-image import](https://www.alibabacloud.com/help/en/ecs/user-guide/import-a-custom-image).
-
-Both routes require an `Available` Linux/x86_64 image with UEFI and NVMe support.
-Import QCOW2 as Ubuntu/Linux with a system disk of at least 20 GiB. The PeerPods
-example requests 40 GiB. CAA enables TDX during VM creation; image import has no
-TPM setting. Record the confirmed ImageID:
-
 ```bash
-printf '%s\n' YOUR_CONFIRMED_IMAGE_ID > "$OPERATOR_DIR/podvm-image-id.txt"
+python3 deployment/ack/prepare-image.py
 ```
 
-Keep the region, ImageID and authenticated reference checksum together. An image
-copied to another region needs its destination ImageID recorded separately.
+Verifies the handoff checksums. For a selected ImageID it checks the ECS image; for
+a new QCOW2 it uploads a private OSS object, imports the image and waits until it
+is Available. Both paths require Linux/x86_64, UEFI and NVMe support. Import uses
+Ubuntu/Linux and a 20 GiB system disk; PeerPods later requests 40 GiB. CAA enables
+TDX when creating the VM.
+
+Outputs: `podvm-image-id.txt` and `podvm-image.json` in `$OPERATOR_DIR`. The latter
+binds region and ImageID to the approved handoff and reference checksums. Existing
+image/reference provenance still needs approval in step 2; ECS metadata cannot
+prove that binding. A cross-region image copy needs its destination ImageID.
 
 ### Configure RAM roles
 
-Enable [RRSA](https://www.alibabacloud.com/help/en/ack/ack-managed-and-ack-dedicated/user-guide/use-rrsa-to-authorize-pods-to-access-different-cloud-services)
-and obtain the OIDC provider ARN and issuer. Copy the four
-[RAM templates](../deployment/ack/ram/) into the private operator directory.
-Fill in account, region, cluster, OIDC, vSwitch and ownership tags, then create
-these separate roles and attach only their corresponding permissions:
+```bash
+python3 deployment/ack/configure-identities.py
+```
 
-| Role | ServiceAccounts |
-| --- | --- |
-| CAA/controller | `cloud-api-adaptor`, `peerpodctrl-controller-manager` in `confidential-containers-system` |
-| CSI | `caa-csi-block` in `caa-csi-block` |
-
-The CAA role needs `vpc:DescribeVSwitchAttributes` on the configured vSwitch.
-Use the same role ARNs, OIDC identity and ownership tags in the Helm values below.
-Do not put access keys in Helm values or grant cloud creation permissions to node Pods.
+Renders the maintained [RAM templates](../deployment/ack/ram/) with the discovered
+account, OIDC identity, cluster and vSwitch. Creates separate CAA/controller and CSI
+roles, attaches their scoped permissions, and records the role ARNs. It reuses an
+existing role only when ownership and policies match. No access keys are passed
+to Kubernetes. Step 7 generates Helm values from these saved results.
 
 ## 4. Install Trustee and register the approved image references
 
@@ -237,19 +272,15 @@ A compatible existing cert-manager installation can be used instead.
 ### Configure and install PeerPods
 
 ```bash
-cp deployment/peerpods/peerpods-values.example.yaml "$OPERATOR_DIR/peerpods-values.yaml"
-${EDITOR:-vi} "$OPERATOR_DIR/peerpods-values.yaml"
+python3 deployment/peerpods/configure-values.py
+cat "$OPERATOR_DIR/peerpods-values.yaml"
+cat "$OPERATOR_DIR/csi-values.yaml"
 ```
 
-Fill in these deployment-specific values:
-
-| Values | Source |
-| --- | --- |
-| CAA, controller, kata-deploy and pause images | Digest records from step 6 |
-| Webhook, kubectl and CSI sidecar images | Their mirror digest records from step 6 |
-| ImageID, region, VPC, vSwitch, security group and TDX instance type | Step 3 |
-| RRSA role/OIDC and ownership tags | Step 3; match RAM restrictions |
-| `INITDATA` | `gzip -n -c /etc/openshell-confidential/guest-initdata-base.toml \| base64 -w0` |
+This fills in the saved cloud identities and network settings, selected PodVM
+ImageID, published image digests and base initdata. It generates both PeerPods and
+CSI values. Review the files before installing; edit private copies if needed.
+The script refuses existing values unless `--replace` is explicitly given.
 
 Label each intended worker, then install:
 
@@ -296,8 +327,6 @@ The handler must be `kata-remote`, with overhead `cpu: 250m`, `memory: 120Mi`.
 ### Configure and install CSI
 
 ```bash
-cp deployment/peerpods/csi-values.example.yaml "$OPERATOR_DIR/csi-values.yaml"
-${EDITOR:-vi} "$OPERATOR_DIR/csi-values.yaml"
 bash deployment/peerpods/install-csi.sh
 ```
 

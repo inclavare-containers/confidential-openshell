@@ -7,7 +7,7 @@ source /etc/os-release
 [[ $ID == ubuntu && $VERSION_ID == 24.04 && $(uname -m) == x86_64 ]] || die 'This recipe requires Ubuntu 24.04 on amd64.'
 role=${1:-build}
 case "$role" in build|service) ;; *) die "$usage" ;; esac
-packages=(ca-certificates curl git git-lfs jq openssl python3 python3-cryptography python3-yaml
+packages=(ca-certificates curl git git-lfs jq openssl openssh-client python3 python3-cryptography python3-yaml
     tar gzip xz-utils zstd file binutils ripgrep rsync docker.io docker-buildx runc cryptsetup-bin util-linux)
 if [[ $role == build ]]; then
     packages+=(build-essential cmake pkg-config clang libclang-dev libssl-dev rustup)
