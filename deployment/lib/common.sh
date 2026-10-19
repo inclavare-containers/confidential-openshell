@@ -51,7 +51,6 @@ build_tags() {
     CAA_TAG="caa-$(jq -er '."cloud-api-adaptor".result_tree[:8]' deployment/build/sources.lock.json)"
     CSI_TAG="csi-$(jq -er '."caa-csi-block-driver".result_tree[:8]' deployment/build/sources.lock.json)"
     PEERPOD_CTRL_TAG=$(jq -er .build_outputs.peerpod_ctrl.tag "$LOCK")
-    AGENT_TAG="confidential-opencode:$(jq -er .version deployment/agent/agent.lock.json)"
 }
 load_selection() {
     local selection="$HANDOFF/selection.json"
@@ -62,7 +61,4 @@ load_selection() {
     CAA_TAG=$(jq -er .caa_tag "$selection")
     CSI_TAG=$(jq -er .csi_tag "$selection")
     PEERPOD_CTRL_TAG=$(jq -er .peerpod_ctrl_tag "$selection")
-    AGENT_TAG=$(jq -er .agent_tag "$selection")
-    AGENT_IMAGE_ID=$(jq -er .agent_image_id "$selection")
-    AGENT_CONFIG_DIGEST=$(jq -er .agent_config_digest "$selection")
 }

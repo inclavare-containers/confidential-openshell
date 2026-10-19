@@ -2,7 +2,8 @@
 
 Confidential OpenShell runs the unmodified OpenShell v0.1.3 Gateway, CLI and
 supervisor with an external confidential Kubernetes ComputeDriver. The coding
-workload image combines released Python/OpenCode binaries.
+workload uses the unmodified, digest-pinned OpenShell Community base image,
+which includes OpenCode, Codex, Claude Code and their developer tools.
 The guest uses the official Ubuntu mkosi/UKI flow and released CoCo 0.22 AA/CDH;
 Trustee 0.22 provides appraisal and key release. Integration hooks add measured
 OpenShell bootstrap and encrypted persistent workspaces. Native OpenShell owns

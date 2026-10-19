@@ -57,7 +57,7 @@
   },
   "images": {
     "sandbox": "ghcr.io/nvidia/openshell/sandbox@sha256:e939e4672da34d4f6eb2d649d0a5c6a0d7b782b95c2f433e986ec35550ced631",
-    "workload_python": "docker.io/library/python@sha256:2b4f19dae3a777dfc3b76730bda1e82e1f66ab2a2686fa93ca78edbfb4f04ffe",
+    "workload": "ghcr.io/nvidia/openshell-community/sandboxes/base@sha256:c2a43bb0d765774e2790b3babfb20997bb2eac7b4bf4c6d7d8661e99817bf904",
     "pause": "registry.k8s.io/pause@sha256:8d4106c88ec0bd28001e34c975d65175d994072d65341f62a8ab0754b0fafe10",
     "supervisor": "ghcr.io/nvidia/openshell/supervisor@sha256:1da55431d1b36e71ac881a93edd5b6743d179faf9b008a31963d2c3db50637a9",
     "trustee_as": "ghcr.io/confidential-containers/attestation-service@sha256:5b3908adfc47568ec24ab4a88a0e0bf3c8fe0a47d4c44ebfa08c16c86eebc890",

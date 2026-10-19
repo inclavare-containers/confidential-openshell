@@ -1,142 +1,197 @@
-# First agent on a confidential gateway
+# Run coding harnesses
 
-Use the official OpenShell v0.1.3 CLI on trusted host T after
-[deployment](deployment.md). OpenCode runs in the workload guest; native supervisor
-egress supplies provider credentials to the approved endpoint.
+The deployment uses the unmodified, digest-pinned OpenShell Community base image
+as the driver's default workload image. It includes OpenCode, Codex, Claude Code,
+Python and Git. No harness image build or `--from` argument is needed.
 
-## 1. Set the connection inputs
+Use native OpenShell v0.1.3 `sandbox create` and `sandbox connect`. Attach
+providers explicitly with `--provider`.
 
-The administrator supplies the Gateway/workspace, a digest-pinned agent image,
-an existing provider with the `confidential-opencode` profile, and a model that
-supports chat completions and tool calling. Choose a unique sandbox name of at
-most 19 characters.
+## 1. Select the Gateway and workspace
+
+Run on trusted host T after [deployment](deployment.md), using the official CLI
+and the operator identity configured there:
 
 ```bash
-set -euo pipefail
-umask 077
-cd /opt/confidential-openshell
-GATEWAY=REPLACE_WITH_GATEWAY
-WORKSPACE=REPLACE_WITH_WORKSPACE
-AGENT_IMAGE=REPLACE_WITH_REPOSITORY_AT_SHA256
-PROVIDER=REPLACE_WITH_PROVIDER_NAME
-AGENT_MODEL=confidential/REPLACE_WITH_MODEL_ID
-SANDBOX=REPLACE_WITH_UNIQUE_NAME
-OPERATOR_DIR=/var/lib/openshell-confidential/operator
+export XDG_CONFIG_HOME=/var/lib/openshell-confidential/cli-config
+export OPENSHELL_LOCAL_TLS_DIR=/var/lib/openshell-confidential/tls
+export OPENSHELL_GATEWAY=confidential-local
+export OPENSHELL_WORKSPACE=default
+export OPENSHELL_SANDBOX_POLICY=/opt/confidential-openshell/deployment/harness/policy.yaml
 export OPENSHELL_PROVISION_TIMEOUT=900
 export OPENSHELL_LIFECYCLE_TIMEOUT=900
-case "$AGENT_IMAGE" in *@sha256:*) ;; *) exit 1 ;; esac
 openshell --version
+openshell whoami --output json
 ```
 
-The CLI defaults to 300 seconds. The bounded 900-second settings allow first-use
-whole-disk checks and encryption setup; workers also need the runbook's
-`create_container_timeout=600`. The [pinned upstream guide](https://github.com/NVIDIA/OpenShell/blob/e1f3c82caa3ed3b65de22889ae7ef32a774878ef/docs/about/run-your-first-agent.mdx)
-uses the same image/provider/command flow.
+Use a unique sandbox name of at most 19 characters. First creation includes guest
+startup, attestation and workspace initialization. Later starts reuse the files.
 
-## 2. Match the provider configuration
+The pinned Community image contains a policy in an older schema. The native
+`OPENSHELL_SANDBOX_POLICY` setting selects the supplied restrictive policy instead;
+attached providers supply approved network access. The image stays unchanged.
 
-Create private copies of the endpoint/model templates. Match the HTTPS hostname,
-port, API path and model to the installed provider.
+## 2. Configure the model provider
+
+The administrator creates providers once; users attach their names when creating
+sandboxes. Existing suitable providers can be reused.
+
+For OpenCode and Codex, copy the [OpenAI-compatible profile](../deployment/harness/openai-compatible.example.yaml)
+to a private location and set its exact approved HTTPS host and port. The endpoint
+must support Chat Completions for OpenCode and Responses for Codex.
+Codex needs Responses tool calling, including the next request carrying tool
+output; check that the chosen model supports this complete exchange.
 
 ```bash
-CONFIG_DIR="$OPERATOR_DIR/agent-config/$SANDBOX"
-test ! -e "$CONFIG_DIR"
-install -d -m 0700 "$CONFIG_DIR"
-install -m 0600 deployment/agent/provider-profile.example.yaml "$CONFIG_DIR/profile.yaml"
-install -m 0600 deployment/agent/opencode.example.json "$CONFIG_DIR/opencode.json"
-${EDITOR:-vi} "$CONFIG_DIR/profile.yaml" "$CONFIG_DIR/opencode.json"
-openshell --gateway "$GATEWAY" --workspace "$WORKSPACE" profile lint --file "$CONFIG_DIR/profile.yaml"
-openshell --gateway "$GATEWAY" --workspace "$WORKSPACE" profile describe confidential-opencode --output json
-openshell --gateway "$GATEWAY" --workspace "$WORKSPACE" provider list --output json
+install -d -m 0700 /var/lib/openshell-confidential/operator/harness
+cd /opt/confidential-openshell
+CONFIG_DIR=/var/lib/openshell-confidential/operator/harness
+install -m 0600 deployment/harness/openai-compatible.example.yaml "$CONFIG_DIR/openai.yaml"
+${EDITOR:-vi} "$CONFIG_DIR/openai.yaml"
+openshell profile lint --file "$CONFIG_DIR/openai.yaml"
+openshell profile import --file "$CONFIG_DIR/openai.yaml"
+# OPENAI_API_KEY must already be set in the administrator's private environment.
+openshell provider create --name coding-openai --type coding-openai --from-existing
 ```
 
-Check the provider name/type and `OPENAI_API_KEY` credential environment. Follow
-`next_page_token` with `--page-token` when listing providers. If the provider is
-absent, the administrator imports the profile and creates it from the credential
-already in their private environment:
+For Claude Code, use the [Anthropic-compatible profile](../deployment/harness/anthropic-compatible.example.yaml)
+and an endpoint that supports Anthropic Messages:
 
 ```bash
-openshell --gateway "$GATEWAY" --workspace "$WORKSPACE" profile import --file "$CONFIG_DIR/profile.yaml"
-openshell --gateway "$GATEWAY" --workspace "$WORKSPACE" provider create \
-  --name "$PROVIDER" --type confidential-opencode --from-existing
+install -m 0600 deployment/harness/anthropic-compatible.example.yaml "$CONFIG_DIR/anthropic.yaml"
+${EDITOR:-vi} "$CONFIG_DIR/anthropic.yaml"
+openshell profile lint --file "$CONFIG_DIR/anthropic.yaml"
+openshell profile import --file "$CONFIG_DIR/anthropic.yaml"
+# ANTHROPIC_API_KEY must already be set in the administrator's private environment.
+openshell provider create --name coding-anthropic --type coding-anthropic --from-existing
 ```
 
-Keep `{env:OPENAI_API_KEY}` in `opencode.json`. OpenShell puts a placeholder in the
-workload and resolves it at supervisor egress. The profile permits OpenCode's
-executable at the configured endpoint; credentials stay out of configs and images.
+Keep API keys out of image layers, configuration files and launch arguments.
+OpenShell supplies credential placeholders and resolves them at the supervisor's
+approved egress endpoint. User environment configuration follows the sealed
+workload bootstrap path after attestation; Kubernetes objects do not carry its
+plaintext. Reserved `OPENSHELL_` variables remain driver-managed.
 
-## 3. Create and attach
+The profile paths match the pinned Community image. Recheck executable paths
+when changing that image; granting network access to a general interpreter is
+unnecessary for these native clients.
+
+## 3. Start a harness
+
+Choose one of the following. Set `MODEL` to a model supported by the endpoint and
+choose a different `SANDBOX` name for each instance. These commands start the
+harness as the sandbox's main process. Remove `--detach` to attach immediately.
+
+### OpenCode
+
+Copy the [OpenCode configuration](../deployment/harness/opencode.example.json),
+then set its base URL and model entry. Keep `{env:OPENAI_API_KEY}` as written.
 
 ```bash
-timeout 930s openshell --gateway "$GATEWAY" --workspace "$WORKSPACE" sandbox create \
-  --name "$SANDBOX" --from "$AGENT_IMAGE" --provider "$PROVIDER" --no-auto-providers --tty --detach \
+install -m 0600 deployment/harness/opencode.example.json "$CONFIG_DIR/opencode.json"
+${EDITOR:-vi} "$CONFIG_DIR/opencode.json"
+SANDBOX=opencode-demo
+MODEL=REPLACE_WITH_MODEL_ID
+PROVIDER=coding-openai
+openshell sandbox create --name "$SANDBOX" --provider "$PROVIDER" --tty --detach \
   --env "OPENCODE_CONFIG_CONTENT=$(jq -c . "$CONFIG_DIR/opencode.json")" \
-  -- /usr/local/bin/opencode -m "$AGENT_MODEL"
-STATE=$(openshell --gateway "$GATEWAY" --workspace "$WORKSPACE" sandbox get "$SANDBOX" --output json)
-jq -e '.phase == "Ready" and .configuration_admission.state == "accepted"' <<< "$STATE"
-SANDBOX_ID=$(jq -er .id <<< "$STATE")
-openshell --gateway "$GATEWAY" --workspace "$WORKSPACE" sandbox provider status "$SANDBOX" "$PROVIDER" \
-  --wait --timeout 30 --output json
-openshell --gateway "$GATEWAY" --workspace "$WORKSPACE" sandbox connect "$SANDBOX"
+  --env OPENCODE_DISABLE_MODELS_FETCH=true \
+  -- opencode -m "approved/$MODEL"
 ```
 
-Require provider target `ready` and `wait_outcome=complete`, with matching installed
-epochs/revisions. `--no-auto-providers` can skip a missing provider; creation alone
-does not prove attachment. A timeout can leave resources allocated, so delete
-before retrying. Ctrl-P then Ctrl-Q detaches without stopping the main process.
+### Codex
 
-Ordinary `--env` values, including `OPENCODE_CONFIG_CONTENT`, are delivered through the
-sealed workload configuration after attestation. They stay out of Kubernetes Pod env,
-CRs and Secrets. Template environment follows the same path; `--env` overrides matching
-template keys. The trusted host retains a private copy for stop/start. Reserved
-`OPENSHELL_` settings remain driver-managed.
-
-## 4. Work with files
-
-Upload after creation: `create --upload` cannot accompany an explicit main command.
-A directory upload nests its basename. This example uses the repository's coding
-fixture, placed at `/sandbox/project`:
+Use an OpenAI-compatible endpoint with Responses support. The configuration flags
+are native Codex options; the key comes from the attached provider.
 
 ```bash
-openshell --gateway "$GATEWAY" --workspace "$WORKSPACE" sandbox upload \
-  "$SANDBOX" tests/e2e/fixtures/project /sandbox
-openshell --gateway "$GATEWAY" --workspace "$WORKSPACE" sandbox connect "$SANDBOX"
+SANDBOX=codex-demo
+MODEL=REPLACE_WITH_MODEL_ID
+BASE_URL=https://REPLACE_WITH_APPROVED_HOST/v1
+PROVIDER=coding-openai
+openshell sandbox create --name "$SANDBOX" --provider "$PROVIDER" --tty --detach \
+  -- codex --model "$MODEL" \
+  --config 'model_provider="approved"' \
+  --config 'model_providers.approved.name="Approved endpoint"' \
+  --config "model_providers.approved.base_url=\"$BASE_URL\"" \
+  --config 'model_providers.approved.env_key="OPENAI_API_KEY"' \
+  --config 'model_providers.approved.wire_api="responses"'
 ```
 
-Give OpenCode `/sandbox/project/TASK.txt`, inspect its changes, then detach and
-read back the result:
+Codex's nested namespace sandbox can be unavailable inside OpenShell. Its normal
+approval flow can retry a command within the outer OpenShell boundary; review
+the proposed command before approving it.
+
+### Claude Code
+
+Set the Anthropic-compatible base URL, without the `/v1/messages` suffix:
 
 ```bash
-openshell --gateway "$GATEWAY" --workspace "$WORKSPACE" sandbox exec --name "$SANDBOX" \
-  --workdir /sandbox/project --no-tty --no-login-shell -- python3 test_clamp.py
-openshell --gateway "$GATEWAY" --workspace "$WORKSPACE" sandbox download \
-  "$SANDBOX" /sandbox/project/result.json "$CONFIG_DIR/result.json"
+SANDBOX=claude-demo
+MODEL=REPLACE_WITH_MODEL_ID
+BASE_URL=https://REPLACE_WITH_APPROVED_HOST
+PROVIDER=coding-anthropic
+openshell sandbox create --name "$SANDBOX" --provider "$PROVIDER" --tty --detach \
+  --env "ANTHROPIC_BASE_URL=$BASE_URL" \
+  --env CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
+  -- claude --bare --model "$MODEL"
 ```
 
-For a scripted task and independent result checks, see
-[the agent fixture](../tests/e2e/README.md).
+The native `--bare` mode uses the API-key provider without the first-run
+Anthropic connectivity check. It keeps coding tools available and skips plugin,
+hook and other automatic discovery. Complete the terminal theme and workspace
+trust prompts normally.
 
-## 5. Stop/start and delete
+## 4. Connect and run a task
 
-Persistent workspace mode preserves the original sandbox's files across restart.
-Check the same ID and read back your files; ephemeral mode has no retained workspace.
+Confirm that the provider was applied, then connect to the running harness:
 
 ```bash
-timeout 930s openshell --gateway "$GATEWAY" --workspace "$WORKSPACE" sandbox stop "$SANDBOX"
-openshell --gateway "$GATEWAY" --workspace "$WORKSPACE" sandbox get "$SANDBOX" --output json | \
-  jq -e '.phase == "Stopped"'
-timeout 930s openshell --gateway "$GATEWAY" --workspace "$WORKSPACE" sandbox start "$SANDBOX"
-openshell --gateway "$GATEWAY" --workspace "$WORKSPACE" sandbox get "$SANDBOX" --output json | \
-  jq -e --arg id "$SANDBOX_ID" '.id == $id and .phase == "Ready" and .configuration_admission.state == "accepted"'
-openshell --gateway "$GATEWAY" --workspace "$WORKSPACE" sandbox provider status "$SANDBOX" "$PROVIDER" \
-  --wait --timeout 30 --output json
-timeout 330s openshell --gateway "$GATEWAY" --workspace "$WORKSPACE" sandbox delete "$SANDBOX"
-openshell --gateway "$GATEWAY" --workspace "$WORKSPACE" sandbox get "$SANDBOX" --output json
+openshell sandbox provider status "$SANDBOX" "$PROVIDER" --wait --timeout 30 --output json
+openshell sandbox connect "$SANDBOX"
 ```
 
-The final get must return explicit NotFound; an authentication or transport error
-does not prove deletion. The administrator confirms controller/cloud cleanup of
-the original owner IDs as described in the [deployment checks](deployment.md#10-verify-both-confidential-roles).
-Normal delete withdraws serving copies and authorization while retaining private
-workspace recovery keys/journals on T; see the
-[driver resource contract](../components/confidential-driver/README.md#bootstrap-resources).
+Require provider target `ready` and `wait_outcome=complete`. Complete the harness's
+normal first-run prompts. Ctrl-P followed by Ctrl-Q detaches while leaving the
+main process running; `sandbox connect` attaches to that same process again.
+
+To check editing and tool execution, upload the public coding task after creation:
+
+```bash
+openshell sandbox upload "$SANDBOX" tests/e2e/fixtures/project /sandbox
+openshell sandbox connect "$SANDBOX"
+```
+
+Ask the harness to follow `/sandbox/project/TASK.txt`. Review its proposed actions
+and allow the required file edits and test command. After it finishes, detach and
+check the result independently:
+
+```bash
+openshell sandbox exec --name "$SANDBOX" --workdir /sandbox/project \
+  --no-tty --no-login-shell -- python3 test_clamp.py
+openshell sandbox download "$SANDBOX" /sandbox/project ./downloaded-work
+python3 tests/e2e/collect.py --work ./downloaded-work --output ./work-check.json
+```
+
+Use a fresh download directory and output file for each run. The oracle checks
+the downloaded implementation and unchanged public tests without executing
+workload code on the trusted host. See [task checks](../tests/e2e/README.md).
+
+## 5. Restart and delete
+
+In persistent workspace mode, Stop/Start preserves the sandbox identity and files.
+It starts a new main process; it does not preserve process memory or a terminal
+session. Reconnect and check the task files after starting:
+
+```bash
+openshell sandbox stop "$SANDBOX"
+openshell sandbox start "$SANDBOX"
+openshell sandbox provider status "$SANDBOX" "$PROVIDER" --wait --timeout 30 --output json
+openshell sandbox connect "$SANDBOX"
+openshell sandbox delete "$SANDBOX"
+openshell sandbox get "$SANDBOX" --output json
+```
+
+The final get must return explicit NotFound. The administrator verifies owned
+cloud-resource cleanup and the confidential-role checks in the
+[deployment guide](deployment.md#10-verify-both-confidential-roles).

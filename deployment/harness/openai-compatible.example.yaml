@@ -1,0 +1,25 @@
+# Copy privately and set the exact approved inference host and port.
+# These executable paths belong to the digest-pinned Community base image.
+id: coding-openai
+display_name: Coding harness inference
+description: Approved OpenAI-compatible endpoint for OpenCode and Codex
+category: inference
+inference_capable: true
+credentials:
+  - name: api_key
+    description: Approved inference API key
+    env_vars: [OPENAI_API_KEY]
+    required: true
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_key]
+endpoints:
+  - host: inference.example.internal
+    port: 443
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+binaries:
+  - /usr/lib/node_modules/opencode-ai/**
+  - /usr/lib/node_modules/@openai/codex/**

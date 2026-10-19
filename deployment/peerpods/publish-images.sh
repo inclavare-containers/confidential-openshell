@@ -8,7 +8,7 @@ verify_handoff
 load_selection
 REGISTRY_ADDR="$HOST_IP:5000"
 install -d -m 0700 "$OPERATOR_DIR"
-for name in pause supervisor sandbox workload_python agent_sandbox_controller \
+for name in pause supervisor sandbox workload agent_sandbox_controller \
   kata_kubectl peerpod_webhook cert_manager_controller cert_manager_webhook \
   cert_manager_cainjector cert_manager_startup csi_provisioner csi_node_registrar; do
   ref=$(jq -er --arg name "$name" '.images[$name]' deployment/runtime/artifacts.lock.json)
@@ -17,21 +17,12 @@ for name in pause supervisor sandbox workload_python agent_sandbox_controller \
   digest=$(SSL_CERT_FILE=/etc/trustee/tls/ca.pem crane digest "$dest")
   printf '%s@%s\n' "${dest%:*}" "$digest" > "$OPERATOR_DIR/$name-image.txt"
 done
-for archive in caa csi peerpod-controller agent; do
+for archive in caa csi peerpod-controller; do
   docker load -i "$HANDOFF/outputs/$archive.tar"
 done
-test "$(docker image inspect "$AGENT_IMAGE_ID" --format '{{.Id}}')" = "$AGENT_IMAGE_ID"
 for pair in "cloud-api-adaptor:$CAA_TAG" "caa-csi-block-driver:$CSI_TAG" "peerpod-ctrl:$PEERPOD_CTRL_TAG"; do
   docker tag "openshell/$pair" "$REGISTRY_ADDR/openshell/$pair"
   docker push "$REGISTRY_ADDR/openshell/$pair"
   digest=$(SSL_CERT_FILE=/etc/trustee/tls/ca.pem crane digest "$REGISTRY_ADDR/openshell/$pair")
   printf '%s@%s\n' "${REGISTRY_ADDR}/openshell/${pair%:*}" "$digest" > "$OPERATOR_DIR/${pair%%:*}-image.txt"
 done
-AGENT_DEST="$REGISTRY_ADDR/openshell/opencode:${AGENT_TAG##*:}"
-docker tag "$AGENT_IMAGE_ID" "$AGENT_DEST"
-docker push "$AGENT_DEST"
-AGENT_DIGEST=$(SSL_CERT_FILE=/etc/trustee/tls/ca.pem crane digest --platform=linux/amd64 "$AGENT_DEST")
-AGENT_IMAGE="${AGENT_DEST%:*}@$AGENT_DIGEST"
-SSL_CERT_FILE=/etc/trustee/tls/ca.pem crane manifest --platform=linux/amd64 "$AGENT_IMAGE" | \
-  jq -e --arg id "$AGENT_CONFIG_DIGEST" '.config.digest == $id'
-printf '%s\n' "$AGENT_IMAGE" > "$OPERATOR_DIR/agent-image.txt"

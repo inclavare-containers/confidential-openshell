@@ -360,9 +360,11 @@ openshell whoami --output json
 
 ## 9. Run the native coding agent and verify its lifecycle
 
-Follow [first agent](first-agent.md), using the published agent image, a provider
-and persistent workspace. It covers provider readiness, file upload/download,
-model use, Stop/Start and Delete through the native CLI.
+Follow [first agent](first-agent.md). The driver defaults to the mirrored
+OpenShell Community image, so users can start OpenCode, Codex or Claude Code
+without building an image or passing `--from`. Configure the matching provider
+and verify creation, interactive reconnect, model use and persistent Stop/Start
+through the native CLI.
 
 ## 10. Verify both confidential roles
 

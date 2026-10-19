@@ -14,7 +14,7 @@ To install, follow these guides in order:
 
 1. [Build](docs/build.md): prepare Ubuntu, build each component and package the outputs.
 2. [Deploy](docs/deployment.md): configure ACK, Trustee, PeerPods and the native Gateway.
-3. [First agent](docs/first-agent.md): connect, run a coding task and check persistent Stop/Start.
+3. [Coding harnesses](docs/first-agent.md): start OpenCode, Codex or Claude Code, reconnect and check persistent Stop/Start.
 
 Each installation step has its own command and expected result. The build and
 service roles can share one machine. An approved compatible PodVM ImageID and
@@ -30,7 +30,7 @@ for verification coverage. Component READMEs describe internals.
 | Guest | Official CAA Ubuntu mkosi/UKI flow plus measured OpenShell bootstrap, ECS clock configuration and encrypted-volume initialization hooks |
 | Confidential ComputeDriver | Derivative of the pinned Kubernetes driver; shared modules compile from upstream, local code seals and authorizes bootstrap/workspace resources |
 | CAA, CSI, PeerPod controller and Kata host shim | Pinned sources with the [required patch queues](patches/README.md) |
-| Coding agent | Official Python base and released OpenCode binary; local image assembly without provider credentials |
+| Coding harnesses | Unmodified, digest-pinned OpenShell Community base image with OpenCode, Codex and Claude Code |
 
 The trusted domain contains CLI, Gateway, driver, Trustee and their authorization
 state. Guest attestation gates KBS release of launch credentials and workspace

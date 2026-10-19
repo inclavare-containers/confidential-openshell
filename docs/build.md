@@ -118,14 +118,8 @@ bash deployment/build/build-controller.sh
 Builds the Alibaba controller and writes `artifacts/images/peerpod-controller.tar`.
 Only the controller executable is added to the pinned runtime image.
 
-### Coding agent image
-
-```bash
-bash deployment/build/build-agent.sh
-```
-
-Builds the pinned OpenCode/Python image without provider credentials and checks
-both executable versions.
+The coding harnesses use the digest-pinned OpenShell Community base image.
+Deployment mirrors that image unchanged; no agent image build is needed.
 
 ### Check the builds
 
@@ -233,7 +227,6 @@ It checks that the archive layout and inherited layers remain intact, then write
 `$OPERATOR_DIR/kata-deploy-image.txt`. Use that digest in the PeerPods values.
 
 The [source](../deployment/build/sources.lock.json),
-[runtime](../deployment/runtime/artifacts.lock.json),
-[guest](../deployment/artifacts.lock.json) and
-[agent](../deployment/agent/agent.lock.json) locks define the inputs. A build
+[runtime](../deployment/runtime/artifacts.lock.json) and
+[guest](../deployment/artifacts.lock.json) locks define the inputs. A build
 manifest inventories outputs; it does not replace build logs or live acceptance.

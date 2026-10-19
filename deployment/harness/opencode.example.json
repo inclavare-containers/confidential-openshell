@@ -1,0 +1,19 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "autoupdate": false,
+  "share": "disabled",
+  "enabled_providers": ["approved"],
+  "provider": {
+    "approved": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Approved endpoint",
+      "options": {
+        "baseURL": "https://inference.example.internal/v1",
+        "apiKey": "{env:OPENAI_API_KEY}"
+      },
+      "models": {
+        "REPLACE_WITH_MODEL_ID": {"name": "Approved model"}
+      }
+    }
+  }
+}

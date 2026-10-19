@@ -77,7 +77,7 @@ def verify_work(source, result, public_test, original_test):
 
 
 def verify_events(events):
-    """OpenCode 1.2.27 run --format json. Retain hashes/counts, not raw content."""
+    """OpenCode run --format json. Retain hashes/counts, not raw content."""
     require(0 < len(events) <= 2000, 'bounded event count required')
     sessions, calls, tools = set(), set(), set()
     text_seen = finished = ran_tests = False

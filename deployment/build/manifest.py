@@ -19,7 +19,6 @@ LAYOUTS = {
     'caa-image-archive': r'images/caa.tar',
     'peerpod-controller-image-archive': r'images/peerpod-controller.tar',
     'csi-image-archive': r'images/csi.tar',
-    'agent-image-archive': r'images/agent.tar',
     'csi-chart': r'charts/caa-csi-block-driver\.tgz',
 }
 
