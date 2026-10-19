@@ -1,8 +1,59 @@
 #!/usr/bin/env python3
 """Prepare PodVM networking in the ACK worker VPC and zone."""
 import argparse
+import ipaddress
 
 from cloud import Cloud, require
+
+
+def inherit_worker_snat(cloud, vpc):
+    worker = cloud.api('vpc', 'DescribeVSwitchAttributes', RegionId=cloud.region,
+                       VSwitchId=cloud.config['worker_vswitch_id'])
+    guest = cloud.api('vpc', 'DescribeVSwitchAttributes', RegionId=cloud.region,
+                      VSwitchId=cloud.state['podvm_vswitch_id'])
+
+    def pages(operation, collection, item, **parameters):
+        page, count = 1, 0
+        while True:
+            result = cloud.api('vpc', operation, RegionId=cloud.region, PageNumber=page, PageSize=50, **parameters)
+            rows = result[collection][item]
+            yield from rows
+            count += len(rows)
+            if count >= int(result['TotalCount']):
+                return
+            page += 1
+
+    entries = []
+    for gateway in pages('DescribeNatGateways', 'NatGateways', 'NatGateway', VpcId=vpc):
+        for table in gateway['SnatTableIds']['SnatTableId']:
+            entries.extend(pages('DescribeSnatTableEntries', 'SnatTableEntries', 'SnatTableEntry', SnatTableId=table))
+
+    def covers(entry, switch, switch_id):
+        return entry.get('SourceVSwitchId') == switch_id or (
+            bool(entry.get('SourceCIDR')) and
+            ipaddress.ip_network(switch['CidrBlock']).subnet_of(ipaddress.ip_network(entry['SourceCIDR'])))
+
+    existing = [e for e in entries if covers(e, guest, cloud.state['podvm_vswitch_id'])]
+    if existing:
+        require(len(existing) == 1, 'Multiple PodVM SNAT routes found; review the VPC route/SNAT configuration.')
+        table, entry_id = existing[0]['SnatTableId'], existing[0]['SnatEntryId']
+    else:
+        candidates = {(e['SnatTableId'], e['SnatIp']) for e in entries
+                      if e['Status'] == 'Available' and covers(e, worker, cloud.config['worker_vswitch_id'])}
+        if not candidates:
+            require(not cloud.state.get('created_cluster'), 'ACK worker SNAT is missing; inspect the cluster NAT gateway before continuing.')
+            print('No worker SNAT to inherit. PodVMs require the routed egress configured for this existing cluster.')
+            return
+        require(len(candidates) == 1, 'Multiple worker SNAT routes found; review the VPC route/SNAT configuration.')
+        table, address = candidates.pop()
+        response = cloud.api('vpc', 'CreateSnatEntry', RegionId=cloud.region, SnatTableId=table,
+                             SourceVSwitchId=cloud.state['podvm_vswitch_id'], SnatIp=address,
+                             SnatEntryName=cloud.name + '-podvm', ClientToken=cloud.name + '-podvm-snat')
+        entry_id = response['SnatEntryId']
+    cloud.save(podvm_snat_entry_id=entry_id, podvm_snat_table_id=table)
+    cloud.wait('PodVM SNAT', lambda: cloud.api('vpc', 'DescribeSnatTableEntries', RegionId=cloud.region,
+               SnatTableId=table, SnatEntryId=entry_id)['SnatTableEntries']['SnatTableEntry'],
+               lambda rows: len(rows) == 1 and rows[0]['Status'] == 'Available', timeout=300)
 
 
 def main():
@@ -31,6 +82,7 @@ def main():
     # CAA dynamically allocates tunnel endpoints. Scope mutual access to these two groups.
     allow(group, worker_group)
     allow(worker_group, group)
+    inherit_worker_snat(cloud, vpc)
     print(f'PodVM network ready: {cloud.state["podvm_vswitch_id"]}, {group}.')
 
 

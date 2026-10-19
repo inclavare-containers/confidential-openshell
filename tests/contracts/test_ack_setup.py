@@ -65,6 +65,9 @@ class CloudFixture:
         self.calls = []
         self.roles, self.policies, self.attachments = {}, {}, {}
         self.disabled_network_policy = False
+        self.snat_entries = [{'SourceVSwitchId': 'vsw-worker', 'SourceCIDR': '192.168.16.0/20',
+                              'SnatTableId': 'stb-test', 'SnatIp': '203.0.113.1',
+                              'SnatEntryId': 'snat-worker', 'Status': 'Available'}]
         for module in (cloud, cluster, network, image, identity, values, inputs, storage):
             for name, value in (('OPERATOR', self.operator), ('HANDOFF', self.handoff)):
                 if hasattr(module, name):
@@ -96,7 +99,18 @@ class CloudFixture:
                      'runtimes': [{'name': 'containerd', 'version': self.config['containerd_version']}],
                      'images': [{'image_type': 'Ubuntu', 'architecture': 'x86_64', 'os_version': '24.04', 'image_id': 'ubuntu-ack'}]}]
         if operation == 'DescribeVSwitchAttributes':
-            return {'VpcId': 'vpc-test', 'ZoneId': 'cn-beijing-i', 'Status': 'Available'}
+            return {'VpcId': 'vpc-test', 'ZoneId': 'cn-beijing-i', 'Status': 'Available',
+                    'CidrBlock': '192.168.48.0/24' if args['VSwitchId'] == 'vsw-podvm' else '192.168.16.0/20'}
+        if operation == 'DescribeNatGateways':
+            return {'TotalCount': 1, 'NatGateways': {'NatGateway': [{'SnatTableIds': {'SnatTableId': ['stb-test']}}]}}
+        if operation == 'DescribeSnatTableEntries':
+            rows = [e for e in self.snat_entries if not args.get('SnatEntryId') or e['SnatEntryId'] == args['SnatEntryId']]
+            return {'TotalCount': len(rows), 'SnatTableEntries': {'SnatTableEntry': deepcopy(rows)}}
+        if operation == 'CreateSnatEntry':
+            self.snat_entries.append({'SourceVSwitchId': args['SourceVSwitchId'], 'SourceCIDR': '192.168.48.0/24',
+                                      'SnatTableId': args['SnatTableId'], 'SnatIp': args['SnatIp'],
+                                      'SnatEntryId': 'snat-podvm', 'Status': 'Available'})
+            return {'SnatEntryId': 'snat-podvm'}
         if operation == 'CreateVSwitch':
             return {'VSwitchId': 'vsw-podvm' if args['VSwitchName'].endswith('podvm') else 'vsw-pod'}
         if operation == 'CreateCluster':
@@ -187,6 +201,37 @@ class Setup(CloudFixture, unittest.TestCase):
         rules = [a for op, a in self.calls if op == 'AuthorizeSecurityGroup']
         self.assertEqual({a['SecurityGroupId'] for a in rules}, {'sg-workers', 'sg-podvm'})
         self.assertFalse(any(a.get('SourceCidrIp') for a in rules))
+
+    def test_podvm_snat_reuses_worker_gateway_and_survives_retries(self):
+        current = cloud.Cloud()
+        current.save(podvm_vswitch_id='vsw-podvm')
+        network.inherit_worker_snat(current, 'vpc-test')
+        network.inherit_worker_snat(current, 'vpc-test')
+        requests = [a for op, a in self.calls if op == 'CreateSnatEntry']
+        self.assertEqual(len(requests), 1)
+        self.assertEqual((requests[0]['SnatTableId'], requests[0]['SnatIp'], requests[0]['SourceVSwitchId']),
+                         ('stb-test', '203.0.113.1', 'vsw-podvm'))
+        self.assertEqual(self.state()['podvm_snat_entry_id'], 'snat-podvm')
+
+    def test_existing_vpc_snat_is_reused_without_narrowing_or_duplicate_creation(self):
+        current = cloud.Cloud()
+        current.save(podvm_vswitch_id='vsw-podvm')
+        self.snat_entries[0].update(SourceCIDR='192.168.0.0/16', SourceVSwitchId='')
+        network.inherit_worker_snat(current, 'vpc-test')
+        self.assertNotIn('CreateSnatEntry', [op for op, _ in self.calls])
+        self.assertEqual(self.state()['podvm_snat_entry_id'], 'snat-worker')
+
+    def test_missing_or_ambiguous_worker_snat_fails_for_a_new_cluster(self):
+        current = cloud.Cloud()
+        current.save(podvm_vswitch_id='vsw-podvm', created_cluster=True)
+        saved = deepcopy(self.snat_entries)
+        self.snat_entries = []
+        with self.assertRaisesRegex(SystemExit, 'worker SNAT is missing'):
+            network.inherit_worker_snat(current, 'vpc-test')
+        self.snat_entries = [saved[0], {**saved[0], 'SnatIp': '203.0.113.2'}]
+        with self.assertRaisesRegex(SystemExit, 'Multiple worker SNAT routes'):
+            network.inherit_worker_snat(current, 'vpc-test')
+        self.assertNotIn('CreateSnatEntry', [op for op, _ in self.calls])
 
     def test_missing_public_api_fails_before_freezing_existing_cluster_inputs(self):
         self.config['ack_api_access'] = 'public'

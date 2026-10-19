@@ -153,8 +153,10 @@ python3 deployment/ack/prepare-network.py
 
 Creates or selects the dedicated PodVM vSwitch in the worker VPC/zone and creates
 a dedicated security group. It permits worker–PodVM tunnel traffic between their
-security groups. The cloud needs outbound routes to T's three TLS endpoints;
-configure SNAT for the worker/PodVM networks if required.
+security groups. When workers use SNAT, it reuses their existing NAT gateway and
+egress addresses for the PodVM vSwitch. An existing VPC-wide rule is retained.
+For an existing cluster without worker SNAT, provide a routed path from the
+PodVM network to T's three TLS endpoints.
 
 Configure the trusted host's firewall/ingress in its own network, permitting the
 intended clients on ports 5000/8443/9443. Arrange worker SSH access through your
