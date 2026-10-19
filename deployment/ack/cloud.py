@@ -42,14 +42,48 @@ def run(args, **kwargs):
     return subprocess.run(args, check=True, text=True, **kwargs)
 
 
-class Cloud:
+class Client:
     def __init__(self):
-        os.umask(0o077)
-        require((OPERATOR / 'ack.json').is_file(), f'Copy deployment/ack/ack.example.json to {OPERATOR / "ack.json"} and edit it first.')
         require((HANDOFF / 'selection.json').is_file(), 'Unpack the verified release handoff first (deployment step 2).')
-        self.config = read(OPERATOR / 'ack.json')
         self.selection = read(HANDOFF / 'selection.json')
         self.region = self.selection['podvm_region']
+
+    def api(self, product, operation, *, body=None, absent=None, **parameters):
+        args = ['aliyun', product, operation, '--region', self.region]
+        profile = os.environ.get('ALIBABA_CLOUD_PROFILE')
+        if profile:
+            args += ['--profile', profile]
+        for key, value in parameters.items():
+            if value is not None:
+                args += ['--' + key, str(value).lower() if isinstance(value, bool) else str(value)]
+        if body is not None:
+            args += ['--body', json.dumps(body, separators=(',', ':'))]
+        result = subprocess.run(args, capture_output=True, text=True, timeout=180)
+        if result.returncode:
+            if absent and absent in result.stderr:
+                return None
+            raise SystemExit(f'{product} {operation} failed:\n{result.stderr}')
+        return json.loads(result.stdout) if result.stdout.strip() else {}
+
+    def oss(self, operation, *arguments, absent=None):
+        args = ['aliyun', 'oss', operation, *map(str, arguments), '-e',
+                f'https://oss-{self.region}-internal.aliyuncs.com']
+        if os.environ.get('ALIBABA_CLOUD_PROFILE'):
+            args += ['--profile', os.environ['ALIBABA_CLOUD_PROFILE']]
+        result = subprocess.run(args, capture_output=True, text=True, timeout=900)
+        if result.returncode:
+            if absent and absent in result.stderr:
+                return None
+            raise SystemExit(f'OSS {operation} failed:\n{result.stderr}')
+        return result.stdout
+
+
+class Cloud(Client):
+    def __init__(self):
+        os.umask(0o077)
+        super().__init__()
+        require((OPERATOR / 'ack.json').is_file(), 'Run python3 deployment/ack/configure-inputs.py first.')
+        self.config = read(OPERATOR / 'ack.json')
         self.name = self.config['name']
         require(re.fullmatch(r'[a-z][a-z0-9-]{1,39}', self.name), 'Use a name of 2–40 lowercase letters, digits or hyphens.')
         require(re.fullmatch(r'sg-[a-z0-9]+', self.config['service_host_security_group_id']),
@@ -71,23 +105,6 @@ class Cloud:
     def save(self, **updates):
         self.state.update(updates)
         write(self.path, self.state)
-
-    def api(self, product, operation, *, body=None, absent=None, **parameters):
-        args = ['aliyun', product, operation, '--region', self.region]
-        profile = os.environ.get('ALIBABA_CLOUD_PROFILE')
-        if profile:
-            args += ['--profile', profile]
-        for key, value in parameters.items():
-            if value is not None:
-                args += ['--' + key, str(value).lower() if isinstance(value, bool) else str(value)]
-        if body is not None:
-            args += ['--body', json.dumps(body, separators=(',', ':'))]
-        result = subprocess.run(args, capture_output=True, text=True, timeout=180)
-        if result.returncode:
-            if absent and absent in result.stderr:
-                return None
-            raise SystemExit(f'{product} {operation} failed:\n{result.stderr}')
-        return json.loads(result.stdout) if result.stdout.strip() else {}
 
     def wait(self, description, get, ready, timeout=2400):
         deadline = time.monotonic() + timeout

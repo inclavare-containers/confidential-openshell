@@ -1,12 +1,14 @@
 {
   "name": "cos-dev",
   "cluster_id": "",
-  "worker_vswitch_id": "YOUR_WORKER_VSWITCH_ID",
+  "service_host_instance_id": "",
+  "service_host_ip": "",
+  "worker_vswitch_id": "",
   "pod_vswitch_id": "",
   "pod_vswitch_cidr": "192.168.32.0/24",
   "podvm_vswitch_id": "",
   "podvm_vswitch_cidr": "192.168.48.0/24",
-  "service_host_security_group_id": "YOUR_SERVICE_HOST_SECURITY_GROUP_ID",
+  "service_host_security_group_id": "",
   "podvm_instance_type": "ecs.g9i.xlarge",
   "kubernetes_version": "1.36.2-aliyun.1",
   "containerd_version": "2.3.4",
@@ -14,6 +16,6 @@
   "worker_image_id": "",
   "worker_count": 1,
   "service_cidr": "172.21.0.0/20",
-  "oss_bucket": "YOUR_PRIVATE_OSS_BUCKET_IN_THE_SELECTED_REGION",
+  "oss_bucket": "",
   "csi_storage_class": "alicloud-disk-essd"
 }

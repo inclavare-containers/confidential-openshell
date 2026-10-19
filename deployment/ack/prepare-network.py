@@ -14,6 +14,8 @@ def main():
     vpc, zone = cloud.state['vpc_id'], cloud.state['zone_id']
     host = ipaddress.ip_address(os.environ['HOST_IP'])
     require(host.version == 4 and host.is_private and not host.is_loopback, 'HOST_IP must be the service host private IPv4.')
+    require(not cloud.config.get('service_host_ip') or str(host) == cloud.config['service_host_ip'],
+            'HOST_IP differs from the discovered service ECS address in ack.json.')
     service_group = cloud.config['service_host_security_group_id']
     require(service_group and not service_group.startswith('YOUR_'), 'Fill in service_host_security_group_id in ack.json.')
     groups = [service_group, detail['security_group_id']]

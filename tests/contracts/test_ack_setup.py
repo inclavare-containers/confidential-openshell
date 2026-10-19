@@ -30,9 +30,11 @@ network = load('ack_network', 'deployment/ack/prepare-network.py')
 image = load('ack_image', 'deployment/ack/prepare-image.py')
 identity = load('ack_identity', 'deployment/ack/configure-identities.py')
 values = load('ack_values', 'deployment/peerpods/configure-values.py')
+inputs = load('ack_inputs', 'deployment/ack/configure-inputs.py')
+storage = load('ack_storage', 'deployment/ack/prepare-storage.py')
 
 
-class Setup(unittest.TestCase):
+class CloudFixture:
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
@@ -61,7 +63,7 @@ class Setup(unittest.TestCase):
         self.calls = []
         self.roles, self.policies, self.attachments = {}, {}, {}
         self.disabled_network_policy = False
-        for module in (cloud, cluster, network, image, identity, values):
+        for module in (cloud, cluster, network, image, identity, values, inputs, storage):
             for name, value in (('OPERATOR', self.operator), ('HANDOFF', self.handoff)):
                 if hasattr(module, name):
                     replacement = patch.object(module, name, value)
@@ -151,6 +153,7 @@ class Setup(unittest.TestCase):
     def state(self):
         return cloud.read(self.operator / 'ack-state.json')
 
+class Setup(CloudFixture, unittest.TestCase):
     def test_existing_cluster_only_reads_and_renews_private_kubeconfig(self):
         self.prepare()
         self.prepare()
@@ -210,18 +213,13 @@ class Setup(unittest.TestCase):
         self.selection.update(podvm_mode='import', guest='guest.qcow2', podvm_image_id='')
         cloud.write(self.handoff / 'outputs/guest.qcow2', 'qcow fixture')
         self.inputs()
-        original = cloud.run
-
-        def upload(args, **kwargs):
-            if args[0] == 'aliyun':
-                self.assertIn('--acl', args)
-                self.assertEqual(args[-1], 'private')
-                return subprocess.CompletedProcess(args, 0)
-            return original(args, **kwargs)
-
-        with patch.object(sys, 'argv', ['prepare-image.py']), patch.object(image, 'run', upload):
+        cloud.Cloud().save(oss_bucket='private-test', image_import_role_arn='arn-import')
+        with patch.object(sys, 'argv', ['prepare-image.py']), patch.object(cloud.Cloud, 'oss', return_value='') as upload:
             image.main()
             image.main()
+        upload.assert_called_once()
+        self.assertEqual(upload.call_args.args[0], 'cp')
+        self.assertEqual(upload.call_args.args[-2:], ('--acl', 'private'))
         imports = [a for op, a in self.calls if op == 'ImportImage']
         self.assertEqual(len(imports), 1)
         self.assertEqual((imports[0]['BootMode'], imports[0]['Features.NvmeSupport']), ('UEFI', 'supported'))
@@ -294,3 +292,121 @@ class Setup(unittest.TestCase):
         self.inputs()
         with self.assertRaisesRegex(SystemExit, 'handoff changed after setup'):
             cloud.Cloud()
+
+
+class InputDiscovery(unittest.TestCase):
+    def client(self):
+        from unittest.mock import Mock
+        client = Mock(region='cn-beijing', selection={'podvm_mode': 'import'})
+        client.api.side_effect = self.api
+        return client
+
+    def api(self, product, operation, **args):
+        if operation == 'DescribeInstances':
+            return {'Instances': {'Instance': [{
+                'InstanceId': 'i-service', 'SecurityGroupIds': {'SecurityGroupId': self.groups},
+                'VpcAttributes': {'VpcId': 'vpc-test', 'VSwitchId': 'vsw-host',
+                                  'PrivateIpAddress': {'IpAddress': ['192.168.16.223']}},
+            }]}}
+        if operation == 'DescribeClusterDetail':
+            return {'region_id': 'cn-beijing', 'vpc_id': 'vpc-test', 'vswitch_ids': ['vsw-ack']}
+        if operation == 'DescribeVSwitchAttributes':
+            return {'VpcId': 'vpc-test', 'ZoneId': 'cn-beijing-i'}
+        if operation == 'DescribeVpcAttribute':
+            return {'CidrBlock': '192.168.0.0/16'}
+        if operation == 'DescribeVSwitches':
+            # Force pagination: allocations on both pages must be excluded.
+            return {'TotalCount': 2, 'VSwitches': {'VSwitch': [
+                {'CidrBlock': '192.168.0.0/24' if args['PageNumber'] == 1 else '192.168.1.0/24'}]}}
+        if operation == 'GetCallerIdentity':
+            return {'AccountId': '123'}
+        self.fail(f'Discovery must not create resources: {operation}')
+
+    def arguments(self, **overrides):
+        from argparse import Namespace
+        return Namespace(**{'name': 'cos-inputs-test', 'cluster_id': '', 'service_host_instance_id': '',
+                            'service_host_security_group_id': '', 'worker_vswitch_id': '',
+                            'pod_vswitch_id': '', 'podvm_vswitch_id': '', 'oss_bucket': '', **overrides})
+
+    def test_new_inputs_discover_host_and_avoid_allocations_on_all_pages(self):
+        self.groups = ['sg-host']
+        with patch.dict('os.environ', HOST_IP='192.168.16.223'):
+            config, location = inputs.discover(self.client(), self.arguments())
+        self.assertEqual(config['service_host_security_group_id'], 'sg-host')
+        self.assertEqual(config['worker_vswitch_id'], 'vsw-host')
+        self.assertEqual(config['pod_vswitch_cidr'], '192.168.2.0/24')
+        self.assertEqual(config['podvm_vswitch_cidr'], '192.168.3.0/24')
+        self.assertTrue(config['oss_bucket'].startswith('cos-123-'))
+        self.assertEqual(location['vpc_id'], 'vpc-test')
+
+    def test_existing_cluster_reuses_ack_network_and_selected_bucket(self):
+        self.groups = ['sg-host']
+        with patch.dict('os.environ', HOST_IP='192.168.16.223'):
+            config, _ = inputs.discover(self.client(), self.arguments(cluster_id='c-test', oss_bucket='existing-bucket'))
+        self.assertEqual(config['worker_vswitch_id'], 'vsw-ack')
+        self.assertEqual(config['pod_vswitch_cidr'], '')
+        self.assertEqual(config['podvm_vswitch_cidr'], '192.168.2.0/24')
+        self.assertEqual(config['oss_bucket'], 'existing-bucket')
+
+    def test_multiple_security_groups_require_an_attached_choice(self):
+        self.groups = ['sg-one', 'sg-two']
+        with patch.dict('os.environ', HOST_IP='192.168.16.223'):
+            with self.assertRaisesRegex(SystemExit, 'multiple security groups'):
+                inputs.discover(self.client(), self.arguments())
+            with self.assertRaisesRegex(SystemExit, 'not attached'):
+                inputs.discover(self.client(), self.arguments(service_host_security_group_id='sg-other'))
+            config, _ = inputs.discover(self.client(), self.arguments(service_host_security_group_id='sg-two'))
+        self.assertEqual(config['service_host_security_group_id'], 'sg-two')
+
+    def test_full_vpc_does_not_generate_overlapping_cidrs(self):
+        with self.assertRaisesRegex(SystemExit, 'Not enough free'):
+            inputs.free_cidrs('192.168.0.0/24', [{'CidrBlock': '192.168.0.0/24'}], 1)
+
+
+class ImportStorage(CloudFixture, unittest.TestCase):
+    def prepare_fixture(self):
+        self.selection.update(podvm_mode='import', guest='guest.qcow2', podvm_image_id='')
+        self.inputs()
+        self.bucket = None
+
+    def oss(self, operation, *args, **kwargs):
+        if operation == 'mb':
+            self.assertEqual(args[-2:], ('--acl', 'private'))
+            self.bucket = 'Location : oss-cn-beijing\nACL : private\nOwner : 123\n'
+            return ''
+        self.assertEqual(operation, 'stat')
+        return self.bucket
+
+    def test_storage_creates_missing_bucket_and_official_authorization_then_reuses(self):
+        self.prepare_fixture()
+        with patch.object(sys, 'argv', ['prepare-storage.py']), patch.object(cloud.Cloud, 'oss', self.oss):
+            with self.assertRaisesRegex(SystemExit, '--authorize-image-import'):
+                storage.main()
+        with patch.object(sys, 'argv', ['prepare-storage.py', '--authorize-image-import']), patch.object(cloud.Cloud, 'oss', self.oss):
+            storage.main()
+            storage.main()
+        self.assertEqual(sum(op == 'CreateRole' for op, _ in self.calls), 1)
+        self.assertEqual(sum(op == 'AttachPolicyToRole' for op, _ in self.calls), 1)
+        self.assertEqual(self.attachments[storage.ROLE][0]['PolicyName'], storage.POLICY)
+        self.assertEqual(self.state()['oss_bucket'], 'private-test')
+
+    def test_storage_check_and_invalid_existing_bucket_do_not_create_or_change_it(self):
+        self.prepare_fixture()
+        self.roles[storage.ROLE] = {'Role': {'Arn': 'arn-import', 'AssumeRolePolicyDocument': storage.TRUST}}
+        self.attachments[storage.ROLE] = [{'PolicyName': storage.POLICY, 'PolicyType': 'System'}]
+        with patch.object(cloud.Cloud, 'oss', self.oss), patch.object(sys, 'argv', ['prepare-storage.py', '--check']):
+            with self.assertRaisesRegex(SystemExit, 'does not exist'):
+                storage.main()
+        self.assertIsNone(self.bucket)
+        self.assertFalse((self.operator / 'ack-state.json').exists())
+        for info, error in [
+            ('Location : oss-cn-shanghai\nACL : private\nOwner : 123\n', 'same region'),
+            ('Location : oss-cn-beijing\nACL : public-read\nOwner : 123\n', 'must be private'),
+            ('Location : oss-cn-beijing\nACL : private\nOwner : 456\n', 'another account'),
+        ]:
+            self.bucket = info
+            with self.subTest(error=error), patch.object(cloud.Cloud, 'oss', self.oss), patch.object(sys, 'argv', ['prepare-storage.py']):
+                with self.assertRaisesRegex(SystemExit, error):
+                    storage.main()
+            self.assertEqual(self.bucket, info)
+        self.assertEqual(self.calls[-1][0], 'ListPoliciesForRole')

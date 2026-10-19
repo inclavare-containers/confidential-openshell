@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Verify the handoff, confirm/import its ECS image and record the reference binding."""
 import argparse
-import os
 
 from cloud import Cloud, HANDOFF, OPERATOR, require, run, sha256, write
 
@@ -29,11 +28,9 @@ def main():
             bucket = cloud.config['oss_bucket']
             require(bucket and not bucket.startswith('YOUR_'), 'Fill in oss_bucket in ack.json.')
             key = f'confidential-openshell/{cloud.name}/{qcow_digest}.qcow2'
-            args = ['aliyun', 'oss', 'cp', str(qcow), f'oss://{bucket}/{key}',
-                    '-e', f'oss-{cloud.region}.aliyuncs.com', '--force', '--acl', 'private']
-            if os.environ.get('ALIBABA_CLOUD_PROFILE'):
-                args += ['--profile', os.environ['ALIBABA_CLOUD_PROFILE']]
-            run(args)
+            require(cloud.state.get('oss_bucket') == bucket and cloud.state.get('image_import_role_arn'),
+                    'Run python3 deployment/ack/prepare-storage.py before importing the image.')
+            cloud.oss('cp', str(qcow), f'oss://{bucket}/{key}', '--force', '--acl', 'private')
             response = cloud.api('ecs', 'ImportImage', RegionId=cloud.region,
                                  ImageName=cloud.name + '-' + qcow_digest[:12], Description=cloud.name,
                                  ClientToken=cloud.name + '-' + qcow_digest[:20],

@@ -6,9 +6,10 @@ For an already installed Gateway, use [first agent](first-agent.md).
 
 You need:
 
-- A trusted Ubuntu service host for Gateway, driver, Trustee and the private registry.
-  It can also be the build machine.
-- An ACK cluster with RRSA and enforced NetworkPolicy, plus access to its workers.
+- A trusted Ubuntu ECS service host for Gateway, driver, Trustee and the private
+  registry, in the selected PodVM region. It can also be the build machine.
+- A new or existing ACK cluster, prepared in step 3. Existing clusters need RRSA,
+  enforced NetworkPolicy and accessible workers.
 - A compatible TDX PodVM image and its approved reference file.
 - Administrator access to ACK, ECS, VPC, RAM and the image registry.
 
@@ -34,74 +35,115 @@ new shell; scripts read the image selection from the handoff:
 
 ```bash
 cd /opt/confidential-openshell
-export HOST_IP=YOUR_TRUSTED_PRIVATE_IPV4
+export HOST_IP=$(ip -4 route get 100.100.100.200 | awk '{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')
+printf 'Service host private IPv4: %s\n' "$HOST_IP"
 export HANDOFF=/var/lib/openshell-confidential/operator/handoff
 export OPERATOR_DIR=/var/lib/openshell-confidential/operator/cluster-config
 ```
 
-Use the same address for Gateway, KBS and registry throughout this guide.
+The address comes from this ECS host's route to the Alibaba metadata service.
+Check it against the ECS console's private IPv4, especially on a host with multiple
+network interfaces. Use the same address for Gateway, KBS and registry throughout this guide.
 The [architecture](architecture.md) explains the trusted host boundary.
 
 ## 3. Prepare cluster, select the cloud image and configure identities
 
-### Install cloud tools and set the deployment inputs
+### Install cloud tools and configure operator access
 
 ```bash
 bash deployment/ack/install-tools.sh
 aliyun configure
-install -d -m 0700 "$OPERATOR_DIR"
-cp deployment/ack/ack.example.json "$OPERATOR_DIR/ack.json"
-chmod 0600 "$OPERATOR_DIR/ack.json"
+export REGION=$(jq -er .podvm_region "$HANDOFF/selection.json")
+aliyun sts GetCallerIdentity --region "$REGION"
+```
+
+Use the operator identity for this deployment's Alibaba account. `aliyun configure`
+accepts a RAM user's AccessKey or another supported credential type. Obtain the
+credentials from your account administrator or [RAM console](https://ram.console.aliyun.com/);
+this operator needs ECS, VPC, ACK, RAM and OSS administration for the steps below.
+Existing profiles or an ECS instance role can also be used. Set
+`ALIBABA_CLOUD_PROFILE` to select a named profile for the scripts; use the same
+profile for manual CLI queries. Credentials stay on this host.
+
+The installer uses the official China CDN. No ACK cluster, dedicated PodVM
+network or OSS bucket needs to exist yet. The service ECS already belongs to a
+VPC, a vSwitch and at least one security group; the next command discovers them.
+
+### Choose an existing cluster, or prepare a new one
+
+For a **new ACK cluster**, generate the inputs:
+
+```bash
+python3 deployment/ack/configure-inputs.py
+```
+
+For an **existing ACK cluster**, first list cluster IDs and names in the selected
+region. Use the ID from the `cluster_id` column in the second command:
+
+```bash
+aliyun cs DescribeClustersV1 --region "$REGION" --region_id "$REGION" \
+  --page_size 100 --profile "${ALIBABA_CLOUD_PROFILE:-default}" \
+  | jq -r '.clusters[] | [.cluster_id, .name, .vpc_id, .state] | @tsv'
+python3 deployment/ack/configure-inputs.py --cluster-id ID_FROM_THE_LIST
+```
+
+Discovery writes `$OPERATOR_DIR/ack.json` and prints the selected values. It does
+not create cloud resources. For a new cluster it uses the service ECS's vSwitch
+for workers; for an existing cluster it discovers the ACK worker vSwitch and
+requires the same VPC as the service ECS. It also:
+
+- Selects the security group **already attached to this service ECS**. This is
+  what `service_host_security_group_id` means; it is not the future PodVM group.
+  If several groups are attached, the script prints their IDs and requires
+  `--service-host-security-group-id` to choose one.
+- Chooses unused `/24` ranges in the VPC for the required Pod/PodVM vSwitches.
+  Their IDs stay empty until the corresponding creation steps run.
+- Generates an OSS bucket name from the account ID and a random suffix for QCOW2
+  import. The bucket does **not** need to exist; the storage step below creates it. No bucket is
+  needed when reusing an approved ImageID.
+
+Review the file, particularly the worker count/type and TDX instance type:
+
+```bash
+cat "$OPERATOR_DIR/ack.json"
 ${EDITOR:-vi} "$OPERATOR_DIR/ack.json"
 ```
 
-The installer downloads checksum-pinned Alibaba Cloud CLI from the official China
-CDN. `aliyun configure` sets the operator's cloud credentials; an existing profile
-or instance role can be used instead. Set `ALIBABA_CLOUD_PROFILE` to select a named
-profile. These credentials stay on this host and are never placed in Helm values.
+The [input reference](../deployment/ack/README.md) explains every field and gives
+queries for selecting existing resources. To reuse a bucket, provide its actual
+name with `configure-inputs.py --oss-bucket NAME_FROM_OSS`; the storage step checks
+its account, region and private ACL. The initializer refuses an existing input
+file unless `--replace` is given, and never replaces inputs after setup starts.
 
-Choose a unique deployment `name`, the service host's security group, and a private
-OSS bucket in the handoff's region if importing QCOW2. Choose unused PodVM and Pod
-vSwitch CIDRs within the VPC, or supply existing vSwitch IDs. Region comes from
-`$HANDOFF/selection.json`. See the [input reference](../deployment/ack/README.md)
-for the few fields that differ between existing and new clusters.
+### Prepare the selected ACK cluster
 
-### Select an existing ACK cluster
-
-Set `cluster_id` in `ack.json`, then run:
+For an existing cluster:
 
 ```bash
 python3 deployment/ack/prepare-cluster.py
 export KUBECONFIG="$OPERATOR_DIR/administrator-kubeconfig"
 ```
 
-The script reads the VPC, worker security group and RRSA OIDC identity, obtains a
-private administrator kubeconfig, and checks Ready workers, containerd,
-`supplementalGroupsPolicy` and Terway's NetworkPolicy configuration. Existing
-workers must already meet these requirements. If RRSA is disabled, run the same
-command with `--enable-rrsa`; that explicitly updates the existing cluster.
+This obtains a private administrator kubeconfig and checks Ready Linux/amd64
+workers, containerd, `supplementalGroupsPolicy` and Terway NetworkPolicy settings.
+If RRSA is disabled, repeat with `--enable-rrsa` to explicitly enable it.
 
-### Or create a new ACK cluster
-
-Leave `cluster_id` empty and set `worker_vswitch_id`. Review the Kubernetes and
-containerd versions, worker instance type/count and non-overlapping service/Pod
-CIDRs. The default is one Ubuntu 24.04 worker. Run:
+For a new cluster:
 
 ```bash
 python3 deployment/ack/prepare-cluster.py --create
 export KUBECONFIG="$OPERATOR_DIR/administrator-kubeconfig"
 ```
 
-This creates a **paid ACK Pro cluster and pay-as-you-go workers**, with a private
-API endpoint, Terway shared ENI, NetworkPolicy and RRSA. It selects the matching
-Ubuntu worker image from ACK metadata and creates an operator SSH key under
-`$OPERATOR_DIR/worker-key`. It waits for workers and runs the same checks as the
-existing-cluster path. The kubeconfig lasts up to three days; repeat this step to
-renew it. Cluster creation enables deletion protection.
+This creates a **paid ACK Pro cluster and pay-as-you-go workers**, using the
+reviewed inputs. It enables a private API endpoint, Terway shared ENI,
+NetworkPolicy and RRSA; selects ACK's Ubuntu 24.04 worker image; generates an SSH
+key under `$OPERATOR_DIR/worker-key`; and waits for workers before checking them.
+Cluster creation enables deletion protection. The default is one worker.
 
-Both paths record resources in `$OPERATOR_DIR/ack-state.json`. Keep that file when
-retrying. Complete `ack.json` before the first command; use a separate operator
-directory and deployment name for a different deployment.
+Both paths save resources in `$OPERATOR_DIR/ack-state.json`. Keep this state when
+retrying. The private kubeconfig lasts up to three days; repeat the cluster step
+to renew it. Use a separate operator directory/name for a different deployment.
 
 ### Prepare the PodVM network
 
@@ -114,6 +156,30 @@ a dedicated security group. It permits worker–PodVM tunnel traffic between the
 security groups, SSH from this host to workers, and private registry 5000, KBS 8443
 and Gateway 9443 access from the worker/PodVM groups. The service host must be in
 the same VPC. Operator-to-host SSH access is managed separately.
+
+### Prepare image-import storage
+
+```bash
+python3 deployment/ack/prepare-storage.py
+```
+
+For QCOW2 import this creates the named bucket if missing, with a **private ACL**
+in the selected region, or verifies an existing bucket's owner, location and ACL.
+It uses the same-region OSS HTTPS internal endpoint. The bucket holds the QCOW2
+until ECS has imported it; it is not the encrypted workspace disk.
+
+The first image import in an account also needs ECS's standard import role. If
+the script reports missing authorization, explicitly create/authorize it:
+
+```bash
+python3 deployment/ack/prepare-storage.py --authorize-image-import
+```
+
+This uses the official `AliyunECSImageImportDefaultRole` and system policy
+`AliyunECSImageImportRolePolicy`. Alternatively, open **ECS console → Images →
+Import Image → Authorize**, then repeat the storage step. A read-only readiness
+check is available with `--check`. For an approved existing ImageID, the script
+skips bucket creation and import authorization.
 
 ### Confirm or import the PodVM image
 
