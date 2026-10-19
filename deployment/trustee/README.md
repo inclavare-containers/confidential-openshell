@@ -3,7 +3,7 @@
 The runtime uses the two official Trustee 0.22 images pinned in
 [the runtime lock](../runtime/artifacts.lock.json): `images.trustee_as` and
 `images.trustee_kbs`. The gRPC AS includes BuiltIn RVPS. Its administrative API
-listens on `127.0.0.1:50004`; KBS exposes the trusted private HTTPS endpoint.
+listens on `127.0.0.1:50004`; KBS exposes the trusted HTTPS endpoint.
 
 Install the two [units](units/) and the public configuration templates under
 `/etc/trustee`. Their required `/etc/trustee/images.env` contains
