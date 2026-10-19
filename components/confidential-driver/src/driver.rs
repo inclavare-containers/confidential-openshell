@@ -739,6 +739,7 @@ pub struct KubernetesComputeDriver {
 }
 
 pub struct ConfidentialDriverSettings {
+    pub bootstrap_timeout: Duration,
     pub initdata_base: PathBuf,
     pub client_tls_ca: PathBuf,
     pub policy_generator: PathBuf,
@@ -782,6 +783,7 @@ fn validate_confidential_gateway_endpoint(endpoint: &str) -> Result<(), Kubernet
 }
 
 struct ConfidentialProfile {
+    bootstrap_timeout: Duration,
     store: BootstrapStore,
     initdata: GuestInitdata,
     client_tls: TrustedClientTlsPaths,
@@ -1595,6 +1597,13 @@ impl KubernetesComputeDriver {
         read_staged_upstream_proxy_ca_bundle(config.proxy_ca_bundle.as_deref())
             .await
             .map_err(|error| KubernetesDriverError::Precondition(error.to_string()))?;
+        if confidential_settings.bootstrap_timeout.is_zero()
+            || confidential_settings.bootstrap_timeout > Duration::from_hours(1)
+        {
+            return Err(KubernetesDriverError::Precondition(
+                "bootstrap timeout must be between 1 and 3600 seconds".to_string(),
+            ));
+        }
         let client_tls = TrustedClientTlsPaths {
             ca: confidential_settings.client_tls_ca,
         };
@@ -1632,6 +1641,7 @@ impl KubernetesComputeDriver {
             ));
         }
         let confidential = Arc::new(ConfidentialProfile {
+            bootstrap_timeout: confidential_settings.bootstrap_timeout,
             initdata: GuestInitdata::load(&confidential_settings.initdata_base)
                 .and_then(|base| base.with_registry_ca(&confidential_settings.policy_registry_ca))
                 .map_err(KubernetesDriverError::Precondition)?,
@@ -1701,6 +1711,14 @@ impl KubernetesComputeDriver {
             confidential: Some(confidential),
             lifecycle_gates: Arc::default(),
         })
+    }
+
+    fn bootstrap_timeout(&self) -> Duration {
+        self.confidential
+            .as_ref()
+            .map_or(SANDBOX_RUNTIME_BOOTSTRAP_GRACE, |profile| {
+                profile.bootstrap_timeout
+            })
     }
 
     pub fn capabilities(&self) -> Result<GetCapabilitiesResponse, String> {
@@ -3570,6 +3588,7 @@ impl KubernetesComputeDriver {
             names.supervisor_pod.clone(),
             cr_name.to_string(),
             Some(cr_uid.to_string()),
+            self.bootstrap_timeout(),
         );
         // Return while the CR remains explicitly bootstrapping. The gateway
         // can now commit the sandbox configuration required by a policy-less
@@ -3943,6 +3962,7 @@ impl KubernetesComputeDriver {
             names.supervisor_pod.clone(),
             cr_name.to_string(),
             Some(cr_uid.to_string()),
+            self.bootstrap_timeout(),
         );
         Ok(())
     }
@@ -5951,11 +5971,8 @@ impl KubernetesComputeDriver {
         lookup_api: &AgentSandboxApi,
         object: &DynamicObject,
     ) {
-        if !sandbox_runtime_bootstrap_is_stale(
-            object,
-            SystemTime::now(),
-            SANDBOX_RUNTIME_BOOTSTRAP_GRACE,
-        ) {
+        if !sandbox_runtime_bootstrap_is_stale(object, SystemTime::now(), self.bootstrap_timeout())
+        {
             return;
         }
         if sandbox_runtime_bootstrap_operation(object) != Some("create") {
@@ -6314,9 +6331,10 @@ fn spawn_sandbox_runtime_bootstrap_completion(
     supervisor_pod_name: String,
     sandbox_name: String,
     expected_sandbox_uid: Option<String>,
+    bootstrap_timeout: Duration,
 ) {
     tokio::spawn(async move {
-        let deadline = tokio::time::Instant::now() + SANDBOX_RUNTIME_BOOTSTRAP_GRACE;
+        let deadline = tokio::time::Instant::now() + bootstrap_timeout;
         let available = |pod: Option<&Pod>| {
             pod.is_some_and(|pod| {
                 sandbox_runtime_control_availability_from_pod(pod)
@@ -9478,6 +9496,7 @@ mod tests {
             config: KubernetesComputeConfig::default(),
             operator_allowlist: None,
             confidential: Some(Arc::new(ConfidentialProfile {
+                bootstrap_timeout: SANDBOX_RUNTIME_BOOTSTRAP_GRACE,
                 store,
                 initdata: GuestInitdata::load(&base).unwrap(),
                 client_tls: TrustedClientTlsPaths { ca: base.clone() },
@@ -9928,6 +9947,7 @@ mod tests {
         )
         .unwrap();
         driver.confidential = Some(Arc::new(ConfidentialProfile {
+            bootstrap_timeout: SANDBOX_RUNTIME_BOOTSTRAP_GRACE,
             store,
             initdata: GuestInitdata::load(&base).unwrap(),
             client_tls: TrustedClientTlsPaths { ca: base.clone() },
@@ -11561,6 +11581,37 @@ mod tests {
             !sandbox_runtime_namespace_fence_generation_matches(&policy, &sandbox),
             "a replacement policy must invalidate the recorded fence identity"
         );
+    }
+
+    #[tokio::test]
+    async fn configured_bootstrap_budget_keeps_slow_start_bounded() {
+        let (mut driver, _) = delete_test_driver(vec![]);
+        assert_eq!(driver.bootstrap_timeout(), Duration::from_mins(5));
+        let (temp, _, _) = attach_delete_test_workspace(&mut driver);
+        Arc::get_mut(driver.confidential.as_mut().unwrap())
+            .unwrap()
+            .bootstrap_timeout = Duration::from_mins(15);
+        let started = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let object: DynamicObject = serde_json::from_value(serde_json::json!({
+            "apiVersion": "agents.x-k8s.io/v1beta1", "kind": "Sandbox",
+            "metadata": {"annotations": {
+                ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_STARTED_AT: "1000000",
+                ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING: "true"
+            }}
+        }))
+        .unwrap();
+        assert!(!sandbox_runtime_bootstrap_is_stale(
+            &object,
+            started + Duration::from_mins(6),
+            driver.bootstrap_timeout()
+        ));
+        assert!(sandbox_runtime_bootstrap_is_stale(
+            &object,
+            started + Duration::from_mins(15),
+            driver.bootstrap_timeout()
+        ));
+        drop(driver);
+        std::fs::remove_dir_all(temp).unwrap();
     }
 
     #[test]

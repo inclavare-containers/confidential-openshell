@@ -25,7 +25,9 @@ openshell whoami --output json
 ```
 
 Use a unique sandbox name of at most 19 characters. First creation includes guest
-startup, attestation and workspace initialization. Later starts reuse the files.
+startup, attestation and workspace initialization. The service allows 15 minutes
+for this bootstrap, including image preparation, before recovering a stalled
+attempt. Later starts reuse the files.
 
 The pinned Community image contains a policy in an older schema. The native
 `OPENSHELL_SANDBOX_POLICY` setting selects the supplied restrictive policy instead;

@@ -22,6 +22,11 @@ use openshell_driver_confidential_kubernetes::{
 #[command(version = VERSION)]
 #[allow(clippy::struct_excessive_bools)]
 struct Args {
+    /// Time budget for policy generation, guest boot and image preparation.
+    #[arg(long, env = "OPENSHELL_BOOTSTRAP_TIMEOUT_SECONDS", default_value_t = 300,
+        value_parser = clap::value_parser!(u64).range(1..=3600))]
+    bootstrap_timeout_seconds: u64,
+
     /// `RuntimeClass` backed by an attested confidential guest for both Pods.
     #[arg(long, env = "OPENSHELL_CONFIDENTIAL_RUNTIME_CLASS")]
     confidential_runtime_class: String,
@@ -327,6 +332,7 @@ async fn main() -> Result<()> {
         },
         shutdown_rx,
         ConfidentialDriverSettings {
+            bootstrap_timeout: std::time::Duration::from_secs(args.bootstrap_timeout_seconds),
             initdata_base: args.guest_initdata_base,
             client_tls_ca: args.confidential_client_tls_ca,
             policy_generator: args.kata_policy_generator,
@@ -421,5 +427,6 @@ mod tests {
             Some("http://collector.example:4317")
         );
         assert_eq!(args.gateway_name.as_deref(), Some("kubernetes-dev"));
+        assert_eq!(args.bootstrap_timeout_seconds, 300);
     }
 }
