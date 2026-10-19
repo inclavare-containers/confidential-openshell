@@ -181,6 +181,20 @@ class Setup(CloudFixture, unittest.TestCase):
         self.assertIn('--SourceGroupId=sg-workers', arguments)
         self.assertIn('--DryRun=true', arguments)
         self.assertFalse(any(a.startswith('--Optional') for a in arguments))
+        self.assertNotIn('--force', arguments)
+
+    def test_import_cli_uses_a_bare_force_flag_and_flat_rpc_fields(self):
+        client = cloud.Client()
+        result = subprocess.CompletedProcess([], 0, '{}', '')
+        with patch.object(cloud.subprocess, 'run', return_value=result) as command:
+            client.api('ecs', 'ImportImage', force=True, method='POST',
+                       **{'Features.NvmeSupport': 'supported', 'DiskDeviceMapping.1.OSSBucket': 'private-test'})
+        arguments = command.call_args.args[0]
+        self.assertIn('--force', arguments)
+        self.assertNotIn('--force=true', arguments)
+        self.assertIn('--method=POST', arguments)
+        self.assertIn('--Features.NvmeSupport=supported', arguments)
+        self.assertIn('--DiskDeviceMapping.1.OSSBucket=private-test', arguments)
 
     def test_existing_cluster_only_reads_and_renews_private_kubeconfig(self):
         self.prepare()

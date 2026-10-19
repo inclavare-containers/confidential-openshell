@@ -48,11 +48,13 @@ class Client:
         self.selection = read(HANDOFF / 'selection.json')
         self.region = self.selection['podvm_region']
 
-    def api(self, product, operation, *, body=None, absent=None, **parameters):
+    def api(self, product, operation, *, body=None, absent=None, force=False, **parameters):
         args = ['aliyun', product, operation, '--region', self.region]
         profile = os.environ.get('ALIBABA_CLOUD_PROFILE')
         if profile:
             args += ['--profile', profile]
+        if force:
+            args.append('--force')
         for key, value in parameters.items():
             if value is not None:
                 value = str(value).lower() if isinstance(value, bool) else str(value)

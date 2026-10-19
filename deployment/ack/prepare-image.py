@@ -31,7 +31,8 @@ def main():
             require(cloud.state.get('oss_bucket') == bucket and cloud.state.get('image_import_role_arn'),
                     'Run python3 deployment/ack/prepare-storage.py before importing the image.')
             cloud.oss('cp', str(qcow), f'oss://{bucket}/{key}', '--force', '--acl', 'private')
-            response = cloud.api('ecs', 'ImportImage', RegionId=cloud.region,
+            # Match the official CLI example: flat RPC fields with local metadata checks disabled.
+            response = cloud.api('ecs', 'ImportImage', force=True, method='POST', RegionId=cloud.region,
                                  ImageName=cloud.name + '-' + qcow_digest[:12], Description=cloud.name,
                                  ClientToken=cloud.name + '-' + qcow_digest[:20],
                                  OSType='linux', Platform='Ubuntu', Architecture='x86_64', BootMode='UEFI',
