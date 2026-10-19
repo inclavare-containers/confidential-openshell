@@ -263,7 +263,9 @@ The registrar reads the values back from BuiltIn RVPS. Confirm anonymous access
 to the HTTPS resource endpoint returns **401 or 403**:
 
 ```bash
-curl --noproxy '*' --cacert /etc/trustee/tls/ca.pem -sS -o /dev/null \
+curl --noproxy '*' --cacert /etc/trustee/tls/ca.pem \
+  --retry 10 --retry-connrefused --retry-delay 1 --retry-max-time 30 \
+  --connect-timeout 5 --max-time 10 -sS -o /dev/null \
   -w '%{http_code}\n' "https://${HOST_IP}:8443/kbs/v0/resource/default/bootstrap/anonymous-check"
 ```
 
