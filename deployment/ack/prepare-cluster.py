@@ -21,10 +21,8 @@ def kubectl(env, *args):
         detail = 'kubectl did not complete within 30 seconds.\n' + stderr.strip()
     raise SystemExit(
         f'ACK Kubernetes API request failed (kubeconfig: {env["KUBECONFIG"]}):\n{detail}\n'
-        'For public API timeouts, check TCP 6443 and the API load balancer ACL/security group '
-        'against the operator network egress IP. Private API access requires a routed connection.\n'
-        'See deployment/ack/README.md#api-connectivity. Keep ack.json and ack-state.json; '
-        'repeat this step after fixing access to resume the existing cluster.'
+        'Keep ack.json and ack-state.json; repeat this step after fixing the reported '
+        'connection or credential error to resume the existing cluster.'
     ) from None
 
 

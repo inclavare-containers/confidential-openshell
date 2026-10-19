@@ -3,6 +3,8 @@
 This guide installs native OpenShell 0.1.3 with the Ubuntu UKI / CoCo 0.22 profile
 on Alibaba Cloud ACK and Intel TDX. Start with a fresh development environment.
 For an already installed Gateway, use [first agent](first-agent.md).
+Developers connect to the trusted Gateway over public TLS using the native
+OpenShell CLI.
 
 You need:
 
@@ -110,9 +112,6 @@ To reuse a private bucket, add `--oss-bucket NAME_FROM_OSS`.
 
 The [input reference](../deployment/ack/README.md) explains every field and its
 source. `--replace` regenerates an input file only before cloud setup starts.
-The selected API endpoint must allow the operator's connection. For public access,
-check any API load balancer whitelist against the operator's actual NAT/proxy
-egress IP; this can differ from `HOST_IP`. See [API connectivity](../deployment/ack/README.md#api-connectivity).
 
 ### Prepare the selected ACK cluster
 
@@ -144,8 +143,7 @@ Both paths save resources in `$OPERATOR_DIR/ack-state.json`. Keep this state whe
 retrying. The kubeconfig lasts up to three days; repeat the cluster step
 to renew it. Use a separate operator directory/name for a different deployment.
 If a Kubernetes API request fails, the script prints the error and exits. Fix
-connectivity or credentials, then repeat the same command to resume. A running
-control plane alone does not establish API reachability from the operator host.
+connectivity or credentials, then repeat the same command to resume.
 
 ### Prepare the PodVM network
 

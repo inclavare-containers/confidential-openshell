@@ -92,26 +92,6 @@ kubectl get storageclass
 For existing ACK, select the host ESSD class from **ACK console → cluster →
 Storage → StorageClasses** before starting setup.
 
-## API connectivity
-
-ACK's cloud API reporting a running cluster does not verify that `kubectl` can
-reach its Kubernetes API. The script obtains the selected kubeconfig and checks
-workers through that endpoint. Each `kubectl` command has a 30-second deadline;
-connection and authentication errors are printed before the step exits.
-
-For public access, allow TCP 6443 from the operator network's actual egress IP in
-the API load balancer's ACL or security group. `HOST_IP` advertises inbound trusted
-services and may differ from that outbound address, especially with NAT/proxies.
-In **ACK console → cluster → Cluster Information**, follow the API endpoint's
-access-control link to inspect its load balancer. Ask the network administrator
-to update organization-managed rules. See [official cluster access guidance](https://www.alibabacloud.com/help/en/ack/ack-managed-and-ack-dedicated/user-guide/access-clusters/).
-
-For private access, verify the VPN/routed path to the selected ACK VPC. For
-certificate or authorization errors, check system time and the kubeconfig's
-validity and permissions. After fixing access, repeat `prepare-cluster.py` with
-the same inputs/state. Keep `ack-state.json` so the existing cluster and node pool
-are reused.
-
 ## Storage and image-import authorization
 
 `prepare-storage.py` creates the generated bucket with private ACL, or checks an

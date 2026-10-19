@@ -29,11 +29,8 @@ host. ACK and the cloud provider do not need administrative access to it. If the
 cloud host administrator is in the adversary model, an ordinary ECS VM cannot
 supply this trust merely because the user owns the account.
 
-The current development setup temporarily runs T's services on an ECS VM because
-the developer machines have NAT egress and no stable inbound public address. This
-makes cloud-to-Gateway/KBS connectivity convenient for functional testing. It does
-not validate isolation of T's keys and policies from a malicious cloud host
-administrator. Production must place T in the actual user-trusted environment.
+Developers run the native CLI on their trusted machines and reach the Gateway's
+public TLS endpoint in T.
 
 T reaches ACK through the selected public API or an explicitly routed private
 connection. Guests reach Gateway/KBS and the image registry through authenticated
