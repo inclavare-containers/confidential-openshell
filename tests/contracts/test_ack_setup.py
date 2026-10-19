@@ -44,13 +44,16 @@ class CloudFixture:
         (self.handoff / 'outputs').mkdir(parents=True)
         self.config = cloud.read(ROOT / 'deployment/ack/ack.example.json')
         self.config.update(cluster_id='c-test', worker_vswitch_id='vsw-worker',
-                           service_host_security_group_id='sg-service', oss_bucket='private-test')
+                           service_host_security_group_id='sg-service', oss_bucket='private-test',
+                           ack_api_access='private', worker_ssh_source_cidr='192.168.16.223/32')
         self.selection = {'podvm_region': 'cn-beijing', 'podvm_mode': 'existing',
                           'podvm_image_id': 'm-test', 'references': 'refs.json', 'guest': None}
         cloud.write(self.handoff / 'outputs/refs.json', {'tdx.mr_td': ['approved']})
         self.inputs()
         self.detail = {'cluster_id': 'c-test', 'region_id': 'cn-beijing', 'state': 'running',
                        'vpc_id': 'vpc-test', 'security_group_id': 'sg-workers',
+                       'master_url': {'api_server_endpoint': 'https://203.0.113.20:6443',
+                                      'intranet_api_server_endpoint': 'https://192.168.1.20:6443'},
                        'rrsa_config': {'enabled': True, 'oidc_arn': 'acs:ram::123:oidc-provider/test',
                                        'issuer': 'https://issuer.example,https://kubernetes.default.svc'}}
         self.nodes = {'items': [{'metadata': {'name': 'worker', 'labels': {'topology.kubernetes.io/zone': 'cn-beijing-i'}},
@@ -160,6 +163,27 @@ class Setup(CloudFixture, unittest.TestCase):
         self.assertFalse(any(op.startswith(('Create', 'Import', 'Modify')) for op, _ in self.calls))
         self.assertEqual((self.operator / 'administrator-kubeconfig').stat().st_mode & 0o777, 0o600)
         self.assertEqual(self.state()['rrsa']['oidc_arn'], self.detail['rrsa_config']['oidc_arn'])
+
+    def test_external_trusted_host_selects_public_ack_api_without_cloud_host_identity(self):
+        self.config.update(ack_api_access='public', service_host_security_group_id='', worker_ssh_source_cidr='')
+        self.inputs()
+        self.prepare()
+        requests = [a for op, a in self.calls if op == 'DescribeClusterUserKubeconfig']
+        self.assertFalse(requests[0]['PrivateIpAddress'])
+        self.assertTrue(cluster.cluster_request(self.config, 'cn-beijing', 'vpc-test', 'vsw-pod')['endpoint_public_access'])
+        with patch.object(sys, 'argv', ['prepare-network.py']):
+            network.main()
+        rules = [a for op, a in self.calls if op == 'AuthorizeSecurityGroup']
+        self.assertEqual({a['SecurityGroupId'] for a in rules}, {'sg-workers', 'sg-podvm'})
+        self.assertFalse(any(a.get('SourceCidrIp') for a in rules))
+
+    def test_missing_public_api_fails_before_freezing_existing_cluster_inputs(self):
+        self.config['ack_api_access'] = 'public'
+        self.detail['master_url']['api_server_endpoint'] = ''
+        self.inputs()
+        with self.assertRaisesRegex(SystemExit, 'public API is disabled'):
+            self.prepare()
+        self.assertFalse((self.operator / 'ack-state.json').exists())
 
     def test_new_cluster_explicit_creation_and_resuming_does_not_duplicate(self):
         self.config['cluster_id'] = ''
@@ -326,12 +350,13 @@ class InputDiscovery(unittest.TestCase):
         from argparse import Namespace
         return Namespace(**{'name': 'cos-inputs-test', 'cluster_id': '', 'service_host_instance_id': '',
                             'service_host_security_group_id': '', 'worker_vswitch_id': '',
-                            'pod_vswitch_id': '', 'podvm_vswitch_id': '', 'oss_bucket': '', **overrides})
+                            'pod_vswitch_id': '', 'podvm_vswitch_id': '', 'oss_bucket': '',
+                            'ack_api_access': 'public', 'oss_endpoint_network': 'public', **overrides})
 
     def test_new_inputs_discover_host_and_avoid_allocations_on_all_pages(self):
         self.groups = ['sg-host']
         with patch.dict('os.environ', HOST_IP='192.168.16.223'):
-            config, location = inputs.discover(self.client(), self.arguments())
+            config, location = inputs.discover(self.client(), self.arguments(service_host_instance_id='i-service'))
         self.assertEqual(config['service_host_security_group_id'], 'sg-host')
         self.assertEqual(config['worker_vswitch_id'], 'vsw-host')
         self.assertEqual(config['pod_vswitch_cidr'], '192.168.2.0/24')
@@ -347,15 +372,27 @@ class InputDiscovery(unittest.TestCase):
         self.assertEqual(config['pod_vswitch_cidr'], '')
         self.assertEqual(config['podvm_vswitch_cidr'], '192.168.2.0/24')
         self.assertEqual(config['oss_bucket'], 'existing-bucket')
+        self.assertEqual(config['service_host_instance_id'], '')
+        self.assertEqual(config['service_host_security_group_id'], '')
+        self.assertEqual(config['ack_api_access'], 'public')
+
+    def test_on_prem_host_does_not_need_or_lookup_an_ecs_identity(self):
+        client = self.client()
+        with patch.dict('os.environ', HOST_IP='203.0.113.10'):
+            config, _ = inputs.discover(client, self.arguments(worker_vswitch_id='vsw-cloud'))
+        self.assertEqual(config['service_host_ip'], '203.0.113.10')
+        self.assertEqual(config['service_host_instance_id'], '')
+        self.assertEqual(config['service_host_security_group_id'], '')
+        self.assertNotIn('DescribeInstances', [call.args[1] for call in client.api.call_args_list])
 
     def test_multiple_security_groups_require_an_attached_choice(self):
         self.groups = ['sg-one', 'sg-two']
         with patch.dict('os.environ', HOST_IP='192.168.16.223'):
             with self.assertRaisesRegex(SystemExit, 'multiple security groups'):
-                inputs.discover(self.client(), self.arguments())
+                inputs.discover(self.client(), self.arguments(service_host_instance_id='i-service'))
             with self.assertRaisesRegex(SystemExit, 'not attached'):
-                inputs.discover(self.client(), self.arguments(service_host_security_group_id='sg-other'))
-            config, _ = inputs.discover(self.client(), self.arguments(service_host_security_group_id='sg-two'))
+                inputs.discover(self.client(), self.arguments(service_host_instance_id='i-service', service_host_security_group_id='sg-other'))
+            config, _ = inputs.discover(self.client(), self.arguments(service_host_instance_id='i-service', service_host_security_group_id='sg-two'))
         self.assertEqual(config['service_host_security_group_id'], 'sg-two')
 
     def test_full_vpc_does_not_generate_overlapping_cidrs(self):

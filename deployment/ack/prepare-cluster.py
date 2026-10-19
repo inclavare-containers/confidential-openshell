@@ -14,7 +14,7 @@ def cluster_request(config, region, vpc, pod_switch):
         'region_id': region, 'kubernetes_version': config['kubernetes_version'],
         'vpcid': vpc, 'vswitch_ids': [config['worker_vswitch_id']],
         'pod_vswitch_ids': [pod_switch], 'service_cidr': config['service_cidr'],
-        'proxy_mode': 'ipvs', 'endpoint_public_access': False, 'snat_entry': True,
+        'proxy_mode': 'ipvs', 'endpoint_public_access': config['ack_api_access'] == 'public', 'snat_entry': True,
         'deletion_protection': True, 'rrsa_config': {'enabled': True},
         'addons': [
             {'name': 'terway-eniip', 'config': json.dumps({'IPVlan': 'true', 'NetworkPolicy': 'true'})},
@@ -90,9 +90,15 @@ def main():
         response = cloud.api('cs', 'CreateCluster', body=request)
         cluster = response['cluster_id']
         cloud.save(cluster_id=cluster, created_cluster=True)
-    cloud.save(cluster_id=cluster)
-    detail = cloud.wait('ACK control plane', cloud.cluster, lambda d: d['state'] == 'running')
+    detail = cloud.wait('ACK control plane', lambda: cloud.api('cs', 'DescribeClusterDetail', ClusterId=cluster),
+                        lambda d: d['state'] == 'running')
     require(detail['region_id'] == cloud.region, 'ACK and the selected PodVM image must be in the same region.')
+    if config['ack_api_access'] == 'public':
+        endpoints = detail['master_url']
+        endpoints = json.loads(endpoints) if isinstance(endpoints, str) else endpoints
+        require(endpoints.get('api_server_endpoint'),
+                'ACK public API is disabled. Enable it in ACK console > Cluster Information, or select private API with routed connectivity.')
+    cloud.save(cluster_id=cluster)
     if not detail.get('rrsa_config', {}).get('enabled') and args.enable_rrsa:
         cloud.api('cs', 'ModifyCluster', ClusterId=cluster, body={'enable_rrsa': True})
         detail = cloud.wait('ACK RRSA', cloud.cluster, lambda d: d['state'] == 'running' and
@@ -118,7 +124,7 @@ def main():
             'cs', 'CreateClusterNodePool', ClusterId=cluster, body=request)['nodepool_id']
         cloud.save(nodepool_id=pool)
     kubeconfig = cloud.api('cs', 'DescribeClusterUserKubeconfig', ClusterId=cluster,
-                          PrivateIpAddress=True, TemporaryDurationMinutes=4320)
+                          PrivateIpAddress=config['ack_api_access'] == 'private', TemporaryDurationMinutes=4320)
     path = OPERATOR / 'administrator-kubeconfig'
     write(path, kubeconfig['config'])
     env = {**os.environ, 'KUBECONFIG': str(path)}
@@ -135,7 +141,7 @@ def main():
             'Terway NetworkPolicy is disabled. See deployment/ack/README.md.')
     cloud.save(zone_id=nodes['items'][0]['metadata']['labels']['topology.kubernetes.io/zone'])
     run(['kubectl', 'get', 'nodes', '-o', 'wide'], env=env)
-    print(f'ACK ready: {cluster}. Private kubeconfig is valid for up to 3 days; repeat this step to renew it.')
+    print(f'ACK ready: {cluster} ({config["ack_api_access"]} API). Kubeconfig is valid for up to 3 days; repeat to renew it.')
 
 
 if __name__ == '__main__':

@@ -3,7 +3,7 @@ usage='Usage: bash deployment/peerpods/publish-images.sh
 Publish handoff images and locked runtime mirrors. Set HOST_IP and HANDOFF; writes digest records in OPERATOR_DIR.'
 source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 require_root
-private_ip
+service_addresses
 verify_handoff
 load_selection
 REGISTRY_ADDR="$HOST_IP:5000"

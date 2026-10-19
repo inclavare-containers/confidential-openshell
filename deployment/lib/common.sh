@@ -19,12 +19,16 @@ trap 'printf "Failed: %s:%s. Fix the reported error, then repeat this step.\n" "
 die() { printf '%s\n' "$*" >&2; exit 1; }
 require_root() { [[ $EUID == 0 ]] || die 'Run this installation step as root.'; }
 need() { local cmd; for cmd in "$@"; do command -v "$cmd" >/dev/null || die "Missing tool: $cmd. See docs/build.md."; done; }
-private_ip() {
-    : "${HOST_IP:?export HOST_IP with the trusted host private IPv4}"
-    python3 - "$HOST_IP" <<'PY'
+service_addresses() {
+    : "${HOST_IP:?export HOST_IP with the trusted service IPv4 reachable from the cloud}"
+    HOST_BIND_IP=${HOST_BIND_IP:-$HOST_IP}
+    export HOST_BIND_IP
+    python3 - "$HOST_IP" "$HOST_BIND_IP" <<'PY'
 import ipaddress, sys
 ip = ipaddress.IPv4Address(sys.argv[1])
-assert ip.is_private and not ip.is_loopback and not ip.is_unspecified
+assert not (ip.is_loopback or ip.is_unspecified or ip.is_multicast), 'HOST_IP must be a cloud-reachable unicast IPv4'
+bind = ipaddress.IPv4Address(sys.argv[2])
+assert not bind.is_multicast, 'HOST_BIND_IP must be a local IPv4 bind address'
 PY
 }
 checked() { [[ -f $2 ]] && printf '%s  %s\n' "$1" "$2" | sha256sum -c - >/dev/null 2>&1; }

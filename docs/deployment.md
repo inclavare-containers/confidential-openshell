@@ -6,8 +6,9 @@ For an already installed Gateway, use [first agent](first-agent.md).
 
 You need:
 
-- A trusted Ubuntu ECS service host for Gateway, driver, Trustee and the private
-  registry, in the selected PodVM region. It can also be the build machine.
+- A user-trusted Ubuntu service host for Gateway, driver, Trustee and the registry.
+  It can be on-premise and can also be the build machine. The ECS development
+  shortcut below is for functional testing, not the production trust boundary.
 - A new or existing ACK cluster, prepared in step 3. Existing clusters need RRSA,
   enforced NetworkPolicy and accessible workers.
 - A compatible TDX PodVM image and its approved reference file.
@@ -30,21 +31,29 @@ In the build guide, [select a guest image](build.md#select-the-guest-image), the
 public source should now be at `/opt/confidential-openshell` on the service host.
 A new guest image needs import in step 3; an approved ImageID can be reused.
 
-Set the service host's private IPv4 once. Repeat these exports when opening a
-new shell; scripts read the image selection from the handoff:
+Set the advertised service address and its local listener address separately:
 
 ```bash
 cd /opt/confidential-openshell
-export HOST_IP=$(ip -4 route get 100.100.100.200 | awk '{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')
-printf 'Service host private IPv4: %s\n' "$HOST_IP"
 export HANDOFF=/var/lib/openshell-confidential/operator/handoff
 export OPERATOR_DIR=/var/lib/openshell-confidential/operator/cluster-config
+read -r -p 'Trusted service IPv4 reachable from cloud workers/guests: ' HOST_IP
+export HOST_IP
+export HOST_BIND_IP=$(ip -4 route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1);exit}}')
 ```
 
-The address comes from this ECS host's route to the Alibaba metadata service.
-Check it against the ECS console's private IPv4, especially on a host with multiple
-network interfaces. Use the same address for Gateway, KBS and registry throughout this guide.
-The [architecture](architecture.md) explains the trusted host boundary.
+`HOST_IP` is the address advertised to the cloud for Gateway 9443, KBS 8443 and
+registry 5000, and included in TLS certificates. `HOST_BIND_IP` is an interface
+address actually present on the trusted host; adjust it for the interface receiving
+this traffic. Both may be equal on a directly routed host. Behind NAT/forwarding,
+the advertised public address can differ from the local listener address.
+
+A machine with outbound NAT alone cannot receive these connections. Provision a
+reachable ingress, VPN, or TCP forwarding route first; obtain its assigned IPv4
+from that network's configuration. Forward the three TCP ports to `HOST_BIND_IP`
+and retain TLS termination/private keys on T. A public NAT **egress** IP alone is
+not evidence that inbound connectivity exists. Permit only approved clients.
+The [architecture](architecture.md) defines T independently of network placement.
 
 ## 3. Prepare cluster, select the cloud image and configure identities
 
@@ -57,28 +66,15 @@ export REGION=$(jq -er .podvm_region "$HANDOFF/selection.json")
 aliyun sts GetCallerIdentity --region "$REGION"
 ```
 
-Use the operator identity for this deployment's Alibaba account. `aliyun configure`
-accepts a RAM user's AccessKey or another supported credential type. Obtain the
-credentials from your account administrator or [RAM console](https://ram.console.aliyun.com/);
-this operator needs ECS, VPC, ACK, RAM and OSS administration for the steps below.
-Existing profiles or an ECS instance role can also be used. Set
-`ALIBABA_CLOUD_PROFILE` to select a named profile for the scripts; use the same
-profile for manual CLI queries. Credentials stay on this host.
-
-The installer uses the official China CDN. No ACK cluster, dedicated PodVM
-network or OSS bucket needs to exist yet. The service ECS already belongs to a
-VPC, a vSwitch and at least one security group; the next command discovers them.
+Obtain the operator identity from your Alibaba account administrator or
+[RAM console](https://ram.console.aliyun.com/). This identity needs ECS, VPC, ACK,
+RAM and OSS administration. Set `ALIBABA_CLOUD_PROFILE` to choose a named CLI
+profile, and use the same profile for manual queries. Credentials stay in T.
+No ECS service-host identity is required by the general deployment path.
 
 ### Choose an existing cluster, or prepare a new one
 
-For a **new ACK cluster**, generate the inputs:
-
-```bash
-python3 deployment/ack/configure-inputs.py
-```
-
-For an **existing ACK cluster**, first list cluster IDs and names in the selected
-region. Use the ID from the `cluster_id` column in the second command:
+For an existing ACK, list clusters and use its ID:
 
 ```bash
 aliyun cs DescribeClustersV1 --region "$REGION" --region_id "$REGION" \
@@ -87,33 +83,59 @@ aliyun cs DescribeClustersV1 --region "$REGION" --region_id "$REGION" \
 python3 deployment/ack/configure-inputs.py --cluster-id ID_FROM_THE_LIST
 ```
 
-Discovery writes `$OPERATOR_DIR/ack.json` and prints the selected values. It does
-not create cloud resources. For a new cluster it uses the service ECS's vSwitch
-for workers; for an existing cluster it discovers the ACK worker vSwitch and
-requires the same VPC as the service ECS. It also:
+For a new ACK, list **cloud-side** worker vSwitches, then select one:
 
-- Selects the security group **already attached to this service ECS**. This is
-  what `service_host_security_group_id` means; it is not the future PodVM group.
-  If several groups are attached, the script prints their IDs and requires
-  `--service-host-security-group-id` to choose one.
-- Chooses unused `/24` ranges in the VPC for the required Pod/PodVM vSwitches.
-  Their IDs stay empty until the corresponding creation steps run.
-- Generates an OSS bucket name from the account ID and a random suffix for QCOW2
-  import. The bucket does **not** need to exist; the storage step below creates it. No bucket is
-  needed when reusing an approved ImageID.
+```bash
+aliyun vpc DescribeVSwitches --region "$REGION" --RegionId "$REGION" --PageSize 50 \
+  | jq -r '.VSwitches.VSwitch[] | [.VSwitchId, .VSwitchName, .VpcId, .ZoneId, .CidrBlock] | @tsv'
+python3 deployment/ack/configure-inputs.py --worker-vswitch-id ID_FROM_THE_LIST
+```
 
-Review the file, particularly the worker count/type and TDX instance type:
+If no suitable cloud network exists, the [network preparation commands](../deployment/ack/README.md#cloud-network-selection)
+create a VPC and worker vSwitch before this step. The trusted service host is not
+required to belong to that VPC. Only workers, Kubernetes Pods and PodVMs use the
+selected cloud network.
+
+The initializer writes `$OPERATOR_DIR/ack.json` and creates no cloud resources.
+It discovers the ACK VPC/zone, proposes unused Pod/PodVM CIDRs and generates a
+bucket name for import. The later steps create those resources. Review the file:
 
 ```bash
 cat "$OPERATOR_DIR/ack.json"
 ${EDITOR:-vi} "$OPERATOR_DIR/ack.json"
 ```
 
-The [input reference](../deployment/ack/README.md) explains every field and gives
-queries for selecting existing resources. To reuse a bucket, provide its actual
-name with `configure-inputs.py --oss-bucket NAME_FROM_OSS`; the storage step checks
-its account, region and private ACL. The initializer refuses an existing input
-file unless `--replace` is given, and never replaces inputs after setup starts.
+The default `ack_api_access=public` obtains a public API kubeconfig; an existing
+ACK must already have its public API enabled. For VPN/private routing, choose
+`--ack-api-access private` instead. The default OSS endpoint is public HTTPS;
+`--oss-endpoint-network internal` requires same-region OSS internal connectivity.
+To reuse a private bucket, add `--oss-bucket NAME_FROM_OSS`.
+
+The [input reference](../deployment/ack/README.md) explains every field and its
+source. `--replace` regenerates an input file only before cloud setup starts.
+
+### Optional ECS development shortcut
+
+For this project's current development environment, services run together on an
+ordinary ECS VM to provide a stable cloud-reachable address. This is an explicit
+functional-test setup, as described in the architecture; the production T/U trust
+separation is not established by placing keys on this VM.
+
+When testing from an ECS in the ACK VPC, use its existing private interface for
+both service addresses. Get the Instance ID from **ECS console → Instances**:
+
+```bash
+export HOST_IP=$(ip -4 route get 100.100.100.200 | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1);exit}}')
+export HOST_BIND_IP="$HOST_IP"
+read -r -p 'Development ECS Instance ID: ' DEV_ECS_ID
+python3 deployment/ack/configure-inputs.py --service-host-instance-id "$DEV_ECS_ID" \
+  --ack-api-access private --oss-endpoint-network internal
+```
+
+This optional shortcut discovers the worker vSwitch and an attached service
+security group. It enables the network step to configure that ECS's ingress. For
+an existing ACK, also pass `--cluster-id`. If several ECS security groups are
+attached, select one with `--service-host-security-group-id` from the printed IDs.
 
 ### Prepare the selected ACK cluster
 
@@ -124,7 +146,7 @@ python3 deployment/ack/prepare-cluster.py
 export KUBECONFIG="$OPERATOR_DIR/administrator-kubeconfig"
 ```
 
-This obtains a private administrator kubeconfig and checks Ready Linux/amd64
+This obtains an administrator kubeconfig for the selected API path and checks Ready Linux/amd64
 workers, containerd, `supplementalGroupsPolicy` and Terway NetworkPolicy settings.
 If RRSA is disabled, repeat with `--enable-rrsa` to explicitly enable it.
 
@@ -136,13 +158,13 @@ export KUBECONFIG="$OPERATOR_DIR/administrator-kubeconfig"
 ```
 
 This creates a **paid ACK Pro cluster and pay-as-you-go workers**, using the
-reviewed inputs. It enables a private API endpoint, Terway shared ENI,
+reviewed inputs. It configures API public access according to `ack_api_access`, Terway shared ENI,
 NetworkPolicy and RRSA; selects ACK's Ubuntu 24.04 worker image; generates an SSH
 key under `$OPERATOR_DIR/worker-key`; and waits for workers before checking them.
 Cluster creation enables deletion protection. The default is one worker.
 
 Both paths save resources in `$OPERATOR_DIR/ack-state.json`. Keep this state when
-retrying. The private kubeconfig lasts up to three days; repeat the cluster step
+retrying. The kubeconfig lasts up to three days; repeat the cluster step
 to renew it. Use a separate operator directory/name for a different deployment.
 
 ### Prepare the PodVM network
@@ -153,9 +175,14 @@ python3 deployment/ack/prepare-network.py
 
 Creates or selects the dedicated PodVM vSwitch in the worker VPC/zone and creates
 a dedicated security group. It permits worker–PodVM tunnel traffic between their
-security groups, SSH from this host to workers, and private registry 5000, KBS 8443
-and Gateway 9443 access from the worker/PodVM groups. The service host must be in
-the same VPC. Operator-to-host SSH access is managed separately.
+security groups. Optional `worker_ssh_source_cidr` adds SSH ingress from the
+operator's selected source network. The cloud needs outbound routes to T's three
+TLS endpoints; configure SNAT for the worker/PodVM networks if required.
+
+Trusted-host firewall/ingress is configured in the user's network. Only the
+optional ECS development shortcut adds service-host security-group ingress
+(5000/8443/9443) and worker SSH access from that ECS. The general deployment does
+not look up or modify a trusted host through cloud APIs.
 
 ### Prepare image-import storage
 
@@ -165,7 +192,7 @@ python3 deployment/ack/prepare-storage.py
 
 For QCOW2 import this creates the named bucket if missing, with a **private ACL**
 in the selected region, or verifies an existing bucket's owner, location and ACL.
-It uses the same-region OSS HTTPS internal endpoint. The bucket holds the QCOW2
+It uses the selected public or internal OSS HTTPS endpoint. The bucket holds the QCOW2
 until ECS has imported it; it is not the encrypted workspace disk.
 
 The first image import in an account also needs ECS's standard import role. If
@@ -218,7 +245,7 @@ to Kubernetes. Step 7 generates Helm values from these saved results.
 bash deployment/trustee/create-certificates.sh
 ```
 
-Creates the CA, private HTTPS server certificate and separate AS token signer
+Creates the CA, HTTPS server certificate and separate AS token signer
 under `/etc/trustee/tls`, with `HOST_IP` in the server SAN. It refuses an existing
 PKI directory. Keep an existing complete certificate set when repeating later
 steps; never regenerate it to resolve an unrelated installation error.
@@ -281,8 +308,8 @@ and authorizes the actual per-role, per-attempt initdata before scheduling.
 bash deployment/peerpods/start-registry.sh
 ```
 
-Installs the public CA in the host trust store, starts the pinned registry on
-`HOST_IP:5000`, and checks HTTPS `/v2/`. Its durable data is under
+Installs the public CA in the host trust store, starts the pinned registry listening on
+`HOST_BIND_IP:5000`, advertised as `HOST_IP:5000`, and checks HTTPS `/v2/`. Its durable data is under
 `/var/lib/openshell-confidential/registry`.
 
 ### Configure each worker to trust the registry

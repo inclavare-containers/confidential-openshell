@@ -3,7 +3,7 @@ usage='Usage: bash deployment/openshell/configure-driver.sh
 Generate driver.env from HOST_IP and the published runtime digest records. Refuses to replace an existing file.'
 source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 require_root
-private_ip
+service_addresses
 target=/etc/openshell-confidential/driver.env
 [[ ! -e $target ]] || die 'driver.env exists. Review it rather than replacing an installed configuration.'
 install -d -m 0750 -o root -g openshell-gateway /etc/openshell-confidential

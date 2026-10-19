@@ -3,7 +3,7 @@ usage='Usage: bash deployment/build/package-kata-shim.sh
 Append the checked host-shim replacement to the private kata-deploy image. Set HOST_IP first.'
 source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 require_root
-private_ip
+service_addresses
 REGISTRY_ADDR="$HOST_IP:5000"
 KATA_DEPLOY_UPSTREAM=$(jq -er .images.kata_deploy deployment/runtime/artifacts.lock.json)
 KATA_DEPLOY_DIGEST=${KATA_DEPLOY_UPSTREAM##*@}

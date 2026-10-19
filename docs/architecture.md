@@ -20,9 +20,26 @@ The trusted user domain **T** contains build execution role **B**, the operator
 CLI, Gateway, driver and its private authorization journals, and Trustee
 AS/KBS and AS's built-in RVPS. The reference configuration co-locates these
 services: driver and KBS share private resource/policy files; gRPC AS and its RVPS
-API share a loopback endpoint. KBS and Gateway expose private authenticated TLS
-endpoints. The official Trustee images run without source changes; the driver
+API share a loopback endpoint. KBS and Gateway expose authenticated TLS endpoints reachable by the cloud guests.
+Their network addresses do not define the trust boundary. The official Trustee images run without source changes; the driver
 adapts local publication to Trustee's flat KV resource layout.
+
+T belongs to the user and is deployed on user-trusted systems, such as an on-premise
+host. ACK and the cloud provider do not need administrative access to it. If the
+cloud host administrator is in the adversary model, an ordinary ECS VM cannot
+supply this trust merely because the user owns the account.
+
+The current development setup temporarily runs T's services on an ECS VM because
+the developer machines have NAT egress and no stable inbound public address. This
+makes cloud-to-Gateway/KBS connectivity convenient for functional testing. It does
+not validate isolation of T's keys and policies from a malicious cloud host
+administrator. Production must place T in the actual user-trusted environment.
+
+T reaches ACK through the selected public API or an explicitly routed private
+connection. Guests reach Gateway/KBS and the image registry through authenticated
+TLS at user-provided reachable addresses. A private address, public address, VPN
+or TCP forwarding route is a transport choice. Forwarding through an untrusted
+relay must preserve TLS termination and private keys inside T.
 
 The untrusted orchestration domain **U** contains ACK, its control plane and
 workers, CAA and CSI. It can replace Pod specifications, images, userdata and

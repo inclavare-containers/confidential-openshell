@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Discover the service ECS network and generate reviewable ACK inputs without creating cloud resources."""
+"""Discover ACK network inputs; an ECS development host is an optional shortcut."""
 from datetime import datetime, timezone
 import argparse
 import ipaddress
@@ -26,31 +26,34 @@ def free_cidrs(vpc_cidr, switches, count):
 
 def discover(client, args):
     host_ip = os.environ.get('HOST_IP', '')
-    require(args.service_host_instance_id or host_ip, 'Set HOST_IP to the service ECS private IPv4, or pass --service-host-instance-id.')
-    query = {'InstanceIds': json.dumps([args.service_host_instance_id])} if args.service_host_instance_id else {
-        'InstanceNetworkType': 'vpc', 'PrivateIpAddresses': json.dumps([host_ip]),
-    }
-    hosts = client.api('ecs', 'DescribeInstances', RegionId=client.region, **query)['Instances']['Instance']
-    require(len(hosts) == 1, 'Cannot uniquely find the service ECS. Check the account/region or pass --service-host-instance-id.')
-    host = hosts[0]
-    private_ips = host['VpcAttributes']['PrivateIpAddress']['IpAddress']
-    require(not host_ip or host_ip in private_ips, 'HOST_IP does not belong to the selected service ECS.')
-    host_ip = host_ip or private_ips[0]
-    groups = host['SecurityGroupIds']['SecurityGroupId']
     group = args.service_host_security_group_id
-    require(group or len(groups) == 1,
-            'Service ECS has multiple security groups: ' + ', '.join(groups) + '. Select one with --service-host-security-group-id.')
-    group = group or groups[0]
-    require(group in groups, 'The selected security group is not attached to the service ECS.')
-    vpc_id = host['VpcAttributes']['VpcId']
-    worker_switch = args.worker_vswitch_id or host['VpcAttributes']['VSwitchId']
+    host = None
+    worker_switch = args.worker_vswitch_id
+    if args.service_host_instance_id:
+        hosts = client.api('ecs', 'DescribeInstances', RegionId=client.region,
+                           InstanceIds=json.dumps([args.service_host_instance_id]))['Instances']['Instance']
+        require(len(hosts) == 1, 'Cannot find the selected ECS development host.')
+        host = hosts[0]
+        host_ip = host_ip or host['VpcAttributes']['PrivateIpAddress']['IpAddress'][0]
+        groups = host['SecurityGroupIds']['SecurityGroupId']
+        require(group or len(groups) == 1, 'Development ECS has multiple security groups: ' + ', '.join(groups) +
+                '. Choose one with --service-host-security-group-id.')
+        group = group or groups[0]
+        require(group in groups, 'The selected security group is not attached to the development ECS.')
+        worker_switch = worker_switch or host['VpcAttributes']['VSwitchId']
+    require(not group or host, '--service-host-security-group-id is only for the optional ECS development host.')
     if args.cluster_id:
         cluster = client.api('cs', 'DescribeClusterDetail', ClusterId=args.cluster_id)
-        require(cluster['region_id'] == client.region and cluster['vpc_id'] == vpc_id,
-                'Existing ACK and the service ECS must use the same region and VPC.')
+        require(cluster['region_id'] == client.region, 'ACK and the selected PodVM image must use the same region.')
         worker_switch = args.worker_vswitch_id or cluster['vswitch_ids'][0]
+    require(worker_switch, 'For a new ACK, pass --worker-vswitch-id. See deployment/ack/README.md to list or create cloud networks.')
     switch = client.api('vpc', 'DescribeVSwitchAttributes', RegionId=client.region, VSwitchId=worker_switch)
-    require(switch['VpcId'] == vpc_id, 'Worker vSwitch must be in the service ECS VPC.')
+    vpc_id = switch['VpcId']
+    if args.cluster_id:
+        require(vpc_id == cluster['vpc_id'], 'Worker vSwitch must be in the selected ACK VPC.')
+    if host:
+        require(host['VpcAttributes']['VpcId'] == vpc_id,
+                'The optional ECS development shortcut requires its host in the ACK VPC. Omit it for an external trusted host.')
     for selected in (args.pod_vswitch_id, args.podvm_vswitch_id):
         if selected:
             detail = client.api('vpc', 'DescribeVSwitchAttributes', RegionId=client.region, VSwitchId=selected)
@@ -67,9 +70,13 @@ def discover(client, args):
     needed = int(not args.cluster_id and not args.pod_vswitch_id) + int(not args.podvm_vswitch_id)
     cidrs = iter(free_cidrs(vpc['CidrBlock'], switches, needed) if needed else [])
     config = read(ROOT / 'deployment/ack/ack.example.json')
-    config.update(name=args.name, cluster_id=args.cluster_id, service_host_instance_id=host['InstanceId'],
+    config.update(name=args.name, cluster_id=args.cluster_id,
+                  ack_api_access=args.ack_api_access, oss_endpoint_network=args.oss_endpoint_network,
+                  service_host_instance_id=host['InstanceId'] if host else '',
                   service_host_ip=host_ip, service_host_security_group_id=group, worker_vswitch_id=worker_switch,
                   pod_vswitch_id=args.pod_vswitch_id, podvm_vswitch_id=args.podvm_vswitch_id)
+    if host:
+        config['worker_ssh_source_cidr'] = host['VpcAttributes']['PrivateIpAddress']['IpAddress'][0] + '/32'
     config['pod_vswitch_cidr'] = next(cidrs) if not args.cluster_id and not args.pod_vswitch_id else ''
     config['podvm_vswitch_cidr'] = next(cidrs) if not args.podvm_vswitch_id else ''
     # Keep the Kubernetes service network outside the VPC address space.
@@ -87,6 +94,8 @@ def main():
     for name in ('cluster-id', 'service-host-instance-id', 'service-host-security-group-id',
                  'worker-vswitch-id', 'pod-vswitch-id', 'podvm-vswitch-id', 'oss-bucket'):
         parser.add_argument('--' + name, default='')
+    parser.add_argument('--ack-api-access', choices=('public', 'private'), default='public')
+    parser.add_argument('--oss-endpoint-network', choices=('public', 'internal'), default='public')
     parser.add_argument('--replace', action='store_true', help='Replace an input file before cloud setup has started.')
     args = parser.parse_args()
     require(re.fullmatch(r'[a-z][a-z0-9-]{1,39}', args.name), 'Use a name of 2–40 lowercase letters, digits or hyphens.')

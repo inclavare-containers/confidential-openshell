@@ -3,8 +3,7 @@ usage='Usage: bash deployment/peerpods/start-registry.sh
 Start the TLS registry on HOST_IP:5000 with the Trustee server certificate.'
 source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 require_root
-private_ip
-: "${HOST_IP:?approved trusted private IPv4 required}"
+service_addresses
 REGISTRY_ADDR="${HOST_IP}:5000"
 install -d -m 0755 "/etc/docker/certs.d/${REGISTRY_ADDR}"
 install -m 0644 /etc/trustee/tls/ca.pem "/etc/docker/certs.d/${REGISTRY_ADDR}/ca.crt"
@@ -17,7 +16,7 @@ else
 fi
 install -d -m 0700 /var/lib/openshell-confidential/registry
 docker run -d --name openshell-registry --restart unless-stopped \
-  -p "${HOST_IP}:5000:5000" \
+  -p "${HOST_BIND_IP}:5000:5000" \
   -v /etc/trustee/tls/server-chain.pem:/certs/domain.crt:ro \
   -v /etc/trustee/tls/server.key:/certs/domain.key:ro \
   -v /var/lib/openshell-confidential/registry:/var/lib/registry \

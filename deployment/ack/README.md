@@ -1,12 +1,15 @@
 # ACK inputs
 
 Start with `configure-inputs.py` as shown in [deployment step 3](../../docs/deployment.md#3-prepare-cluster-select-the-cloud-image-and-configure-identities).
-It queries the service ECS and writes a private `$OPERATOR_DIR/ack.json`. Region
-comes from the approved handoff. It creates no cloud resources.
+It discovers the **cloud-side ACK network** and writes `$OPERATOR_DIR/ack.json`.
+Region comes from the approved handoff. It creates no cloud resources.
+The user-trusted service host can remain outside the cloud; it needs outbound
+ACK access and reachable inbound TLS endpoints for the cloud guests. See the
+[trust boundary](../../docs/architecture.md).
 
-The service ECS must already exist: it is the Ubuntu host used in steps 1–2.
-Its existing VPC/vSwitch/security group are discovered. A pre-created ACK cluster,
-PodVM network, OSS bucket and image-import role are **not** prerequisites.
+The optional `--service-host-instance-id` shortcut is only for ECS-based functional
+development. It discovers that ECS's vSwitch/security group; it is not a
+requirement for deploying the trusted services.
 
 ## What each field means
 
@@ -14,9 +17,12 @@ PodVM network, OSS bucket and image-import role are **not** prerequisites.
 | --- | --- | --- |
 | `name` | Deployment/resource-name prefix. The initializer generates a unique name; `--name` chooses one explicitly. | Generated locally. |
 | `cluster_id` | Existing ACK ID, selected from the listing below with `--cluster-id`. Empty means a new cluster. | `prepare-cluster.py --create` creates ACK. |
-| `service_host_instance_id`, `service_host_ip` | The existing Ubuntu service ECS and its private IPv4, discovered using `HOST_IP`. `--service-host-instance-id` selects it explicitly. | Provision the service ECS before following this guide. |
-| `service_host_security_group_id` | A security group **attached to the service ECS**; later receives private registry/KBS/Gateway ingress rules. It is not the worker or PodVM security group. | An ECS already has at least one security group. The initializer selects it; with several groups, choose an attached ID using `--service-host-security-group-id`. |
-| `worker_vswitch_id` | Existing vSwitch where new workers will run. Defaults to the service ECS vSwitch, or the selected ACK's worker vSwitch. Override with `--worker-vswitch-id`. | The service ECS already has a vSwitch. To choose another, list vSwitches in its VPC below. |
+| `service_host_instance_id`, `service_host_ip` | Optional development ECS ID, and the advertised trusted service IPv4 from `HOST_IP`. The service address may be outside the cloud. | Leave the ECS ID empty for a user-hosted T. Configure a reachable public/VPN ingress for T. |
+| `service_host_security_group_id` | Optional ingress security group, discovered only for the explicit ECS development shortcut. | Empty for user-hosted T; configure ingress/firewall in the user network. |
+| `worker_vswitch_id` | Cloud worker network. Discovered from existing ACK, or selected with `--worker-vswitch-id` for new ACK. | Create a cloud VPC/vSwitch using the commands below. T does not need to join this VPC. |
+| `ack_api_access` | ACK API connection: `public` by default; `private` requires VPN/VPC routing. Set with `--ack-api-access`. | New ACK configures its public endpoint accordingly. For existing ACK, enable public API access in ACK console when selecting public mode. |
+| `oss_endpoint_network` | OSS transport: `public` HTTPS by default; `internal` requires same-region OSS private connectivity. | Set with `--oss-endpoint-network`. |
+| `worker_ssh_source_cidr` | Optional operator network permitted to SSH to workers, for example the operator NAT egress IPv4 `/32`. The ECS development shortcut fills its private `/32`. | Empty adds no SSH ingress; configure access through the operator's chosen route. |
 | `pod_vswitch_id`, `pod_vswitch_cidr` | New ACK's Kubernetes Pod network. Initializer chooses a free `/24` in the VPC; ID remains empty until creation. Existing ACK keeps its network. | Cluster preparation creates the vSwitch. `--pod-vswitch-id` reuses an existing one. |
 | `podvm_vswitch_id`, `podvm_vswitch_cidr` | Dedicated network for the confidential VMs. Initializer chooses another free `/24`; this is separate from Kubernetes Pods. | Network preparation creates the vSwitch and dedicated PodVM security group. `--podvm-vswitch-id` reuses an existing dedicated vSwitch. |
 | `oss_bucket` | **Bucket name**, not a URL, path or region. Stores the QCOW2 for ECS import. Initializer generates a name from the account ID and random suffix; `--oss-bucket` selects an existing name. | Storage preparation creates a private bucket in the selected region. Unused with an approved ImageID. |
@@ -32,52 +38,70 @@ routes. Review the proposed networks before starting setup. Dedicated vSwitches
 must be in the selected VPC and worker zone. This reference profile uses one
 worker zone.
 
-## Query existing resources
+## Cloud network selection
 
-Run on the service host after `aliyun configure`. Commands below use the active
-CLI profile; append `--profile NAME` if using a named profile.
+Run cloud queries from T after `aliyun configure`; append `--profile NAME` for a
+named profile. The cloud resources below belong to U and do not locate T.
 
 ```bash
 export REGION=$(jq -er .podvm_region "$HANDOFF/selection.json")
-# Find the service ECS from its private IPv4; output includes its attached groups.
-aliyun ecs DescribeInstances --region "$REGION" --RegionId "$REGION" \
-  --InstanceNetworkType vpc \
-  --PrivateIpAddresses "$(jq -cn --arg ip "$HOST_IP" '[$ip]')" \
-  > "$OPERATOR_DIR/service-ecs.json"
-jq '.Instances.Instance[] | {InstanceId, InstanceName, VpcAttributes, SecurityGroupIds}' \
-  "$OPERATOR_DIR/service-ecs.json"
-export VPC_ID=$(jq -er '.Instances.Instance[0].VpcAttributes.VpcId' "$OPERATOR_DIR/service-ecs.json")
-export ZONE_ID=$(jq -er '.Instances.Instance[0].ZoneId' "$OPERATOR_DIR/service-ecs.json")
-
-# Existing security group IDs/names and vSwitch IDs/CIDRs in this VPC.
-aliyun ecs DescribeSecurityGroups --region "$REGION" --RegionId "$REGION" --VpcId "$VPC_ID"
-aliyun vpc DescribeVSwitches --region "$REGION" --RegionId "$REGION" --VpcId "$VPC_ID" --PageSize 50
-
-# Existing ACK IDs/names. Pick an entry in the service ECS VPC.
 aliyun cs DescribeClustersV1 --region "$REGION" --region_id "$REGION" --page_size 100 \
   | jq -r '.clusters[] | [.cluster_id, .name, .vpc_id, .state] | @tsv'
-
-# Existing OSS bucket names. No result is required for the default create path.
-aliyun oss ls -e "https://oss-${REGION}-internal.aliyuncs.com"
-
-# Capacity for the default TDX type in the worker/PodVM zone.
-aliyun ecs DescribeAvailableResource --region "$REGION" --RegionId "$REGION" \
-  --ZoneId "$ZONE_ID" --DestinationResource InstanceType \
-  --InstanceChargeType PostPaid --InstanceType ecs.g9i.xlarge
+aliyun vpc DescribeVSwitches --region "$REGION" --RegionId "$REGION" --PageSize 50 \
+  | jq -r '.VSwitches.VSwitch[] | [.VSwitchId, .VSwitchName, .VpcId, .ZoneId, .CidrBlock] | @tsv'
 ```
 
-These are paginated list APIs: use later `--page_number`/`--PageNumber` pages when
-needed. The initializer paginates the vSwitch query itself before selecting CIDRs.
-For existing ACK, choose the host ESSD class in **ACK console → cluster →
-Storage → StorageClasses** before starting setup and set `csi_storage_class`.
-After obtaining kubeconfig, `kubectl get storageclass` confirms that choice.
-When using a different worker vSwitch, use its zone in the capacity query.
+If a suitable cloud network exists, pass its worker vSwitch ID to the initializer.
+List APIs are paginated; use later pages when needed. The initializer paginates
+vSwitches itself before allocating the new Pod/PodVM CIDRs.
+
+If no network exists, select a zone that offers the desired TDX instance type:
+
+```bash
+aliyun ecs DescribeAvailableResource --region "$REGION" --RegionId "$REGION" \
+  --DestinationResource InstanceType --InstanceChargeType PostPaid --InstanceType ecs.g9i.xlarge
+read -r -p 'ZoneId with available TDX capacity from the result: ' ZONE_ID
+install -d -m 0700 "$OPERATOR_DIR"
+NETWORK_NAME="cos-$(date -u +%Y%m%d%H%M%S)"
+aliyun vpc CreateVpc --region "$REGION" --RegionId "$REGION" \
+  --VpcName "$NETWORK_NAME" --CidrBlock 192.168.0.0/16 > "$OPERATOR_DIR/cloud-vpc.json"
+VPC_ID=$(jq -er .VpcId "$OPERATOR_DIR/cloud-vpc.json")
+aliyun vpc DescribeVpcAttribute --region "$REGION" --RegionId "$REGION" --VpcId "$VPC_ID"
+```
+
+Wait until the returned VPC `Status` is `Available`, then create its worker vSwitch:
+
+```bash
+aliyun vpc CreateVSwitch --region "$REGION" --RegionId "$REGION" --VpcId "$VPC_ID" \
+  --ZoneId "$ZONE_ID" --CidrBlock 192.168.16.0/20 --VSwitchName "$NETWORK_NAME-worker" \
+  > "$OPERATOR_DIR/cloud-worker-vswitch.json"
+WORKER_VSWITCH_ID=$(jq -er .VSwitchId "$OPERATOR_DIR/cloud-worker-vswitch.json")
+python3 deployment/ack/configure-inputs.py --worker-vswitch-id "$WORKER_VSWITCH_ID"
+```
+
+These address ranges are an example for a **new** cloud VPC. Choose ranges that do
+not overlap connected networks. Retain the two JSON outputs for cleanup. Workers
+and PodVMs need egress to the trusted service endpoints; arrange NAT/SNAT or routed
+connectivity for the selected cloud subnets.
+
+Other resource queries:
+
+```bash
+aliyun oss ls -e "https://oss-${REGION}.aliyuncs.com"
+# After obtaining kubeconfig, inspect the host ACK disk classes:
+kubectl get storageclass
+```
+
+For existing ACK, select the host ESSD class from **ACK console → cluster →
+Storage → StorageClasses** before starting setup. Optional ECS development IDs
+come from **ECS console → Instances**; the shortcut prints attached security-group
+IDs when an explicit selection is needed.
 
 ## Storage and image-import authorization
 
 `prepare-storage.py` creates the generated bucket with private ACL, or checks an
-existing bucket's owner, region and ACL. The upload uses HTTPS over the same-region
-OSS internal endpoint. The bucket stores the image file; it does not store live
+existing bucket's owner, region and ACL. The upload uses HTTPS over the selected
+public or internal OSS endpoint. The bucket stores the image file; it does not store live
 workspaces. OSS storage and image-import snapshots incur the cloud's normal fees.
 
 For a first import, `prepare-storage.py --authorize-image-import` creates

@@ -11,12 +11,10 @@ import tomllib
 
 def main() -> int:
     if len(sys.argv) != 3:
-        raise SystemExit("usage: render-guest-initdata.py HOST_PRIVATE_IPV4 TRUSTEE_CA_PEM")
+        raise SystemExit("usage: render-guest-initdata.py HOST_IPV4 TRUSTEE_CA_PEM")
     address = ipaddress.IPv4Address(sys.argv[1])
-    private_ranges = tuple(ipaddress.IPv4Network(cidr) for cidr in
-                           ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
-    if not any(address in network for network in private_ranges):
-        raise SystemExit("Trustee endpoint must be a private non-loopback IPv4 address")
+    if address.is_loopback or address.is_unspecified or address.is_multicast:
+        raise SystemExit("Trustee endpoint must be a cloud-reachable unicast IPv4 address")
     ca_path = pathlib.Path(sys.argv[2])
     if ca_path.is_symlink() or not ca_path.is_file():
         raise SystemExit("Trustee CA must be a regular file")

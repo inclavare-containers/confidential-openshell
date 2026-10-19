@@ -66,8 +66,9 @@ class Client:
         return json.loads(result.stdout) if result.stdout.strip() else {}
 
     def oss(self, operation, *arguments, absent=None):
+        suffix = '-internal' if self.config['oss_endpoint_network'] == 'internal' else ''
         args = ['aliyun', 'oss', operation, *map(str, arguments), '-e',
-                f'https://oss-{self.region}-internal.aliyuncs.com']
+                f'https://oss-{self.region}{suffix}.aliyuncs.com']
         if os.environ.get('ALIBABA_CLOUD_PROFILE'):
             args += ['--profile', os.environ['ALIBABA_CLOUD_PROFILE']]
         result = subprocess.run(args, capture_output=True, text=True, timeout=900)
@@ -86,8 +87,10 @@ class Cloud(Client):
         self.config = read(OPERATOR / 'ack.json')
         self.name = self.config['name']
         require(re.fullmatch(r'[a-z][a-z0-9-]{1,39}', self.name), 'Use a name of 2–40 lowercase letters, digits or hyphens.')
-        require(re.fullmatch(r'sg-[a-z0-9]+', self.config['service_host_security_group_id']),
-                'Fill in service_host_security_group_id in ack.json before starting setup.')
+        group = self.config['service_host_security_group_id']
+        require(not group or re.fullmatch(r'sg-[a-z0-9]+', group), 'Invalid service_host_security_group_id.')
+        require(self.config['ack_api_access'] in ('public', 'private'), 'ack_api_access must be public or private.')
+        require(self.config['oss_endpoint_network'] in ('public', 'internal'), 'oss_endpoint_network must be public or internal.')
         if self.selection['podvm_mode'] == 'import':
             require(self.config['oss_bucket'] and not self.config['oss_bucket'].startswith('YOUR_'),
                     'Fill in oss_bucket in ack.json before starting setup.')

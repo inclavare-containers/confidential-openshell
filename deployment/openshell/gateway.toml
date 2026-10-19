@@ -3,7 +3,7 @@ version = 2
 
 [openshell.gateway]
 name = "confidential-ack"
-# Replace this address with the trusted host's private IPv4 address.
+# Replaced with HOST_BIND_IP, the local interface used to listen for TLS.
 # Supervisors connect directly using server TLS and their sealed sandbox JWT.
 bind_address = "10.0.0.10:9443"
 health_bind_address = "127.0.0.1:17671"

@@ -3,11 +3,11 @@ usage='Usage: bash deployment/trustee/create-certificates.sh
 Create the initial Trustee CA, server certificate and AS signer using HOST_IP. Existing PKI is refused.'
 source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 require_root
-private_ip
+service_addresses
 install -d -m 0700 /etc/trustee/tls "$OPERATOR_DIR"
 [[ -z $(find /etc/trustee/tls -mindepth 1 -print -quit) ]] || die 'PKI already exists. Retain it; do not regenerate the CA.'
 test ! -e /etc/trustee/tls/ca.key && test ! -e /etc/trustee/tls/ca.pem
-sed "s/TRUSTED_PRIVATE_IP/$HOST_IP/g" deployment/trustee/certificates/server.example.ext > "$OPERATOR_DIR/server.ext"
+sed "s/TRUSTED_SERVICE_IP/$HOST_IP/g" deployment/trustee/certificates/server.example.ext > "$OPERATOR_DIR/server.ext"
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out /etc/trustee/tls/ca.key
 openssl req -x509 -new -sha256 -days 3650 \
   -key /etc/trustee/tls/ca.key \

@@ -1,5 +1,5 @@
 [http_server]
-sockets = ["TRUSTED_PRIVATE_IP:8443"]
+sockets = ["TRUSTED_BIND_IP:8443"]
 private_key = "/etc/trustee/tls/server.key"
 certificate = "/etc/trustee/tls/server-chain.pem"
 insecure_http = false

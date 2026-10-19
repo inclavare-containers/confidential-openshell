@@ -3,7 +3,7 @@ usage='Usage: bash deployment/trustee/install.sh
 Install locked Trustee images, directories and deny policies. Does not start services.'
 source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 require_root
-private_ip
+service_addresses
 [[ ! -e /opt/trustee/kbs/storage/kbs/resource-policy.rego ]] || die 'Trustee already initialized. Do not reset live bindings.'
 install -d -m 0700 "$OPERATOR_DIR"
 test -f /etc/trustee/tls/server.pem
@@ -21,7 +21,7 @@ install -d -m 0700 -o openshell-gateway -g openshell-gateway \
   /opt/trustee/kbs /opt/trustee/kbs/storage /opt/trustee/kbs/storage/kbs \
   /opt/trustee/kbs/storage/repository /opt/trustee/kbs/signing \
   /opt/trustee/kbs/signing/bindings /opt/trustee/kbs/signing/workspace-bindings
-sed "s/TRUSTED_PRIVATE_IP/$HOST_IP/g" deployment/trustee/kbs-config.example.toml > "$OPERATOR_DIR/kbs-config.toml"
+sed "s/TRUSTED_BIND_IP/$HOST_BIND_IP/g" deployment/trustee/kbs-config.example.toml > "$OPERATOR_DIR/kbs-config.toml"
 install -m 0600 "$OPERATOR_DIR/kbs-config.toml" /etc/trustee/kbs-config.toml
 install -m 0600 deployment/trustee/as-config.json /etc/trustee/as-config.json
 runuser -u openshell-gateway -- test -r "$ROOT/deployment/trustee/render-kbs-policy.py"

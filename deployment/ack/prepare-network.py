@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""Prepare the dedicated PodVM vSwitch, security group and private connectivity."""
+"""Prepare cloud-side PodVM networking; optionally configure an ECS development host."""
 import argparse
 import ipaddress
-import os
 
 from cloud import Cloud, require
 
@@ -12,16 +11,14 @@ def main():
     cloud = Cloud()
     detail = cloud.cluster()
     vpc, zone = cloud.state['vpc_id'], cloud.state['zone_id']
-    host = ipaddress.ip_address(os.environ['HOST_IP'])
-    require(host.version == 4 and host.is_private and not host.is_loopback, 'HOST_IP must be the service host private IPv4.')
-    require(not cloud.config.get('service_host_ip') or str(host) == cloud.config['service_host_ip'],
-            'HOST_IP differs from the discovered service ECS address in ack.json.')
     service_group = cloud.config['service_host_security_group_id']
-    require(service_group and not service_group.startswith('YOUR_'), 'Fill in service_host_security_group_id in ack.json.')
-    groups = [service_group, detail['security_group_id']]
-    for group in groups:
+    worker_group = detail['security_group_id']
+    ssh_source = cloud.config['worker_ssh_source_cidr']
+    if ssh_source:
+        require(ipaddress.ip_network(ssh_source).version == 4, 'worker_ssh_source_cidr must be an IPv4 CIDR.')
+    for group in (g for g in (service_group, worker_group) if g):
         info = cloud.api('ecs', 'DescribeSecurityGroupAttribute', RegionId=cloud.region, SecurityGroupId=group)
-        require(info['VpcId'] == vpc, 'Service host, ACK workers and PodVMs must use the same VPC.')
+        require(info['VpcId'] == vpc, 'The optional service ECS group and worker group must be in the ACK VPC.')
     cloud.switch('podvm', vpc, zone)
     group = cloud.state.get('podvm_security_group_id')
     if not group:
@@ -39,12 +36,14 @@ def main():
                   absent='InvalidPermission.Duplicate')
 
     # CAA dynamically allocates tunnel endpoints. Scope mutual access to these two groups.
-    allow(group, groups[1])
-    allow(groups[1], group)
-    allow(groups[1], port=22, cidr=str(host) + '/32')
-    for source in (groups[1], group):
-        for port in (5000, 8443, 9443):
-            allow(service_group, source, port)
+    allow(group, worker_group)
+    allow(worker_group, group)
+    if ssh_source:
+        allow(worker_group, port=22, cidr=ssh_source)
+    if service_group:
+        for source in (worker_group, group):
+            for port in (5000, 8443, 9443):
+                allow(service_group, source, port)
     print(f'PodVM network ready: {cloud.state["podvm_vswitch_id"]}, {group}.')
 
 

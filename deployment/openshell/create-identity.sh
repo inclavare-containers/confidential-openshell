@@ -3,7 +3,7 @@ usage='Usage: bash deployment/openshell/create-identity.sh
 Generate native Gateway mTLS/JWT credentials and install its configuration using HOST_IP.'
 source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 require_root
-private_ip
+service_addresses
 install -d -o root -g openshell-gateway -m 0750 /etc/openshell-confidential
 install -d -o root -g openshell-gateway -m 0750 /var/lib/openshell-confidential
 install -d -o openshell-gateway -g openshell-gateway -m 0700 \
@@ -29,11 +29,10 @@ chmod 0644 "$TLS_ROOT/ca.crt" "$TLS_ROOT/server/tls.crt" "$TLS_ROOT/client/tls.c
 chmod 0700 "$TLS_ROOT/client"
 install -o root -g openshell-gateway -m 0640 \
   deployment/openshell/gateway.toml /etc/openshell-confidential/gateway.toml
-python3 - "$HOST_IP" <<'PYCONFIG'
+python3 - "$HOST_BIND_IP" <<'PYCONFIG'
 from pathlib import Path
 import ipaddress, sys
 address = str(ipaddress.IPv4Address(sys.argv[1]))
-assert ipaddress.IPv4Address(address).is_private
 path = Path("/etc/openshell-confidential/gateway.toml")
 text = path.read_text()
 assert 'bind_address = "10.0.0.10:9443"' in text
