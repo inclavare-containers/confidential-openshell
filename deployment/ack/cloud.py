@@ -87,8 +87,6 @@ class Cloud(Client):
         self.config = read(OPERATOR / 'ack.json')
         self.name = self.config['name']
         require(re.fullmatch(r'[a-z][a-z0-9-]{1,39}', self.name), 'Use a name of 2–40 lowercase letters, digits or hyphens.')
-        group = self.config['service_host_security_group_id']
-        require(not group or re.fullmatch(r'sg-[a-z0-9]+', group), 'Invalid service_host_security_group_id.')
         require(self.config['ack_api_access'] in ('public', 'private'), 'ack_api_access must be public or private.')
         require(self.config['oss_endpoint_network'] in ('public', 'internal'), 'oss_endpoint_network must be public or internal.')
         if self.selection['podvm_mode'] == 'import':

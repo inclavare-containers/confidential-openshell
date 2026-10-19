@@ -14,18 +14,20 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class Addresses(unittest.TestCase):
-    def addresses(self, advertised, bind):
-        return subprocess.run(['bash', '-c', 'source "$1"; service_addresses; printf "%s %s" "$HOST_IP" "$HOST_BIND_IP"',
+    def addresses(self, advertised):
+        return subprocess.run(['bash', '-c', 'source "$1"; service_addresses; printf "%s" "$HOST_IP"',
                                'addresses-test', str(ROOT / 'deployment/lib/common.sh')],
-                              env={**os.environ, 'HOST_IP': advertised, 'HOST_BIND_IP': bind}, capture_output=True, text=True)
+                              env={**os.environ, 'HOST_IP': advertised}, capture_output=True, text=True)
 
-    def test_public_advertisement_and_local_listener_are_separate(self):
-        result = self.addresses('203.0.113.10', '127.0.0.1')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, '203.0.113.10 127.0.0.1')
+    def test_service_address_accepts_public_or_private_unicast(self):
+        for ip in ('203.0.113.10', '192.168.16.223'):
+            with self.subTest(ip=ip):
+                result = self.addresses(ip)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, ip)
         for ip in ('127.0.0.1', '0.0.0.0', '224.0.0.1'):
             with self.subTest(ip=ip):
-                self.assertNotEqual(self.addresses(ip, '127.0.0.1').returncode, 0)
+                self.assertNotEqual(self.addresses(ip).returncode, 0)
 
     def test_public_trustee_url_keeps_aa_and_cdh_ca_binding(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -39,7 +41,7 @@ class Addresses(unittest.TestCase):
             self.assertEqual(cdh['kbc']['url'], aa['token_configs']['kbs']['url'])
             self.assertEqual(cdh['kbc']['kbs_cert'].strip(), ca.read_text().strip())
 
-    def test_tls_authenticates_advertised_ip_while_listening_on_loopback(self):
+    def test_tls_authenticates_advertised_ip_without_binding_that_address(self):
         with tempfile.TemporaryDirectory() as temp:
             directory = Path(temp)
             def openssl(*args):
@@ -59,7 +61,9 @@ class Addresses(unittest.TestCase):
                     self.wfile.write(b'TLS identity verified')
                 def log_message(self, *args):
                     pass
-            server = HTTPServer(('127.0.0.1', 0), Handler)
+            config = tomllib.loads((ROOT / 'deployment/trustee/kbs-config.example.toml').read_text())
+            listen_ip = config['http_server']['sockets'][0].split(':')[0]
+            server = HTTPServer((listen_ip, 0), Handler)
             context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             context.load_cert_chain(directory / 'server.pem', directory / 'server.key')
             server.socket = context.wrap_socket(server.socket, server_side=True)
@@ -67,7 +71,7 @@ class Addresses(unittest.TestCase):
             thread.start()
             try:
                 client = ssl.create_default_context(cafile=str(directory / 'ca.pem'))
-                with socket.create_connection(server.server_address, timeout=5) as raw:
+                with socket.create_connection(('127.0.0.1', server.server_port), timeout=5) as raw:
                     with client.wrap_socket(raw, server_hostname='203.0.113.10') as channel:
                         channel.sendall(b'GET / HTTP/1.0\r\nHost: service\r\n\r\n')
                         response = b''

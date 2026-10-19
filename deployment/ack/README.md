@@ -7,9 +7,9 @@ The user-trusted service host can remain outside the cloud; it needs outbound
 ACK access and reachable inbound TLS endpoints for the cloud guests. See the
 [trust boundary](../../docs/architecture.md).
 
-The optional `--service-host-instance-id` shortcut is only for ECS-based functional
-development. It discovers that ECS's vSwitch/security group; it is not a
-requirement for deploying the trusted services.
+`HOST_IP` configures the trusted service endpoints in deployment step 2. ACK
+inputs describe cloud resources only: an existing cluster supplies its network,
+and a new cluster uses the selected cloud worker vSwitch.
 
 ## What each field means
 
@@ -17,12 +17,9 @@ requirement for deploying the trusted services.
 | --- | --- | --- |
 | `name` | Deployment/resource-name prefix. The initializer generates a unique name; `--name` chooses one explicitly. | Generated locally. |
 | `cluster_id` | Existing ACK ID, selected from the listing below with `--cluster-id`. Empty means a new cluster. | `prepare-cluster.py --create` creates ACK. |
-| `service_host_instance_id`, `service_host_ip` | Optional development ECS ID, and the advertised trusted service IPv4 from `HOST_IP`. The service address may be outside the cloud. | Leave the ECS ID empty for a user-hosted T. Configure a reachable public/VPN ingress for T. |
-| `service_host_security_group_id` | Optional ingress security group, discovered only for the explicit ECS development shortcut. | Empty for user-hosted T; configure ingress/firewall in the user network. |
 | `worker_vswitch_id` | Cloud worker network. Discovered from existing ACK, or selected with `--worker-vswitch-id` for new ACK. | Create a cloud VPC/vSwitch using the commands below. T does not need to join this VPC. |
 | `ack_api_access` | ACK API connection: `public` by default; `private` requires VPN/VPC routing. Set with `--ack-api-access`. | New ACK configures its public endpoint accordingly. For existing ACK, enable public API access in ACK console when selecting public mode. |
 | `oss_endpoint_network` | OSS transport: `public` HTTPS by default; `internal` requires same-region OSS private connectivity. | Set with `--oss-endpoint-network`. |
-| `worker_ssh_source_cidr` | Optional operator network permitted to SSH to workers, for example the operator NAT egress IPv4 `/32`. The ECS development shortcut fills its private `/32`. | Empty adds no SSH ingress; configure access through the operator's chosen route. |
 | `pod_vswitch_id`, `pod_vswitch_cidr` | New ACK's Kubernetes Pod network. Initializer chooses a free `/24` in the VPC; ID remains empty until creation. Existing ACK keeps its network. | Cluster preparation creates the vSwitch. `--pod-vswitch-id` reuses an existing one. |
 | `podvm_vswitch_id`, `podvm_vswitch_cidr` | Dedicated network for the confidential VMs. Initializer chooses another free `/24`; this is separate from Kubernetes Pods. | Network preparation creates the vSwitch and dedicated PodVM security group. `--podvm-vswitch-id` reuses an existing dedicated vSwitch. |
 | `oss_bucket` | **Bucket name**, not a URL, path or region. Stores the QCOW2 for ECS import. Initializer generates a name from the account ID and random suffix; `--oss-bucket` selects an existing name. | Storage preparation creates a private bucket in the selected region. Unused with an approved ImageID. |
@@ -93,9 +90,7 @@ kubectl get storageclass
 ```
 
 For existing ACK, select the host ESSD class from **ACK console → cluster →
-Storage → StorageClasses** before starting setup. Optional ECS development IDs
-come from **ECS console → Instances**; the shortcut prints attached security-group
-IDs when an explicit selection is needed.
+Storage → StorageClasses** before starting setup.
 
 ## Storage and image-import authorization
 

@@ -29,12 +29,3 @@ chmod 0644 "$TLS_ROOT/ca.crt" "$TLS_ROOT/server/tls.crt" "$TLS_ROOT/client/tls.c
 chmod 0700 "$TLS_ROOT/client"
 install -o root -g openshell-gateway -m 0640 \
   deployment/openshell/gateway.toml /etc/openshell-confidential/gateway.toml
-python3 - "$HOST_BIND_IP" <<'PYCONFIG'
-from pathlib import Path
-import ipaddress, sys
-address = str(ipaddress.IPv4Address(sys.argv[1]))
-path = Path("/etc/openshell-confidential/gateway.toml")
-text = path.read_text()
-assert 'bind_address = "10.0.0.10:9443"' in text
-path.write_text(text.replace('bind_address = "10.0.0.10:9443"', f'bind_address = "{address}:9443"'))
-PYCONFIG

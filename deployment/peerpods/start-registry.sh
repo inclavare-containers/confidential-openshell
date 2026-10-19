@@ -16,7 +16,7 @@ else
 fi
 install -d -m 0700 /var/lib/openshell-confidential/registry
 docker run -d --name openshell-registry --restart unless-stopped \
-  -p "${HOST_BIND_IP}:5000:5000" \
+  -p 0.0.0.0:5000:5000 \
   -v /etc/trustee/tls/server-chain.pem:/certs/domain.crt:ro \
   -v /etc/trustee/tls/server.key:/certs/domain.key:ro \
   -v /var/lib/openshell-confidential/registry:/var/lib/registry \

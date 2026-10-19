@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Discover ACK network inputs; an ECS development host is an optional shortcut."""
+"""Discover network inputs from existing ACK or the selected new-cluster network."""
 from datetime import datetime, timezone
 import argparse
 import ipaddress
@@ -25,35 +25,16 @@ def free_cidrs(vpc_cidr, switches, count):
 
 
 def discover(client, args):
-    host_ip = os.environ.get('HOST_IP', '')
-    group = args.service_host_security_group_id
-    host = None
     worker_switch = args.worker_vswitch_id
-    if args.service_host_instance_id:
-        hosts = client.api('ecs', 'DescribeInstances', RegionId=client.region,
-                           InstanceIds=json.dumps([args.service_host_instance_id]))['Instances']['Instance']
-        require(len(hosts) == 1, 'Cannot find the selected ECS development host.')
-        host = hosts[0]
-        host_ip = host_ip or host['VpcAttributes']['PrivateIpAddress']['IpAddress'][0]
-        groups = host['SecurityGroupIds']['SecurityGroupId']
-        require(group or len(groups) == 1, 'Development ECS has multiple security groups: ' + ', '.join(groups) +
-                '. Choose one with --service-host-security-group-id.')
-        group = group or groups[0]
-        require(group in groups, 'The selected security group is not attached to the development ECS.')
-        worker_switch = worker_switch or host['VpcAttributes']['VSwitchId']
-    require(not group or host, '--service-host-security-group-id is only for the optional ECS development host.')
     if args.cluster_id:
         cluster = client.api('cs', 'DescribeClusterDetail', ClusterId=args.cluster_id)
         require(cluster['region_id'] == client.region, 'ACK and the selected PodVM image must use the same region.')
-        worker_switch = args.worker_vswitch_id or cluster['vswitch_ids'][0]
+        worker_switch = cluster['vswitch_ids'][0]
     require(worker_switch, 'For a new ACK, pass --worker-vswitch-id. See deployment/ack/README.md to list or create cloud networks.')
     switch = client.api('vpc', 'DescribeVSwitchAttributes', RegionId=client.region, VSwitchId=worker_switch)
     vpc_id = switch['VpcId']
     if args.cluster_id:
         require(vpc_id == cluster['vpc_id'], 'Worker vSwitch must be in the selected ACK VPC.')
-    if host:
-        require(host['VpcAttributes']['VpcId'] == vpc_id,
-                'The optional ECS development shortcut requires its host in the ACK VPC. Omit it for an external trusted host.')
     for selected in (args.pod_vswitch_id, args.podvm_vswitch_id):
         if selected:
             detail = client.api('vpc', 'DescribeVSwitchAttributes', RegionId=client.region, VSwitchId=selected)
@@ -72,11 +53,8 @@ def discover(client, args):
     config = read(ROOT / 'deployment/ack/ack.example.json')
     config.update(name=args.name, cluster_id=args.cluster_id,
                   ack_api_access=args.ack_api_access, oss_endpoint_network=args.oss_endpoint_network,
-                  service_host_instance_id=host['InstanceId'] if host else '',
-                  service_host_ip=host_ip, service_host_security_group_id=group, worker_vswitch_id=worker_switch,
+                  worker_vswitch_id=worker_switch,
                   pod_vswitch_id=args.pod_vswitch_id, podvm_vswitch_id=args.podvm_vswitch_id)
-    if host:
-        config['worker_ssh_source_cidr'] = host['VpcAttributes']['PrivateIpAddress']['IpAddress'][0] + '/32'
     config['pod_vswitch_cidr'] = next(cidrs) if not args.cluster_id and not args.pod_vswitch_id else ''
     config['podvm_vswitch_cidr'] = next(cidrs) if not args.podvm_vswitch_id else ''
     # Keep the Kubernetes service network outside the VPC address space.
@@ -91,8 +69,10 @@ def discover(client, args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--name', default='cos-' + datetime.now(timezone.utc).strftime('%Y%m%d-') + secrets.token_hex(3))
-    for name in ('cluster-id', 'service-host-instance-id', 'service-host-security-group-id',
-                 'worker-vswitch-id', 'pod-vswitch-id', 'podvm-vswitch-id', 'oss-bucket'):
+    target = parser.add_mutually_exclusive_group(required=True)
+    target.add_argument('--cluster-id', default='', help='Use the network of this existing ACK cluster.')
+    target.add_argument('--worker-vswitch-id', default='', help='Use this cloud network for a new ACK cluster.')
+    for name in ('pod-vswitch-id', 'podvm-vswitch-id', 'oss-bucket'):
         parser.add_argument('--' + name, default='')
     parser.add_argument('--ack-api-access', choices=('public', 'private'), default='public')
     parser.add_argument('--oss-endpoint-network', choices=('public', 'internal'), default='public')

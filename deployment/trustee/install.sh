@@ -21,8 +21,7 @@ install -d -m 0700 -o openshell-gateway -g openshell-gateway \
   /opt/trustee/kbs /opt/trustee/kbs/storage /opt/trustee/kbs/storage/kbs \
   /opt/trustee/kbs/storage/repository /opt/trustee/kbs/signing \
   /opt/trustee/kbs/signing/bindings /opt/trustee/kbs/signing/workspace-bindings
-sed "s/TRUSTED_BIND_IP/$HOST_BIND_IP/g" deployment/trustee/kbs-config.example.toml > "$OPERATOR_DIR/kbs-config.toml"
-install -m 0600 "$OPERATOR_DIR/kbs-config.toml" /etc/trustee/kbs-config.toml
+install -m 0600 deployment/trustee/kbs-config.example.toml /etc/trustee/kbs-config.toml
 install -m 0600 deployment/trustee/as-config.json /etc/trustee/as-config.json
 runuser -u openshell-gateway -- test -r "$ROOT/deployment/trustee/render-kbs-policy.py"
 runuser -u openshell-gateway -- python3 deployment/trustee/render-kbs-policy.py \

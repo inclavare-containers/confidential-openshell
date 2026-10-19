@@ -7,8 +7,8 @@ For an already installed Gateway, use [first agent](first-agent.md).
 You need:
 
 - A user-trusted Ubuntu service host for Gateway, driver, Trustee and the registry.
-  It can be on-premise and can also be the build machine. The ECS development
-  shortcut below is for functional testing, not the production trust boundary.
+  It can be on-premise and can also be the build machine. Its placement is
+  independent of the ACK network; see the [trust boundary](architecture.md).
 - A new or existing ACK cluster, prepared in step 3. Existing clusters need RRSA,
   enforced NetworkPolicy and accessible workers.
 - A compatible TDX PodVM image and its approved reference file.
@@ -31,7 +31,7 @@ In the build guide, [select a guest image](build.md#select-the-guest-image), the
 public source should now be at `/opt/confidential-openshell` on the service host.
 A new guest image needs import in step 3; an approved ImageID can be reused.
 
-Set the advertised service address and its local listener address separately:
+Set the trusted service address reachable from the cloud:
 
 ```bash
 cd /opt/confidential-openshell
@@ -39,18 +39,16 @@ export HANDOFF=/var/lib/openshell-confidential/operator/handoff
 export OPERATOR_DIR=/var/lib/openshell-confidential/operator/cluster-config
 read -r -p 'Trusted service IPv4 reachable from cloud workers/guests: ' HOST_IP
 export HOST_IP
-export HOST_BIND_IP=$(ip -4 route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1);exit}}')
 ```
 
 `HOST_IP` is the address advertised to the cloud for Gateway 9443, KBS 8443 and
-registry 5000, and included in TLS certificates. `HOST_BIND_IP` is an interface
-address actually present on the trusted host; adjust it for the interface receiving
-this traffic. Both may be equal on a directly routed host. Behind NAT/forwarding,
-the advertised public address can differ from the local listener address.
+registry 5000, and included in TLS certificates. It is the only service-address
+input. Services listen on `0.0.0.0` locally, so a public address mapped through NAT
+does not need to appear on the host's network interfaces.
 
 A machine with outbound NAT alone cannot receive these connections. Provision a
 reachable ingress, VPN, or TCP forwarding route first; obtain its assigned IPv4
-from that network's configuration. Forward the three TCP ports to `HOST_BIND_IP`
+from that network's configuration. Forward the three TCP ports to the trusted host
 and retain TLS termination/private keys on T. A public NAT **egress** IP alone is
 not evidence that inbound connectivity exists. Permit only approved clients.
 The [architecture](architecture.md) defines T independently of network placement.
@@ -70,7 +68,6 @@ Obtain the operator identity from your Alibaba account administrator or
 [RAM console](https://ram.console.aliyun.com/). This identity needs ECS, VPC, ACK,
 RAM and OSS administration. Set `ALIBABA_CLOUD_PROFILE` to choose a named CLI
 profile, and use the same profile for manual queries. Credentials stay in T.
-No ECS service-host identity is required by the general deployment path.
 
 ### Choose an existing cluster, or prepare a new one
 
@@ -114,29 +111,6 @@ To reuse a private bucket, add `--oss-bucket NAME_FROM_OSS`.
 The [input reference](../deployment/ack/README.md) explains every field and its
 source. `--replace` regenerates an input file only before cloud setup starts.
 
-### Optional ECS development shortcut
-
-For this project's current development environment, services run together on an
-ordinary ECS VM to provide a stable cloud-reachable address. This is an explicit
-functional-test setup, as described in the architecture; the production T/U trust
-separation is not established by placing keys on this VM.
-
-When testing from an ECS in the ACK VPC, use its existing private interface for
-both service addresses. Get the Instance ID from **ECS console → Instances**:
-
-```bash
-export HOST_IP=$(ip -4 route get 100.100.100.200 | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1);exit}}')
-export HOST_BIND_IP="$HOST_IP"
-read -r -p 'Development ECS Instance ID: ' DEV_ECS_ID
-python3 deployment/ack/configure-inputs.py --service-host-instance-id "$DEV_ECS_ID" \
-  --ack-api-access private --oss-endpoint-network internal
-```
-
-This optional shortcut discovers the worker vSwitch and an attached service
-security group. It enables the network step to configure that ECS's ingress. For
-an existing ACK, also pass `--cluster-id`. If several ECS security groups are
-attached, select one with `--service-host-security-group-id` from the printed IDs.
-
 ### Prepare the selected ACK cluster
 
 For an existing cluster:
@@ -175,14 +149,14 @@ python3 deployment/ack/prepare-network.py
 
 Creates or selects the dedicated PodVM vSwitch in the worker VPC/zone and creates
 a dedicated security group. It permits worker–PodVM tunnel traffic between their
-security groups. Optional `worker_ssh_source_cidr` adds SSH ingress from the
-operator's selected source network. The cloud needs outbound routes to T's three
-TLS endpoints; configure SNAT for the worker/PodVM networks if required.
+security groups. The cloud needs outbound routes to T's three TLS endpoints;
+configure SNAT for the worker/PodVM networks if required.
 
-Trusted-host firewall/ingress is configured in the user's network. Only the
-optional ECS development shortcut adds service-host security-group ingress
-(5000/8443/9443) and worker SSH access from that ECS. The general deployment does
-not look up or modify a trusted host through cloud APIs.
+Configure the trusted host's firewall/ingress in its own network, permitting the
+intended clients on ports 5000/8443/9443. Arrange worker SSH access through your
+chosen operator route; in ACK console, select the worker security group and allow
+TCP 22 from that route's source address when needed. Cluster preparation manages
+only the selected ACK and its cloud resources.
 
 ### Prepare image-import storage
 
@@ -309,7 +283,7 @@ bash deployment/peerpods/start-registry.sh
 ```
 
 Installs the public CA in the host trust store, starts the pinned registry listening on
-`HOST_BIND_IP:5000`, advertised as `HOST_IP:5000`, and checks HTTPS `/v2/`. Its durable data is under
+`0.0.0.0:5000`, advertised as `HOST_IP:5000`, and checks HTTPS `/v2/`. Its durable data is under
 `/var/lib/openshell-confidential/registry`.
 
 ### Configure each worker to trust the registry
