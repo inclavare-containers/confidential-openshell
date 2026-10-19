@@ -156,6 +156,18 @@ class CloudFixture:
         return cloud.read(self.operator / 'ack-state.json')
 
 class Setup(CloudFixture, unittest.TestCase):
+    def test_cli_keeps_negative_values_attached_to_their_parameter(self):
+        client = cloud.Client()
+        result = subprocess.CompletedProcess([], 0, '{}', '')
+        with patch.object(cloud.subprocess, 'run', return_value=result) as command:
+            client.api('ecs', 'AuthorizeSecurityGroup', IpProtocol='all', PortRange='-1/-1',
+                       SourceGroupId='sg-workers', DryRun=True, Optional=None)
+        arguments = command.call_args.args[0]
+        self.assertIn('--PortRange=-1/-1', arguments)
+        self.assertIn('--SourceGroupId=sg-workers', arguments)
+        self.assertIn('--DryRun=true', arguments)
+        self.assertFalse(any(a.startswith('--Optional') for a in arguments))
+
     def test_existing_cluster_only_reads_and_renews_private_kubeconfig(self):
         self.prepare()
         self.prepare()

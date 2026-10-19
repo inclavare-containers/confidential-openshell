@@ -55,7 +55,8 @@ class Client:
             args += ['--profile', profile]
         for key, value in parameters.items():
             if value is not None:
-                args += ['--' + key, str(value).lower() if isinstance(value, bool) else str(value)]
+                value = str(value).lower() if isinstance(value, bool) else str(value)
+                args.append(f'--{key}={value}')
         if body is not None:
             args += ['--body', json.dumps(body, separators=(',', ':'))]
         result = subprocess.run(args, capture_output=True, text=True, timeout=180)
