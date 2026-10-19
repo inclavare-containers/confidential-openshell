@@ -32,6 +32,8 @@ attempt. Later starts reuse the files.
 The pinned Community image contains a policy in an older schema. The native
 `OPENSHELL_SANDBOX_POLICY` setting selects the supplied restrictive policy instead;
 attached providers supply approved network access. The image stays unchanged.
+The supplied filesystem policy permits `/dev/tty` so the interactive harness can
+configure its controlling terminal.
 
 ## 2. Configure the model provider
 
