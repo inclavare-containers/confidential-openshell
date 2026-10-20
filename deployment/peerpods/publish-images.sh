@@ -13,6 +13,7 @@ for name in pause supervisor sandbox workload agent_sandbox_controller \
   cert_manager_cainjector cert_manager_startup csi_provisioner csi_node_registrar; do
   ref=$(jq -er --arg name "$name" '.images[$name]' deployment/runtime/artifacts.lock.json)
   dest="$REGISTRY_ADDR/openshell/mirror/$name:locked"
+  printf 'Publishing %s\n' "$name"
   crane copy --platform linux/amd64 "$ref" "$dest"
   digest=$(SSL_CERT_FILE=/etc/trustee/tls/ca.pem crane digest "$dest")
   printf '%s@%s\n' "${dest%:*}" "$digest" > "$OPERATOR_DIR/$name-image.txt"
@@ -26,3 +27,4 @@ for pair in "cloud-api-adaptor:$CAA_TAG" "caa-csi-block-driver:$CSI_TAG" "peerpo
   digest=$(SSL_CERT_FILE=/etc/trustee/tls/ca.pem crane digest "$REGISTRY_ADDR/openshell/$pair")
   printf '%s@%s\n' "${REGISTRY_ADDR}/openshell/${pair%:*}" "$digest" > "$OPERATOR_DIR/${pair%%:*}-image.txt"
 done
+printf 'Images published. Digest records ready in %s\n' "$OPERATOR_DIR"

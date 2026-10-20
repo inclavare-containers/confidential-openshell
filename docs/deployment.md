@@ -310,15 +310,22 @@ Only the public CA goes to workers.
 
 ```bash
 bash deployment/peerpods/publish-images.sh
+```
+
+This loads the handoff archives and mirrors the pinned runtime and cluster
+dependency images. Wait for `Images published. Digest records ready in ...` before
+continuing. If publication fails, fix the reported error and repeat this command.
+Workers pull these images from the private registry, so only this host needs
+access to upstream registries.
+
+Then add the host-shim replacement to kata-deploy:
+
+```bash
 bash deployment/build/package-kata-shim.sh
 ```
 
-The first command loads the authenticated handoff archives and mirrors the pinned
-runtime and cluster dependency images. Workers pull these from the private
-registry, so only this host needs access to upstream registries.
-The second adds the host-shim replacement to kata-deploy.
-Both write destination digest references to `$OPERATOR_DIR/*-image.txt`.
-Use those exact references in the next step. No insecure registry flags are needed.
+Both commands write destination digest references to `$OPERATOR_DIR/*-image.txt`.
+The following steps use those records.
 
 ## 7. Install Kata, PeerPods and CSI, then verify workers
 

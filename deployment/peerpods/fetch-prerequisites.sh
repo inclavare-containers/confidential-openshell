@@ -3,6 +3,14 @@ usage='Usage: bash deployment/peerpods/fetch-prerequisites.sh
 Fetch the pinned cluster dependencies and configure their published image mirrors.'
 source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 need jq curl python3
+missing=()
+for name in agent_sandbox_controller cert_manager_controller cert_manager_webhook \
+  cert_manager_cainjector cert_manager_startup; do
+  [[ -s "$OPERATOR_DIR/$name-image.txt" ]] || missing+=("$name")
+done
+if (( ${#missing[@]} )); then
+  die "Images not published: ${missing[*]}. Run bash deployment/peerpods/publish-images.sh (deployment step 6), then repeat this step."
+fi
 install -d -m 0700 "$OPERATOR_DIR"
 for item in agent_sandbox_manifest cert_manager_chart; do
   release_download "$item" "$OPERATOR_DIR/$item"
