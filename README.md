@@ -17,7 +17,7 @@ To install, follow these guides in order:
 3. [Coding harnesses](docs/first-agent.md): start OpenCode, Codex or Claude Code, reconnect and check persistent Stop/Start.
 
 Each installation step has its own command and expected result. The build and
-service roles can share one machine. An approved compatible PodVM ImageID and
+service roles can share one machine. An existing compatible PodVM ImageID and
 matching references can be reused without rebuilding the guest.
 
 See [architecture](docs/architecture.md) for trust boundaries and [tests](tests/README.md)

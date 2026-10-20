@@ -2,7 +2,7 @@
 
 Start with `configure-inputs.py` as shown in [deployment step 3](../../docs/deployment.md#3-prepare-cluster-select-the-cloud-image-and-configure-identities).
 It discovers the **cloud-side ACK network** and writes `$OPERATOR_DIR/ack.json`.
-Region comes from the approved handoff. It creates no cloud resources.
+Region comes from the selected handoff. It creates no cloud resources.
 The user-trusted service host can remain outside the cloud; it needs outbound
 ACK access and reachable inbound TLS endpoints for the cloud guests. See the
 [trust boundary](../../docs/architecture.md).
@@ -22,7 +22,7 @@ and a new cluster uses the selected cloud worker vSwitch.
 | `oss_endpoint_network` | OSS transport: `public` HTTPS by default; `internal` requires same-region OSS private connectivity. | Set with `--oss-endpoint-network`. |
 | `pod_vswitch_id`, `pod_vswitch_cidr` | New ACK's Kubernetes Pod network. Initializer chooses a free `/24` in the VPC; ID remains empty until creation. Existing ACK keeps its network. | Cluster preparation creates the vSwitch. `--pod-vswitch-id` reuses an existing one. |
 | `podvm_vswitch_id`, `podvm_vswitch_cidr` | Dedicated network for the confidential VMs. Initializer chooses another free `/24`; this is separate from Kubernetes Pods. | Network preparation creates the vSwitch and dedicated PodVM security group, and inherits worker SNAT when present. `--podvm-vswitch-id` reuses an existing dedicated vSwitch. |
-| `oss_bucket` | **Bucket name**, not a URL, path or region. Stores the QCOW2 for ECS import. Initializer generates a name from the account ID and random suffix; `--oss-bucket` selects an existing name. | Storage preparation creates a private bucket in the selected region. Unused with an approved ImageID. |
+| `oss_bucket` | **Bucket name**, not a URL, path or region. Stores the QCOW2 for ECS import. Initializer generates a name from the account ID and random suffix; `--oss-bucket` selects an existing name. | Storage preparation creates a private bucket in the selected region. Unused with an existing ImageID. |
 | `podvm_instance_type` | ECS type for TDX guests. Default `ecs.g9i.xlarge`; confirm availability in the chosen zone below. | Choose an available TDX type; creating an instance type is not an operator task. |
 | `kubernetes_version`, `containerd_version` | New ACK versions, checked against ACK metadata. Existing workers are checked, not upgraded. | Cluster preparation installs the selected versions. |
 | `worker_image_id` | Optional new worker OS ImageID. Empty selects ACK's Ubuntu 24.04 amd64 image automatically. This is **not** the PodVM ImageID. | Selected from ACK metadata; no worker image build/import is needed. |
@@ -104,7 +104,7 @@ For a first import, `prepare-storage.py --authorize-image-import` creates
 `AliyunECSImageImportRolePolicy` system policy. It does not replace an existing
 trust policy. The console alternative is **ECS → Images → Import Image → Authorize**.
 This follows the [official ImportImage authorization procedure](https://help.aliyun.com/en/ecs/developer-reference/api-ecs-2014-05-26-importimage).
-For an approved existing ImageID, neither bucket nor import authorization is needed.
+For an existing ImageID, neither bucket nor import authorization is needed.
 
 ## Saved configuration and runtime identities
 

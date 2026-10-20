@@ -26,9 +26,9 @@ becomes the literal filename `default\x2Fbootstrap\x2FID`. The signed
 `resource/default/...` identity stay the same. Private ownership records and
 workspace key journals remain in their separate trusted directories.
 
-Start AS after installing the strict CPU policy. Register the final image's
-independently derived reference file and the separately reviewed ECS firmware
-reference map with the official loopback API, then start KBS:
+Start AS after installing the CPU policy. Register the final image's generated
+reference file and the ECS platform map included in this repository with the
+official loopback API, then start KBS:
 
 ```sh
 python3 deployment/trustee/register-references.py \

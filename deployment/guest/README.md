@@ -64,7 +64,7 @@ line and initrd digests are derived from the final UKI, including the upstream
 systemd-stub generated os-release cpio. Only the verified systemd-stub
 259.5-0ubuntu3.4 profile without extra credential/addon initrds is accepted;
 the overlay pins this released Ubuntu `systemd-boot-efi` package version.
-Other versions or additional embedded initrds fail closed. The separately approved
+Other versions or additional embedded initrds fail closed. The repository's ECS
 platform map supplies MRTD and three static RTMR0 event digests. Policy requires
 the exact six event types, names and order; dynamic ACPI contents remain accepted
 untrusted VMM input handled by trusted TDVF/kernel, not independently approved

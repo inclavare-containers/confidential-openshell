@@ -138,9 +138,9 @@ later commands do not depend on shell variables from earlier build steps.
 
 ### Use an existing image
 
-Use an approved compatible image and its authenticated reference file. A generic
-Ubuntu image cannot replace the measured UKI/verity image with TDX AA/CDH, sealed
-bootstrap and encrypted workspace support.
+Use a compatible measured UKI/verity image with TDX AA/CDH, sealed bootstrap and
+encrypted workspace support. Obtain its matching reference file from the image
+publisher.
 
 ```bash
 bash deployment/build/select-guest.sh existing \

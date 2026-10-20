@@ -13,7 +13,7 @@ You need:
   independent of the ACK network; see the [trust boundary](architecture.md).
 - A new or existing ACK cluster, prepared in step 3. Existing clusters need RRSA,
   enforced NetworkPolicy and accessible workers.
-- A compatible TDX PodVM image and its approved reference file.
+- A compatible TDX PodVM image and its matching reference file.
 - Administrator access to ACK, ECS, VPC, RAM and the image registry.
 
 Run the numbered steps in order. Commands run as root on the trusted service
@@ -31,7 +31,7 @@ for each component; there is no combined install-and-deploy command.
 In the build guide, [select a guest image](build.md#select-the-guest-image), then
 [package and unpack the release](build.md#build-and-transfer). The verified
 public source should now be at `/opt/confidential-openshell` on the service host.
-A new guest image needs import in step 3; an approved ImageID can be reused.
+A new guest image needs import in step 3; an existing ImageID can be reused.
 
 Set the trusted service address reachable from the cloud:
 
@@ -52,7 +52,7 @@ A machine with outbound NAT alone cannot receive these connections. Provision a
 reachable ingress, VPN, or TCP forwarding route first; obtain its assigned IPv4
 from that network's configuration. Forward the three TCP ports to the trusted host
 and retain TLS termination/private keys on T. A public NAT **egress** IP alone is
-not evidence that inbound connectivity exists. Permit only approved clients.
+not evidence that inbound connectivity exists. Permit only intended clients.
 The [architecture](architecture.md) defines T independently of network placement.
 
 ## 3. Prepare cluster, select the cloud image and configure identities
@@ -134,7 +134,7 @@ export KUBECONFIG="$OPERATOR_DIR/administrator-kubeconfig"
 ```
 
 This creates a **paid ACK Pro cluster and pay-as-you-go workers**, using the
-reviewed inputs. It configures API public access according to `ack_api_access`, Terway shared ENI,
+saved inputs. It configures API public access according to `ack_api_access`, Terway shared ENI,
 NetworkPolicy and RRSA; selects ACK's Ubuntu 24.04 worker image; generates an SSH
 key under `$OPERATOR_DIR/worker-key`; and waits for workers before checking them.
 Cluster creation enables deletion protection. The default is one worker.
@@ -185,7 +185,7 @@ python3 deployment/ack/prepare-storage.py --authorize-image-import
 This uses the official `AliyunECSImageImportDefaultRole` and system policy
 `AliyunECSImageImportRolePolicy`. Alternatively, open **ECS console → Images →
 Import Image → Authorize**, then repeat the storage step. A read-only readiness
-check is available with `--check`. For an approved existing ImageID, the script
+check is available with `--check`. For an existing ImageID, the script
 skips bucket creation and import authorization.
 
 ### Confirm or import the PodVM image
@@ -201,9 +201,8 @@ Ubuntu/Linux and a 20 GiB system disk; PeerPods later requests 40 GiB. CAA enabl
 TDX when creating the VM.
 
 Outputs: `podvm-image-id.txt` and `podvm-image.json` in `$OPERATOR_DIR`. The latter
-binds region and ImageID to the approved handoff and reference checksums. Existing
-image/reference provenance still needs approval in step 2; ECS metadata cannot
-prove that binding. A cross-region image copy needs its destination ImageID.
+records the region, ImageID and selected handoff/reference checksums. A cross-region
+image copy needs its destination ImageID.
 
 ### Configure RAM roles
 
@@ -217,7 +216,7 @@ roles, attaches their scoped permissions, and records the role ARNs. It reuses a
 existing role only when ownership and policies match. No access keys are passed
 to Kubernetes. Step 7 generates Helm values from these saved results.
 
-## 4. Install Trustee and register the approved image references
+## 4. Install Trustee and register image and platform references
 
 ### Create the initial certificates
 
@@ -242,19 +241,17 @@ replace an existing resource policy. Empty bindings deny resource release.
 
 ### Start AS, register references, then start KBS
 
-Select the image reference filename from `$HANDOFF/selection.json`. Separately
-review the [ECS platform map](../deployment/trustee/ecs-tdx-platform.references.json)
-and use its approved checksum:
+Register the selected image's references together with the
+[ECS platform map](../deployment/trustee/ecs-tdx-platform.references.json)
+included in this repository:
 
 ```bash
 export PODVM_REFERENCE_VALUES="$HANDOFF/outputs/$(jq -er .references "$HANDOFF/selection.json")"
-export PODVM_PLATFORM_REFERENCES="$PWD/deployment/trustee/ecs-tdx-platform.references.json"
-PLATFORM_SHA256=YOUR_APPROVED_PLATFORM_REFERENCE_SHA256
-printf '%s  %s\n' "$PLATFORM_SHA256" "$PODVM_PLATFORM_REFERENCES" | sha256sum -c -
 systemctl enable --now as.service
 python3 deployment/trustee/register-references.py \
   --address http://127.0.0.1:50004 \
-  --references "$PODVM_REFERENCE_VALUES" --references "$PODVM_PLATFORM_REFERENCES"
+  --references "$PODVM_REFERENCE_VALUES" \
+  --references deployment/trustee/ecs-tdx-platform.references.json
 systemctl enable --now kbs.service
 systemctl is-active as.service kbs.service
 ```
