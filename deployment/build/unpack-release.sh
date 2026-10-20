@@ -9,17 +9,20 @@ SOURCE_ROOT=${3:-/opt/confidential-openshell}
 [[ $EXPECTED_HANDOFF_SHA256 =~ ^[0-9a-f]{64}$ ]] || die 'Invalid SHA256SUMS checksum'
 printf '%s  %s\n' "$EXPECTED_HANDOFF_SHA256" "$HANDOFF/SHA256SUMS" | sha256sum -c -
 (cd "$HANDOFF" && sha256sum -c SHA256SUMS)
-test ! -e "$SOURCE_ROOT"
-install -d -m 0755 "$SOURCE_ROOT"
-tar -xf "$HANDOFF/source/integration.tar" -C "$SOURCE_ROOT"
+[[ ! -e $SOURCE_ROOT ]] || die "Deployment source already exists: $SOURCE_ROOT. Continue deployment there; release installation does not replace an existing installation."
+install -d -m 0755 "$(dirname "$SOURCE_ROOT")"
+staging=$(mktemp -d "$(dirname "$SOURCE_ROOT")/.confidential-openshell.XXXXXX")
+trap 'rm -rf -- "$staging"' EXIT
+tar -xf "$HANDOFF/source/integration.tar" -C "$staging"
 for repo in openshell cloud-api-adaptor caa-csi-block-driver; do
-  install -d -m 0755 "$SOURCE_ROOT/repos" "$SOURCE_ROOT/repos/$repo"
-  tar -xf "$HANDOFF/source/$repo.tar" -C "$SOURCE_ROOT/repos/$repo"
+  install -d -m 0755 "$staging/repos" "$staging/repos/$repo"
+  tar -xf "$HANDOFF/source/$repo.tar" -C "$staging/repos/$repo"
 done
-OPERATOR_DIR=/var/lib/openshell-confidential/operator/cluster-config
 install -d -m 0700 "$OPERATOR_DIR"
 install -m 0755 "$HANDOFF/outputs/containerd-shim-kata-v2" "$OPERATOR_DIR/"
 (cd "$OPERATOR_DIR" && sha256sum containerd-shim-kata-v2 > shim.sha256)
+chmod 0755 "$staging"
+mv -T "$staging" "$SOURCE_ROOT"
 cd "$SOURCE_ROOT"
 
 printf 'Public source installed: %s\n' "$SOURCE_ROOT"

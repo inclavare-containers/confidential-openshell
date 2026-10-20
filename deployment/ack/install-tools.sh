@@ -9,7 +9,8 @@ expected=$(jq -er '.tools.aliyun.sha256' "$LOCK")
 if ! checked "$expected" /usr/local/bin/aliyun; then
     mkdir -p "$TOOL_CACHE"
     if ! checked "$expected" "$TOOL_CACHE/aliyun"; then
-        curl -fsSL --connect-timeout 15 --max-time 900 --retry 5 --retry-all-errors \
+        printf 'Downloading Alibaba Cloud CLI %s…\n' "$version"
+        curl -fL --progress-bar --connect-timeout 15 --max-time 900 --retry 5 --retry-all-errors \
             "https://aliyuncli.alicdn.com/aliyun-cli-linux-${version}-amd64.tgz" \
             -o "$TOOL_CACHE/aliyun.download.part"
         tar -xzOf "$TOOL_CACHE/aliyun.download.part" aliyun > "$TOOL_CACHE/aliyun.part"
@@ -19,4 +20,4 @@ if ! checked "$expected" /usr/local/bin/aliyun; then
     install -m 0755 "$TOOL_CACHE/aliyun" /usr/local/bin/aliyun
 fi
 aliyun version
-printf 'Alibaba Cloud CLI ready. Configure your operator credentials with aliyun configure.\n'
+printf 'Alibaba Cloud CLI ready. Next: ./cos deploy configure\n'

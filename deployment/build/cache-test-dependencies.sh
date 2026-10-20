@@ -14,4 +14,4 @@ for module in \
   .local/build-sources/caa-csi-block-driver tests; do
   (cd "$module" && go mod download)
 done
-printf 'Dependency cache ready. Run: bash tests/run.sh\n'
+printf 'Dependency cache ready. Next: ./cos build test\n'

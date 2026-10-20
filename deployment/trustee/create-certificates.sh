@@ -1,11 +1,19 @@
 #!/usr/bin/env bash
 usage='Usage: bash deployment/trustee/create-certificates.sh
-Create the initial Trustee CA, server certificate and AS signer using HOST_IP. Existing PKI is refused.'
+Create the initial Trustee CA, server certificate and AS signer using HOST_IP; retain and verify complete existing PKI.'
 source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 require_root
 service_addresses
 install -d -m 0700 /etc/trustee/tls "$OPERATOR_DIR"
-[[ -z $(find /etc/trustee/tls -mindepth 1 -print -quit) ]] || die 'PKI already exists. Retain it; do not regenerate the CA.'
+if [[ -n $(find /etc/trustee/tls -mindepth 1 -print -quit) ]]; then
+  for name in ca.key ca.pem server.key server.pem server-chain.pem as-token.key as-token.pem as-token-chain.pem as-token-public.pem; do
+    [[ -s /etc/trustee/tls/$name ]] || die 'Existing Trustee PKI is incomplete. Retain the files and inspect the failed certificate step; the CA will not be regenerated.'
+  done
+  openssl verify -CAfile /etc/trustee/tls/ca.pem /etc/trustee/tls/server.pem /etc/trustee/tls/as-token.pem
+  openssl x509 -in /etc/trustee/tls/server.pem -checkip "$HOST_IP" -noout
+  printf 'Existing Trustee certificates verified; the CA and private keys are retained.\n'
+  exit 0
+fi
 test ! -e /etc/trustee/tls/ca.key && test ! -e /etc/trustee/tls/ca.pem
 sed "s/TRUSTED_SERVICE_IP/$HOST_IP/g" deployment/trustee/certificates/server.example.ext > "$OPERATOR_DIR/server.ext"
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out /etc/trustee/tls/ca.key

@@ -10,6 +10,11 @@ podvm="${source_root}/src/cloud-api-adaptor/podvm"
 artifacts="${root}/artifacts"
 state="${root}/.local/guest-build"
 integration_commit="$(git -C "${root}" rev-parse HEAD)"
+if [[ ${OPENSHELL_GUEST_MANIFEST_PROFILE:-release} == release && -n $(git -C "${root}" status --porcelain --untracked-files=normal) ]]; then
+    git -C "${root}" status --short
+    printf 'Guest release builds require a clean committed checkout. Resolve the source changes above before starting the image build.\n' >&2
+    exit 1
+fi
 guest_inputs_sha256() {
     (
         cd "${root}"
@@ -64,33 +69,36 @@ mkosi_commit="$(jq -r '.mkosi.commit' "${lock}")"
 [[ "${mkosi_commit}" =~ ^[0-9a-f]{40}$ ]]
 image="${OPENSHELL_MKOSI_TOOLS_IMAGE:-}"
 if [[ -z "${image}" ]]; then
+    printf '[guest] Building mkosi tools; log: %s/tools-build.log\n' "${evidence}"
     image="openshell-mkosi-tools:${mkosi_commit:0:12}"
     docker build --build-arg "BASE_IMAGE=${OPENSHELL_MKOSI_TOOLS_BASE_IMAGE:-$(jq -r '.mkosi.tools_base_image' "${lock}")}" \
         --build-arg "MKOSI_COMMIT=${mkosi_commit}" -t "${image}" \
         -f "${root}/deployment/guest/Dockerfile.mkosi-tools" "${root}/deployment/guest" \
-        >"${evidence}/tools-build.log" 2>&1
+        2>&1 | tee "${evidence}/tools-build.log"
 fi
 image_id="$(docker image inspect --format '{{.Id}}' "${image}")"
 [[ "${image_id}" =~ ^sha256:[0-9a-f]{64}$ ]]
 # A reusable tools image is accepted only with the exact official mkosi source.
 docker run --rm "${image_id}" bash -euc \
     'test "$(git -C /build/mkosi rev-parse HEAD)" = "$1"; git -C /build/mkosi diff --quiet; for tool in mkosi sfdisk mcopy veritysetup unsquashfs pesign qemu-img python3; do command -v "$tool"; done' \
-    bash "${mkosi_commit}" >"${evidence}/tools-check.log" 2>&1
+    bash "${mkosi_commit}" 2>&1 | tee "${evidence}/tools-check.log"
 
 payload_sha="$(sha256sum "${payload}" | cut -d' ' -f1)"
 recipe_sha="$(sha256sum "${root}/deployment/guest/build-image.sh" | cut -d' ' -f1)"
 version="$(git -C "${root}" rev-parse --short=12 HEAD)"
 # Native mkosi uses the ECS host kernel, with no nested VM and no disk mappings.
+printf '[guest] Building Ubuntu UKI/verity image; log: %s/mkosi.log\n' "${evidence}"
 docker run --rm --privileged --network host \
     --mount "type=bind,source=${work}/image,target=/image" \
     --mount "type=bind,source=${artifacts}/cache/mkosi-packages,target=/package-cache" \
     "${image_id}" /build/mkosi/bin/mkosi --profile=production --image-version="${version}" \
-    --package-cache-dir=/package-cache build >"${evidence}/mkosi.log" 2>&1
+    --package-cache-dir=/package-cache build 2>&1 | tee "${evidence}/mkosi.log"
 raw="${work}/image/build/system.raw"
 [[ -f "${raw}" && ! -L "${raw}" ]]
 cp "${work}/image/build/system.manifest" "${evidence}/distro-manifest.json"
 
 # Independently check the final raw image before converting or publishing it.
+printf '[guest] Verifying image and deriving measurements; log: %s/verify.log\n' "${evidence}"
 docker run --rm --privileged \
     --mount "type=bind,source=${root}/deployment/guest,target=/source/deployment/guest,readonly" \
     --mount "type=bind,source=${lock},target=/source/deployment/artifacts.lock.json,readonly" \
@@ -99,7 +107,7 @@ docker run --rm --privileged \
     --mount "type=bind,source=${evidence},target=/evidence" \
     "${image_id}" python3 /source/deployment/guest/verify-image.py \
     /work/image/build/system.raw /work/inspection /evidence \
-    >"${evidence}/verify.log" 2>&1
+    2>&1 | tee "${evidence}/verify.log"
 
 docker run --rm --mount "type=bind,source=${work},target=/work" "${image_id}" \
     qemu-img convert -f raw -O qcow2 /work/image/build/system.raw /work/guest.qcow2
@@ -139,4 +147,6 @@ else
         --artifact "guest-references=${refs}" >"${evidence}/source-manifest.json"
 fi
 completed=1
+printf '%s/build.json\n' "${evidence}" > "${root}/.local/guest-build/latest-receipt.tmp"
+mv "${root}/.local/guest-build/latest-receipt.tmp" "${root}/.local/guest-build/latest-receipt"
 printf '[guest] qcow2: %s\n[guest] references: %s\n[guest] receipt: %s/build.json\n' "${final}" "${refs}" "${evidence}"

@@ -3,6 +3,10 @@ usage='Usage: bash deployment/build/package-release.sh
 Package public outputs with source provenance. Select a guest first; requires a clean committed checkout.'
 source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 need jq docker git python3
+if [[ -n $(git status --porcelain --untracked-files=normal) ]]; then
+  git status --short
+  die 'Release packaging requires a clean committed checkout. Resolve the source changes above before packaging.'
+fi
 build_tags
 selection=.local/guest-selection.json
 PODVM_MODE=$(jq -er .mode "$selection")
@@ -57,5 +61,6 @@ jq -n --arg caa "$CAA_TAG" --arg csi "$CSI_TAG" --arg peerpod_ctrl "$PEERPOD_CTR
 (cd "$HANDOFF" && sha256sum source/*.tar outputs/* charts/* \
   *.json > SHA256SUMS)
 sha256sum "$HANDOFF/SHA256SUMS" # Retain through the authenticated administrative channel.
+sha256sum "$HANDOFF/SHA256SUMS" | cut -d ' ' -f1 > "$BUILD_ROOT/artifacts/handoff.sha256"
 printf 'Handoff ready: %s\n' "$HANDOFF"
 printf 'Retain the SHA256SUMS hash above for authenticated transfer.\n'

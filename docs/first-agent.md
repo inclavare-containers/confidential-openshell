@@ -40,7 +40,9 @@ install -m 0600 deployment/harness/openai-compatible.example.yaml "$CONFIG_DIR/o
 ${EDITOR:-vi} "$CONFIG_DIR/openai.yaml"
 openshell profile lint --file "$CONFIG_DIR/openai.yaml"
 openshell profile import --file "$CONFIG_DIR/openai.yaml"
-# The administrator's private environment already contains OPENAI_API_KEY.
+read -r -s -p 'OpenAI-compatible provider API key: ' OPENAI_API_KEY
+printf '\n'
+export OPENAI_API_KEY
 openshell provider create --name coding-openai --type coding-openai --from-existing
 ```
 
@@ -55,7 +57,9 @@ install -m 0600 deployment/harness/anthropic-compatible.example.yaml "$CONFIG_DI
 ${EDITOR:-vi} "$CONFIG_DIR/anthropic.yaml"
 openshell profile lint --file "$CONFIG_DIR/anthropic.yaml"
 openshell profile import --file "$CONFIG_DIR/anthropic.yaml"
-# The administrator's private environment already contains ANTHROPIC_API_KEY.
+read -r -s -p 'Anthropic-compatible provider API key: ' ANTHROPIC_API_KEY
+printf '\n'
+export ANTHROPIC_API_KEY
 openshell provider create --name coding-anthropic --type coding-anthropic --from-existing
 ```
 
@@ -84,7 +88,7 @@ set its base URL/model entry, and keep `{env:OPENAI_API_KEY}` unchanged:
 install -m 0600 deployment/harness/opencode.example.json "$CONFIG_DIR/opencode.json"
 ${EDITOR:-vi} "$CONFIG_DIR/opencode.json"
 SANDBOX=opencode-demo
-MODEL=approved/REPLACE_WITH_MODEL_ID
+read -r -p 'OpenCode model identifier (including provider prefix): ' MODEL
 openshell sandbox create --name "$SANDBOX" --provider coding-openai --tty --detach \
   --env "OPENCODE_CONFIG_CONTENT=$(jq -c . "$CONFIG_DIR/opencode.json")" \
   --env OPENCODE_DISABLE_MODELS_FETCH=true --env "HARNESS_MODEL=$MODEL"
@@ -104,8 +108,8 @@ On **T**, select a Responses-compatible model and endpoint:
 
 ```bash
 SANDBOX=codex-demo
-MODEL=REPLACE_WITH_MODEL_ID
-BASE_URL=https://REPLACE_WITH_APPROVED_HOST/v1
+read -r -p 'Codex model identifier: ' MODEL
+read -r -p 'Responses-compatible HTTPS base URL (including /v1): ' BASE_URL
 openshell sandbox create --name "$SANDBOX" --provider coding-openai --tty --detach \
   --env "HARNESS_MODEL=$MODEL" --env "HARNESS_BASE_URL=$BASE_URL"
 openshell sandbox provider status "$SANDBOX" coding-openai --wait --timeout 30 --output json
@@ -132,8 +136,8 @@ On **T**, use the Anthropic-compatible base URL without `/v1/messages`:
 
 ```bash
 SANDBOX=claude-demo
-MODEL=REPLACE_WITH_MODEL_ID
-BASE_URL=https://REPLACE_WITH_APPROVED_HOST
+read -r -p 'Claude model identifier: ' MODEL
+read -r -p 'Anthropic-compatible HTTPS base URL (without /v1/messages): ' BASE_URL
 openshell sandbox create --name "$SANDBOX" --provider coding-anthropic --tty --detach \
   --env "HARNESS_MODEL=$MODEL" --env "ANTHROPIC_BASE_URL=$BASE_URL" \
   --env CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1

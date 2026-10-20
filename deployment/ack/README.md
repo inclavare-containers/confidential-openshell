@@ -1,124 +1,64 @@
-# ACK inputs
+# ACK implementation reference
 
-Start with `configure-inputs.py` as shown in [deployment step 3](../../docs/deployment.md#3-prepare-cluster-select-the-cloud-image-and-configure-identities).
-It discovers the **cloud-side ACK network** and writes `$OPERATOR_DIR/ack.json`.
-Region comes from the selected handoff. It creates no cloud resources.
-The user-trusted service host can remain outside the cloud; it needs outbound
-ACK access and reachable inbound TLS endpoints for the cloud guests. See the
-[trust boundary](../../docs/architecture.md).
+Users follow [deployment](../../docs/deployment.md) using `./cos` for each step.
+The Python files here implement cloud operations; users do not invoke them or
+copy generated resource IDs into configuration templates.
 
-`HOST_IP` configures the trusted service endpoints in deployment step 2. ACK
-inputs describe cloud resources only: an existing cluster supplies its network,
-and a new cluster uses the selected cloud worker vSwitch.
+## New cluster
 
-## What each field means
+`./cos cluster create` selects worker/TDX capacity, saves inputs and creates a
+dedicated VPC, worker/Pod vSwitches, ACK Pro and an Ubuntu node pool. ACK enables
+RRSA, Terway NetworkPolicy, storage add-ons and worker SNAT.
+`./cos cloud network` creates the PodVM vSwitch/security group and inherits egress.
 
-| Field | Meaning and source | If it does not exist yet |
-| --- | --- | --- |
-| `name` | Deployment/resource-name prefix. The initializer generates a unique name; `--name` chooses one explicitly. | Generated locally. |
-| `cluster_id` | Existing ACK ID, selected from the listing below with `--cluster-id`. Empty means a new cluster. | `prepare-cluster.py --create` creates ACK. |
-| `worker_vswitch_id` | Cloud worker network. Discovered from existing ACK, or selected with `--worker-vswitch-id` for new ACK. | Create a cloud VPC/vSwitch using the commands below. T does not need to join this VPC. |
-| `ack_api_access` | ACK API connection: `public` by default; `private` requires VPN/VPC routing. Set with `--ack-api-access`. | New ACK configures its public endpoint accordingly. For existing ACK, enable public API access in ACK console when selecting public mode. |
-| `oss_endpoint_network` | OSS transport: `public` HTTPS by default; `internal` requires same-region OSS private connectivity. | Set with `--oss-endpoint-network`. |
-| `pod_vswitch_id`, `pod_vswitch_cidr` | New ACK's Kubernetes Pod network. Initializer chooses a free `/24` in the VPC; ID remains empty until creation. Existing ACK keeps its network. | Cluster preparation creates the vSwitch. `--pod-vswitch-id` reuses an existing one. |
-| `podvm_vswitch_id`, `podvm_vswitch_cidr` | Dedicated network for the confidential VMs. Initializer chooses another free `/24`; this is separate from Kubernetes Pods. | Network preparation creates the vSwitch and dedicated PodVM security group, and inherits worker SNAT when present. `--podvm-vswitch-id` reuses an existing dedicated vSwitch. |
-| `oss_bucket` | **Bucket name**, not a URL, path or region. Stores the QCOW2 for ECS import. Initializer generates a name from the account ID and random suffix; `--oss-bucket` selects an existing name. | Storage preparation creates a private bucket in the selected region. Unused with an existing ImageID. |
-| `podvm_instance_type` | ECS type for TDX guests. Default `ecs.g9i.xlarge`; confirm availability in the chosen zone below. | Choose an available TDX type; creating an instance type is not an operator task. |
-| `kubernetes_version`, `containerd_version` | New ACK versions, checked against ACK metadata. Existing workers are checked, not upgraded. | Cluster preparation installs the selected versions. |
-| `worker_image_id` | Optional new worker OS ImageID. Empty selects ACK's Ubuntu 24.04 amd64 image automatically. This is **not** the PodVM ImageID. | Selected from ACK metadata; no worker image build/import is needed. |
-| `worker_instance_type`, `worker_count` | New ACK worker type/count. Default: one `ecs.g9i.xlarge` worker. Existing cluster ignores these fields. | Cluster preparation creates pay-as-you-go workers. |
-| `service_cidr` | Kubernetes Service address range for new ACK. Initializer selects a range outside the VPC; review against any connected networks. | ACK uses this range during creation. |
-| `csi_storage_class` | Host ACK ESSD StorageClass for CSI controller state; default `alicloud-disk-essd`. It is separate from encrypted guest workspace storage. | New ACK installs the standard CSI add-ons. For an existing ACK, enable `csi-plugin` and `csi-provisioner` in ACK console → Add-ons → Storage if absent. |
+Zone selection uses official ECS
+[DescribeAvailableResource](https://help.aliyun.com/en/ecs/developer-reference/api-ecs-2014-05-26-describeavailableresource).
+Network creation uses [CreateVpc](https://help.aliyun.com/en/vpc/developer-reference/api-vpc-2016-04-28-createvpc)
+and [CreateVSwitch](https://help.aliyun.com/en/vpc/api-createvswitch), with saved IDs,
+idempotency tokens and availability waits before dependent operations.
 
-Discovery checks existing vSwitch CIDRs, not future allocations or connected-VPC
-routes. Review the proposed networks before starting setup. Dedicated vSwitches
-must be in the selected VPC and worker zone. This reference profile uses one
-worker zone.
+## Existing cluster
 
-## Cloud network selection
+`./cos cluster attach` lists/selects ACK and checks the supported profile.
+It keeps existing VPC, worker vSwitches and node pools, obtains a temporary
+administrator kubeconfig and reports missing requirements without changing
+cluster features. Common deployment steps add PodVM resources and identities.
 
-Run cloud queries from T after `aliyun configure`; append `--profile NAME` for a
-named profile. The cloud resources below belong to U and do not locate T.
+## Saved configuration
 
-```bash
-export REGION=$(jq -er .podvm_region "$HANDOFF/selection.json")
-aliyun cs DescribeClustersV1 --region "$REGION" --region_id "$REGION" --page_size 100 \
-  | jq -r '.clusters[] | [.cluster_id, .name, .vpc_id, .state] | @tsv'
-aliyun vpc DescribeVSwitches --region "$REGION" --RegionId "$REGION" --PageSize 50 \
-  | jq -r '.VSwitches.VSwitch[] | [.VSwitchId, .VSwitchName, .VpcId, .ZoneId, .CidrBlock] | @tsv'
-```
+Under `/var/lib/openshell-confidential/operator/cluster-config`:
 
-If a suitable cloud network exists, pass its worker vSwitch ID to the initializer.
-List APIs are paginated; use later pages when needed. The initializer paginates
-vSwitches itself before allocating the new Pod/PodVM CIDRs.
+| File | Contents |
+| --- | --- |
+| `operator.json` | Trusted service address and CLI profile, loaded automatically |
+| `ack.json` | Immutable inputs, generated names/CIDRs and versions |
+| `ack-state.json` | Created/discovered IDs, role ARNs, egress IPs and selected workers |
+| `administrator-kubeconfig` | ACK administrator credentials, valid for up to three days |
+| `podvm-image.json` | ECS image binding to the release/reference checksums |
+| `*-image.txt` | Published destination image digests |
+| `steps.json`, `logs/` | Previous command results and private output |
 
-If no network exists, select a zone that offers the desired TDX instance type:
+Generated IDs live in state; input files stay immutable on retries. Retain both.
+Use a separate `OPERATOR_DIR` for a different deployment. Repeat the same cluster
+create/attach command to renew kubeconfig. The trusted host needs no ECS identity.
 
-```bash
-aliyun ecs DescribeAvailableResource --region "$REGION" --RegionId "$REGION" \
-  --DestinationResource InstanceType --InstanceChargeType PostPaid --InstanceType ecs.g9i.xlarge
-read -r -p 'ZoneId with available TDX capacity from the result: ' ZONE_ID
-install -d -m 0700 "$OPERATOR_DIR"
-NETWORK_NAME="cos-$(date -u +%Y%m%d%H%M%S)"
-aliyun vpc CreateVpc --region "$REGION" --RegionId "$REGION" \
-  --VpcName "$NETWORK_NAME" --CidrBlock 192.168.0.0/16 > "$OPERATOR_DIR/cloud-vpc.json"
-VPC_ID=$(jq -er .VpcId "$OPERATOR_DIR/cloud-vpc.json")
-aliyun vpc DescribeVpcAttribute --region "$REGION" --RegionId "$REGION" --VpcId "$VPC_ID"
-```
+The new VPC defaults to `10.64.0.0/16`, with three distinct `/24` ranges for workers,
+Kubernetes Pods and PodVMs. `--vpc-cidr` changes this plan. The Service CIDR is
+outside the VPC. Review planned network connections for overlap before creation.
+This profile uses one worker zone.
 
-Wait until the returned VPC `Status` is `Available`, then create its worker vSwitch:
+## Image storage and runtime identities
 
-```bash
-aliyun vpc CreateVSwitch --region "$REGION" --RegionId "$REGION" --VpcId "$VPC_ID" \
-  --ZoneId "$ZONE_ID" --CidrBlock 192.168.16.0/20 --VSwitchName "$NETWORK_NAME-worker" \
-  > "$OPERATOR_DIR/cloud-worker-vswitch.json"
-WORKER_VSWITCH_ID=$(jq -er .VSwitchId "$OPERATOR_DIR/cloud-worker-vswitch.json")
-python3 deployment/ack/configure-inputs.py --worker-vswitch-id "$WORKER_VSWITCH_ID"
-```
+`./cos cloud image` creates/checks a private, same-region OSS bucket for import
+when needed. It ensures the official `AliyunECSImageImportDefaultRole` with
+`AliyunECSImageImportRolePolicy`, retaining existing trust policies. See
+[ImportImage authorization](https://help.aliyun.com/en/ecs/developer-reference/api-ecs-2014-05-26-importimage).
+An existing ImageID needs neither bucket creation nor import authorization.
 
-These address ranges are an example for a **new** cloud VPC. Choose ranges that do
-not overlap connected networks. Retain the two JSON outputs for cleanup. Workers
-and PodVMs need egress to the trusted service endpoints; arrange NAT/SNAT or routed
-connectivity for the selected cloud subnets.
+`./cos cloud identities` uses the [RAM templates](ram/) for separate CAA/controller
+and CSI roles, scoped by ServiceAccount, cluster ownership and vSwitch. Runtime
+roles are separate from the operator and image-import identities.
 
-Other resource queries:
-
-```bash
-aliyun oss ls -e "https://oss-${REGION}.aliyuncs.com"
-# After obtaining kubeconfig, inspect the host ACK disk classes:
-kubectl get storageclass
-```
-
-For existing ACK, select the host ESSD class from **ACK console → cluster →
-Storage → StorageClasses** before starting setup.
-
-## Storage and image-import authorization
-
-`prepare-storage.py` creates the generated bucket with private ACL, or checks an
-existing bucket's owner, region and ACL. The upload uses HTTPS over the selected
-public or internal OSS endpoint. The bucket stores the image file; it does not store live
-workspaces. OSS storage and image-import snapshots incur the cloud's normal fees.
-
-For a first import, `prepare-storage.py --authorize-image-import` creates
-`AliyunECSImageImportDefaultRole` with ECS service trust and attaches the official
-`AliyunECSImageImportRolePolicy` system policy. It does not replace an existing
-trust policy. The console alternative is **ECS → Images → Import Image → Authorize**.
-This follows the [official ImportImage authorization procedure](https://help.aliyun.com/en/ecs/developer-reference/api-ecs-2014-05-26-importimage).
-For an existing ImageID, neither bucket nor import authorization is needed.
-
-## Saved configuration and runtime identities
-
-Complete the private inputs before starting cloud setup. The initializer's
-`--replace` option can regenerate inputs only before `ack-state.json` exists.
-Keep configuration/state together on retries. Use another name and operator
-directory for another deployment. Resource IDs and created identities remain in
-`ack-state.json`; resources persist until the operator deletes them. Disable ACK
-deletion protection before deleting a newly created cluster. An existing shared
-image-import role or reused bucket is not a deployment-owned disposable resource.
-
-The [RAM templates](ram/) are for runtime CAA/controller and CSI identities,
-separate from the operator credentials and ECS import role. They restrict OIDC
-trust to their ServiceAccounts and use cluster ownership tags. Helm values reuse
-the same identities/tags. Existing clusters need Ready Linux/amd64 workers,
-containerd, `supplementalGroupsPolicy`, and Terway shared ENI with NetworkPolicy.
-Actual network denial is verified in deployment step 10.
+Cloud resources remain billable until deleted. New ACK has deletion protection;
+disable it before deletion. State identifies generated resources. Shared import
+roles and existing-cluster resources are retained resources.

@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 usage='Usage: bash deployment/openshell/configure-driver.sh
-Generate driver.env from HOST_IP and the published runtime digest records. Refuses to replace an existing file.'
+Generate/check driver.env from HOST_IP and the published runtime digest records.'
 source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 require_root
 service_addresses
 target=/etc/openshell-confidential/driver.env
-[[ ! -e $target ]] || die 'driver.env exists. Review it rather than replacing an installed configuration.'
 install -d -m 0750 -o root -g openshell-gateway /etc/openshell-confidential
 python3 - "$HOST_IP" "$OPERATOR_DIR" > "$target.part" <<'PY'
 from pathlib import Path
@@ -18,6 +17,10 @@ for key, name in [('WORKLOAD_IMAGE', 'workload'), ('SANDBOX_IMAGE', 'sandbox'),
     assert re.fullmatch(re.escape(address) + r':5000/[a-z0-9_./-]+@sha256:[0-9a-f]{64}', ref), name
     print(f'{key}={ref}')
 PY
-install -o root -g openshell-gateway -m 0640 "$target.part" "$target"
+if [[ -e $target ]]; then
+  cmp -s "$target.part" "$target" || die 'Existing driver.env differs from the selected release; review the configuration before changing it.'
+else
+  install -o root -g openshell-gateway -m 0640 "$target.part" "$target"
+fi
 rm "$target.part"
 printf 'Driver configuration ready: %s\n' "$target"

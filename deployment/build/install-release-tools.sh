@@ -8,6 +8,7 @@ mkdir -p "$TOOL_CACHE"
 for tool in helm kubectl crane gh oras yq; do
     version=$(jq -er --arg t "$tool" '.tools[$t].version' "$LOCK")
     expected=$(jq -er --arg t "$tool" '.tools[$t].sha256' "$LOCK")
+    printf 'Preparing %s %s…\n' "$tool" "$version"
     member=
     case "$tool" in
         helm) url="https://get.helm.sh/helm-v${version}-linux-amd64.tar.gz"; member=linux-amd64/helm ;;
@@ -19,7 +20,7 @@ for tool in helm kubectl crane gh oras yq; do
     esac
     if ! checked "$expected" "/usr/local/bin/$tool"; then
         if ! checked "$expected" "$TOOL_CACHE/$tool"; then
-            curl -fsSL --connect-timeout 15 --max-time 900 --retry 5 --retry-all-errors \
+            curl -fL --progress-bar --connect-timeout 15 --max-time 900 --retry 5 --retry-all-errors \
                 "$url" -o "$TOOL_CACHE/$tool.download.part"
             if [[ -n $member ]]; then
                 tar -xzOf "$TOOL_CACHE/$tool.download.part" "$member" > "$TOOL_CACHE/$tool.part"

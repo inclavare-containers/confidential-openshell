@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+usage='Usage: ./cos trustee start
+Start the official AS/KBS containers, register selected references and verify anonymous resource denial.'
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
+require_root
+service_addresses
+refs="$HANDOFF/outputs/$(jq -er .references "$HANDOFF/selection.json")"
+systemctl enable --now as.service
+python3 deployment/trustee/register-references.py \
+  --references "$refs" --references deployment/trustee/ecs-tdx-platform.references.json
+systemctl enable --now kbs.service
+systemctl is-active --quiet as.service kbs.service
+code=$(curl --noproxy '*' --cacert /etc/trustee/tls/ca.pem \
+  --retry 10 --retry-connrefused --retry-delay 1 --retry-max-time 30 \
+  --connect-timeout 5 --max-time 10 -sS -o /dev/null -w '%{http_code}' \
+  "https://${HOST_IP}:8443/kbs/v0/resource/default/bootstrap/anonymous-check")
+[[ $code == 401 || $code == 403 ]] || die "KBS anonymous denial check failed: HTTP $code (expected 401 or 403)."
+printf 'Trustee ready: AS active; references registered and read back; KBS HTTPS denies anonymous access (HTTP %s).\n' "$code"

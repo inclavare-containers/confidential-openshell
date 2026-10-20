@@ -1,495 +1,312 @@
 # Deploy
 
-This guide installs native OpenShell 0.1.3 with the Ubuntu UKI / CoCo 0.22 profile
-on Alibaba Cloud ACK and Intel TDX. Start with a fresh development environment.
-For an already installed Gateway, use [first agent](first-agent.md).
-Developers connect to the trusted Gateway over public TLS using the native
-OpenShell CLI.
+Deploy native OpenShell 0.1.3 with CoCo 0.22, Trustee, ACK and Intel TDX.
+Complete [build](build.md), including release installation, first. Run the commands
+below as root from `/opt/confidential-openshell` on the **trusted service host**.
+It hosts Gateway, driver, Trustee and the private registry. It may be your build
+machine, an on-premise host or a cloud VM; ACK does not determine its location.
 
-You need:
+Each `./cos` command runs one step and prints its purpose, progress,
+`OK`/`FAILED`, elapsed time, log path and next command. A failure stops the step.
+Use `./cos --help` to list commands and `./cos status` to inspect saved resources
+and previous command results.
 
-- A user-trusted Ubuntu service host for Gateway, driver, Trustee and the registry.
-  It can be on-premise and can also be the build machine. Its placement is
-  independent of the ACK network; see the [trust boundary](architecture.md).
-- A new or existing ACK cluster, prepared in step 3. Existing clusters need RRSA,
-  enforced NetworkPolicy and accessible workers.
-- A compatible TDX PodVM image and its matching reference file.
-- Administrator access to ACK, ECS, VPC, RAM and the image registry.
+## 1. Build and install the release
 
-Run the numbered steps in order. Commands run as root on the trusted service
-host unless a worker is named. Keep edited configuration and credentials under
-`/var/lib/openshell-confidential/operator/`, outside the source checkout.
+Complete [the build guide](build.md#build-and-transfer). Keep the Git checkout for
+future builds; use the installed source for deployment.
 
-## 1. Pin sources and build integration binaries/images
-
-Follow [build](build.md) in order: install tools, prepare sources, build each
-component and run the offline tests. The build guide gives the command and output
-for each component; there is no combined install-and-deploy command.
-
-## 2. Select the guest image and matching references
-
-In the build guide, [select a guest image](build.md#select-the-guest-image), then
-[package and unpack the release](build.md#build-and-transfer). The verified
-public source should now be at `/opt/confidential-openshell` on the service host.
-A new guest image needs import in step 3; an existing ImageID can be reused.
-
-Set the trusted service address reachable from the cloud:
+## 2. Configure the trusted service host
 
 ```bash
-cd /opt/confidential-openshell
-export HANDOFF=/var/lib/openshell-confidential/operator/handoff
-export OPERATOR_DIR=/var/lib/openshell-confidential/operator/cluster-config
-read -r -p 'Trusted service IPv4 reachable from cloud workers/guests: ' HOST_IP
-export HOST_IP
+./cos host cloud-tools
 ```
 
-`HOST_IP` is the address advertised to the cloud for Gateway 9443, KBS 8443 and
-registry 5000, and included in TLS certificates. It is the only service-address
-input. Services listen on `0.0.0.0` locally, so a public address mapped through NAT
-does not need to appear on the host's network interfaces.
-
-A machine with outbound NAT alone cannot receive these connections. Provision a
-reachable ingress, VPN, or TCP forwarding route first; obtain its assigned IPv4
-from that network's configuration. Forward the three TCP ports to the trusted host
-and retain TLS termination/private keys on T. A public NAT **egress** IP alone is
-not evidence that inbound connectivity exists. Permit only intended clients.
-The [architecture](architecture.md) defines T independently of network placement.
-
-## 3. Prepare cluster, select the cloud image and configure identities
-
-### Install cloud tools and configure operator access
+Installs the pinned Alibaba Cloud CLI. Then configure the deployment:
 
 ```bash
-bash deployment/ack/install-tools.sh
-aliyun configure
-export REGION=$(jq -er .podvm_region "$HANDOFF/selection.json")
-aliyun sts GetCallerIdentity --region "$REGION"
+./cos deploy configure
 ```
 
-Obtain the operator identity from your Alibaba account administrator or
-[RAM console](https://ram.console.aliyun.com/). This identity needs ECS, VPC, ACK,
-RAM and OSS administration. Set `ALIBABA_CLOUD_PROFILE` to choose a named CLI
-profile, and use the same profile for manual queries. Credentials stay in T.
+Asks for the trusted host's **IPv4 reachable from the cloud**, checks the Alibaba
+CLI identity and saves the configuration. If credentials are needed, it opens the
+normal CLI credential setup. Existing valid profiles are reused.
+The region comes from your guest selection. The operator needs administration of
+ACK, ECS, VPC, RAM and OSS, including ECS Cloud Assistant commands on workers.
+Credentials remain on the trusted host. Use `--profile` followed by a CLI profile
+name when needed.
 
-### Choose an existing cluster, or prepare a new one
+Later steps automatically load the service address, profile, handoff and
+administrator kubeconfig, including in a new shell. State and private logs stay
+under `/var/lib/openshell-confidential/operator/cluster-config`.
 
-For an existing ACK, list clusters and use its ID:
+The service address needs inbound TLS on TCP **5000** (registry), **8443** (KBS)
+and **9443** (Gateway). Configure ingress/firewall in the trusted host's own
+network; keep TLS termination and keys on this host. Outbound NAT alone does not
+provide inbound access. Cloud network preparation prints the egress IPs to permit.
+Gateway clients also need access to 9443.
+
+## 3. Create a new ACK cluster
+
+Use this path for a new deployment. No existing VPC, vSwitch, security group or
+OSS bucket is required.
 
 ```bash
-aliyun cs DescribeClustersV1 --region "$REGION" --region_id "$REGION" \
-  --page_size 100 --profile "${ALIBABA_CLOUD_PROFILE:-default}" \
-  | jq -r '.clusters[] | [.cluster_id, .name, .vpc_id, .state] | @tsv'
-python3 deployment/ack/configure-inputs.py --cluster-id ID_FROM_THE_LIST
+./cos cluster create
 ```
 
-For a new ACK, list **cloud-side** worker vSwitches, then select one:
+Creates a **paid ACK Pro cluster and pay-as-you-go worker**. It selects a zone with
+worker/TDX capacity, creates a dedicated VPC and worker/Pod vSwitches, and configures
+public API access, Terway NetworkPolicy, RRSA, storage add-ons, worker egress and
+Ubuntu 24.04/containerd. The default is one worker.
+
+Success prints cluster/VPC/vSwitch/security-group IDs and Ready nodes. These IDs
+are saved automatically; rerunning resumes the same deployment.
+
+The default VPC CIDR is `10.64.0.0/16`. Pass a different private CIDR with
+`--vpc-cidr` if planned network connections would overlap. Optional `--zone`
+chooses an available zone; `--name` chooses a resource-name prefix.
+`--private-api` requires routed private access from this host to ACK.
+
+Continue with [step 4](#4-prepare-cloud-resources).
+
+## Use an existing ACK cluster instead
+
+Skip step 3. This command lists existing clusters and asks which to use:
 
 ```bash
-aliyun vpc DescribeVSwitches --region "$REGION" --RegionId "$REGION" --PageSize 50 \
-  | jq -r '.VSwitches.VSwitch[] | [.VSwitchId, .VSwitchName, .VpcId, .ZoneId, .CidrBlock] | @tsv'
-python3 deployment/ack/configure-inputs.py --worker-vswitch-id ID_FROM_THE_LIST
+./cos cluster attach
 ```
 
-If no suitable cloud network exists, the [network preparation commands](../deployment/ack/README.md#cloud-network-selection)
-create a VPC and worker vSwitch before this step. The trusted service host is not
-required to belong to that VPC. Only workers, Kubernetes Pods and PodVMs use the
-selected cloud network.
+Obtains an administrator kubeconfig and checks the region, API access, RRSA,
+Ready Linux/amd64 containerd workers, `supplementalGroupsPolicy` and Terway
+NetworkPolicy. It retains the existing cluster, VPC, node pools and worker OS.
+Missing prerequisites fail with an explanation; it does not upgrade the cluster
+or silently enable its features.
 
-The initializer writes `$OPERATOR_DIR/ack.json` and creates no cloud resources.
-It discovers the ACK VPC/zone, proposes unused Pod/PodVM CIDRs and generates a
-bucket name for import. The later steps create those resources. Review the file:
+The supported profile uses one worker zone, Ubuntu 24.04 workers with ECS Cloud
+Assistant running, and host StorageClass `alicloud-disk-essd` from ACK's CSI
+add-ons. Public API access must already be enabled unless you pass `--private-api`
+and have private routing. `--cluster-id` can provide an ID directly.
+
+Continue with step 4. The common steps add deployment-specific PodVM resources,
+identities and workloads while retaining the existing cluster network.
+
+## 4. Prepare cloud resources
+
+### PodVM network
 
 ```bash
-cat "$OPERATOR_DIR/ack.json"
-${EDITOR:-vi} "$OPERATOR_DIR/ack.json"
+./cos cloud network
 ```
 
-The default `ack_api_access=public` obtains a public API kubeconfig; an existing
-ACK must already have its public API enabled. For VPN/private routing, choose
-`--ack-api-access private` instead. The default OSS endpoint is public HTTPS;
-`--oss-endpoint-network internal` requires same-region OSS internal connectivity.
-To reuse a private bucket, add `--oss-bucket NAME_FROM_OSS`.
+Creates a dedicated PodVM vSwitch/security group in ACK's VPC/worker zone, permits
+worker–PodVM tunnel traffic and inherits worker NAT/SNAT for guest egress.
+Success prints the vSwitch, security group and public egress IPs. Permit these
+cloud clients on the trusted host's ports from step 2. An existing cluster with
+routed egress can retain its route instead of SNAT.
 
-The [input reference](../deployment/ack/README.md) explains every field and its
-source. `--replace` regenerates an input file only before cloud setup starts.
-
-### Prepare the selected ACK cluster
-
-For an existing cluster:
+### Guest image
 
 ```bash
-python3 deployment/ack/prepare-cluster.py
-export KUBECONFIG="$OPERATOR_DIR/administrator-kubeconfig"
+./cos cloud image
 ```
 
-This obtains an administrator kubeconfig for the selected API path and checks Ready Linux/amd64
-workers, containerd, `supplementalGroupsPolicy` and Terway NetworkPolicy settings.
-If RRSA is disabled, repeat with `--enable-rrsa` to explicitly enable it.
+For a built guest, creates a private OSS import bucket, ensures ECS's standard
+import role, uploads the QCOW2 and waits for the image to become Available.
+A selected existing ImageID is checked directly, skipping bucket/import work.
+Success prints the ImageID and saves its binding to the release references.
+Both paths require Linux/x86_64, UEFI and NVMe support.
 
-For a new cluster:
+### Runtime identities
 
 ```bash
-python3 deployment/ack/prepare-cluster.py --create
-export KUBECONFIG="$OPERATOR_DIR/administrator-kubeconfig"
+./cos cloud identities
 ```
 
-This creates a **paid ACK Pro cluster and pay-as-you-go workers**, using the
-saved inputs. It configures API public access according to `ack_api_access`, Terway shared ENI,
-NetworkPolicy and RRSA; selects ACK's Ubuntu 24.04 worker image; generates an SSH
-key under `$OPERATOR_DIR/worker-key`; and waits for workers before checking them.
-Cluster creation enables deletion protection. The default is one worker.
+Creates separate scoped CAA/controller and CSI RAM roles using RRSA, prints their
+ARNs and saves them for Helm values. Kubernetes receives no operator access keys.
+Generated names and IDs are passed between steps automatically.
 
-Both paths save resources in `$OPERATOR_DIR/ack-state.json`. Keep this state when
-retrying. The kubeconfig lasts up to three days; repeat the cluster step
-to renew it. Use a separate operator directory/name for a different deployment.
-If a Kubernetes API request fails, the script prints the error and exits. Fix
-connectivity or credentials, then repeat the same command to resume.
-
-### Prepare the PodVM network
+## 5. Select deployment workers
 
 ```bash
-python3 deployment/ack/prepare-network.py
+./cos workers select
 ```
 
-Creates or selects the dedicated PodVM vSwitch in the worker VPC/zone and creates
-a dedicated security group. It permits worker–PodVM tunnel traffic between their
-security groups. When workers use SNAT, it reuses their existing NAT gateway and
-egress addresses for the PodVM vSwitch. An existing VPC-wide rule is retained.
-For an existing cluster without worker SNAT, provide a routed path from the
-PodVM network to T's three TLS endpoints.
+Selects the new cluster's workers automatically. A single eligible worker is also
+selected automatically. With multiple workers in an existing cluster, lists their
+names and asks which numbered entries to use. It labels and saves the selection.
+Later operations use ECS Cloud Assistant; no node-name placeholders, public worker
+IPs or SSH aliases are required.
 
-Configure the trusted host's firewall/ingress in its own network, permitting the
-intended clients on ports 5000/8443/9443. Arrange worker SSH access through your
-chosen operator route; in ACK console, select the worker security group and allow
-TCP 22 from that route's source address when needed. Cluster preparation manages
-only the selected ACK and its cloud resources.
+## 6. Install and start Trustee
 
-### Prepare image-import storage
+### Certificates
 
 ```bash
-python3 deployment/ack/prepare-storage.py
+./cos trustee certificates
 ```
 
-For QCOW2 import this creates the named bucket if missing, with a **private ACL**
-in the selected region, or verifies an existing bucket's owner, location and ACL.
-It uses the selected public or internal OSS HTTPS endpoint. The bucket holds the QCOW2
-until ECS has imported it; it is not the encrypted workspace disk.
+Creates the Trustee CA, HTTPS certificate with the saved service address, and AS
+signer. Success verifies the certificates and address. An existing complete
+certificate set is verified and retained. An incomplete set
+stops with an explanation; its CA is never regenerated automatically.
 
-The first image import in an account also needs ECS's standard import role. If
-the script reports missing authorization, explicitly create/authorize it:
+### Containers and configuration
 
 ```bash
-python3 deployment/ack/prepare-storage.py --authorize-image-import
+./cos trustee install
 ```
 
-This uses the official `AliyunECSImageImportDefaultRole` and system policy
-`AliyunECSImageImportRolePolicy`. Alternatively, open **ECS console → Images →
-Import Image → Authorize**, then repeat the storage step. A read-only readiness
-check is available with `--check`. For an existing ImageID, the script
-skips bucket creation and import authorization.
+Pulls the official pinned AS/KBS container images and installs configuration and
+systemd units. Docker runs the containers; systemd manages their lifecycle.
+Empty bindings deny resource release. Existing authorization state is not reset.
 
-### Confirm or import the PodVM image
+### Start and check
 
 ```bash
-python3 deployment/ack/prepare-image.py
+./cos trustee start
 ```
 
-Verifies the handoff checksums. For a selected ImageID it checks the ECS image; for
-a new QCOW2 it uploads a private OSS object, imports the image and waits until it
-is Available. Both paths require Linux/x86_64, UEFI and NVMe support. Import uses
-Ubuntu/Linux and a 20 GiB system disk; PeerPods later requests 40 GiB. CAA enables
-TDX when creating the VM.
+Starts AS, registers and reads back the selected image and bundled ECS platform
+references, then starts KBS. Requires active services and anonymous HTTPS resource
+access to return 401 or 403. This proves readiness and denial; real TDX appraisal
+is checked in step 10.
 
-Outputs: `podvm-image-id.txt` and `podvm-image.json` in `$OPERATOR_DIR`. The latter
-records the region, ImageID and selected handoff/reference checksums. A cross-region
-image copy needs its destination ImageID.
+## 7. Prepare bootstrap and publish images
 
-### Configure RAM roles
+### Base initdata
 
 ```bash
-python3 deployment/ack/configure-identities.py
+./cos deploy initdata
 ```
 
-Renders the maintained [RAM templates](../deployment/ack/ram/) with the discovered
-account, OIDC identity, cluster and vSwitch. Creates separate CAA/controller and CSI
-roles, attaches their scoped permissions, and records the role ARNs. It reuses an
-existing role only when ownership and policies match. No access keys are passed
-to Kubernetes. Step 7 generates Helm values from these saved results.
+Writes the public deny-only base initdata from the saved address and CA.
+The driver later creates the actual per-role, per-attempt bindings.
 
-## 4. Install Trustee and register image and platform references
-
-### Create the initial certificates
+### Registry and images
 
 ```bash
-bash deployment/trustee/create-certificates.sh
+./cos registry start
 ```
 
-Creates the CA, HTTPS server certificate and separate AS token signer
-under `/etc/trustee/tls`, with `HOST_IP` in the server SAN. It refuses an existing
-PKI directory. Keep an existing complete certificate set when repeating later
-steps; never regenerate it to resolve an unrelated installation error.
-
-### Install Trustee
-
-```bash
-bash deployment/trustee/install.sh
-```
-
-Pulls the locked official AS/KBS images, installs configuration and service units,
-and initializes policies with empty bindings. It does not start the services or
-replace an existing resource policy. Empty bindings deny resource release.
-
-### Start AS, register references, then start KBS
-
-Register the selected image's references together with the
-[ECS platform map](../deployment/trustee/ecs-tdx-platform.references.json)
-included in this repository:
-
-```bash
-export PODVM_REFERENCE_VALUES="$HANDOFF/outputs/$(jq -er .references "$HANDOFF/selection.json")"
-systemctl enable --now as.service
-python3 deployment/trustee/register-references.py \
-  --address http://127.0.0.1:50004 \
-  --references "$PODVM_REFERENCE_VALUES" \
-  --references deployment/trustee/ecs-tdx-platform.references.json
-systemctl enable --now kbs.service
-systemctl is-active as.service kbs.service
-```
-
-The registrar reads the values back from BuiltIn RVPS. Confirm anonymous access
-to the HTTPS resource endpoint returns **401 or 403**:
-
-```bash
-curl --noproxy '*' --cacert /etc/trustee/tls/ca.pem \
-  --retry 10 --retry-connrefused --retry-delay 1 --retry-max-time 30 \
-  --connect-timeout 5 --max-time 10 -sS -o /dev/null \
-  -w '%{http_code}\n' "https://${HOST_IP}:8443/kbs/v0/resource/default/bootstrap/anonymous-check"
-```
-
-This checks the listener, certificate and denial; real attestation is checked in
-step 10. Reference/policy details are in the [Trustee reference](../deployment/trustee/README.md).
-
-## 5. Generate measured base initdata
-
-```bash
-bash deployment/guest/install-initdata.sh
-```
-
-Writes `/etc/openshell-confidential/guest-initdata-base.toml` using `HOST_IP` and
-the Trustee public CA. This is a deny-only fallback for CAA. The driver generates
-and authorizes the actual per-role, per-attempt initdata before scheduling.
-
-## 6. Configure registry and transfer digest-pinned images
-
-### Start the private TLS registry
-
-```bash
-bash deployment/peerpods/start-registry.sh
-```
-
-Installs the public CA in the host trust store, starts the pinned registry listening on
-`0.0.0.0:5000`, advertised as `HOST_IP:5000`, and checks HTTPS `/v2/`. Its durable data is under
+Starts the TLS registry and checks HTTPS. Durable registry storage is under
 `/var/lib/openshell-confidential/registry`.
 
-### Configure each worker to trust the registry
-
-Copy and edit the [registry hosts template](../deployment/peerpods/registry-hosts.example.toml)
-with `HOST_IP:5000`. Transfer that file and `/etc/trustee/tls/ca.pem` to each worker.
-Install them as:
-
-| Worker path | File |
-| --- | --- |
-| `/etc/containerd/certs.d/HOST_IP:5000/hosts.toml` | Edited registry hosts template |
-| `/etc/containerd/certs.d/HOST_IP:5000/ca.crt` | Trustee public CA |
-
-Keep `/etc/containerd/certs.d` in containerd's effective CRI registry `config_path`.
-ACK can already include it alongside `/etc/containerd/cert.d`; preserve that list.
-Only the public CA goes to workers.
-
-### Publish the images
-
 ```bash
-bash deployment/peerpods/publish-images.sh
+./cos registry publish
 ```
 
-This loads the handoff archives and mirrors the pinned runtime and cluster
-dependency images. Wait for `Images published. Digest records ready in ...` before
-continuing. If publication fails, fix the reported error and repeat this command.
-Workers pull these images from the private registry, so only this host needs
-access to upstream registries.
+Publishes built images, mirrors all pinned upstream dependencies and the unchanged
+Community harness image, then publishes kata-deploy with the verified host shim.
+Success requires both stages and saves destination digests. Either stage failing
+stops this command.
 
-Then add the host-shim replacement to kata-deploy:
-
-```bash
-bash deployment/build/package-kata-shim.sh
-```
-
-Both commands write destination digest references to `$OPERATOR_DIR/*-image.txt`.
-The following steps use those records.
-
-## 7. Install Kata, PeerPods and CSI, then verify workers
-
-### Install cluster dependencies
+### Worker trust
 
 ```bash
-bash deployment/peerpods/fetch-prerequisites.sh
+./cos workers registry
 ```
 
-This prepares the Agent Sandbox manifest and cert-manager values using the
-published image records. Install them:
+Installs the public CA and `hosts.toml` on selected workers through ECS Cloud
+Assistant, then performs a real CRI pull on every worker. Retains TLS verification
+and containerd's registry search paths. Also verifies worker-to-KBS HTTPS access
+and anonymous denial. Repeat after selecting additional workers.
+
+## 8. Install cluster components
+
+### Dependencies
 
 ```bash
-kubectl apply --server-side -f "$OPERATOR_DIR/agent-sandbox-pinned.yaml"
-kubectl -n agent-sandbox-system rollout status deployment/agent-sandbox-controller --timeout=10m
-helm upgrade --install cert-manager "$OPERATOR_DIR/cert_manager_chart" \
-  --namespace cert-manager --create-namespace \
-  --values "$OPERATOR_DIR/cert-manager-values.json" --wait --timeout=15m
+./cos cluster dependencies
 ```
 
-A compatible existing cert-manager installation can be used instead.
+Generates pinned manifests, installs Agent Sandbox and cert-manager and waits for
+readiness. Prints Pods/events and exits if the Agent Sandbox controller fails.
 
-### Configure and install PeerPods
+### Configuration
 
 ```bash
-python3 deployment/peerpods/configure-values.py
-cat "$OPERATOR_DIR/peerpods-values.yaml"
-cat "$OPERATOR_DIR/csi-values.yaml"
+./cos cluster values
 ```
 
-This fills in the saved cloud identities and network settings, selected PodVM
-ImageID, published image digests and base initdata. It generates both PeerPods and
-CSI values. Review the files before installing; edit private copies if needed.
-The script refuses existing values unless `--replace` is explicitly given.
+Generates private PeerPods/CSI values from saved IDs, identities, digests and
+initdata, then prints their paths. Existing values are retained; `--replace`
+intentionally regenerates them after reviewing changed inputs.
 
-Label each intended worker, then install:
+### Kata and PeerPods
 
 ```bash
-kubectl label node YOUR_WORKER_NODE node.kubernetes.io/worker= --overwrite
-bash deployment/peerpods/install-peerpods.sh
+./cos cluster peerpods
 ```
 
-The script verifies chart dependencies, renders the release, installs it, applies
-the controller RRSA token mount, and waits for rollouts. Check desired/ready counts
-cover every selected worker; a zero-node DaemonSet is not a successful deployment.
-After changing provider ConfigMap values, restart both CAA and the controller so
-their `envFrom` settings reload.
-
-### Configure and check each worker
-
-After each kata-deploy rollout, inspect the containerd service command to find its
-actual config file, then use `containerd --config PATH config dump` to locate the
-`kata-remote` runtime's `options.ConfigPath`. Merge the
-[Kata settings](../deployment/peerpods/kata-remote-settings.example.toml) into that
-active file: `shared_fs=none`, guest image pull enabled, creation timeout 600.
-Preserve the other settings, set the same private pause digest in CRI, and restart
-containerd.
-
-From the service host, read back and check each worker:
+Installs the verified charts, applies controller RRSA and waits for worker
+DaemonSets and controller/webhook deployments.
 
 ```bash
-export WORKER_SSH=YOUR_EXISTING_WORKER_SSH_ALIAS
-export CONTAINERD_CONFIG=/etc/containerd/config.toml
-bash deployment/peerpods/check-worker.sh
+./cos workers configure
 ```
 
-This checks the merged configuration, active Kata settings and installed shim hash.
-Propagate these settings through node-pool initialization. Keep confidential
-scheduling stopped until every selected worker passes.
+Finds the active Kata profile, merges required guest-pull, shared-filesystem and
+timeout settings, sets the private pause image and verifies the installed shim.
+Preserves unrelated settings and backs up changed files. Restarts containerd when
+needed, waits for the node and verifies a CRI pull. Marks `kata-remote` attachable.
+Repeat after kata-deploy upgrades or selecting new workers.
+
+### Workspace CSI
 
 ```bash
-kubectl get runtimeclass kata-remote -o yaml
-kubectl label runtimeclass kata-remote openshell.ai/sandbox-attachable=true --overwrite
+./cos cluster csi
 ```
 
-The handler must be `kata-remote`, with overhead `cpu: 250m`, `memory: 120Mi`.
+Installs the release chart and checks rollouts and a Bound controller-state PVC.
+Controller state uses host ACK ESSD storage; guest workspaces use the separate
+PeerPod class. Stop/Start retains a workspace; final deletion removes its owned disk.
 
-### Configure and install CSI
+## 9. Install and connect to OpenShell
 
 ```bash
-bash deployment/peerpods/install-csi.sh
+./cos gateway install
 ```
 
-Use the published CSI digest and separate RRSA role. Controller state needs a
-durable PVC on the host ACK ESSD StorageClass, not the PeerPod class it provisions.
-Keep one controller replica and `Recreate` strategy.
-
-The script verifies chart provenance and waits for deployment/DaemonSet rollouts.
-Confirm the controller-state PVC is Bound. Resources are in `caa-csi-block`;
-the Helm release namespace is `confidential-containers-system`.
-The PeerPod StorageClass uses `Delete` reclaim policy and disables expansion.
-Stop/Start retains the original workspace PVC; final deletion removes its owned disk.
-
-## 8. Install the native Gateway and confidential driver
-
-Install the released Gateway/CLI, handoff driver and official Kata policy tools:
+Installs the native Gateway/CLI, driver and Kata policy tools, creates/checks
+TLS/JWT identities, configures the driver and installs restricted Kubernetes
+credentials. Success includes RBAC preflight. Operator client keys remain on T.
 
 ```bash
-bash deployment/openshell/install-binaries.sh
-bash deployment/openshell/create-identity.sh
+./cos gateway start
 ```
 
-The identity step creates native mTLS/JWT credentials with `HOST_IP` in the SAN.
-An existing complete set is retained and checked. Operator client private keys
-remain on this trusted host; guests receive the public CA and their own sealed
-launch credentials.
-
-Using the administrator `KUBECONFIG`, create the restricted Gateway credentials
-and verify permissions:
+Requires the driver socket, Gateway readiness endpoint and worker-to-Gateway TCP
+reachability. Anonymous access stays disabled; native TLS/operator identity is
+checked by the following login step.
 
 ```bash
-bash deployment/openshell/install-kubeconfig.sh
+./cos gateway login
 ```
 
-The script applies RBAC, installs a private ServiceAccount kubeconfig, runs native
-Gateway preflight and installs the namespace ingress default denial. Verify actual
-network denial in step 10; NetworkPolicy objects alone do not prove enforcement.
-
-Generate the driver image settings from step 6, review them, then start services:
-
-```bash
-bash deployment/openshell/configure-driver.sh
-cat /etc/openshell-confidential/driver.env
-bash deployment/openshell/start-services.sh
-```
-
-Expect the driver socket and Gateway `/readyz` to become available. The Gateway
-uses native operator mTLS and sandbox-scoped JWTs; anonymous users are disabled.
-
-Register the local CLI with its private operator identity:
-
-```bash
-install -d -m 0700 /var/lib/openshell-confidential/cli-config
-export XDG_CONFIG_HOME=/var/lib/openshell-confidential/cli-config
-export OPENSHELL_LOCAL_TLS_DIR=/var/lib/openshell-confidential/tls
-openshell gateway add --name confidential-local --local "https://${HOST_IP}:9443"
-export OPENSHELL_GATEWAY=confidential-local
-openshell whoami --output json
-```
-
-## 9. Run the native coding agent and verify its lifecycle
-
-Follow [first agent](first-agent.md). The driver defaults to the mirrored
-OpenShell Community image, so users can start OpenCode, Codex or Claude Code
-without building an image or passing `--from`. Configure the matching provider
-and verify creation, interactive reconnect, model use and persistent Stop/Start
-through the native CLI.
+Registers the native operator CLI and checks `whoami`. Continue with
+[coding harnesses](first-agent.md) for providers and native
+`openshell sandbox create/connect/stop/start/delete` commands.
+OpenCode, Codex and Claude Code use the default Community image.
 
 ## 10. Verify both confidential roles
 
-Before accepting a new image or deployment, verify these behaviors in the actual
-environment:
+Installation/readiness checks do not prove real attestation or all security
+boundaries. Before accepting a new image or deployment, check:
 
 | Check | Required result |
 | --- | --- |
-| Supervisor and workload attestation | Valid signed TDX appraisal against the selected image/platform references and current initdata |
-| KBS release | Current role/attempt/CR UID bindings succeed; invalid image, quote, policy, descriptor or binding denies release |
-| Access and network boundaries | Anonymous and cross-sandbox access fail; private guest mounts and network denial hold |
-| Coding agent | Real model use, PTY and independent task-result checks succeed |
-| Persistent Stop/Start | Same CR UID, ESSD, LUKS header UUID, workspace key and file bytes; new bootstrap attempts revoke old bindings |
-| Encryption | Detached stopped workspace disk contains ciphertext; inspect using host cryptsetup/util-linux |
+| Supervisor/workload attestation | Signed TDX appraisal matches selected image/platform references and current initdata |
+| KBS release | Current role/attempt/CR UID succeeds; invalid image, quote, policy or binding denies release |
+| Access/network boundaries | Anonymous/cross-sandbox access fails; private mounts and network denial hold |
+| Coding agent | Real model use, PTY reconnect and independently checked task results |
+| Stop/Start | Same CR UID, ESSD, LUKS UUID, key and files; new attempts revoke old bindings |
+| Encryption | Stopped detached workspace disk contains ciphertext |
 | Delete | Owned role VMs/disks and controller metadata disappear |
 
-Keep sanitized hashes, owner IDs and observed decisions privately; do not commit
-credentials or validation transcripts. The default policy accepts TCB `UpToDate`
-and `OutOfDate` for development. Record the actual status and choose a production
-TCB requirement separately. [Tests](../tests/README.md) describe automated coverage.
+Keep private evidence outside source/releases. The development policy accepts TCB
+`UpToDate` and `OutOfDate`; record the actual status and choose production
+requirements separately. See [tests](../tests/README.md) and
+[architecture](architecture.md).

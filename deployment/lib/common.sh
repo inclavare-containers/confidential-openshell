@@ -36,10 +36,12 @@ download() {
         return
     fi
     mkdir -p "$(dirname "$destination")"
-    curl -fsSL --connect-timeout 15 --max-time 900 --retry 5 --retry-all-errors \
+    printf 'Downloading: %s\n' "$destination"
+    curl -fL --progress-bar --connect-timeout 15 --max-time 900 --retry 5 --retry-all-errors \
         "$url" -o "$destination.part"
     checked "$expected" "$destination.part" || die "Checksum mismatch: $destination.part"
     mv -f "$destination.part" "$destination"
+    printf 'Downloaded and verified: %s\n' "$destination"
 }
 release_download() {
     local name=$1 path=$2

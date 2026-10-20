@@ -4,7 +4,6 @@ Install locked Trustee images, directories and deny policies. Does not start ser
 source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 require_root
 service_addresses
-[[ ! -e /opt/trustee/kbs/storage/kbs/resource-policy.rego ]] || die 'Trustee already initialized. Do not reset live bindings.'
 install -d -m 0700 "$OPERATOR_DIR"
 test -f /etc/trustee/tls/server.pem
 for image in trustee_as trustee_kbs; do
@@ -21,18 +20,29 @@ install -d -m 0700 -o openshell-gateway -g openshell-gateway \
   /opt/trustee/kbs /opt/trustee/kbs/storage /opt/trustee/kbs/storage/kbs \
   /opt/trustee/kbs/storage/repository /opt/trustee/kbs/signing \
   /opt/trustee/kbs/signing/bindings /opt/trustee/kbs/signing/workspace-bindings
-install -m 0600 deployment/trustee/kbs-config.example.toml /etc/trustee/kbs-config.toml
-install -m 0600 deployment/trustee/as-config.json /etc/trustee/as-config.json
+for pair in kbs-config.example.toml:kbs-config.toml as-config.json:as-config.json; do
+  source_file="deployment/trustee/${pair%:*}"
+  target_file="/etc/trustee/${pair#*:}"
+  if [[ -e $target_file ]]; then
+    cmp -s "$source_file" "$target_file" || die "Existing $target_file differs from the release; review it before changing it."
+  else
+    install -m 0600 "$source_file" "$target_file"
+  fi
+done
 runuser -u openshell-gateway -- test -r "$ROOT/deployment/trustee/render-kbs-policy.py"
-runuser -u openshell-gateway -- python3 deployment/trustee/render-kbs-policy.py \
+if [[ ! -e /opt/trustee/kbs/storage/kbs/resource-policy.rego ]]; then
+  runuser -u openshell-gateway -- python3 deployment/trustee/render-kbs-policy.py \
   --bindings-dir /opt/trustee/kbs/signing/bindings \
   --workspace-bindings-dir /opt/trustee/kbs/signing/workspace-bindings \
   --as-policy-output /opt/trustee/attestation-service/storage/attestation_service_policy/default_cpu.rego \
   --output /opt/trustee/kbs/storage/kbs/resource-policy.rego
+else
+  printf 'Existing Trustee resource policy and bindings retained.\n'
+fi
 
 printf 'TRUSTEE_AS_IMAGE=%s\nTRUSTEE_KBS_IMAGE=%s\n' \
   "$(jq -er .images.trustee_as "$LOCK")" "$(jq -er .images.trustee_kbs "$LOCK")" > /etc/trustee/images.env
 install -m 0644 deployment/trustee/units/as.service /etc/systemd/system/as.service
 install -m 0644 deployment/trustee/units/kbs.service /etc/systemd/system/kbs.service
 systemctl daemon-reload
-printf 'Trustee installed with empty bindings. Start AS and register references next.\n'
+printf 'Trustee installed; authorization state retained. Next: ./cos trustee start\n'

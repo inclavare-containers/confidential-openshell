@@ -16,9 +16,11 @@ To install, follow these guides in order:
 2. [Deploy](docs/deployment.md): configure ACK, Trustee, PeerPods and the native Gateway.
 3. [Coding harnesses](docs/first-agent.md): start OpenCode, Codex or Claude Code, reconnect and check persistent Stop/Start.
 
-Each installation step has its own command and expected result. The build and
-service roles can share one machine. An existing compatible PodVM ImageID and
-matching references can be reused without rebuilding the guest.
+Use `./cos --help` for the build/deployment commands. Each command runs one step,
+streams progress and reports success/failure, a private log and the next command.
+New-cluster deployment creates its VPC and vSwitches; existing-cluster attachment
+has a separate path. The build and service roles can share one machine. An
+existing compatible PodVM image and references can be reused without rebuilding.
 
 See [architecture](docs/architecture.md) for trust boundaries and [tests](tests/README.md)
 for verification coverage. Component READMEs describe internals.
@@ -51,6 +53,6 @@ Exact source identities are in the [source lock](deployment/build/sources.lock.j
 release identities in the [guest](deployment/artifacts.lock.json) and
 [runtime](deployment/runtime/artifacts.lock.json) locks. The
 [driver provenance](components/confidential-driver/UPSTREAM.md) records its local delta.
-Run `bash tests/run.sh` with cached dependencies for offline verification.
+Run `./cos build test` with cached dependencies for offline verification.
 Keep credentials, deployed authorization state and private evidence out of source
 and release packages.

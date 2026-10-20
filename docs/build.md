@@ -1,232 +1,197 @@
 # Build
 
-Use an Ubuntu 24.04 amd64 machine with root access, 8 CPUs, 32 GiB RAM and
-at least 150 GiB free disk. Docker runs native builds; nested virtualization is
-not needed. Commands below run from this repository checkout.
+Start on Ubuntu 24.04 amd64 with root access, 8 CPUs, 32 GiB RAM and at least
+150 GiB free disk. The build machine can also host the trusted services.
+Builds use Docker and the host kernel; nested virtualization is not needed.
 
-Builds produce public artifacts under `artifacts/`. Patched upstream copies live
-under `.local/build-sources/`; the original `repos/` checkouts remain unchanged.
-Keep credentials and deployment state outside the build package.
+Run these commands from the supplied Git checkout. `./cos` runs one step,
+prints its purpose and streams progress, then reports `OK` or `FAILED`,
+elapsed time, a private log path and the next command. On failure, correct the
+reported problem and repeat that step. Build logs stay under `.local/logs/`
+and are excluded from the release.
 
 ## Prepare an Ubuntu 24.04 host
-
-Run these three steps separately. Each prints the installed versions or a success
-message. If a download fails, fix connectivity and repeat that step; verified
-cached downloads are reused.
 
 ### Host packages
 
 ```bash
-bash deployment/build/install-host-packages.sh build
+./cos host packages
 ```
 
-This installs Ubuntu packages, including Python 3, Docker, compiler dependencies
-and Rustup, then starts Docker. A service-only host can use `service` instead of
-`build`. Python must be at least 3.11; Ubuntu 24.04 supplies 3.12.
+Installs Ubuntu packages, including Python 3.12, Docker and compiler dependencies,
+then starts Docker. Success prints Python and Docker server versions.
 
 ### Build toolchains
 
 ```bash
-bash deployment/build/install-toolchains.sh
+./cos host toolchains
 ```
 
-Expect Rust 1.95.0 and Go 1.26.7. The script reads the repository toolchain/locks,
-installs Go under `/usr/local/go`, and configures its PATH for future login shells.
-It reuses matching installations and refuses to replace a different Go installation.
+Installs the pinned Rust 1.95.0 and Go 1.26.7 toolchains. These sources need
+newer compiler versions than Ubuntu 24.04 supplies. Matching versions are reused.
 
-These compiler downloads are necessary: the pinned upstream sources require
-newer versions than Ubuntu 24.04 supplies. Rustup itself comes from apt.
-
-### Release command-line tools
+### Release tools
 
 ```bash
-bash deployment/build/install-release-tools.sh
+./cos host tools
 ```
 
-This installs checksum-pinned Helm, kubectl, crane, GitHub CLI, ORAS and yq v4.
-CAA's upstream Makefiles require yq v4; Ubuntu's `yq` is a different implementation.
-The test suite uses Ubuntu's Python YAML parser.
+Installs checksum-pinned Helm, kubectl, crane, GitHub CLI, ORAS and yq v4 and prints
+their versions. Ubuntu supplies the other tools and the Python YAML parser.
 
-All downloads need outbound access to the URLs and registries in the locks,
-including GitHub, GHCR, Go and Rust release servers. The scripts honor standard
-proxy variables. A retry cannot fix blocked outbound access.
-
-If `docker pull` times out, configure outbound access for the **Docker daemon**
-using the [Docker proxy guide](https://docs.docker.com/engine/daemon/proxy/).
-Setting `HTTPS_PROXY` only in your shell does not configure the daemon. Verify
-`docker pull` works before starting the image builds below.
+Downloads need access to GitHub, GHCR, Docker registries and Go/Rust release
+servers. Standard command-scoped proxy variables are supported. Docker image
+downloads also need working daemon connectivity; configure it using Docker's
+[daemon proxy instructions](https://docs.docker.com/engine/daemon/proxy/) when needed.
 
 ## Obtain complete fixed sources
 
 ```bash
-bash deployment/build/fetch-inputs.sh
+./cos build sources
 ```
 
-This initializes the pinned submodules, fetches the complete Kata source revision,
-prepares the patch queues and packages the required charts. Expect all
-`check-inputs.py` checks to report `passed`, followed by `Source trees and charts
-ready`. Existing prepared trees are reused only when their base, patched tree
-and working files match.
-
-A supplied checkout with initialized submodules needs no GitHub authentication.
-Kata and the remaining release inputs are public downloads.
+Initializes pinned submodules, fetches Kata, prepares the patch queues and packages
+charts. Expect passed input checks and `Source trees and charts ready`.
+Prepared copies live under `.local/build-sources/`; `repos/` remains unchanged.
+A supplied checkout with initialized submodules needs no GitHub authentication
+for the remaining public inputs.
 
 ## Build integration outputs
 
-Run one component at a time. A failure leaves the other components available;
-repeat the failed build after correcting its error.
-
-### Driver and Kata host shim
+### Driver
 
 ```bash
-bash deployment/build/build-driver.sh
+./cos build driver
 ```
 
-Output: `artifacts/openshell-driver-confidential-kubernetes`.
+Produces `artifacts/openshell-driver-confidential-kubernetes`.
+
+### Kata host shim
 
 ```bash
-bash deployment/build/build-kata-shim.sh
+./cos build kata-shim
 ```
 
-Output: `artifacts/containerd-shim-kata-v2` and `artifacts/shim.sha256`.
-The shim build also runs the exec-process conversion test. Its patch is merged
-upstream, but the pinned Kata 4.2.0 release still needs the backport. The guest
-agent and policy generator use unmodified release binaries.
+Produces `artifacts/containerd-shim-kata-v2` and its checksum, and runs the exec
+conversion test. The fix is merged upstream; pinned Kata 4.2.0 needs the backport.
+The guest agent and policy generator use unmodified release binaries.
 
-### CAA and CSI images
+### Cloud API adaptor
 
 ```bash
-bash deployment/build/build-caa.sh
+./cos build caa
 ```
 
-Builds the Alibaba adapter using upstream Make, then packages it over the pinned
-CAA runtime. Prints the local image tag.
+Builds the Alibaba adaptor with upstream Make and packages it over the pinned
+runtime. Success prints the local image tag.
+
+### Workspace CSI
 
 ```bash
-bash deployment/build/build-csi.sh
+./cos build csi
 ```
 
-Builds the CSI image and `artifacts/charts/caa-csi-block-driver.tgz` from the verified
-patched source. Prints the local image tag.
+Builds the CSI image and `artifacts/charts/caa-csi-block-driver.tgz`.
 
 ### PeerPod controller
 
 ```bash
-bash deployment/build/build-controller.sh
+./cos build controller
 ```
 
 Builds the Alibaba controller and writes `artifacts/images/peerpod-controller.tar`.
-Only the controller executable is added to the pinned runtime image.
+Only its executable replaces the one in the pinned runtime image.
 
-The coding harnesses use the digest-pinned OpenShell Community base image.
-Deployment mirrors that image unchanged; no agent image build is needed.
+OpenCode, Codex and Claude Code use the unchanged OpenShell Community image.
+There is no coding-agent image to build.
 
-### Check the builds
+### Offline checks
 
 ```bash
-bash deployment/build/cache-test-dependencies.sh
-bash tests/run.sh
+./cos build test-cache
 ```
 
-The first command fetches locked dependencies. The second runs the offline suite.
-See [test coverage](../tests/README.md). Neither command proves real TDX attestation.
+Downloads the locked test dependencies. Then run:
+
+```bash
+./cos build test
+```
+
+Runs the [offline suites](../tests/README.md). These checks do not exercise cloud
+deployment or real TDX attestation.
 
 ## Select the guest image
 
-Choose one of the following routes. Both save the selection for packaging, so
-later commands do not depend on shell variables from earlier build steps.
-
-### Use an existing image
-
-Use a compatible measured UKI/verity image with TDX AA/CDH, sealed bootstrap and
-encrypted workspace support. Obtain its matching reference file from the image
-publisher.
+### Build the Ubuntu guest
 
 ```bash
-bash deployment/build/select-guest.sh existing \
-  cn-beijing IMAGE_ID /path/to/image.references.json APPROVED_REFERENCE_SHA256
+./cos build guest --region cn-beijing
 ```
 
-Replace the region, ECS ImageID and reference inputs with your release values.
-The script checks the reference checksum and copies it into `artifacts/guest/`.
+Choose the region where ACK and the TDX guests will run. This step builds the
+upstream Ubuntu UKI/verity image, verifies it, records its measurements and selects
+that exact build for the release. It prints the QCOW2, reference JSON and receipt
+paths; there is no receipt path to copy into another command.
+See [guest internals](../deployment/guest/README.md).
 
-### Build a new image (optional)
+### Use an existing image instead
+
+Skip the guest build only when a publisher supplies a compatible image and matching
+references. Run:
 
 ```bash
-bash deployment/guest/build-image.sh
+./cos build guest-existing --region cn-beijing
 ```
 
-The builder prints the path to its `build.json` receipt. Select that exact result:
-
-```bash
-bash deployment/build/select-guest.sh built cn-beijing /path/printed/by/build/build.json
-```
-
-The receipt binds the source commit, payload, final QCOW2 and independently derived
-measurements. See [guest internals](../deployment/guest/README.md). A new image
-still needs the [real deployment checks](deployment.md#10-verify-both-confidential-roles).
+It asks for the ECS ImageID, local reference JSON path and reference checksum
+obtained from the publisher, then verifies and records the selection. The image
+must support TDX AA/CDH, sealed bootstrap and encrypted workspaces.
 
 ## Build and transfer
 
-### Create the public handoff on B
+### Package the release
 
-Use a clean committed checkout with all builds above complete:
+Use a clean committed checkout after completing the builds and guest selection:
 
 ```bash
-bash deployment/build/package-release.sh
+./cos build package
 ```
 
-Output: `artifacts/handoff/`, containing public source snapshots, binaries, image
-archives, charts, the selected guest references and a build manifest. The script
-prints the SHA-256 of `SHA256SUMS`; keep it with the release record. The directory
-must be absent before packaging to avoid mixing releases.
+Produces `artifacts/handoff/` with public sources, binaries, images, charts,
+guest references and a build manifest. Saves `artifacts/handoff.sha256` for the
+installation step. Credentials and deployment state are not packaged.
+An existing handoff directory is refused to prevent mixing releases.
 
-For a build and service host on the same machine:
-
-```bash
-install -d -m 0700 /var/lib/openshell-confidential/operator/handoff
-cp -a artifacts/handoff/. /var/lib/openshell-confidential/operator/handoff/
-```
-
-For separate hosts, transfer that directory over your administrator SSH connection:
+### Install on the same machine
 
 ```bash
-ssh TRUSTED_HOST 'install -d -m 0700 /var/lib/openshell-confidential/operator/handoff'
-scp -r artifacts/handoff/. TRUSTED_HOST:/var/lib/openshell-confidential/operator/handoff/
-```
-
-### Verify and extract on T
-
-On the service host, use the checksum saved during packaging:
-
-```bash
-bash deployment/build/unpack-release.sh \
-  /var/lib/openshell-confidential/operator/handoff APPROVED_SHA256SUMS_HASH
+./cos release install
 cd /opt/confidential-openshell
 ```
 
-This verifies the package and installs public source into a new
-`/opt/confidential-openshell`. For a separate service host, copy this checkout's
-`deployment/` scripts there first, then install the `service` host packages and
-release tools. The extracted snapshot is for deployment; build from the Git checkout.
-
+Uses the saved build checksum, verifies the handoff, copies it into
+`/var/lib/openshell-confidential/operator/handoff` and installs deployment sources
+under `/opt/confidential-openshell`. The Git build checkout is retained.
 Continue with [deployment](deployment.md).
 
-## Package the Kata host shim
+### Install on a separate trusted service host
 
-Run this on the service host after the deployment guide's
-[registry step](deployment.md#6-configure-registry-and-transfer-digest-pinned-images):
+Copy the source checkout, `artifacts/handoff/` and `artifacts/handoff.sha256`
+over your normal administrator SSH connection, keeping their relative paths.
+On the Ubuntu 24.04 service host, from the copied source:
 
 ```bash
-bash deployment/build/package-kata-shim.sh
+./cos host service-packages
+./cos host tools
+./cos release install
+cd /opt/confidential-openshell
 ```
 
-Uses exported `HOST_IP` and the verified handoff shim. It replaces the executable
-inside kata-deploy's component archive and publishes one additional OCI layer.
-It checks that the archive layout and inherited layers remain intact, then writes
-`$OPERATOR_DIR/kata-deploy-image.txt`. Use that digest in the PeerPods values.
+If the handoff is elsewhere, run `./cos release install --handoff` with its local
+directory as the argument; it asks for the checksum retained on the build host.
+This host needs no compiler toolchains or build caches and can be outside the cloud.
 
 The [source](../deployment/build/sources.lock.json),
 [runtime](../deployment/runtime/artifacts.lock.json) and
-[guest](../deployment/artifacts.lock.json) locks define the inputs. A build
-manifest inventories outputs; it does not replace build logs or live acceptance.
+[guest](../deployment/artifacts.lock.json) locks define inputs. Real attestation
+and workspace checks follow [deployment](deployment.md#10-verify-both-confidential-roles).

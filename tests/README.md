@@ -1,6 +1,6 @@
 # Tests
 
-Run `bash tests/run.sh` from the repository root with the pinned toolchain and
+Run `./cos build test` from the repository root with the pinned toolchain and
 cached dependencies. Cargo uses offline/locked mode; Go disables proxy/sumdb.
 The runner prepares missing CAA/CSI/controller build copies, checks their source
 identities and leaves the pinned `repos/` checkouts unchanged. Missing Kata sources
@@ -13,15 +13,15 @@ and [fixed source inputs](../docs/build.md#obtain-complete-fixed-sources).
 Populate dependency caches while network access is available, then run the suite:
 
 ```bash
-bash deployment/build/cache-test-dependencies.sh
-bash tests/run.sh
+./cos build test-cache
+./cos build test
 ```
 
 | Suite | Coverage |
 | --- | --- |
 | Driver Rust and imported upstream tests | Admission, sealed resources, UID/attempt bindings, workspace identity, lifecycle and recovery |
 | `tests/policy` | TDX/AAEL appraisal, exact KBS resources and guest mount/pull denials |
-| `tests/contracts` | Build provenance, public artifact paths, initdata, operator-key exclusion, service ordering and guest permissions |
+| `tests/contracts` | Build provenance, initdata, permissions; cloud creation/resume with mocked APIs; step failure logs, worker selection/profile preservation and atomic release extraction |
 | CAA/CSI Go tests | The maintained adapter and storage patches |
 | PeerPod provider tests | Deletion succeeds only after exact typed absence; present instances and read errors preserve failure |
 | Controller compilation | Import graph compiled with `-run '^$'`; envtest's API server/etcd suite is not run |

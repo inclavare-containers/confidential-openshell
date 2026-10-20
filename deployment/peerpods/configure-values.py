@@ -15,7 +15,7 @@ INITDATA = Path('/etc/openshell-confidential/guest-initdata-base.toml')
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(prog='./cos cluster values', description=__doc__)
     parser.add_argument('--replace', action='store_true', help='Replace previously generated values after reviewing input changes.')
     args = parser.parse_args()
     cloud = Cloud()
@@ -62,6 +62,8 @@ def main():
     for path, values in zip(paths, (peer, csi)):
         write(path, yaml.safe_dump(values, sort_keys=False))
         print(f'Generated {path}; review before installing.')
+    print(f'Using cluster {state["cluster_id"]}, guest image {state["podvm_image_id"]}, PodVM vSwitch {state["podvm_vswitch_id"]}.')
+    print(f'Runtime images use published digests; controller-state StorageClass: {cloud.config["csi_storage_class"]}.')
 
 
 if __name__ == '__main__':
