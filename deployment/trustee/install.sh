@@ -29,7 +29,8 @@ for pair in kbs-config.example.toml:kbs-config.toml as-config.json:as-config.jso
     install -m 0600 "$source_file" "$target_file"
   fi
 done
-runuser -u openshell-gateway -- test -r "$ROOT/deployment/trustee/render-kbs-policy.py"
+runuser -u openshell-gateway -- test -r "$ROOT/deployment/trustee/render-kbs-policy.py" || \
+  die "The service account cannot read deployment sources under $ROOT. Continue from the installed release: cd /opt/confidential-openshell && ./cos trustee install"
 if [[ ! -e /opt/trustee/kbs/storage/kbs/resource-policy.rego ]]; then
   runuser -u openshell-gateway -- python3 deployment/trustee/render-kbs-policy.py \
   --bindings-dir /opt/trustee/kbs/signing/bindings \
