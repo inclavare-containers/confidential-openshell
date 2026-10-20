@@ -67,11 +67,21 @@ cp "${root}/deployment/guest/mkosi.conf" \
 
 mkosi_commit="$(jq -r '.mkosi.commit' "${lock}")"
 [[ "${mkosi_commit}" =~ ^[0-9a-f]{40}$ ]]
+# Docker does not inherit the invoking command's proxy environment.
+proxy_build_args=()
+proxy_run_args=()
+for name in http_proxy https_proxy all_proxy no_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY; do
+    if [[ -v "${name}" ]]; then
+        proxy_build_args+=(--build-arg "${name}")
+        proxy_run_args+=(--env "${name}")
+    fi
+done
 image="${OPENSHELL_MKOSI_TOOLS_IMAGE:-}"
 if [[ -z "${image}" ]]; then
     printf '[guest] Building mkosi tools; log: %s/tools-build.log\n' "${evidence}"
     image="openshell-mkosi-tools:${mkosi_commit:0:12}"
-    docker build --build-arg "BASE_IMAGE=${OPENSHELL_MKOSI_TOOLS_BASE_IMAGE:-$(jq -r '.mkosi.tools_base_image' "${lock}")}" \
+    docker build --network host "${proxy_build_args[@]}" \
+        --build-arg "BASE_IMAGE=${OPENSHELL_MKOSI_TOOLS_BASE_IMAGE:-$(jq -r '.mkosi.tools_base_image' "${lock}")}" \
         --build-arg "MKOSI_COMMIT=${mkosi_commit}" -t "${image}" \
         -f "${root}/deployment/guest/Dockerfile.mkosi-tools" "${root}/deployment/guest" \
         2>&1 | tee "${evidence}/tools-build.log"
@@ -88,7 +98,7 @@ recipe_sha="$(sha256sum "${root}/deployment/guest/build-image.sh" | cut -d' ' -f
 version="$(git -C "${root}" rev-parse --short=12 HEAD)"
 # Native mkosi uses the ECS host kernel, with no nested VM and no disk mappings.
 printf '[guest] Building Ubuntu UKI/verity image; log: %s/mkosi.log\n' "${evidence}"
-docker run --rm --privileged --network host \
+docker run --rm --privileged --network host "${proxy_run_args[@]}" \
     --mount "type=bind,source=${work}/image,target=/image" \
     --mount "type=bind,source=${artifacts}/cache/mkosi-packages,target=/package-cache" \
     "${image_id}" /build/mkosi/bin/mkosi --profile=production --image-version="${version}" \
