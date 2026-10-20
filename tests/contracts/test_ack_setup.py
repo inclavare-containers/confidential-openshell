@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import yaml
@@ -58,6 +59,7 @@ class CloudFixture:
         self.nodes = {'items': [{'metadata': {'name': 'worker', 'labels': {'topology.kubernetes.io/zone': 'cn-beijing-i'}},
                                 'status': {'features': {'supplementalGroupsPolicy': True},
                                            'nodeInfo': {'containerRuntimeVersion': 'containerd://2.3.4',
+                                                        'osImage': 'Ubuntu 24.04.3 LTS',
                                                         'operatingSystem': 'linux', 'architecture': 'amd64'},
                                            'conditions': [{'type': 'Ready', 'status': 'True'}]}}]}
         self.ecs_image = {'Status': 'Available', 'OSType': 'linux', 'Architecture': 'x86_64',
@@ -158,6 +160,8 @@ class CloudFixture:
     def kubectl(self, args, **kwargs):
         if 'configmap' in args:
             data = {'data': {'eni_conf': json.dumps({'disable_network_policy': self.disabled_network_policy})}}
+        elif 'storageclass' in args:
+            data = {'items': [{'metadata': {'name': self.config['csi_storage_class']}}]}
         else:
             data = self.nodes
         return subprocess.CompletedProcess(args, 0, json.dumps(data), '')
@@ -277,6 +281,83 @@ class Setup(CloudFixture, unittest.TestCase):
         pools = [args['body'] for op, args in self.calls if op == 'CreateClusterNodePool']
         self.assertEqual(len(pools), 1)
         self.assertEqual(pools[0]['scaling_group']['image_id'], 'ubuntu-ack')
+
+    def test_new_cluster_creates_its_network_and_resumes_after_worker_switch_failure(self):
+        self.config.update(cluster_id='', worker_vswitch_id='', zone_id='cn-beijing-i',
+                           vpc_cidr='10.64.0.0/16', worker_vswitch_cidr='10.64.0.0/24',
+                           pod_vswitch_cidr='10.64.1.0/24', podvm_vswitch_cidr='10.64.2.0/24')
+        self.inputs()
+        cloud.write(self.operator / 'worker-key', 'private key fixture')
+        cloud.write(self.operator / 'worker-key.pub', 'public key fixture')
+        original_api = self.api
+        switches = {}
+        calls = []
+        fail_worker = [True]
+
+        def api(client, product, operation, **args):
+            calls.append((operation, args))
+            if operation == 'CreateVpc':
+                return {'VpcId': 'vpc-test'}
+            if operation == 'DescribeVpcAttribute':
+                return {'Status': 'Available', 'CidrBlock': '10.64.0.0/16'}
+            if operation == 'CreateVSwitch':
+                if args['VSwitchName'].endswith('-worker') and fail_worker:
+                    fail_worker.clear()
+                    raise RuntimeError('temporary worker vSwitch API failure')
+                switch = 'vsw-' + args['VSwitchName'].rsplit('-', 1)[1]
+                switches[switch] = {'Status': 'Available', 'VpcId': 'vpc-test',
+                                    'ZoneId': 'cn-beijing-i', 'CidrBlock': args['CidrBlock']}
+                return {'VSwitchId': switch}
+            if operation == 'DescribeVSwitchAttributes':
+                return deepcopy(switches[args['VSwitchId']])
+            return original_api(product, operation, **args)
+
+        with patch.object(cloud.Cloud, 'api', api):
+            with self.assertRaisesRegex(RuntimeError, 'temporary worker'):
+                self.prepare('--create')
+            self.assertEqual(self.state()['vpc_id'], 'vpc-test')
+            self.assertNotIn('cluster_id', self.state())
+            self.prepare('--create')
+            self.prepare('--create')
+        self.assertEqual(sum(op == 'CreateVpc' for op, _ in calls), 1)
+        self.assertEqual(sum(op == 'CreateCluster' for op, _ in calls), 1)
+        self.assertEqual(self.state()['worker_vswitch_id'], 'vsw-worker')
+        self.assertTrue(self.state()['created_vpc'])
+        request = next(args['body'] for op, args in calls if op == 'CreateCluster')
+        self.assertEqual(request['vswitch_ids'], ['vsw-worker'])
+        self.assertEqual(request['pod_vswitch_ids'], ['vsw-pod'])
+
+    def test_new_inputs_select_exact_in_stock_capacity_and_do_not_need_resource_ids(self):
+        calls = []
+        class Client:
+            region = 'cn-beijing'
+            selection = {'podvm_mode': 'import'}
+            def api(client, product, operation, **args):
+                calls.append(operation)
+                if operation == 'GetCallerIdentity':
+                    return {'AccountId': '123'}
+                self.assertEqual(operation, 'DescribeAvailableResource')
+                return {'AvailableZones': {'AvailableZone': [
+                    {'ZoneId': 'cn-beijing-a', 'Status': 'Available', 'AvailableResources': {'AvailableResource': [
+                        {'Type': 'InstanceType', 'SupportedResources': {'SupportedResource': [
+                            {'Value': args['InstanceType'], 'Status': 'SoldOut'}]}}]}},
+                    {'ZoneId': 'cn-beijing-i', 'Status': 'Available', 'AvailableResources': {'AvailableResource': [
+                        {'Type': 'InstanceType', 'SupportedResources': {'SupportedResource': [
+                            {'Value': args['InstanceType'], 'Status': 'Available'}]}}]}},
+                ]}}
+        args = SimpleNamespace(new=True, vpc_cidr='10.64.0.0/16', name='new-test', zone='',
+                               ack_api_access='public', oss_endpoint_network='public', oss_bucket='')
+        config, location = inputs.discover(Client(), args)
+        self.assertEqual(location['zone_id'], 'cn-beijing-i')
+        self.assertEqual(config['worker_vswitch_id'], '')
+        self.assertEqual(config['worker_vswitch_cidr'], '10.64.0.0/24')
+        self.assertEqual(config['pod_vswitch_cidr'], '10.64.1.0/24')
+        self.assertEqual(config['podvm_vswitch_cidr'], '10.64.2.0/24')
+        self.assertTrue(config['oss_bucket'].startswith('cos-123-'))
+        self.assertFalse(any(op.startswith('Create') for op in calls))
+        args.zone = 'cn-beijing-a'
+        with self.assertRaisesRegex(SystemExit, 'no matching capacity'):
+            inputs.discover(Client(), args)
 
     def test_kubectl_deadline_is_bounded_and_reports_how_to_resume(self):
         env = {'KUBECONFIG': str(self.operator / 'administrator-kubeconfig')}
@@ -442,15 +523,15 @@ class InputDiscovery(unittest.TestCase):
 
     def arguments(self, **overrides):
         from argparse import Namespace
-        return Namespace(**{'name': 'cos-inputs-test', 'cluster_id': '', 'worker_vswitch_id': '',
+        return Namespace(**{'name': 'cos-inputs-test', 'new': False, 'cluster_id': '',
                             'pod_vswitch_id': '', 'podvm_vswitch_id': '', 'oss_bucket': '',
                             'ack_api_access': 'public', 'oss_endpoint_network': 'public', **overrides})
 
-    def test_new_cluster_uses_selected_cloud_network_and_avoids_allocations_on_all_pages(self):
-        config, location = inputs.discover(self.client(), self.arguments(worker_vswitch_id='vsw-cloud'))
-        self.assertEqual(config['worker_vswitch_id'], 'vsw-cloud')
-        self.assertEqual(config['pod_vswitch_cidr'], '192.168.2.0/24')
-        self.assertEqual(config['podvm_vswitch_cidr'], '192.168.3.0/24')
+    def test_existing_cluster_cidr_discovery_avoids_allocations_on_all_pages(self):
+        config, location = inputs.discover(self.client(), self.arguments(cluster_id='c-test'))
+        self.assertEqual(config['worker_vswitch_id'], 'vsw-ack')
+        self.assertEqual(config['pod_vswitch_cidr'], '')
+        self.assertEqual(config['podvm_vswitch_cidr'], '192.168.2.0/24')
         self.assertTrue(config['oss_bucket'].startswith('cos-123-'))
         self.assertEqual(location['vpc_id'], 'vpc-test')
 
@@ -463,7 +544,7 @@ class InputDiscovery(unittest.TestCase):
         self.assertEqual(config['ack_api_access'], 'public')
 
     def test_cluster_configuration_is_independent_of_the_service_host_address(self):
-        for target in ({'cluster_id': 'c-test'}, {'worker_vswitch_id': 'vsw-cloud'}):
+        for target in ({'cluster_id': 'c-test'},):
             with self.subTest(target=target):
                 client = self.client()
                 args = self.arguments(oss_bucket='existing-bucket', **target)
@@ -473,10 +554,6 @@ class InputDiscovery(unittest.TestCase):
                     private, private_location = inputs.discover(client, args)
                 self.assertEqual(public, private)
                 self.assertEqual(public_location, private_location)
-
-    def test_new_cluster_requires_a_cloud_network_selection(self):
-        with self.assertRaisesRegex(SystemExit, '--worker-vswitch-id'):
-            inputs.discover(self.client(), self.arguments())
 
     def test_full_vpc_does_not_generate_overlapping_cidrs(self):
         with self.assertRaisesRegex(SystemExit, 'Not enough free'):

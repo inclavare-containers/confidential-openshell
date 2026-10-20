@@ -6,6 +6,7 @@ import os
 import subprocess
 
 from cloud import Cloud, OPERATOR, require, run, write
+from network import create_network
 
 
 def kubectl(env, *args):
@@ -70,9 +71,10 @@ def validate_nodes(nodes):
         status = node['status']
         require(status.get('features', {}).get('supplementalGroupsPolicy') is True and
                 status['nodeInfo']['operatingSystem'] == 'linux' and status['nodeInfo']['architecture'] == 'amd64' and
+                'Ubuntu 24.04' in status['nodeInfo'].get('osImage', '') and
                 status['nodeInfo']['containerRuntimeVersion'].startswith('containerd://') and
                 any(c['type'] == 'Ready' and c['status'] == 'True' for c in status['conditions']),
-                f"Worker {node['metadata']['name']} must be Ready Linux/amd64 and support containerd/supplementalGroupsPolicy.")
+                f"Worker {node['metadata']['name']} must be Ready Ubuntu 24.04/amd64 and support containerd/supplementalGroupsPolicy.")
 
 
 def main():
@@ -86,8 +88,6 @@ def main():
     require(cluster or args.create, 'Set cluster_id in ack.json, or use --create to create a new paid cluster.')
     if not cluster:
         require(config['worker_count'] > 0, 'worker_count must be positive.')
-        require(config['worker_vswitch_id'] and not config['worker_vswitch_id'].startswith('YOUR_'),
-                'Fill in worker_vswitch_id in ack.json.')
         versions = cloud.api('cs', 'DescribeKubernetesVersionMetadata', Region=cloud.region,
                              ClusterType='ManagedKubernetes', KubernetesVersion=config['kubernetes_version'])
         version = next((v for v in versions if v['version'] == config['kubernetes_version'] and v['creatable']), None)
@@ -99,6 +99,9 @@ def main():
             require(images, 'ACK does not offer an Ubuntu 24.04 worker image for this version.')
             config = {**config, 'worker_image_id': images[0]['image_id']}
         cloud.save(worker_image_id=config['worker_image_id'])
+        if not config['worker_vswitch_id']:
+            create_network(cloud)
+            config = {**config, 'worker_vswitch_id': cloud.config['worker_vswitch_id']}
         switch = cloud.api('vpc', 'DescribeVSwitchAttributes', RegionId=cloud.region,
                            VSwitchId=config['worker_vswitch_id'])
         vpc, zone = switch['VpcId'], switch['ZoneId']
@@ -106,6 +109,7 @@ def main():
         pod_switch = cloud.switch('pod', vpc, zone)
         request = cluster_request(config, cloud.region, vpc, pod_switch)
         write(OPERATOR / 'cluster-request.json', request)
+        print(f'Creating ACK Pro cluster {cloud.name} with Terway, RRSA, public API={request["endpoint_public_access"]}…', flush=True)
         response = cloud.api('cs', 'CreateCluster', body=request)
         cluster = response['cluster_id']
         cloud.save(cluster_id=cluster, created_cluster=True)
@@ -155,9 +159,13 @@ def main():
     eni = json.loads(network['data']['eni_conf'])
     require(str(eni.get('disable_network_policy', False)).lower() == 'false',
             'Terway NetworkPolicy is disabled. See deployment/ack/README.md.')
+    classes = json.loads(kubectl(env, 'get', 'storageclass', '-o', 'json'))
+    require(any(c['metadata']['name'] == config['csi_storage_class'] for c in classes['items']),
+            f'Host StorageClass {config["csi_storage_class"]} is missing. Enable the ACK csi-plugin and csi-provisioner storage add-ons before attachment.')
     cloud.save(zone_id=nodes['items'][0]['metadata']['labels']['topology.kubernetes.io/zone'])
     print(kubectl(env, 'get', 'nodes', '-o', 'wide'), end='')
     print(f'ACK ready: {cluster} ({config["ack_api_access"]} API). Kubeconfig is valid for up to 3 days; repeat to renew it.')
+    print(f'VPC: {cloud.state["vpc_id"]}; worker vSwitch: {config["worker_vswitch_id"]}; worker security group: {cloud.state["worker_security_group_id"]}.')
 
 
 if __name__ == '__main__':

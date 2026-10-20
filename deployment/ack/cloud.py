@@ -105,6 +105,9 @@ class Cloud(Client):
                 'ack.json/region changed after setup began. Use a separate OPERATOR_DIR for another deployment.')
         require(self.state['handoff_sha256'] == handoff_digest,
                 'Release handoff changed after setup began. Use a separate OPERATOR_DIR for another deployment.')
+        # Generated IDs live in the state; the reviewed input file stays immutable.
+        if self.state.get('worker_vswitch_id'):
+            self.config['worker_vswitch_id'] = self.state['worker_vswitch_id']
 
     def save(self, **updates):
         self.state.update(updates)
@@ -128,6 +131,7 @@ class Cloud(Client):
         key = kind + '_vswitch_id'
         switch = self.state.get(key) or self.config.get(key)
         if not switch:
+            print(f'Creating {kind} vSwitch {self.config[kind + "_vswitch_cidr"]} in {zone}…', flush=True)
             response = self.api('vpc', 'CreateVSwitch', RegionId=self.region, VpcId=vpc, ZoneId=zone,
                                 CidrBlock=self.config[kind + '_vswitch_cidr'],
                                 VSwitchName=self.name + '-' + kind, ClientToken=self.name + '-' + kind,
@@ -140,4 +144,5 @@ class Cloud(Client):
         require(detail['VpcId'] == vpc and detail['ZoneId'] == zone,
                 f'{key} must be in the selected VPC and zone.')
         self.save(**{key: switch})
+        print(f'{kind.capitalize()} vSwitch ready: {switch} ({detail["CidrBlock"]}).', flush=True)
         return switch

@@ -51,9 +51,11 @@ def inherit_worker_snat(cloud, vpc):
                              SnatEntryName=cloud.name + '-podvm', ClientToken=cloud.name + '-podvm-snat')
         entry_id = response['SnatEntryId']
     cloud.save(podvm_snat_entry_id=entry_id, podvm_snat_table_id=table)
-    cloud.wait('PodVM SNAT', lambda: cloud.api('vpc', 'DescribeSnatTableEntries', RegionId=cloud.region,
+    rows = cloud.wait('PodVM SNAT', lambda: cloud.api('vpc', 'DescribeSnatTableEntries', RegionId=cloud.region,
                SnatTableId=table, SnatEntryId=entry_id)['SnatTableEntries']['SnatTableEntry'],
                lambda rows: len(rows) == 1 and rows[0]['Status'] == 'Available', timeout=300)
+    cloud.save(podvm_egress_ips=rows[0]['SnatIp'].split(','))
+    print(f'PodVM outbound public IPs: {rows[0]["SnatIp"]}.', flush=True)
 
 
 def main():
@@ -84,6 +86,8 @@ def main():
     allow(worker_group, group)
     inherit_worker_snat(cloud, vpc)
     print(f'PodVM network ready: {cloud.state["podvm_vswitch_id"]}, {group}.')
+    print('Worker/PodVM tunnel access is configured between their security groups.')
+    print('Trusted host ingress must allow these cloud clients on TCP 5000 (registry), 8443 (KBS), and 9443 (Gateway).')
 
 
 if __name__ == '__main__':
