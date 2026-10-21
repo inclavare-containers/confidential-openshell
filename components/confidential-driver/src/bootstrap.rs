@@ -568,10 +568,11 @@ impl BootstrapStore {
                 if existing.identity_sha256 == id {
                     continue;
                 }
+                // PVC names can be reused after deletion. Preserve the
+                // physical volume bindings across CR identities instead.
                 for volume in existing.volumes {
-                    if (existing.namespace == namespace && volume.pvc_name == pvc_name)
-                        || pv_uid_or_name
-                            .is_some_and(|value| volume.pv_uid_or_name.as_deref() == Some(value))
+                    if pv_uid_or_name
+                        .is_some_and(|value| volume.pv_uid_or_name.as_deref() == Some(value))
                         || cloud_disk_id
                             .is_some_and(|value| volume.cloud_disk_id.as_deref() == Some(value))
                     {
@@ -2362,6 +2363,73 @@ pathlib.Path(args[args.index('--output') + 1]).write_text('package policy\ndefau
     }
 
     #[test]
+    fn deleted_sandbox_name_can_be_recreated_with_a_new_volume() {
+        let (_tmp, store) = fixture();
+        let namespace = "openshell";
+        let pvc = "workspace-default--opencode-demo";
+        store
+            .record_workspace_owner("sandbox-old", namespace, "old-cr-uid")
+            .unwrap();
+        store
+            .record_workspace_volume(
+                namespace,
+                "old-cr-uid",
+                pvc,
+                Some("old-pv-uid"),
+                Some("d-old"),
+            )
+            .unwrap();
+        store
+            .ensure_workspace_key(namespace, "old-cr-uid", INITDATA)
+            .unwrap();
+        let old_id = workspace_hash(namespace, "old-cr-uid");
+        let old_key = read_private(&store.workspace_key(&old_id)).unwrap();
+        let marker = store
+            .begin_delete("sandbox-old", namespace, "old-cr-uid", None)
+            .unwrap();
+        store.revoke_pending_delete(&marker).unwrap();
+        store.finish_delete(&marker).unwrap();
+        assert!(!store.workspace_resource(&old_id).exists());
+        assert!(store.workspace_journal(&old_id).exists());
+
+        store
+            .record_workspace_owner("sandbox-new", namespace, "new-cr-uid")
+            .unwrap();
+        store
+            .record_workspace_volume(namespace, "new-cr-uid", pvc, None, None)
+            .unwrap();
+        store
+            .record_workspace_volume(
+                namespace,
+                "new-cr-uid",
+                pvc,
+                Some("new-pv-uid"),
+                Some("d-new"),
+            )
+            .unwrap();
+        store
+            .ensure_workspace_key(namespace, "new-cr-uid", INITDATA)
+            .unwrap();
+        assert_ne!(
+            old_key,
+            read_private(&store.workspace_key(&workspace_hash(namespace, "new-cr-uid"))).unwrap()
+        );
+
+        // A reusable name must not permit reusing an old physical volume or
+        // replacing the volume already bound to the current CR identity.
+        for (uid, pv, disk) in [
+            ("pv-rebind-uid", "old-pv-uid", "d-unrelated"),
+            ("disk-rebind-uid", "unrelated-pv-uid", "d-old"),
+            ("new-cr-uid", "changed-pv-uid", "d-changed"),
+        ] {
+            assert!(matches!(
+                store.record_workspace_volume(namespace, uid, pvc, Some(pv), Some(disk)),
+                Err(StoreError::Conflict)
+            ));
+        }
+    }
+
+    #[test]
     fn workspace_key_is_stable_and_access_can_rotate() {
         let (tmp, store) = fixture();
         let planned = store.plan_workspace_key("workspace", "cr-uid-1").unwrap();
@@ -2381,8 +2449,17 @@ pathlib.Path(args[args.index('--output') + 1]).write_text('package policy\ndefau
                 Some("disk-a"),
             )
             .unwrap();
+        store
+            .record_workspace_volume("workspace", "different-cr", "pvc-a", None, None)
+            .unwrap();
         assert!(matches!(
-            store.record_workspace_volume("workspace", "different-cr", "pvc-a", None, None),
+            store.record_workspace_volume(
+                "workspace",
+                "different-cr",
+                "pvc-a",
+                Some("pv-a"),
+                Some("disk-a")
+            ),
             Err(StoreError::Conflict)
         ));
         assert!(matches!(
