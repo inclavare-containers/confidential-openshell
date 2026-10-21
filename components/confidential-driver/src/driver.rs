@@ -5430,7 +5430,9 @@ impl KubernetesComputeDriver {
             Err(error) => warn!(%error, "cannot inspect confidential sandbox owner index"),
         }
         for (sandbox_id, expected_uid) in targets {
-            let _guard = self.lifecycle_lock(&sandbox_id).lock_owned().await;
+            let Ok(_guard) = self.lifecycle_lock(&sandbox_id).try_lock_owned() else {
+                continue;
+            };
             if let Err(error) = self
                 .delete_sandbox_inner(&sandbox_id, expected_uid.as_deref())
                 .await
@@ -5510,7 +5512,11 @@ impl KubernetesComputeDriver {
             let Ok(sandbox_id) = sandbox_id_from_object(&object) else {
                 continue;
             };
-            let _lifecycle_guard = self.lifecycle_lock(&sandbox_id).lock_owned().await;
+            // A long-running create must not stall cleanup of other sandboxes.
+            // Refresh under the acquired gate below to reject stale LIST identities.
+            let Ok(_lifecycle_guard) = self.lifecycle_lock(&sandbox_id).try_lock_owned() else {
+                continue;
+            };
             let live_namespace = object
                 .metadata
                 .namespace
@@ -9342,6 +9348,69 @@ mod tests {
 
         driver.reconcile_sandbox_runtime_resources().await;
 
+        assert!(steps.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconcile_skips_busy_sandbox_and_revisits_it_next_pass() {
+        let object = |id: &str| {
+            serde_json::json!({
+                "apiVersion": "agents.x-k8s.io/v1beta1", "kind": "Sandbox",
+                "metadata": {"name": id, "namespace": "openshell", "uid": id,
+                    "labels": {LABEL_SANDBOX_ID: id}},
+                "spec": {"operatingMode": "Suspended"}
+            })
+        };
+        let list = || {
+            kube_test_response(
+                http::StatusCode::OK,
+                serde_json::json!({
+                    "apiVersion": "agents.x-k8s.io/v1beta1", "kind": "SandboxList",
+                    "items": [object("busy"), object("ready")]
+                }),
+            )
+        };
+        let (driver, steps, _) = scripted_driver(
+            KubernetesComputeConfig::default(),
+            vec![
+                (
+                    http::Method::GET,
+                    "/apis/agents.x-k8s.io/v1beta1/namespaces/openshell/sandboxes",
+                    list(),
+                ),
+                (
+                    http::Method::GET,
+                    "/apis/agents.x-k8s.io/v1beta1/namespaces/openshell/sandboxes/ready",
+                    kube_test_not_found("sandboxes", "ready"),
+                ),
+                (
+                    http::Method::GET,
+                    "/apis/agents.x-k8s.io/v1beta1/namespaces/openshell/sandboxes",
+                    list(),
+                ),
+                (
+                    http::Method::GET,
+                    "/apis/agents.x-k8s.io/v1beta1/namespaces/openshell/sandboxes/busy",
+                    kube_test_not_found("sandboxes", "busy"),
+                ),
+                (
+                    http::Method::GET,
+                    "/apis/agents.x-k8s.io/v1beta1/namespaces/openshell/sandboxes/ready",
+                    kube_test_not_found("sandboxes", "ready"),
+                ),
+            ],
+        );
+        driver.sandbox_api_version.set(SANDBOX_VERSION_V1BETA1).ok();
+        let busy = driver.lifecycle_lock("busy").lock_owned().await;
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            driver.reconcile_sandbox_runtime_resources(),
+        )
+        .await
+        .expect("busy sandbox must not block the rest of the pass");
+        assert_eq!(steps.lock().unwrap().len(), 3);
+        drop(busy);
+        driver.reconcile_sandbox_runtime_resources().await;
         assert!(steps.lock().unwrap().is_empty());
     }
 
