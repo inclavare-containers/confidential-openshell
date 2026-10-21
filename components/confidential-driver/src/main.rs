@@ -39,7 +39,7 @@ struct Args {
     #[arg(long, env = "OPENSHELL_CONFIDENTIAL_CLIENT_TLS_CA")]
     confidential_client_tls_ca: PathBuf,
 
-    /// Trusted policy generator that derives Rego from each gated Pod's actual spec.
+    /// Trusted policy generator that verifies admitted Pods against T's launch intent.
     #[arg(long, env = "OPENSHELL_KATA_POLICY_GENERATOR")]
     kata_policy_generator: PathBuf,
 
@@ -56,7 +56,7 @@ struct Args {
     #[arg(long, env = "OPENSHELL_KATA_POLICY_PAUSE_IMAGE")]
     kata_policy_pause_image: String,
 
-    /// Trustee local-fs repository, shared with the KBS process.
+    /// Private driver publication staging; never shared with Trustee.
     #[arg(long, env = "OPENSHELL_BOOTSTRAP_STORE_DIR")]
     bootstrap_store_dir: PathBuf,
 
@@ -71,6 +71,10 @@ struct Args {
 
     #[arg(long, env = "OPENSHELL_AS_POLICY_OUTPUT")]
     as_policy_output: PathBuf,
+
+    /// Authenticated KBS management endpoint and private admin key configuration.
+    #[arg(long, env = "OPENSHELL_TRUSTEE_CONFIG")]
+    trustee_config: PathBuf,
 
     /// Operator-owned JSON policy; omitted means driver config disabled and labels required.
     #[arg(
@@ -345,6 +349,7 @@ async fn main() -> Result<()> {
             kbs_policy_renderer: args.kbs_policy_renderer,
             kbs_policy_output: args.kbs_policy_output,
             as_policy_output: args.as_policy_output,
+            trustee_config: args.trustee_config,
         },
     )
     .await
@@ -391,6 +396,7 @@ mod tests {
             "openshell-driver-confidential-kubernetes",
             "--confidential-runtime-class",
             "kata-confidential",
+            "--trustee-config", "/tmp/trustee-client.json",
             "--guest-initdata-base",
             "/tmp/initdata.toml",
             "--confidential-client-tls-ca",

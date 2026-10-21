@@ -1,6 +1,6 @@
 //! Trusted-host publisher for upstream CDH signed vault references.
 //!
-//! Trustee 0.22 LocalFs stores resource keys as flat files in its `repository` namespace.
+//! Private staging is reconciled to the authenticated Trustee management API.
 //! Kubernetes receives only the signed `sealed.<JWS>` descriptor. KBS policy
 //! must independently authorize both its signer and each file from verified
 //! measured initdata; fields in the binding record are not attestation claims.
@@ -45,6 +45,8 @@ pub(super) enum StoreError {
     Json(#[from] serde_json::Error),
     #[error("bootstrap store cryptography failed")]
     Crypto,
+    #[error("Trustee management publication failed: {0}")]
+    Publication(String),
     #[error("bootstrap cleanup remains pending: {0}")]
     Cleanup(String),
 }
@@ -150,11 +152,20 @@ pub(super) struct PendingDelete {
     pub(super) bootstrap_identities: Vec<String>,
 }
 
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
+struct ActiveAttempt {
+    sandbox_id: String,
+    sandbox_cr_uid: String,
+    generation: String,
+    attempt: String,
+}
+
 pub(super) struct BootstrapStore {
     repository: PathBuf,
     state: PathBuf,
     signing_key: PathBuf,
     policy: Option<(PathBuf, PathBuf, PathBuf)>,
+    trustee_config: Option<PathBuf>,
 }
 
 impl BootstrapStore {
@@ -171,8 +182,8 @@ impl BootstrapStore {
             .parent()
             .ok_or(StoreError::Invalid("signing key path"))?
             .to_path_buf();
-        ensure_dir(&repository)?;
         ensure_private_dir(&state)?;
+        ensure_private_dir(&repository)?;
         ensure_private_dir(&state.join("bindings"))?;
         ensure_private_dir(&state.join("descriptors"))?;
         ensure_private_dir(&state.join("revoked"))?;
@@ -183,11 +194,15 @@ impl BootstrapStore {
         ensure_private_dir(&state.join("workspace-owners"))?;
         ensure_private_dir(&state.join("pending-deletes"))?;
         ensure_private_dir(&state.join("workload-environments"))?;
+        ensure_private_dir(&state.join("launch-intents"))?;
+        ensure_private_dir(&state.join("active-attempts"))?;
+        ensure_private_dir(&state.join("pending-revocations"))?;
         let store = Self {
             repository,
             state,
             signing_key,
             policy: None,
+            trustee_config: None,
         };
         store.with_lock(|| {
             store.clean_temporary_files()?;
@@ -198,8 +213,8 @@ impl BootstrapStore {
         Ok(store)
     }
 
-    /// Production constructor. The renderer must durably replace Trustee's
-    /// AS and KBS policy files before a new raw resource is published.
+    /// Offline store fixture: render private policies without contacting Trustee.
+    #[cfg(test)]
     pub(super) fn open_with_policies(
         repository_dir: impl AsRef<Path>,
         signing_key_path: impl AsRef<Path>,
@@ -207,7 +222,44 @@ impl BootstrapStore {
         kbs_policy_output: impl AsRef<Path>,
         as_policy_output: impl AsRef<Path>,
     ) -> Result<Self> {
+        Self::open_configured(
+            repository_dir,
+            signing_key_path,
+            renderer_script,
+            kbs_policy_output,
+            as_policy_output,
+            None,
+        )
+    }
+
+    pub(super) fn open_with_trustee(
+        repository_dir: impl AsRef<Path>,
+        signing_key_path: impl AsRef<Path>,
+        renderer_script: impl AsRef<Path>,
+        kbs_policy_output: impl AsRef<Path>,
+        as_policy_output: impl AsRef<Path>,
+        trustee_config: &Path,
+    ) -> Result<Self> {
+        Self::open_configured(
+            repository_dir,
+            signing_key_path,
+            renderer_script,
+            kbs_policy_output,
+            as_policy_output,
+            Some(trustee_config.to_path_buf()),
+        )
+    }
+
+    fn open_configured(
+        repository_dir: impl AsRef<Path>,
+        signing_key_path: impl AsRef<Path>,
+        renderer_script: impl AsRef<Path>,
+        kbs_policy_output: impl AsRef<Path>,
+        as_policy_output: impl AsRef<Path>,
+        trustee_config: Option<PathBuf>,
+    ) -> Result<Self> {
         let mut store = Self::open(repository_dir, signing_key_path)?;
+        store.trustee_config = trustee_config;
         if !fs::symlink_metadata(renderer_script.as_ref())?
             .file_type()
             .is_file()
@@ -223,6 +275,13 @@ impl BootstrapStore {
         // Withdraw every marked raw resource before this constructor returns,
         // even if Trustee policy rendering is temporarily broken.
         let mut pending_error = None;
+        for owner in store.pending_revocations()? {
+            if let Err(error) =
+                store.revoke_owned_sandbox(&owner.sandbox_id, Some(&owner.sandbox_cr_uid))
+            {
+                pending_error = Some(error);
+            }
+        }
         for marker in store.pending_deletes()? {
             if let Err(error) = store.revoke_pending_delete(&marker) {
                 pending_error = Some(error);
@@ -284,6 +343,201 @@ impl BootstrapStore {
             resource_uri: format!("kbs:///default/workspace/{id}"),
             resource_path: format!("resource/default/workspace/{id}"),
         })
+    }
+
+    pub(super) fn record_attempt(
+        &self,
+        sandbox_id: &str,
+        namespace: &str,
+        uid: &str,
+        generation: &str,
+        attempt: &str,
+    ) -> Result<()> {
+        validate(
+            BootstrapRole::Workload,
+            generation,
+            sandbox_id,
+            attempt,
+            None,
+            None,
+        )?;
+        validate_workspace_identity(namespace, uid)?;
+        self.with_lock(|| {
+            if self.has_pending_delete_for_sandbox(sandbox_id)? {
+                return Err(StoreError::Revoked);
+            }
+            if self
+                .state
+                .join("pending-revocations")
+                .join(format!("{}.json", workspace_hash(namespace, uid)))
+                .exists()
+            {
+                return Err(StoreError::Revoked);
+            }
+            self.record_workspace_owner_locked(sandbox_id, namespace, uid)?;
+            let record = ActiveAttempt {
+                sandbox_id: sandbox_id.into(),
+                sandbox_cr_uid: uid.into(),
+                generation: generation.into(),
+                attempt: attempt.into(),
+            };
+            let path = self
+                .state
+                .join("active-attempts")
+                .join(format!("{}.json", workspace_hash(namespace, uid)));
+            if path.try_exists()? {
+                let previous: ActiveAttempt = serde_json::from_slice(&read_private(&path)?)?;
+                if previous == record {
+                    return Ok(());
+                }
+                if previous.sandbox_id != sandbox_id
+                    || previous.sandbox_cr_uid != uid
+                    || [BootstrapRole::Workload, BootstrapRole::Supervisor]
+                        .iter()
+                        .any(|role| {
+                            !self
+                                .tombstone(&identity_hash(
+                                    *role,
+                                    &previous.generation,
+                                    sandbox_id,
+                                    &previous.attempt,
+                                ))
+                                .exists()
+                        })
+                {
+                    return Err(StoreError::Conflict);
+                }
+            }
+            atomic_replace(&path, &serde_json::to_vec(&record)?)
+        })
+    }
+
+    /// Locate authorizations from T, even when Kubernetes is unreachable or
+    /// annotations have been removed. The caller holds the sandbox lifecycle gate.
+    pub(super) fn revoke_owned_sandbox(
+        &self,
+        sandbox_id: &str,
+        expected_uid: Option<&str>,
+    ) -> Result<()> {
+        validate_sandbox(sandbox_id)?;
+        let mut errors = Vec::new();
+        for owner in self.workspace_owners()?.into_iter().filter(|owner| {
+            owner.sandbox_id == sandbox_id
+                && expected_uid.is_none_or(|uid| owner.sandbox_cr_uid == uid)
+        }) {
+            let path = self
+                .state
+                .join("pending-revocations")
+                .join(format!("{}.json", owner.workspace_identity_sha256));
+            self.with_lock(|| {
+                if !path.exists() {
+                    atomic_new(&path, &serde_json::to_vec(&owner)?)?;
+                }
+                Ok(())
+            })?;
+            let mut complete = true;
+            for result in [
+                self.deauthorize_workspace_key(&owner.namespace, &owner.sandbox_cr_uid),
+                self.revoke_sandbox_uid(sandbox_id, &owner.sandbox_cr_uid),
+            ] {
+                if let Err(error) = result {
+                    complete = false;
+                    errors.push(error.to_string());
+                }
+            }
+            if complete {
+                self.with_lock(|| {
+                    fs::remove_file(&path)?;
+                    sync_dir(path.parent().unwrap())
+                })?;
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(StoreError::Cleanup(errors.join("; ")))
+        }
+    }
+
+    pub(super) fn pending_revocations(&self) -> Result<Vec<WorkspaceOwner>> {
+        let mut owners = Vec::new();
+        for entry in fs::read_dir(self.state.join("pending-revocations"))? {
+            let path = entry?.path();
+            if path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with('.'))
+            {
+                continue;
+            }
+            let owner: WorkspaceOwner = serde_json::from_slice(&read_private(&path)?)?;
+            validate_sandbox(&owner.sandbox_id)?;
+            validate_workspace_identity(&owner.namespace, &owner.sandbox_cr_uid)?;
+            if owner.workspace_identity_sha256
+                != workspace_hash(&owner.namespace, &owner.sandbox_cr_uid)
+                || path.file_stem().and_then(|v| v.to_str())
+                    != Some(owner.workspace_identity_sha256.as_str())
+            {
+                return Err(StoreError::Conflict);
+            }
+            owners.push(owner);
+        }
+        Ok(owners)
+    }
+
+    pub(super) fn record_launch(&self, launch: &crate::launch::LaunchIntent) -> Result<()> {
+        validate_sandbox(&launch.sandbox_id)?;
+        validate_workspace_identity(&launch.namespace, &launch.sandbox_cr_uid)?;
+        let path = self.launch_path(&launch.namespace, &launch.sandbox_cr_uid);
+        self.with_lock(|| {
+            if self.has_pending_delete_for_sandbox(&launch.sandbox_id)? {
+                return Err(StoreError::Revoked);
+            }
+            self.record_workspace_owner_locked(
+                &launch.sandbox_id,
+                &launch.namespace,
+                &launch.sandbox_cr_uid,
+            )?;
+            if path.try_exists()? {
+                let prior: crate::launch::LaunchIntent =
+                    serde_json::from_slice(&read_private(&path)?)?;
+                if prior != *launch {
+                    return Err(StoreError::Conflict);
+                }
+            } else {
+                atomic_new(&path, &serde_json::to_vec(launch)?)?;
+            }
+            Ok(())
+        })
+    }
+
+    pub(super) fn load_launch(
+        &self,
+        sandbox_id: &str,
+        namespace: &str,
+        uid: &str,
+    ) -> Result<crate::launch::LaunchIntent> {
+        validate_sandbox(sandbox_id)?;
+        validate_workspace_identity(namespace, uid)?;
+        self.with_lock(|| {
+            if self.has_pending_delete_for_sandbox(sandbox_id)? {
+                return Err(StoreError::Revoked);
+            }
+            let launch: crate::launch::LaunchIntent =
+                serde_json::from_slice(&read_private(&self.launch_path(namespace, uid))?)?;
+            if launch.sandbox_id != sandbox_id
+                || launch.namespace != namespace
+                || launch.sandbox_cr_uid != uid
+            {
+                return Err(StoreError::Conflict);
+            }
+            Ok(launch)
+        })
+    }
+
+    fn launch_path(&self, namespace: &str, uid: &str) -> PathBuf {
+        self.state
+            .join("launch-intents")
+            .join(format!("{}.json", workspace_hash(namespace, uid)))
     }
 
     pub(super) fn record_workload_environment(
@@ -425,6 +679,24 @@ impl BootstrapStore {
                     identities.insert(binding.identity_sha256);
                 }
             }
+            let active = self.state.join("active-attempts").join(format!(
+                "{}.json",
+                workspace_hash(namespace, sandbox_cr_uid)
+            ));
+            if active.try_exists()? {
+                let record: ActiveAttempt = serde_json::from_slice(&read_private(&active)?)?;
+                if record.sandbox_id != sandbox_id || record.sandbox_cr_uid != sandbox_cr_uid {
+                    return Err(StoreError::Conflict);
+                }
+                for role in [BootstrapRole::Workload, BootstrapRole::Supervisor] {
+                    identities.insert(identity_hash(
+                        role,
+                        &record.generation,
+                        sandbox_id,
+                        &record.attempt,
+                    ));
+                }
+            }
             let marker = PendingDelete {
                 sandbox_id: sandbox_id.to_owned(),
                 namespace: namespace.to_owned(),
@@ -518,6 +790,27 @@ impl BootstrapStore {
                 }
                 fs::remove_file(&environment)?;
                 sync_dir(environment.parent().unwrap())?;
+            }
+            let attempt = self.state.join("active-attempts").join(format!(
+                "{}.json",
+                workspace_hash(&marker.namespace, &marker.sandbox_cr_uid)
+            ));
+            if attempt.try_exists()? {
+                fs::remove_file(&attempt)?;
+                sync_dir(attempt.parent().unwrap())?;
+            }
+            let revoke = self.state.join("pending-revocations").join(format!(
+                "{}.json",
+                workspace_hash(&marker.namespace, &marker.sandbox_cr_uid)
+            ));
+            if revoke.try_exists()? {
+                fs::remove_file(&revoke)?;
+                sync_dir(revoke.parent().unwrap())?;
+            }
+            let launch = self.launch_path(&marker.namespace, &marker.sandbox_cr_uid);
+            if launch.try_exists()? {
+                fs::remove_file(&launch)?;
+                sync_dir(launch.parent().unwrap())?;
             }
             fs::remove_file(&path)?;
             sync_dir(&self.state.join("pending-deletes"))?;
@@ -662,11 +955,32 @@ impl BootstrapStore {
     /// Preserve one 32-byte key across workload attempts and generations.
     /// The previous serving path is withdrawn before a new measured workload
     /// binding becomes active. The key itself remains in private host state.
+    #[cfg(test)]
     pub(super) fn ensure_workspace_key(
         &self,
         namespace: &str,
         sandbox_cr_uid: &str,
         workload_initdata_sha384: &str,
+    ) -> Result<PlannedSecret> {
+        self.authorize_workspace_key(namespace, sandbox_cr_uid, workload_initdata_sha384, None)
+    }
+
+    pub(super) fn ensure_workspace_key_for_attempt(
+        &self,
+        namespace: &str,
+        uid: &str,
+        digest: &str,
+        attempt: &str,
+    ) -> Result<PlannedSecret> {
+        self.authorize_workspace_key(namespace, uid, digest, Some(attempt))
+    }
+
+    fn authorize_workspace_key(
+        &self,
+        namespace: &str,
+        sandbox_cr_uid: &str,
+        workload_initdata_sha384: &str,
+        attempt: Option<&str>,
     ) -> Result<PlannedSecret> {
         validate_workspace_identity(namespace, sandbox_cr_uid)?;
         validate_digest(workload_initdata_sha384)?;
@@ -676,6 +990,33 @@ impl BootstrapStore {
         let planned = self.plan_workspace_key(namespace, sandbox_cr_uid)?;
         let id = workspace_hash(namespace, sandbox_cr_uid);
         self.with_lock(|| {
+            if let Some(expected) = attempt {
+                let record: ActiveAttempt = serde_json::from_slice(&read_private(
+                    &self
+                        .state
+                        .join("active-attempts")
+                        .join(format!("{id}.json")),
+                )?)?;
+                if record.attempt != expected
+                    || record.sandbox_cr_uid != sandbox_cr_uid
+                    || self
+                        .state
+                        .join("pending-revocations")
+                        .join(format!("{id}.json"))
+                        .exists()
+                    || self
+                        .tombstone(&identity_hash(
+                            BootstrapRole::Workload,
+                            &record.generation,
+                            &record.sandbox_id,
+                            &record.attempt,
+                        ))
+                        .exists()
+                {
+                    return Err(StoreError::Revoked);
+                }
+            }
+
             for item in fs::read_dir(self.state.join("pending-deletes"))? {
                 let pending = self.read_pending_delete(&item?.path())?;
                 if pending.namespace == namespace && pending.sandbox_cr_uid == sandbox_cr_uid {
@@ -738,8 +1079,8 @@ impl BootstrapStore {
             }
             atomic_replace(&binding_path, &serde_json::to_vec(&binding)?)?;
             let operation = (|| {
-                self.refresh_policy()?;
                 atomic_new(&serving, &key)?;
+                self.refresh_policy()?;
                 Ok(())
             })();
             if operation.is_err() {
@@ -835,7 +1176,6 @@ impl BootstrapStore {
             let was_unserved = !resource.exists();
             let operation = (|| {
                 let descriptor = self.load_or_sign_descriptor(&id, &input)?;
-                self.refresh_policy()?;
                 if resource.exists() {
                     if hex::encode(Sha256::digest(read_regular(&resource)?)) != digest {
                         return Err(StoreError::Conflict);
@@ -843,6 +1183,7 @@ impl BootstrapStore {
                 } else {
                     atomic_new(&resource, plaintext)?;
                 }
+                self.refresh_policy()?;
                 Ok(descriptor)
             })();
             if operation.is_err() && (was_unserved || new_binding) {
@@ -957,6 +1298,21 @@ impl BootstrapStore {
                     identities.insert(record.identity_sha256);
                 }
             }
+            // Include attempts that have not published a binding yet. A late
+            // publisher must encounter a tombstone, not resurrect a stopped VM.
+            for item in fs::read_dir(self.state.join("active-attempts"))? {
+                let attempt: ActiveAttempt = serde_json::from_slice(&read_private(&item?.path())?)?;
+                if attempt.sandbox_id == sandbox_id && attempt.sandbox_cr_uid == sandbox_cr_uid {
+                    for role in [BootstrapRole::Workload, BootstrapRole::Supervisor] {
+                        identities.insert(identity_hash(
+                            role,
+                            &attempt.generation,
+                            sandbox_id,
+                            &attempt.attempt,
+                        ));
+                    }
+                }
+            }
             for identity in identities {
                 if let Err(error) = self.revoke_identity(&identity) {
                     errors.push(error.to_string());
@@ -1059,7 +1415,7 @@ impl BootstrapStore {
 
     fn resource(&self, id: &str) -> PathBuf {
         self.repository
-            .join(local_fs_resource_key(&format!("default/bootstrap/{id}")))
+            .join(staged_resource_key(&format!("default/bootstrap/{id}")))
     }
     fn quarantine(&self, id: &str) -> PathBuf {
         self.repository.join(format!(".revoking-{id}"))
@@ -1090,7 +1446,7 @@ impl BootstrapStore {
             .join(format!("{identity}.json"))
     }
     fn workspace_resource(&self, identity: &str) -> PathBuf {
-        self.repository.join(local_fs_resource_key(&format!(
+        self.repository.join(staged_resource_key(&format!(
             "default/workspace/{identity}"
         )))
     }
@@ -1205,7 +1561,8 @@ impl BootstrapStore {
 
     fn refresh_policy(&self) -> Result<()> {
         let (script, output, as_output) = self.policy.as_ref().ok_or(StoreError::Policy)?;
-        let result = Command::new("python3")
+        let mut command = Command::new("python3");
+        command
             .arg(script)
             .arg("--bindings-dir")
             .arg(self.binding_directory())
@@ -1214,26 +1571,56 @@ impl BootstrapStore {
             .arg("--as-policy-output")
             .arg(as_output)
             .arg("--output")
-            .arg(output)
-            .output()?;
+            .arg(output);
+        if let Some(config) = &self.trustee_config {
+            command
+                .arg("--trustee-config")
+                .arg(config)
+                .arg("--resources-dir")
+                .arg(&self.repository)
+                .arg("--publication-journal")
+                .arg(self.state.join("trustee-publication.json"));
+        }
+        let result = command.output()?;
         if result.status.success() {
             Ok(())
+        } else if self.trustee_config.is_some() {
+            Err(StoreError::Publication(
+                String::from_utf8_lossy(&result.stderr)
+                    .lines()
+                    .last()
+                    .unwrap_or("management client failed")
+                    .chars()
+                    .take(600)
+                    .collect(),
+            ))
         } else {
             Err(StoreError::Policy)
         }
     }
 
     fn with_lock<T>(&self, op: impl FnOnce() -> Result<T>) -> Result<T> {
-        let lock = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(self.state.join(".lock"))?;
-        lock.lock_exclusive()?;
-        let result = op();
-        FileExt::unlock(&lock)?;
-        result
+        let operation = || {
+            let lock = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(self.state.join(".lock"))?;
+            lock.lock_exclusive()?;
+            let result = op();
+            FileExt::unlock(&lock)?;
+            result
+        };
+        // Filesystem transactions and bounded API publication must not occupy
+        // a Tokio worker while waiting for flock or a management response.
+        if tokio::runtime::Handle::try_current().is_ok_and(|handle| {
+            handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+        }) {
+            tokio::task::block_in_place(operation)
+        } else {
+            operation()
+        }
     }
 
     fn clean_temporary_files(&self) -> Result<()> {
@@ -1249,6 +1636,9 @@ impl BootstrapStore {
             self.state.join("workspace-owners"),
             self.state.join("pending-deletes"),
             self.state.join("workload-environments"),
+            self.state.join("launch-intents"),
+            self.state.join("active-attempts"),
+            self.state.join("pending-revocations"),
             self.repository.clone(),
         ] {
             let mut changed = false;
@@ -1299,7 +1689,7 @@ impl BootstrapStore {
         let bytes = serde_json::to_vec(&jwk)?;
         let path = self
             .repository
-            .join(local_fs_resource_key("default/bootstrap-signer/key"));
+            .join(staged_resource_key("default/bootstrap-signer/key"));
         if path.exists() {
             if read_regular(&path)? != bytes {
                 return Err(StoreError::Conflict);
@@ -1311,10 +1701,13 @@ impl BootstrapStore {
     }
 }
 
-/// Match upstream key-value-storage LocalFs: slashes become literal \x2F.
+/// Private staging names; these are not Trustee storage-backend filenames.
 /// The caller supplies a canonical resource key; URI and binding formats stay unchanged.
-pub(super) fn local_fs_resource_key(resource_key: &str) -> String {
-    resource_key.replace('/', "\\x2F")
+pub(super) fn staged_resource_key(resource_key: &str) -> String {
+    resource_key
+        .strip_prefix("default/")
+        .expect("owned resource namespace")
+        .replace('/', "-")
 }
 
 fn validate(
@@ -1749,62 +2142,151 @@ pathlib.Path(args[args.index('--output') + 1]).write_text('package policy\ndefau
     }
 
     #[test]
-    fn released_trustee_local_fs_reads_flat_bootstrap_signer_and_workspace_keys() {
+    #[ignore = "requires released Trustee processes; run tests/acceptance/check-trustee-api.py"]
+    fn released_trustee_api_driver_publication() {
+        let root =
+            PathBuf::from(std::env::var("OPENSHELL_TEST_API_STATE").expect("isolated state"));
+        let config = PathBuf::from(
+            std::env::var("OPENSHELL_TEST_TRUSTEE_CONFIG").expect("isolated API config"),
+        );
+        let renderer = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deployment/trustee/render-kbs-policy.py");
+        let store = BootstrapStore::open_with_trustee(
+            root.join("resources"),
+            root.join("signer.pk8"),
+            renderer,
+            root.join("policy.rego"),
+            root.join("as.rego"),
+            &config,
+        )
+        .unwrap();
+        if std::env::var("OPENSHELL_TEST_API_ACTION").as_deref() == Ok("revoke") {
+            store.revoke_owned_sandbox("api-sandbox", None).unwrap();
+            assert!(store.pending_revocations().unwrap().is_empty());
+        } else {
+            store
+                .record_attempt("api-sandbox", "ns", "uid", GENERATION, ATTEMPT)
+                .unwrap();
+            let published = store
+                .publish_file(
+                    BootstrapRole::Workload,
+                    GENERATION,
+                    "api-sandbox",
+                    "uid",
+                    ATTEMPT,
+                    "tls.key",
+                    b"driver-api-integration-fixture",
+                    INITDATA,
+                )
+                .unwrap();
+            fs::write(
+                root.join("receipt.json"),
+                serde_json::to_vec(&serde_json::json!({"resource_path": published.resource_path}))
+                    .unwrap(),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn trusted_launch_survives_reopen_and_rejects_replacement() {
         let (tmp, store) = fixture();
-        let published = store
+        let launch = crate::launch::LaunchIntent {
+            sandbox_id: "sandbox-launch".into(), namespace: "ns".into(), sandbox_cr_uid: "uid".into(),
+            sandbox_name: "native".into(), main_process_spec: "trusted command".into(), log_level: "info".into(),
+            agent_uid: 1000, agent_gid: 1000, volume_claim_templates: serde_json::Value::Null,
+            workload: serde_json::from_value(serde_json::json!({"apiVersion":"v1", "kind":"Pod",
+                "spec":{"containers":[{"name":"agent", "image":"approved", "command":["native"]}],
+                    "volumes":[{"name":"openshell-sandbox-bootstrap", "secret":{"secretName":"old"}}]}})).unwrap(),
+        };
+        store.record_launch(&launch).unwrap();
+        let mut altered = launch.clone();
+        altered.main_process_spec = "untrusted command".into();
+        assert!(matches!(
+            store.record_launch(&altered),
+            Err(StoreError::Conflict)
+        ));
+        drop(store);
+        let store = BootstrapStore::open_with_policies(
+            tmp.path().join("repo"),
+            tmp.path().join("state/signer.pk8"),
+            tmp.path().join("renderer.py"),
+            tmp.path().join("policy.rego"),
+            tmp.path().join("as.rego"),
+        )
+        .unwrap();
+        let restored = store.load_launch("sandbox-launch", "ns", "uid").unwrap();
+        assert!(restored == launch);
+        let pod = restored.workload_for_generation("new", &["pull-new".into()]);
+        let spec = pod.spec.unwrap();
+        assert_eq!(spec.containers[0].command, Some(vec!["native".into()]));
+        assert_eq!(
+            spec.volumes.unwrap()[0]
+                .secret
+                .as_ref()
+                .unwrap()
+                .secret_name
+                .as_deref(),
+            Some("new")
+        );
+        assert_eq!(spec.image_pull_secrets.unwrap()[0].name, "pull-new");
+        assert!(store.load_launch("different-sandbox", "ns", "uid").is_err());
+    }
+
+    #[test]
+    fn stopping_before_publication_tombstones_the_trusted_attempt() {
+        let (_tmp, store) = fixture();
+        store
+            .record_attempt("sandbox-pending", "ns", "uid", GENERATION, ATTEMPT)
+            .unwrap();
+        store.revoke_owned_sandbox("sandbox-pending", None).unwrap();
+        for role in [BootstrapRole::Workload, BootstrapRole::Supervisor] {
+            assert!(matches!(
+                store.publish_file(
+                    role,
+                    GENERATION,
+                    "sandbox-pending",
+                    "uid",
+                    ATTEMPT,
+                    "tls.key",
+                    b"must-not-be-published",
+                    INITDATA
+                ),
+                Err(StoreError::Revoked)
+            ));
+        }
+        let next = "1".repeat(64);
+        store
+            .record_attempt("sandbox-pending", "ns", "uid", RESTART_GENERATION, &next)
+            .unwrap();
+        store
             .publish_file(
                 BootstrapRole::Workload,
-                GENERATION,
-                "sandbox-flat",
-                "cr-uid",
-                ATTEMPT,
-                "auth.json",
-                b"native-bootstrap",
+                RESTART_GENERATION,
+                "sandbox-pending",
+                "uid",
+                &next,
+                "tls.key",
+                b"new-attempt",
                 INITDATA,
             )
             .unwrap();
-        let id = published.resource_uri.rsplit('/').next().unwrap();
-        let bootstrap = tmp
-            .path()
-            .join("repo")
-            .join(format!("default\\x2Fbootstrap\\x2F{id}"));
-        assert_eq!(fs::read(&bootstrap).unwrap(), b"native-bootstrap");
-        assert_eq!(
-            published.resource_path,
-            format!("resource/default/bootstrap/{id}")
-        );
-        let signer = tmp.path().join("repo/default\\x2Fbootstrap-signer\\x2Fkey");
-        let jwk: serde_json::Value = serde_json::from_slice(&fs::read(signer).unwrap()).unwrap();
-        assert_eq!(jwk["crv"], "P-256");
         store
-            .record_workspace_owner("sandbox-flat", "ns", "cr-uid")
+            .revoke_owned_sandbox("sandbox-pending", Some("unrelated-uid"))
             .unwrap();
-        store
-            .record_workspace_volume("ns", "cr-uid", "pvc", Some("pv-uid"), Some("d-workspace"))
-            .unwrap();
-        let key = store
-            .ensure_workspace_key("ns", "cr-uid", INITDATA)
-            .unwrap();
-        let workspace = tmp.path().join("repo").join(format!(
-            "default\\x2Fworkspace\\x2F{}",
-            key.resource_uri.rsplit('/').next().unwrap()
-        ));
-        assert_eq!(fs::read(&workspace).unwrap().len(), 32);
-        assert!(
-            fs::read_dir(tmp.path().join("repo")).unwrap().all(|e| e
-                .unwrap()
-                .file_type()
-                .unwrap()
-                .is_file())
-        );
-        store.revoke_sandbox_uid("sandbox-flat", "cr-uid").unwrap();
-        store.deauthorize_workspace_key("ns", "cr-uid").unwrap();
-        assert!(!bootstrap.exists());
-        assert!(!workspace.exists());
         assert!(
             store
-                .workspace_key(&workspace_hash("ns", "cr-uid"))
-                .exists()
+                .publish_file(
+                    BootstrapRole::Workload,
+                    RESTART_GENERATION,
+                    "sandbox-pending",
+                    "uid",
+                    &next,
+                    "tls.key",
+                    b"new-attempt",
+                    INITDATA
+                )
+                .is_ok()
         );
     }
 
@@ -1894,7 +2376,7 @@ pathlib.Path(args[args.index('--output') + 1]).write_text('package policy\ndefau
                 &"b".repeat(96),
             )
             .unwrap();
-        let replacement_bootstrap_serving = store.repository.join(local_fs_resource_key(
+        let replacement_bootstrap_serving = store.repository.join(staged_resource_key(
             replacement_bootstrap
                 .resource_path
                 .strip_prefix("resource/")
@@ -1909,7 +2391,7 @@ pathlib.Path(args[args.index('--output') + 1]).write_text('package policy\ndefau
         let workspace = store
             .ensure_workspace_key("namespace", "old-uid", INITDATA)
             .unwrap();
-        let old_workspace_serving = store.repository.join(local_fs_resource_key(
+        let old_workspace_serving = store.repository.join(staged_resource_key(
             workspace.resource_path.strip_prefix("resource/").unwrap(),
         ));
         let private_key = store.workspace_key(&workspace_hash("namespace", "old-uid"));
@@ -1938,7 +2420,7 @@ pathlib.Path(args[args.index('--output') + 1]).write_text('package policy\ndefau
         let replacement = store
             .ensure_workspace_key("namespace", "replacement-uid", &"b".repeat(96))
             .unwrap();
-        let replacement_serving = store.repository.join(local_fs_resource_key(
+        let replacement_serving = store.repository.join(staged_resource_key(
             replacement.resource_path.strip_prefix("resource/").unwrap(),
         ));
         assert!(matches!(
@@ -1969,7 +2451,7 @@ pathlib.Path(args[args.index('--output') + 1]).write_text('package policy\ndefau
         assert!(
             !store
                 .repository
-                .join(local_fs_resource_key(
+                .join(staged_resource_key(
                     old.resource_path.strip_prefix("resource/").unwrap()
                 ))
                 .exists()
@@ -1977,7 +2459,7 @@ pathlib.Path(args[args.index('--output') + 1]).write_text('package policy\ndefau
         assert!(
             !store
                 .repository
-                .join(local_fs_resource_key(
+                .join(staged_resource_key(
                     supervisor.resource_path.strip_prefix("resource/").unwrap()
                 ))
                 .exists()
@@ -1998,7 +2480,7 @@ pathlib.Path(args[args.index('--output') + 1]).write_text('package policy\ndefau
         assert!(
             !reopened
                 .repository
-                .join(local_fs_resource_key(
+                .join(staged_resource_key(
                     old.resource_path.strip_prefix("resource/").unwrap()
                 ))
                 .exists()
@@ -2033,7 +2515,7 @@ pathlib.Path(args[args.index('--output') + 1]).write_text('package policy\ndefau
                 INITDATA,
             )
             .unwrap();
-        let resource = store.repository.join(local_fs_resource_key(
+        let resource = store.repository.join(staged_resource_key(
             published.resource_path.strip_prefix("resource/").unwrap(),
         ));
         let marker = store
@@ -2109,7 +2591,7 @@ pathlib.Path(args[args.index('--output') + 1]).write_text('package policy\ndefau
             assert!(
                 !store
                     .repository
-                    .join(local_fs_resource_key(
+                    .join(staged_resource_key(
                         old.resource_path.strip_prefix("resource/").unwrap()
                     ))
                     .exists()
@@ -2118,7 +2600,7 @@ pathlib.Path(args[args.index('--output') + 1]).write_text('package policy\ndefau
         assert!(
             store
                 .repository
-                .join(local_fs_resource_key(
+                .join(staged_resource_key(
                     replacement.resource_path.strip_prefix("resource/").unwrap()
                 ))
                 .exists()
@@ -2208,7 +2690,7 @@ pathlib.Path(args[args.index('--output') + 1]).write_text('package policy\ndefau
             &read_regular(
                 &store
                     .repository
-                    .join(local_fs_resource_key("default/bootstrap-signer/key")),
+                    .join(staged_resource_key("default/bootstrap-signer/key")),
             )
             .unwrap(),
         )

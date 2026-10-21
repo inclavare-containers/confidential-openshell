@@ -185,3 +185,50 @@ class MeasuredPolicyBindingTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class TrustedLaunchTests(unittest.TestCase):
+    def pair(self):
+        expected = supervisor_pod()
+        expected['metadata']['name'] = 'supervisor'
+        c = expected['spec']['containers'][0]
+        c.update(command=['/openshell-supervisor'], args=['--bootstrap', '/private/input'],
+                 env=[{'name': 'RUST_LOG', 'value': 'info'}], workingDir='/')
+        expected['spec'].pop('overhead')
+        actual = policy._default_pod(expected)
+        actual['spec']['overhead'] = {'cpu': '250m', 'memory': '120Mi'}
+        actual['spec']['containers'][0]['resources'] = {
+            'requests': {'kata.peerpods.io/vm': '1'}, 'limits': {'kata.peerpods.io/vm': '1'}}
+        return expected, actual
+
+    def test_defaults_and_placement_do_not_change_trusted_execution(self):
+        expected, actual = self.pair()
+        actual['spec']['nodeSelector'] = {'node.kubernetes.io/worker': ''}
+        actual['spec']['tolerations'] = [{'key': 'node.kubernetes.io/not-ready', 'operator': 'Exists'}]
+        actual['metadata']['annotations'] = {'untrusted': 'must-not-enter-policy'}
+        pod = policy._trusted_policy_pod(expected, actual)
+        self.assertNotIn('untrusted', pod['metadata']['annotations'])
+        self.assertNotIn('nodeSelector', pod['spec'])
+        self.assertEqual(pod['spec']['containers'][0]['command'], ['/openshell-supervisor'])
+        policy._validate_pod(pod, 'supervisor', 'kata-remote')
+
+    def test_execution_mutations_fail_before_policy_tool_or_authorization(self):
+        mutations = [
+            lambda p: p['spec']['containers'][0].update(image='evil/image@sha256:' + 'b'*64),
+            lambda p: p['spec']['containers'][0].update(command=['/bin/sh']),
+            lambda p: p['spec']['containers'][0].update(args=['--different']),
+            lambda p: p['spec']['containers'][0].update(workingDir='/tmp'),
+            lambda p: p['spec']['containers'][0]['env'][0].update(value='debug'),
+            lambda p: p['spec']['containers'][0].update(readinessProbe={'exec': {'command': ['/bin/sh']}}),
+            lambda p: p['spec']['containers'][0].update(lifecycle={'postStart': {'exec': {'command': ['/bin/sh']}}}),
+            lambda p: p['spec']['containers'][0]['volumeMounts'][0].update(readOnly=False),
+            lambda p: p['spec']['volumes'][0]['secret'].update(secretName='other'),
+            lambda p: p['spec'].update(ephemeralContainers=[{'name': 'extra', 'image': IMAGE}]),
+        ]
+        for index, mutate in enumerate(mutations):
+            with self.subTest(mutation=index):
+                expected, actual = self.pair()
+                mutate(actual)
+                with mock.patch.object(policy.subprocess, 'run') as tool:
+                    with self.assertRaisesRegex(policy.PolicyError, 'execution differs'):
+                        policy._trusted_policy_pod(expected, actual)
+                    tool.assert_not_called()

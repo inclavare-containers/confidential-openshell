@@ -3,6 +3,7 @@
 
 mod bootstrap;
 mod confidential;
+mod launch;
 // Compile unchanged modules from the pinned upstream checkout. They resolve
 // crate:: references against this driver and retain their upstream tests.
 #[path = "../../../repos/openshell/crates/openshell-driver-kubernetes/src/config.rs"]

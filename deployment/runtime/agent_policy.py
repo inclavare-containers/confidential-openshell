@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate a Kata 4.2 policy for the actual, still-gated OpenShell Pod.
+"""Generate a Kata 4.2 policy from the trusted OpenShell launch template.
 
 The confidential driver calls this program before it adds initdata to a Pod.
 One Pod JSON document is read from stdin; only Rego is written to stdout.
@@ -67,7 +67,94 @@ def _read_pod() -> dict:
         raise PolicyError(f"invalid Pod JSON: {exc}") from exc
     if not isinstance(pod, dict):
         raise PolicyError("Pod JSON must be an object")
+    if "expected" in pod or "admitted" in pod:
+        if set(pod) != {"expected", "admitted"}:
+            raise PolicyError("policy envelope requires expected and admitted Pods")
+        return _trusted_policy_pod(pod["expected"], pod["admitted"])
+    # Direct CLI input is an operator-supplied trusted Pod. The driver always
+    # supplies the envelope above; U cannot select this operator-only path.
     return pod
+
+
+def _default_pod(pod: dict) -> dict:
+    result = copy.deepcopy(pod)
+    spec = result["spec"]
+    for key, value in {"restartPolicy": "Always", "dnsPolicy": "ClusterFirst",
+                       "terminationGracePeriodSeconds": 30, "serviceAccountName": "default",
+                       "hostNetwork": False, "hostPID": False, "hostIPC": False,
+                       "shareProcessNamespace": False}.items():
+        spec.setdefault(key, value)
+    alias = spec.pop("serviceAccount", spec["serviceAccountName"])
+    if alias != spec["serviceAccountName"]:
+        raise PolicyError("service account aliases disagree")
+    # U controls placement, not execution. These fields are not policy inputs.
+    for key in ("nodeName", "nodeSelector", "tolerations", "affinity", "schedulerName",
+                "priority", "priorityClassName", "preemptionPolicy", "topologySpreadConstraints"):
+        spec.pop(key, None)
+    for container in spec.get("containers", []) + spec.get("initContainers", []):
+        for key, value in {"imagePullPolicy": "IfNotPresent", "terminationMessagePath": "/dev/termination-log",
+                           "terminationMessagePolicy": "File", "resources": {}}.items():
+            container.setdefault(key, value)
+        for port in container.get("ports", []):
+            port.setdefault("protocol", "TCP")
+        for mount in container.get("volumeMounts", []):
+            mount.setdefault("readOnly", False)
+        for entry in container.get("env", []):
+            if "fieldRef" in entry.get("valueFrom", {}):
+                entry["valueFrom"]["fieldRef"].setdefault("apiVersion", "v1")
+        for key in ("livenessProbe", "readinessProbe", "startupProbe"):
+            if key not in container:
+                continue
+            probe = container[key]
+            for field, value in {"failureThreshold": 3, "successThreshold": 1,
+                                 "periodSeconds": 10, "timeoutSeconds": 1, "initialDelaySeconds": 0}.items():
+                probe.setdefault(field, value)
+            if "httpGet" in probe:
+                probe["httpGet"].setdefault("scheme", "HTTP")
+        security = container.get("securityContext")
+        if security is not None:
+            security.setdefault("privileged", False)
+    for volume in spec.get("volumes", []):
+        for key in ("secret", "configMap", "downwardAPI", "projected"):
+            if key in volume:
+                source = volume[key]
+                source.setdefault("defaultMode", 420)
+                for item in source.get("items", []):
+                    if "fieldRef" in item:
+                        item["fieldRef"].setdefault("apiVersion", "v1")
+        if "persistentVolumeClaim" in volume:
+            volume["persistentVolumeClaim"].setdefault("readOnly", False)
+    spec["volumes"] = sorted(spec.get("volumes", []), key=lambda v: v["name"])
+    if not spec.get("imagePullSecrets"):
+        spec.pop("imagePullSecrets", None)
+    return result
+
+
+def _trusted_policy_pod(expected: dict, admitted: dict) -> dict:
+    """Accept only execution-preserving defaults; generate from T's input."""
+    if not all(isinstance(p, dict) and isinstance(p.get("spec"), dict)
+               and isinstance(p.get("metadata"), dict) for p in (expected, admitted)):
+        raise PolicyError("trusted and admitted Pods are required")
+    for key in ("name", "namespace"):
+        if admitted["metadata"].get(key) != expected["metadata"].get(key):
+            raise PolicyError(f"admitted Pod changed trusted {key}")
+    for key, value in expected["metadata"].get("labels", {}).items():
+        if admitted["metadata"].get("labels", {}).get(key) != value:
+            raise PolicyError("admitted Pod changed trusted labels")
+    trusted = _default_pod(expected)
+    actual = _default_pod(admitted)
+    # Exactly the mutation performed by the pinned PeerPods resource webhook.
+    trusted["spec"]["overhead"] = {"cpu": "250m", "memory": "120Mi"}
+    for container in trusted["spec"].get("containers", []) + trusted["spec"].get("initContainers", []):
+        container["resources"] = {}
+    trusted["spec"]["containers"][0]["resources"] = {
+        "requests": {"kata.peerpods.io/vm": "1"}, "limits": {"kata.peerpods.io/vm": "1"}}
+    if trusted["spec"] != actual["spec"]:
+        # Do not print the diff: it can contain user-supplied command arguments.
+        raise PolicyError("admitted Pod execution differs from trusted launch intent")
+    trusted["metadata"].setdefault("annotations", {})[INITDATA_ANNOTATION] = ""
+    trusted.pop("status", None)
+    return trusted
 
 
 def _names(containers: object, label: str) -> list[str]:

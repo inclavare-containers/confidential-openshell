@@ -202,8 +202,17 @@ def main() -> None:
     parser.add_argument("--workspace-bindings-dir", type=Path)
     parser.add_argument("--as-policy-output", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--trustee-config", type=Path)
+    parser.add_argument("--resources-dir", type=Path)
+    parser.add_argument("--publication-journal", type=Path)
     args = parser.parse_args()
     render(args.bindings_dir, args.output, args.as_policy_output, args.workspace_bindings_dir)
+    if args.trustee_config:
+        if not args.resources_dir or not args.publication_journal:
+            parser.error("API publication requires resources-dir and publication-journal")
+        from admin_client import AdminClient, staged_resources, synchronize
+        synchronize(AdminClient(args.trustee_config), staged_resources(args.resources_dir),
+                    args.output.read_bytes(), args.as_policy_output.read_bytes(), args.publication_journal)
 
 
 if __name__ == "__main__":

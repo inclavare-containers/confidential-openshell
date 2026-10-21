@@ -80,32 +80,8 @@ impl GuestInitdata {
             .get("cdh.toml")
             .and_then(toml::Value::as_str)
             .ok_or_else(|| "guest initdata lacks cdh.toml".to_string())?;
-        let aa: toml::Value = toml::from_str(
-            data.get("aa.toml")
-                .and_then(toml::Value::as_str)
-                .ok_or_else(|| "guest initdata lacks aa.toml".to_string())?,
-        )
-        .map_err(|error| format!("parse aa.toml: {error}"))?;
         let mut cdh: toml::Value =
             toml::from_str(cdh_raw).map_err(|error| format!("parse cdh.toml: {error}"))?;
-        if aa
-            .get("token_configs")
-            .and_then(|value| value.get("kbs"))
-            .and_then(|value| value.get("cert"))
-            .and_then(toml::Value::as_str)
-            .map(str::trim)
-            != Some(ca.trim())
-            || cdh
-                .get("kbc")
-                .and_then(|value| value.get("kbs_cert"))
-                .and_then(toml::Value::as_str)
-                .map(str::trim)
-                != Some(ca.trim())
-        {
-            return Err(
-                "AA and CDH KBS trust roots must equal the trusted registry CA".to_string(),
-            );
-        }
         let cdh_table = cdh
             .as_table_mut()
             .ok_or_else(|| "cdh.toml must be a table".to_string())?;
@@ -115,14 +91,6 @@ impl GuestInitdata {
         let image_table = image
             .as_table_mut()
             .ok_or_else(|| "cdh.toml [image] must be a table".to_string())?;
-        if let Some(existing) = image_table.get("extra_root_certificates") {
-            let roots = existing
-                .as_array()
-                .ok_or_else(|| "cdh.toml image CA list must be an array".to_string())?;
-            if roots.len() != 1 || roots[0].as_str().map(str::trim) != Some(ca.trim()) {
-                return Err("CDH image registry trust root differs from trusted CA".to_string());
-            }
-        }
         image_table.insert(
             "extra_root_certificates".to_string(),
             toml::Value::Array(vec![toml::Value::String(ca)]),
@@ -345,11 +313,19 @@ mod tests {
                 .pem(),
         )
         .unwrap();
-        assert!(
-            GuestInitdata::load(&base)
+        let independent = GuestInitdata::load(&base)
+            .unwrap()
+            .with_registry_ca(&other_ca)
+            .unwrap();
+        let cdh: toml::Value =
+            toml::from_str(independent.base["data"]["cdh.toml"].as_str().unwrap()).unwrap();
+        assert_eq!(cdh["kbc"]["kbs_cert"].as_str().unwrap().trim(), ca.trim());
+        assert_eq!(
+            cdh["image"]["extra_root_certificates"][0]
+                .as_str()
                 .unwrap()
-                .with_registry_ca(&other_ca)
-                .is_err()
+                .trim(),
+            std::fs::read_to_string(&other_ca).unwrap().trim()
         );
         let generation = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let attempt = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
