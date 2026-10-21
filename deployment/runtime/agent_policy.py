@@ -339,6 +339,11 @@ def _genpolicy_pod(pod: dict, role: str) -> dict:
         # tool input; _bind_sealed_volume removes it from the measured policy.
         result["spec"]["securityContext"]["supplementalGroups"] = [0]
     for volume in result["spec"].get("volumes", []):
+        pvc = volume.get("persistentVolumeClaim")
+        if pvc is not None and pvc.get("readOnly") is False:
+            # Comparison expands the Kubernetes default. Kata 4.2's PVC
+            # schema omits this field; absence has the same read-write meaning.
+            pvc.pop("readOnly")
         downward = volume.get("downwardAPI")
         if downward is not None:
             # The admitted volume above is a public Pod UID file with the

@@ -223,6 +223,19 @@ class TrustedLaunchTests(unittest.TestCase):
         with self.assertRaises(policy.PolicyError):
             policy._trusted_policy_pod(expected, actual)
 
+    def test_comparison_defaults_do_not_enter_unsupported_kata_pvc_schema(self):
+        expected, actual = self.pair()
+        volume = {'name': 'workspace', 'persistentVolumeClaim': {'claimName': 'workspace-test'}}
+        expected['spec']['volumes'].append(copy.deepcopy(volume))
+        actual['spec']['volumes'].append(copy.deepcopy(volume))
+        trusted = policy._trusted_policy_pod(expected, actual)
+        rendered = policy._genpolicy_pod(trusted, 'supervisor')
+        pvc = next(v['persistentVolumeClaim'] for v in rendered['spec']['volumes'] if v['name'] == 'workspace')
+        self.assertEqual(pvc, {'claimName': 'workspace-test'})
+        actual['spec']['volumes'][-1]['persistentVolumeClaim']['readOnly'] = True
+        with self.assertRaises(policy.PolicyError):
+            policy._trusted_policy_pod(expected, actual)
+
     def test_execution_mutations_fail_before_policy_tool_or_authorization(self):
         mutations = [
             lambda p: p['spec']['containers'][0].update(image='evil/image@sha256:' + 'b'*64),
