@@ -1,8 +1,8 @@
-# Copy privately and set the exact approved inference host and port.
+# Bailian's OpenAI-compatible API; use the host of your selected Base URL.
 # These executable paths belong to the digest-pinned Community base image.
-id: coding-openai
-display_name: Coding harness inference
-description: Approved OpenAI-compatible endpoint for OpenCode and Codex
+id: bailian-openai
+display_name: Bailian OpenAI-compatible API
+description: Bailian access for OpenCode and Codex in the Community image
 category: inference
 inference_capable: true
 credentials:
@@ -15,7 +15,7 @@ credentials:
 discovery:
   credentials: [api_key]
 endpoints:
-  - host: inference.example.internal
+  - host: dashscope.aliyuncs.com
     port: 443
     protocol: rest
     access: read-write

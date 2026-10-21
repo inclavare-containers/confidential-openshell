@@ -1,7 +1,7 @@
-# Copy privately and set the exact approved inference host and port.
-id: coding-anthropic
-display_name: Claude Code inference
-description: Approved Anthropic-compatible endpoint for Claude Code
+# Bailian's Anthropic-compatible API; use the host of your selected Base URL.
+id: bailian-anthropic
+display_name: Bailian Anthropic-compatible API
+description: Bailian access for Claude Code in the Community image
 category: inference
 inference_capable: true
 credentials:
@@ -14,7 +14,7 @@ credentials:
 discovery:
   credentials: [api_key]
 endpoints:
-  - host: inference.example.internal
+  - host: dashscope.aliyuncs.com
     port: 443
     protocol: rest
     access: read-write
