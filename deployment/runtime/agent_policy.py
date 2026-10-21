@@ -87,6 +87,8 @@ def _default_pod(pod: dict) -> dict:
     alias = spec.pop("serviceAccount", spec["serviceAccountName"])
     if alias != spec["serviceAccountName"]:
         raise PolicyError("service account aliases disagree")
+    if "securityContext" in spec:
+        spec["securityContext"].setdefault("supplementalGroups", [])
     # U controls placement, not execution. These fields are not policy inputs.
     for key in ("nodeName", "nodeSelector", "tolerations", "affinity", "schedulerName",
                 "priority", "priorityClassName", "preemptionPolicy", "topologySpreadConstraints"):
@@ -100,6 +102,8 @@ def _default_pod(pod: dict) -> dict:
         for mount in container.get("volumeMounts", []):
             mount.setdefault("readOnly", False)
         for entry in container.get("env", []):
+            if "valueFrom" not in entry:
+                entry.setdefault("value", "")
             if "fieldRef" in entry.get("valueFrom", {}):
                 entry["valueFrom"]["fieldRef"].setdefault("apiVersion", "v1")
         for key in ("livenessProbe", "readinessProbe", "startupProbe"):

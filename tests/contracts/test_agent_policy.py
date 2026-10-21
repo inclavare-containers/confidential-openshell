@@ -211,6 +211,18 @@ class TrustedLaunchTests(unittest.TestCase):
         self.assertEqual(pod['spec']['containers'][0]['command'], ['/openshell-supervisor'])
         policy._validate_pod(pod, 'supervisor', 'kata-remote')
 
+    def test_apiserver_omits_empty_env_values_and_supplemental_groups(self):
+        expected, actual = self.pair()
+        expected['spec']['securityContext']['supplementalGroups'] = []
+        expected['spec']['containers'][0]['env'].append({'name': 'EMPTY', 'value': ''})
+        actual['spec']['securityContext'].pop('supplementalGroups', None)
+        actual['spec']['containers'][0]['env'].append({'name': 'EMPTY'})
+        result = policy._trusted_policy_pod(expected, actual)
+        self.assertEqual(result['spec']['containers'][0]['env'][-1]['value'], '')
+        actual['spec']['securityContext']['supplementalGroups'] = [0]
+        with self.assertRaises(policy.PolicyError):
+            policy._trusted_policy_pod(expected, actual)
+
     def test_execution_mutations_fail_before_policy_tool_or_authorization(self):
         mutations = [
             lambda p: p['spec']['containers'][0].update(image='evil/image@sha256:' + 'b'*64),
