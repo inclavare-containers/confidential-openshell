@@ -58,12 +58,23 @@ def main():
     image = cloud.wait('ECS image import', get_image, lambda d: d['Status'] == 'Available')
     validate_image(image)
     cloud.save(podvm_image_id=image_id)
+    # Exercise the actual TDX launch parameters without allocating an instance.
+    for key in ('podvm_vswitch_id', 'podvm_security_group_id'):
+        require(cloud.state.get(key), 'Run ./cos cloud network before checking the guest image.')
+    print('Checking ECS TDX launch with DryRun (no instance is created)…', flush=True)
+    cloud.api('ecs', 'RunInstances', RegionId=cloud.region, DryRun=True,
+              InstanceChargeType='PostPaid', InstanceType=cloud.config['podvm_instance_type'],
+              ImageId=image_id, VSwitchId=cloud.state['podvm_vswitch_id'],
+              SecurityGroupId=cloud.state['podvm_security_group_id'], Amount=1, MinAmount=1,
+              **{'SystemDisk.Category': 'cloud_essd', 'SystemDisk.Size': '40',
+                 'SecurityOptions.ConfidentialComputingMode': 'TDX'},
+              absent='ErrorCode: DryRunOperation')
     write(OPERATOR / 'podvm-image-id.txt', image_id + '\n')
     write(OPERATOR / 'podvm-image.json', {
         'region': cloud.region, 'image_id': image_id, 'references_sha256': sha256(refs),
         'qcow2_sha256': qcow_digest, 'handoff_sha256': sha256(HANDOFF / 'SHA256SUMS'),
     })
-    print(f'PodVM image ready: {image_id}; image/reference binding: {OPERATOR / "podvm-image.json"}')
+    print(f'PodVM image ready: {image_id}; TDX launch DryRun passed; image/reference binding: {OPERATOR / "podvm-image.json"}')
 
 
 if __name__ == '__main__':

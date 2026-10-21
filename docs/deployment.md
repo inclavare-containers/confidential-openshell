@@ -55,8 +55,8 @@ OSS bucket is required.
 ./cos cluster create
 ```
 
-Creates a **paid ACK Pro cluster and pay-as-you-go worker**. It selects a zone with
-worker/TDX capacity, creates a dedicated VPC and worker/Pod vSwitches, and configures
+Creates a **paid ACK Pro cluster and pay-as-you-go worker**. It checks ECS inventory
+within the documented TDX zones, creates a dedicated VPC and worker/Pod vSwitches, and configures
 public API access, Terway NetworkPolicy, RRSA, storage add-ons, worker egress and
 Ubuntu 24.04/containerd. The default is one worker.
 
@@ -65,7 +65,9 @@ are saved automatically; rerunning resumes the same deployment.
 
 The default VPC CIDR is `10.64.0.0/16`. Pass a different private CIDR with
 `--vpc-cidr` if planned network connections would overlap. Optional `--zone`
-chooses an available zone; `--name` chooses a resource-name prefix.
+chooses a supported zone with available inventory; `--name` chooses a resource-name prefix.
+The default Beijing `ecs.g9i.xlarge` profile uses **Zone I**; ordinary ECS availability
+in other zones does not imply TDX support.
 `--private-api` requires routed private access from this host to ACK.
 
 Continue with [step 4](#4-prepare-cloud-resources).
@@ -116,7 +118,9 @@ For a built guest, creates a private OSS import bucket, ensures ECS's standard
 import role, uploads the QCOW2 and waits for the image to become Available.
 A selected existing ImageID is checked directly, skipping bucket/import work.
 Success prints the ImageID and saves its binding to the release references.
-Both paths require Linux/x86_64, UEFI and NVMe support.
+Both paths require Linux/x86_64, UEFI and NVMe support. The step also runs an ECS
+TDX launch **DryRun** with the selected image, instance type and PodVM network.
+It creates no VM and reports cloud-side launch errors before component installation.
 
 ### Runtime identities
 

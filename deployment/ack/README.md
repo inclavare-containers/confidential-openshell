@@ -6,13 +6,17 @@ copy generated resource IDs into configuration templates.
 
 ## New cluster
 
-`./cos cluster create` selects worker/TDX capacity, saves inputs and creates a
+`./cos cluster create` selects a documented TDX zone with ECS inventory, saves inputs and creates a
 dedicated VPC, worker/Pod vSwitches, ACK Pro and an Ubuntu node pool. ACK enables
 RRSA, Terway NetworkPolicy, storage add-ons and worker SNAT.
 `./cos cloud network` creates the PodVM vSwitch/security group and inherits egress.
 
-Zone selection uses official ECS
-[DescribeAvailableResource](https://help.aliyun.com/en/ecs/developer-reference/api-ecs-2014-05-26-describeavailableresource).
+Zone selection intersects the published [TDX region/family support](https://help.aliyun.com/zh/ecs/user-guide/build-a-tdx-confidential-computing-environment)
+with official ECS [DescribeAvailableResource](https://help.aliyun.com/en/ecs/developer-reference/api-ecs-2014-05-26-describeavailableresource)
+inventory. The default Beijing `ecs.g9i.xlarge` profile selects Zone I.
+`./cos cloud image` then checks the actual TDX launch parameters with
+[RunInstances DryRun](https://help.aliyun.com/zh/ecs/developer-reference/api-ecs-2014-05-26-runinstances)
+without creating a VM. Ordinary ECS inventory alone cannot establish TDX availability.
 Network creation uses [CreateVpc](https://help.aliyun.com/en/vpc/developer-reference/api-vpc-2016-04-28-createvpc)
 and [CreateVSwitch](https://help.aliyun.com/en/vpc/api-createvswitch), with saved IDs,
 idempotency tokens and availability waits before dependent operations.

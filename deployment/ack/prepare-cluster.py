@@ -6,7 +6,7 @@ import os
 import subprocess
 
 from cloud import Cloud, OPERATOR, require, run, write
-from network import create_network
+from network import create_network, require_tdx_zone
 
 
 def kubectl(env, *args):
@@ -84,6 +84,8 @@ def main():
     args = parser.parse_args()
     cloud = Cloud()
     config = cloud.config
+    if config.get('zone_id'):
+        require_tdx_zone(cloud.region, config['podvm_instance_type'], config['zone_id'])
     cluster = cloud.state.get('cluster_id') or config.get('cluster_id')
     require(cluster or args.create, 'Set cluster_id in ack.json, or use --create to create a new paid cluster.')
     if not cluster:
@@ -155,6 +157,8 @@ def main():
                lambda d: bool(d['items']) and all(any(c['type'] == 'Ready' and c['status'] == 'True'
                for c in n['status'].get('conditions', [])) for n in d['items']))
     validate_nodes(nodes)
+    require_tdx_zone(cloud.region, config['podvm_instance_type'],
+                     nodes['items'][0]['metadata']['labels']['topology.kubernetes.io/zone'])
     network = json.loads(kubectl(env, '-n', 'kube-system', 'get', 'configmap', 'eni-config', '-o', 'json'))
     eni = json.loads(network['data']['eni_conf'])
     require(str(eni.get('disable_network_policy', False)).lower() == 'false',

@@ -133,6 +133,10 @@ class CloudFixture:
             return {'Images': {'Image': [deepcopy(self.ecs_image)]}}
         if operation == 'ImportImage':
             return {'ImageId': 'm-imported'}
+        if operation == 'RunInstances':
+            self.assertIs(args['DryRun'], True)
+            self.assertEqual(args['SecurityOptions.ConfidentialComputingMode'], 'TDX')
+            return None
         if operation == 'GetCallerIdentity':
             return {'AccountId': '123'}
         if operation == 'GetRole':
@@ -338,6 +342,9 @@ class Setup(CloudFixture, unittest.TestCase):
                     return {'AccountId': '123'}
                 self.assertEqual(operation, 'DescribeAvailableResource')
                 return {'AvailableZones': {'AvailableZone': [
+                    {'ZoneId': 'cn-beijing-d', 'Status': 'Available', 'AvailableResources': {'AvailableResource': [
+                        {'Type': 'InstanceType', 'SupportedResources': {'SupportedResource': [
+                            {'Value': args['InstanceType'], 'Status': 'Available'}]}}]}},
                     {'ZoneId': 'cn-beijing-a', 'Status': 'Available', 'AvailableResources': {'AvailableResource': [
                         {'Type': 'InstanceType', 'SupportedResources': {'SupportedResource': [
                             {'Value': args['InstanceType'], 'Status': 'SoldOut'}]}}]}},
@@ -356,8 +363,28 @@ class Setup(CloudFixture, unittest.TestCase):
         self.assertTrue(config['oss_bucket'].startswith('cos-123-'))
         self.assertFalse(any(op.startswith('Create') for op in calls))
         args.zone = 'cn-beijing-a'
-        with self.assertRaisesRegex(SystemExit, 'no matching capacity'):
+        with self.assertRaisesRegex(SystemExit, 'does not support the configured TDX profile'):
             inputs.discover(Client(), args)
+        args.zone = 'cn-beijing-d'
+        with self.assertRaisesRegex(SystemExit, 'cn-beijing-i'):
+            inputs.discover(Client(), args)
+
+    def test_ordinary_inventory_cannot_select_a_zone_without_tdx_support(self):
+        from unittest.mock import Mock
+        client = Mock(region='cn-beijing')
+        client.api.return_value = {'AvailableZones': {'AvailableZone': [
+            {'ZoneId': 'cn-beijing-d', 'AvailableResources': {'AvailableResource': [
+                {'Type': 'InstanceType', 'SupportedResources': {'SupportedResource': [
+                    {'Value': 'ecs.g9i.xlarge', 'Status': 'Available'}]}}]}}]}}
+        with self.assertRaisesRegex(SystemExit, 'No zone currently'):
+            inputs.select_zone(client, self.config)
+
+    def test_unsupported_saved_zone_fails_before_creating_a_cluster(self):
+        self.config.update(cluster_id='', zone_id='cn-beijing-d')
+        self.inputs()
+        with self.assertRaisesRegex(SystemExit, 'cn-beijing-i'):
+            self.prepare('--create')
+        self.assertFalse(any(op.startswith('Create') for op, _ in self.calls))
 
     def test_kubectl_deadline_is_bounded_and_reports_how_to_resume(self):
         env = {'KUBECONFIG': str(self.operator / 'administrator-kubeconfig')}
@@ -402,7 +429,8 @@ class Setup(CloudFixture, unittest.TestCase):
         self.selection.update(podvm_mode='import', guest='guest.qcow2', podvm_image_id='')
         cloud.write(self.handoff / 'outputs/guest.qcow2', 'qcow fixture')
         self.inputs()
-        cloud.Cloud().save(oss_bucket='private-test', image_import_role_arn='arn-import')
+        cloud.Cloud().save(oss_bucket='private-test', image_import_role_arn='arn-import',
+                           podvm_vswitch_id='vsw-podvm', podvm_security_group_id='sg-podvm')
         original_api = self.api
         states = iter(('Creating', 'Available', 'Available'))
         def importing_api(client, product, operation, **args):
@@ -424,6 +452,25 @@ class Setup(CloudFixture, unittest.TestCase):
         binding = cloud.read(self.operator / 'podvm-image.json')
         self.assertEqual(binding['image_id'], 'm-imported')
         self.assertEqual(binding['references_sha256'], cloud.sha256(self.handoff / 'outputs/refs.json'))
+        launches = [a for op, a in self.calls if op == 'RunInstances']
+        self.assertEqual(len(launches), 2)
+        self.assertTrue(all(a['DryRun'] is True and a['ImageId'] == 'm-imported' and
+                            a['VSwitchId'] == 'vsw-podvm' and a['SecurityGroupId'] == 'sg-podvm'
+                            for a in launches))
+
+    def test_tdx_launch_failure_does_not_publish_an_image_ready_binding(self):
+        cloud.Cloud().save(podvm_vswitch_id='vsw-podvm', podvm_security_group_id='sg-podvm')
+        original_api = self.api
+        def rejected_launch(client, product, operation, **args):
+            if operation == 'RunInstances':
+                self.assertIs(args['DryRun'], True)
+                raise SystemExit('InvalidResourceType.NotSupported')
+            return original_api(product, operation, **args)
+        with patch.object(sys, 'argv', ['prepare-image.py']), patch.object(cloud.Cloud, 'api', rejected_launch):
+            with self.assertRaisesRegex(SystemExit, 'InvalidResourceType.NotSupported'):
+                image.main()
+        self.assertFalse((self.operator / 'podvm-image.json').exists())
+        self.assertFalse((self.operator / 'podvm-image-id.txt').exists())
 
     def test_failed_image_import_does_not_produce_a_ready_binding(self):
         self.ecs_image['Status'] = 'CreateFailed'

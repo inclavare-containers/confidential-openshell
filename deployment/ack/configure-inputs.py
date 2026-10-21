@@ -8,7 +8,7 @@ import re
 import secrets
 
 from cloud import Client, OPERATOR, ROOT, read, require, write
-from network import network_config, select_zone
+from network import network_config, require_tdx_zone, select_zone
 
 
 def free_cidrs(vpc_cidr, switches, count):
@@ -37,10 +37,12 @@ def discover(client, args):
                                       if not ipaddress.ip_network(c).overlaps(ipaddress.ip_network(config['vpc_cidr'])))
         return config, {'region': client.region, 'zone_id': config['zone_id']}
     require(args.cluster_id, 'Select --new or --cluster-id.')
+    config = read(ROOT / 'deployment/ack/ack.example.json')
     cluster = client.api('cs', 'DescribeClusterDetail', ClusterId=args.cluster_id)
     require(cluster['region_id'] == client.region, 'ACK and the selected PodVM image must use the same region.')
     worker_switch = cluster['vswitch_ids'][0]
     switch = client.api('vpc', 'DescribeVSwitchAttributes', RegionId=client.region, VSwitchId=worker_switch)
+    require_tdx_zone(client.region, config['podvm_instance_type'], switch['ZoneId'])
     vpc_id = switch['VpcId']
     require(vpc_id == cluster['vpc_id'], 'Worker vSwitch must be in the selected ACK VPC.')
     for selected in (args.pod_vswitch_id, args.podvm_vswitch_id):
@@ -58,7 +60,6 @@ def discover(client, args):
         page += 1
     needed = int(not args.podvm_vswitch_id)
     cidrs = iter(free_cidrs(vpc['CidrBlock'], switches, needed) if needed else [])
-    config = read(ROOT / 'deployment/ack/ack.example.json')
     config.update(name=args.name, cluster_id=args.cluster_id,
                   ack_api_access=args.ack_api_access, oss_endpoint_network=args.oss_endpoint_network,
                   worker_vswitch_id=worker_switch,
