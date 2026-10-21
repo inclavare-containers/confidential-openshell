@@ -72,11 +72,11 @@ def main():
     if (not isinstance(aa_ca, str) or not isinstance(cdh_ca, str) or
         not isinstance(image_cas, list) or len(image_cas) != 1 or
         not isinstance(image_cas[0], str) or
-        not aa_ca.strip() or aa_ca.strip() != cdh_ca.strip() or
-        aa_ca.strip() != image_cas[0].strip()):
-        raise ValueError("measured AA, CDH, and registry CA must match")
+        not aa_ca.strip() or aa_ca.strip() != cdh_ca.strip()):
+        raise ValueError("measured AA and CDH KBS CA must match; registry CA is independent")
     try:
         ssl.PEM_cert_to_DER_cert(aa_ca.strip())
+        ssl.PEM_cert_to_DER_cert(image_cas[0].strip())
     except ValueError as error:
         raise ValueError("measured registry CA is not a PEM certificate") from error
     aa_url = aa_kbs.get("url")

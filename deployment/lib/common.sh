@@ -26,6 +26,25 @@ import ipaddress, sys
 ip = ipaddress.IPv4Address(sys.argv[1])
 assert not (ip.is_loopback or ip.is_unspecified or ip.is_multicast), 'HOST_IP must be a cloud-reachable unicast IPv4'
 PY
+    local client=/etc/openshell-confidential/trustee-client.json
+    if [[ -f $client ]]; then
+        local -a trustee_values
+        mapfile -t trustee_values < <(python3 - "$client" <<'PYCLIENT'
+import json, sys
+settings = json.load(open(sys.argv[1]))
+print(settings['kbs_url'])
+print(settings['ca_cert'])
+PYCLIENT
+)
+        KBS_URL="${KBS_URL:-${trustee_values[0]}}"
+        KBS_CA="${KBS_CA:-${trustee_values[1]}}"
+    fi
+    export KBS_URL="${KBS_URL:-https://${HOST_IP}:8443}"
+    export KBS_CA="${KBS_CA:-/etc/trustee/tls/ca.pem}"
+    export REGISTRY_ADDR="${REGISTRY_ADDR:-${HOST_IP}:5000}"
+    export REGISTRY_CA="${REGISTRY_CA:-/etc/trustee/tls/ca.pem}"
+    export REGISTRY_TLS_CERT="${REGISTRY_TLS_CERT:-/etc/trustee/tls/server-chain.pem}"
+    export REGISTRY_TLS_KEY="${REGISTRY_TLS_KEY:-/etc/trustee/tls/server.key}"
 }
 checked() { [[ -f $2 ]] && printf '%s  %s\n' "$1" "$2" | sha256sum -c - >/dev/null 2>&1; }
 download() {

@@ -42,10 +42,10 @@ def main():
     require(cloud.state.get('cluster_id'), 'Run prepare-cluster.py first.')
     require(os.environ.get('HOST_IP'), 'Set the trusted service address first: ./cos deploy configure.')
     address = ipaddress.IPv4Address(os.environ['HOST_IP'])
-    registry = str(address) + ':5000'
-    ca = Path('/etc/trustee/tls/ca.pem').read_bytes()
+    registry = os.environ.get('REGISTRY_ADDR', str(address) + ':5000')
+    ca = Path(os.environ.get('REGISTRY_CA', '/etc/trustee/tls/ca.pem')).read_bytes()
     require(b'-----BEGIN CERTIFICATE-----' in ca and b'PRIVATE KEY' not in ca,
-            'Use the public Trustee CA certificate in /etc/trustee/tls/ca.pem.')
+            'Use the public registry CA certificate, without private keys.')
     record = OPERATOR / 'pause-image.txt'
     require(record.is_file(), 'Run bash deployment/peerpods/publish-images.sh first.')
     image = record.read_text().strip()

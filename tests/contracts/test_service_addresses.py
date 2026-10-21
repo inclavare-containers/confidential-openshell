@@ -34,7 +34,7 @@ class Addresses(unittest.TestCase):
             ca = Path(temp) / 'ca.pem'
             ca.write_text('-----BEGIN CERTIFICATE-----\nYQ==\n-----END CERTIFICATE-----\n')
             result = subprocess.run(['python3', str(ROOT / 'deployment/guest/render-guest-initdata.py'),
-                                     '203.0.113.10', str(ca)], capture_output=True, text=True, check=True)
+                                     '--kbs-url', 'https://203.0.113.10:8443', '--kbs-ca', str(ca), '--registry-ca', str(ca)], capture_output=True, text=True, check=True)
             data = tomllib.loads(result.stdout)['data']
             aa, cdh = tomllib.loads(data['aa.toml']), tomllib.loads(data['cdh.toml'])
             self.assertEqual(aa['token_configs']['kbs']['url'], 'https://203.0.113.10:8443')

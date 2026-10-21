@@ -12,10 +12,11 @@ and the [deployment runbook](../../docs/deployment.md).
 | Imported `config`, `grpc`, `lifecycle`, `otel_tracing`, `resource_admission` | Unchanged pinned upstream modules and their tests. |
 | `sandbox_runtime.rs`, `isolation.rs` | Upstream builders and tests, with thin wrappers for guest-memory state, strict process groups, disabled service links, and supervisor ingress denial. |
 | `driver.rs`, `main.rs` | Local derivation integrating confidential admission, scheduling gates, Secret sealing, UID checks and lifecycle recovery. |
-| `confidential.rs`, private `bootstrap.rs` | Project-owned measured initdata, signed resource descriptors, KBS publication, authorization bindings, workspace keys and durable journals. |
+| `launch.rs`, `confidential.rs`, private `bootstrap.rs` | Project-owned measured initdata, signed resource descriptors, KBS publication, authorization bindings, workspace keys and durable journals. |
 
 Both Pods require the configured confidential RuntimeClass and immutable image digests. The
-driver generates Kata policy from each actual gated Pod, binds the policy and resource
+driver verifies each admitted Pod against the launch template retained on T, generates
+Kata policy from that trusted template, and binds the policy and resource
 descriptors into SHA-384 of the raw initdata TOML, and checks the Pod UID, spec and annotation
 again before gate release. Initdata includes role, namespace, Sandbox CR UID, bootstrap
 generation and fresh attempt, resource URIs, descriptor hashes and the expected mount
@@ -28,11 +29,12 @@ Each original bootstrap Secret value becomes a signed CDH vault descriptor befor
 Kubernetes Secret write. The Secret names, keys and mounts remain compatible with native
 runtime binaries. Released CoCo CDH 0.22 accepts the `sealed.<ES256 JWS>` vault descriptor;
 its persistent host P-256 signer publishes the verification JWK at
-`kbs:///default/bootstrap-signer/key`. The local publisher renders AS/KBS authorization under
-its store lock before exposing the corresponding raw bytes through KBS. Its storage adapter
-writes Trustee 0.22's flat KV resource namespace; logical `kbs:///default/...` URIs and
-private journal identities stay stable. This publication and recovery code is part of this
-project, not an upstream bootstrap-store implementation.
+`kbs:///default/bootstrap-signer/key`. The publisher retains desired resources and authorization in T's private
+state, then uses authenticated KBS APIs to upload resources and update AS/KBS policy.
+Its publication journal records requests before sending them, so retries can clean
+up resources even after a successful upload's response is lost. Trustee storage
+paths and filesystem ownership are not part of the driver interface. This
+publication and recovery code belongs to this project.
 
 User environment from the template and `--env` travels only in the workload's sealed
 `boundary.json.child_env`. Native OpenShell applies it to workload child processes after
@@ -81,8 +83,8 @@ Supervisor sockets, TLS state and logs use guest-memory EmptyDir volumes, with e
 supplemental groups and no service-link environment injection. Kata 4.2 does not forward
 EmptyDir `sizeLimit` into guest tmpfs, so those volumes consume guest memory without a
 per-volume bound. The generated policy profile expects OCI spec version `1.3.0`; other
-runtimes require a compatible policy profile. Registry trust is pinned into measured AA/CDH
-configuration before image pulls.
+runtimes require a compatible policy profile. KBS and registry trust roots are configured independently in measured AA/CDH
+configuration before resource retrieval and image pulls.
 
 The [driver service](../../deployment/openshell/openshell-confidential-driver.service) shows
 the required operator paths and configuration. `OPENSHELL_COMPUTE_DRIVER_SOCKET` carries the
@@ -94,3 +96,9 @@ Run `cargo test -p openshell-driver-confidential-kubernetes` for driver, importe
 bootstrap tests. Use the
 [deployment checks](../../docs/deployment.md#10-verify-both-confidential-roles) for hardware
 attestation, CDH unseal, KBS release and lifecycle behavior.
+
+Restart uses the private launch template, command and identity, not CR annotations.
+Stop records and withdraws authorization from T-owned attempt/owner records before
+waiting for Kubernetes. Failed remote revocation remains pending and is retried at
+startup and during reconciliation; failure is not reported as successful withdrawal.
+Busy lifecycle gates are skipped by background reconciliation and revisited later.

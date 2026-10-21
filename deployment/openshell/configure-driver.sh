@@ -4,17 +4,21 @@ Generate/check driver.env from HOST_IP and the published runtime digest records.
 source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 require_root
 service_addresses
+test -r /etc/openshell-confidential/trustee-client.json || die "Connect Trustee first: ./cos trustee start or ./cos trustee connect."
+install -d -m 0700 -o openshell-gateway -g openshell-gateway /var/lib/openshell-confidential/driver
 target=/etc/openshell-confidential/driver.env
 install -d -m 0750 -o root -g openshell-gateway /etc/openshell-confidential
-python3 - "$HOST_IP" "$OPERATOR_DIR" > "$target.part" <<'PY'
+python3 - "$HOST_IP" "$OPERATOR_DIR" "$REGISTRY_ADDR" "$REGISTRY_CA" > "$target.part" <<'PY'
 from pathlib import Path
 import re, sys
-address, directory = sys.argv[1], Path(sys.argv[2])
+address, directory, registry, registry_ca = sys.argv[1], Path(sys.argv[2]), sys.argv[3], sys.argv[4]
+print(f'REGISTRY_ADDR={registry}')
+print(f'REGISTRY_CA={registry_ca}')
 print(f'HOST_IP={address}')
 for key, name in [('WORKLOAD_IMAGE', 'workload'), ('SANDBOX_IMAGE', 'sandbox'),
                   ('SUPERVISOR_IMAGE', 'supervisor'), ('PAUSE_IMAGE', 'pause')]:
     ref = (directory / f'{name}-image.txt').read_text().strip()
-    assert re.fullmatch(re.escape(address) + r':5000/[a-z0-9_./-]+@sha256:[0-9a-f]{64}', ref), name
+    assert re.fullmatch(re.escape(registry) + r'/[a-z0-9_./-]+@sha256:[0-9a-f]{64}', ref), name
     print(f'{key}={ref}')
 PY
 if [[ -e $target ]]; then

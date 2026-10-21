@@ -29,3 +29,18 @@ cover embedded-LUKS reopen and read-only behavior, not attestation-gated release
 Use the [deployment checks](../../docs/deployment.md#10-verify-both-confidential-roles)
 for real quote/EAR verification, KBS decisions, native authorization/network
 enforcement, workspace restart and owned-resource cleanup.
+
+To exercise authenticated management with independent TLS/AS roots, including the
+Rust driver's actual publisher and restart/revoke path:
+
+```sh
+python3 tests/acceptance/check-trustee-api.py \
+  --kbs-rootfs /absolute/path/to/kbs-rootfs \
+  --as-rootfs /absolute/path/to/as-rootfs \
+  --output /path/to/private-results.json
+```
+
+This starts temporary loopback services, checks anonymous/wrong-key denial,
+reference registration/readback, policy publication, synthetic resource release
+and revocation, then terminates both services. It uses the cached Cargo toolchain
+and synthetic resources; it does not establish real TDX attestation.

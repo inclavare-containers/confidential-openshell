@@ -18,11 +18,14 @@ and [certificate generator](https://github.com/NVIDIA/OpenShell/blob/v0.1.3/crat
 
 The trusted user domain **T** contains build execution role **B**, the operator
 CLI, Gateway, driver and its private authorization journals, and Trustee
-AS/KBS and AS's built-in RVPS. The reference configuration co-locates these
-services: driver and KBS share private resource/policy files; gRPC AS and its RVPS
-API share a loopback endpoint. KBS and Gateway expose authenticated TLS endpoints reachable by the cloud guests.
-Their network addresses do not define the trust boundary. The official Trustee images run without source changes; the driver
-adapts local publication to Trustee's flat KV resource layout.
+AS/KBS and AS's built-in RVPS. Trustee may run on a separate trusted host.
+The driver publishes resources and policies through authenticated KBS management
+APIs; its private staging and recovery journal are never shared with Trustee.
+KBS proxies policy and reference administration to AS. The deployment owns a
+dedicated KBS resource policy and AS default CPU policy; multiple independent
+policy writers are not supported. KBS and Gateway expose authenticated TLS endpoints
+reachable by the cloud guests. Their addresses do not define the trust boundary.
+The official Trustee images run without source changes.
 
 T belongs to the user and is deployed on user-trusted systems, such as an on-premise
 host. ACK and the cloud provider do not need administrative access to it. If the
@@ -79,10 +82,10 @@ flowchart LR
 
 | Path | Contract |
 | --- | --- |
-| Control | Gateway calls the external driver over its private socket. The driver creates gated role Pods, derives their actual Kata policy, commits authorization and verifies Pod identity before releasing scheduling gates. Kubernetes receives sealed descriptors and references. |
+| Control | Gateway calls the external driver over its private socket. The driver creates gated role Pods, derives Kata policy from T-owned launch templates after checking admitted Pods, commits authorization and verifies Pod identity before releasing scheduling gates. Kubernetes receives sealed descriptors and references. |
 | Attestation and release | Exact initdata bytes bind role, generation, attempt, Sandbox CR UID, resources and descriptor hashes. AA measures initdata once; AS checks quote, boot and AAEL; KBS authorizes the exact resource under the driver's current bindings. CDH verifies and unseals the descriptor before APF exposes a private read-only mount. |
 | Gateway authentication | Operators present their native client certificate. Supervisors verify the Gateway's server CA and present native sandbox-scoped JWTs. The driver seals launch/session credentials, per-role TLS server keys and public trust material; the operator client private key never enters either guest. Anonymous user access is disabled. |
-| Workload channel | The supervisor verifies the workload's TLS server identity and authenticates with the native sandbox JWT. Namespace and driver fences restrict the workload to this boundary. |
+| Workload channel | The supervisor verifies the workload's TLS server identity and authenticates with the native sandbox JWT. The workload’s in-guest seccomp/network broker mediates outbound connections; namespace and driver fences provide additional isolation. |
 | User environment | Template and `--env` values enter the existing sealed workload configuration and reach child processes after CDH/KBS release. Kubernetes receives descriptors without those values. A private namespace/CR-UID record on T preserves them across stop/start. |
 | Storage | The measured workload initializer obtains its key through CDH/KBS and initializes new LUKS volumes with stock cryptsetup. Released CDH SecureMount reopens encrypted volumes. The key identity remains stable for namespace and Sandbox CR UID; each attempt receives a new release binding. CSI owns disk lifecycle metadata. |
 | Model requests | The supervisor obtains the attached provider credential at runtime and uses the approved HTTPS endpoint. The external inference service receives requests and is outside this confidential boundary. |

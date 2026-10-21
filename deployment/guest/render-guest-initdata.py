@@ -3,30 +3,39 @@
 
 from __future__ import annotations
 
-import ipaddress
+import argparse
+import json
+from urllib.parse import urlsplit
 import pathlib
 import sys
 import tomllib
 
 
 def main() -> int:
-    if len(sys.argv) != 3:
-        raise SystemExit("usage: render-guest-initdata.py HOST_IPV4 TRUSTEE_CA_PEM")
-    address = ipaddress.IPv4Address(sys.argv[1])
-    if address.is_loopback or address.is_unspecified or address.is_multicast:
-        raise SystemExit("Trustee endpoint must be a cloud-reachable unicast IPv4 address")
-    ca_path = pathlib.Path(sys.argv[2])
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--kbs-url", required=True)
+    parser.add_argument("--kbs-ca", required=True, type=pathlib.Path)
+    parser.add_argument("--registry-ca", required=True, type=pathlib.Path)
+    args = parser.parse_args()
+    endpoint = args.kbs_url.rstrip('/')
+    address = urlsplit(endpoint)
+    if (address.scheme != 'https' or not address.hostname or address.username or address.password
+            or address.path or address.query or address.fragment):
+        raise SystemExit("KBS URL must be a cloud-reachable HTTPS origin")
+    ca_path = args.kbs_ca
     if ca_path.is_symlink() or not ca_path.is_file():
         raise SystemExit("Trustee CA must be a regular file")
     ca = ca_path.read_text().rstrip()
     if '"""' in ca or "'''" in ca:
         raise SystemExit("Trustee CA cannot be represented safely in initdata")
-    endpoint = f"https://{address}:8443"
+    registry_ca = args.registry_ca.read_text().rstrip()
+    if chr(34) * 3 in registry_ca or chr(39) * 3 in registry_ca:
+        raise SystemExit("Registry CA cannot be represented safely in initdata")
     aa = f'''[eventlog_config]
 enable_eventlog = true
 init_pcr = 17
 [token_configs.kbs]
-url = "{endpoint}"
+url = {json.dumps(endpoint)}
 tee_key_algorithm = "ECDH-ES+A256KW-P256"
 cert = """\n{ca}\n"""
 '''
@@ -34,11 +43,11 @@ cert = """\n{ca}\n"""
 credentials = []
 [kbc]
 name = "cc_kbc"
-url = "{endpoint}"
+url = {json.dumps(endpoint)}
 kbs_cert = """\n{ca}\n"""
 [image]
 work_dir = "/var/lib/confidential-containers/image"
-extra_root_certificates = ["""\n{ca}\n"""]
+extra_root_certificates = ["""\n{registry_ca}\n"""]
 '''
     policy = "package agent_policy\nimport rego.v1\ndefault allow := false\n"
     values = {"aa.toml": aa, "cdh.toml": cdh, "policy.rego": policy}

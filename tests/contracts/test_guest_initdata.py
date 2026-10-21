@@ -53,6 +53,16 @@ class GuestContract(unittest.TestCase):
                 files = validate(fixture(role))
                 self.assertEqual(files['workspace-required.env'], b'ENCRYPTED_VOLUMES_REQUIRED=false\n')
 
+    def test_registry_trust_is_independent_of_kbs_trust(self):
+        data = fixture('workload')
+        other = CA.replace('YQ==', 'Yg==')
+        data['cdh.toml'] = data['cdh.toml'].replace('extra_root_certificates=[' + json.dumps(CA),
+                                                        'extra_root_certificates=[' + json.dumps(other))
+        validate(data)
+        data['aa.toml'] = data['aa.toml'].replace(json.dumps(CA), json.dumps(other))
+        with self.assertRaisesRegex(ValueError, 'AA and CDH KBS CA'):
+            validate(data)
+
     def test_core_negative_bindings_remain_enforced(self):
         for key, value, error in [('role', 'unknown', 'role'), ('bootstrap_attempt', 'short', 'attempt'),
                                   ('sandbox_resource_uid', '', 'sandbox_resource_uid'),

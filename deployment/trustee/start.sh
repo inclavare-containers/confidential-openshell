@@ -6,13 +6,15 @@ require_root
 service_addresses
 refs="$HANDOFF/outputs/$(jq -er .references "$HANDOFF/selection.json")"
 systemctl enable --now as.service
-python3 deployment/trustee/register-references.py \
-  --references "$refs" --references deployment/trustee/ecs-tdx-platform.references.json
 systemctl enable --now kbs.service
 systemctl is-active --quiet as.service kbs.service
-code=$(curl --noproxy '*' --cacert /etc/trustee/tls/ca.pem \
+code=$(curl --noproxy '*' --cacert "$KBS_CA" \
   --retry 10 --retry-connrefused --retry-delay 1 --retry-max-time 30 \
   --connect-timeout 5 --max-time 10 -sS -o /dev/null -w '%{http_code}' \
-  "https://${HOST_IP}:8443/kbs/v0/resource/default/bootstrap/anonymous-check")
+  "${KBS_URL}/kbs/v0/resource/default/bootstrap/anonymous-check")
 [[ $code == 401 || $code == 403 ]] || die "KBS anonymous denial check failed: HTTP $code (expected 401 or 403)."
+python3 deployment/trustee/configure-client.py --url "$KBS_URL" --ca "$KBS_CA" \
+  --admin-key /etc/openshell-confidential/trustee-admin.key
+python3 deployment/trustee/register-references.py \
+  --references "$refs" --references deployment/trustee/ecs-tdx-platform.references.json
 printf 'Trustee ready: AS active; references registered and read back; KBS HTTPS denies anonymous access (HTTP %s).\n' "$code"

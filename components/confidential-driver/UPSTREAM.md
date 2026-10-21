@@ -21,6 +21,6 @@ paths differ because this driver builds in the integration workspace. The submod
 unchanged; the source manifest and controlled diff identify the local derivation.
 
 The CoCo 0.22 integration keeps official AA/CDH and Trustee binaries unchanged. Its local
-publisher adapts Trustee's flat KV resource storage, while measured role/attempt
+publisher uses Trustee's authenticated management APIs, while measured role/attempt
 authorization, workspace ownership and recovery journals remain project-owned contracts.
 Native OpenShell authentication and protocol remain upstream.

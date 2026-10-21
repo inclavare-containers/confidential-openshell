@@ -42,6 +42,7 @@ STEPS = {
     'workers select': ('Select the ACK workers for Kata and CAA', 'deployment/peerpods/select-workers.py', [], 'trustee certificates'),
     'trustee certificates': ('Create the Trustee CA, server certificate and AS signer', 'deployment/trustee/create-certificates.sh', [], 'trustee install'),
     'trustee install': ('Install the official Trustee containers and service units', 'deployment/trustee/install.sh', [], 'trustee start'),
+    'trustee connect': ('Connect to an existing dedicated Trustee using its admin identity', 'deployment/trustee/configure-client.py', [], 'deploy initdata'),
     'trustee start': ('Start Trustee, register references and check anonymous denial', 'deployment/trustee/start.sh', [], 'deploy initdata'),
     'deploy initdata': ('Generate the public base initdata', 'deployment/guest/install-initdata.sh', [], 'registry start'),
     'registry start': ('Start the private TLS image registry', 'deployment/peerpods/start-registry.sh', [], 'registry publish'),
@@ -67,6 +68,8 @@ def configure(args):
     parser = argparse.ArgumentParser(prog='./cos deploy configure', description='Save the trusted service address; configure the normal Alibaba CLI identity.')
     parser.add_argument('--host-ip')
     parser.add_argument('--profile')
+    for option in ('registry-addr', 'registry-ca', 'registry-cert', 'registry-key'):
+        parser.add_argument('--' + option)
     options = parser.parse_args(args)
     started = time.monotonic()
     print('[deploy configure] START — Save the trusted service address and verify cloud access', flush=True)
@@ -92,7 +95,11 @@ def configure(args):
     account = json.loads(identity.stdout)['AccountId']
     OPERATOR.mkdir(mode=0o700, parents=True, exist_ok=True)
     path = OPERATOR / 'operator.json'
-    path.write_text(json.dumps({'host_ip': address, 'profile': profile}, indent=2) + '\n')
+    saved.update(host_ip=address, profile=profile)
+    for key in ('registry_addr', 'registry_ca', 'registry_cert', 'registry_key'):
+        if getattr(options, key) is not None:
+            saved[key] = getattr(options, key)
+    path.write_text(json.dumps(saved, indent=2) + '\n')
     path.chmod(0o600)
     print(f'Trusted service: {address}; cloud account: {account}; region: {region}', flush=True)
     print(f'Configuration saved: {path}. Future ./cos steps load it automatically.', flush=True)
@@ -107,6 +114,10 @@ def environment():
         env['HOST_IP'] = saved['host_ip']
     if saved.get('profile'):
         env['ALIBABA_CLOUD_PROFILE'] = saved['profile']
+    for key, name in [('registry_addr', 'REGISTRY_ADDR'), ('registry_ca', 'REGISTRY_CA'),
+                      ('registry_cert', 'REGISTRY_TLS_CERT'), ('registry_key', 'REGISTRY_TLS_KEY')]:
+        if saved.get(key):
+            env[name] = saved[key]
     env['OPERATOR_DIR'] = str(OPERATOR)
     env.setdefault('HANDOFF', str(HANDOFF))
     env['KUBECONFIG'] = str(OPERATOR / 'administrator-kubeconfig')

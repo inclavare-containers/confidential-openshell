@@ -3,7 +3,8 @@
 Deploy native OpenShell 0.1.3 with CoCo 0.22, Trustee, ACK and Intel TDX.
 Complete [build](build.md), including release installation, first. Run the commands
 below as root from `/opt/confidential-openshell` on the **trusted service host**.
-It hosts Gateway, driver, Trustee and the private registry. It may be your build
+It hosts Gateway, driver and the private registry; Trustee can run here or on a
+separate trusted host. It may be your build
 machine, an on-premise host or a cloud VM; ACK does not determine its location.
 
 Each `./cos` command runs one step and prints its purpose, progress,
@@ -173,10 +174,44 @@ Empty bindings deny resource release. Existing authorization state is not reset.
 ./cos trustee start
 ```
 
-Starts AS, registers and reads back the selected image and bundled ECS platform
-references, then starts KBS. Requires active services and anonymous HTTPS resource
+Starts AS/KBS, verifies management authentication, then registers and reads back
+the selected image and bundled ECS platform references through KBS. Requires active services and anonymous HTTPS resource
 access to return 401 or 403. This proves readiness and denial; real TDX appraisal
 is checked in step 10.
+
+### Existing or separately deployed Trustee
+
+Skip the three local Trustee commands above. On the Trustee server, configure an
+admin public key and the endpoint ACLs shown in
+[the KBS configuration](../deployment/trustee/kbs-config.example.toml). Use a dedicated
+KBS resource policy and AS `default_cpu` policy for this deployment. The driver
+manages these policies as a whole, so it must be their only writer.
+
+On the driver host, connect with your endpoint, public TLS CA and private management key:
+
+```bash
+./cos trustee connect --url https://trustee.example.com:8443 \
+  --ca /path/to/trustee-ca.pem --admin-key /path/to/driver-admin.key
+HANDOFF=/var/lib/openshell-confidential/operator/handoff
+python3 deployment/trustee/register-references.py \
+  --references "$HANDOFF/outputs/$(jq -er .references "$HANDOFF/selection.json")" \
+  --references deployment/trustee/ecs-tdx-platform.references.json
+```
+
+The connection command verifies authentication and saves the client settings.
+No Trustee storage mount or local service is required. AS remains behind KBS;
+its internal management port need not be exposed to the driver or cloud guests.
+
+Provide the registry's certificate and key separately when it does not use the
+PoC Trustee certificate. These optional settings are saved with the deployment:
+
+```bash
+./cos deploy configure --registry-ca /path/to/registry-ca.pem \
+  --registry-cert /path/to/registry-chain.pem --registry-key /path/to/registry.key
+```
+
+KBS and registry may have different CAs. The default PoC can continue sharing
+certificate material. Registry addresses can also be selected with `--registry-addr`.
 
 ## 7. Prepare bootstrap and publish images
 
@@ -186,7 +221,8 @@ is checked in step 10.
 ./cos deploy initdata
 ```
 
-Writes the public deny-only base initdata from the saved address and CA.
+Writes public deny-only base initdata using the saved KBS endpoint and independently
+configured KBS/registry CAs.
 The driver later creates the actual per-role, per-attempt bindings.
 
 ### Registry and images

@@ -15,30 +15,30 @@ id openshell-gateway >/dev/null 2>&1 || useradd --system \
 install -d -m 0750 -o root -g openshell-gateway \
   /etc/trustee /etc/trustee/tls /opt/trustee \
   /opt/trustee/attestation-service /opt/trustee/attestation-service/storage
-install -d -m 0700 -o openshell-gateway -g openshell-gateway \
-  /opt/trustee/attestation-service/storage/attestation_service_policy \
-  /opt/trustee/kbs /opt/trustee/kbs/storage /opt/trustee/kbs/storage/kbs \
-  /opt/trustee/kbs/storage/repository /opt/trustee/kbs/signing \
-  /opt/trustee/kbs/signing/bindings /opt/trustee/kbs/signing/workspace-bindings
+install -d -m 0700 /opt/trustee/attestation-service/storage/attestation_service_policy \
+  /opt/trustee/kbs/storage/kbs
+install -d -m 0750 -o root -g openshell-gateway /etc/openshell-confidential
+if [[ ! -f /etc/openshell-confidential/trustee-admin.key ]]; then
+  openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
+    -out /etc/openshell-confidential/trustee-admin.key
+fi
+chown root:openshell-gateway /etc/openshell-confidential/trustee-admin.key
+chmod 0640 /etc/openshell-confidential/trustee-admin.key
+openssl pkey -in /etc/openshell-confidential/trustee-admin.key -pubout -out /etc/trustee/admin-public.pem
+chmod 0644 /etc/trustee/admin-public.pem
 for pair in kbs-config.example.toml:kbs-config.toml as-config.json:as-config.json; do
   source_file="deployment/trustee/${pair%:*}"
   target_file="/etc/trustee/${pair#*:}"
   if [[ -e $target_file ]]; then
-    cmp -s "$source_file" "$target_file" || die "Existing $target_file differs from the release; review it before changing it."
+    printf 'Retaining configured Trustee server settings: %s\n' "$target_file"
   else
     install -m 0600 "$source_file" "$target_file"
   fi
 done
-runuser -u openshell-gateway -- test -r "$ROOT/deployment/trustee/render-kbs-policy.py" || \
-  die "The service account cannot read deployment sources under $ROOT. Continue from the installed release: cd /opt/confidential-openshell && ./cos trustee install"
+# Initial server bootstrap is deny-only. Dynamic policy and resources are
+# subsequently managed exclusively through authenticated KBS APIs.
 if [[ ! -e /opt/trustee/kbs/storage/kbs/resource-policy.rego ]]; then
-  runuser -u openshell-gateway -- python3 deployment/trustee/render-kbs-policy.py \
-  --bindings-dir /opt/trustee/kbs/signing/bindings \
-  --workspace-bindings-dir /opt/trustee/kbs/signing/workspace-bindings \
-  --as-policy-output /opt/trustee/attestation-service/storage/attestation_service_policy/default_cpu.rego \
-  --output /opt/trustee/kbs/storage/kbs/resource-policy.rego
-else
-  printf 'Existing Trustee resource policy and bindings retained.\n'
+  printf 'package policy\ndefault allow = false\n' > /opt/trustee/kbs/storage/kbs/resource-policy.rego
 fi
 
 printf 'TRUSTEE_AS_IMAGE=%s\nTRUSTEE_KBS_IMAGE=%s\n' \

@@ -13,7 +13,16 @@ type = "coco_as_grpc"
 as_addr = "http://127.0.0.1:50004"
 
 [admin]
-authorization_mode = "DenyAll"
+authorization_mode = "AuthenticatedAuthorization"
+
+[admin.authentication.bearer_jwt]
+identity_providers = [{ issuer = "confidential-openshell-driver", audience = "kbs-admin", public_key_uri = "file:///etc/trustee/admin-public.pem" }]
+
+[admin.authorization.regex_acl]
+acls = [
+  { role = "confidential-openshell", allowed_endpoints = "^/kbs/v0/resource/default/(bootstrap/[0-9a-f]{64}|workspace/[0-9a-f]{64}|bootstrap-signer/key)$" },
+  { role = "confidential-openshell", allowed_endpoints = "^/kbs/v0/(resource-policy|attestation-policy|reference-value(/measurement[.][A-Za-z0-9_.-]+)?)$" }
+]
 
 [[plugins]]
 name = "resource"

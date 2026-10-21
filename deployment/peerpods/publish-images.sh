@@ -6,7 +6,6 @@ require_root
 service_addresses
 verify_handoff
 load_selection
-REGISTRY_ADDR="$HOST_IP:5000"
 install -d -m 0700 "$OPERATOR_DIR"
 for name in pause supervisor sandbox workload agent_sandbox_controller \
   kata_kubectl peerpod_webhook cert_manager_controller cert_manager_webhook \
@@ -15,7 +14,7 @@ for name in pause supervisor sandbox workload agent_sandbox_controller \
   dest="$REGISTRY_ADDR/openshell/mirror/$name:locked"
   printf 'Publishing %s\n' "$name"
   crane copy --platform linux/amd64 "$ref" "$dest"
-  digest=$(SSL_CERT_FILE=/etc/trustee/tls/ca.pem crane digest "$dest")
+  digest=$(SSL_CERT_FILE="$REGISTRY_CA" crane digest "$dest")
   printf '%s@%s\n' "${dest%:*}" "$digest" > "$OPERATOR_DIR/$name-image.txt"
 done
 for archive in caa csi peerpod-controller; do
@@ -24,7 +23,7 @@ done
 for pair in "cloud-api-adaptor:$CAA_TAG" "caa-csi-block-driver:$CSI_TAG" "peerpod-ctrl:$PEERPOD_CTRL_TAG"; do
   docker tag "openshell/$pair" "$REGISTRY_ADDR/openshell/$pair"
   docker push "$REGISTRY_ADDR/openshell/$pair"
-  digest=$(SSL_CERT_FILE=/etc/trustee/tls/ca.pem crane digest "$REGISTRY_ADDR/openshell/$pair")
+  digest=$(SSL_CERT_FILE="$REGISTRY_CA" crane digest "$REGISTRY_ADDR/openshell/$pair")
   printf '%s@%s\n' "${REGISTRY_ADDR}/openshell/${pair%:*}" "$digest" > "$OPERATOR_DIR/${pair%%:*}-image.txt"
 done
 printf 'Images published. Digest records ready in %s\n' "$OPERATOR_DIR"

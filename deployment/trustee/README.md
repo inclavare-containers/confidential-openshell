@@ -11,31 +11,22 @@ Install the two [units](units/) and the public configuration templates under
 entries. Preserve the existing CA, KBS server certificate and ES256 AS signer in
 `/etc/trustee/tls`; the configuration does not generate credentials.
 
-Upstream LocalFs uses these paths:
+The driver uses authenticated management APIs for resources, resource policy,
+AS CPU policy and reference registration. It keeps its own state under
+`/var/lib/openshell-confidential/driver`; it does not mount or write Trustee storage.
+KBS may use any supported storage backend. The deployment requires exclusive
+management of its KBS resource policy and AS `default_cpu` policy.
 
-| Content | Path |
-| --- | --- |
-| AS CPU policy | `/opt/trustee/attestation-service/storage/attestation_service_policy/default_cpu.rego` |
-| BuiltIn RVPS values | `/opt/trustee/attestation-service/storage/reference_value/` |
-| KBS resource policy | `/opt/trustee/kbs/storage/kbs/resource-policy.rego` |
-| Driver bootstrap store | `/opt/trustee/kbs/storage/repository/` |
+For the bundled deployment, `./cos trustee install` creates a P-256 management
+identity and configures KBS to verify its JWTs with scoped endpoint ACLs.
+`./cos trustee start` verifies the HTTPS endpoint and management identity, then
+registers and reads back the selected reference values through KBS.
 
-Resource keys use upstream flat filenames: a logical `default/bootstrap/ID`
-becomes the literal filename `default\x2Fbootstrap\x2FID`. The signed
-`kbs:///default/...` URI and the trusted binding journal's
-`resource/default/...` identity stay the same. Private ownership records and
-workspace key journals remain in their separate trusted directories.
-
-Start AS after installing the CPU policy. Register the final image's generated
-reference file and the ECS platform map included in this repository with the
-official loopback API, then start KBS:
-
-```sh
-python3 deployment/trustee/register-references.py \
-  --address http://127.0.0.1:50004 \
-  --references FINAL_IMAGE.references.json \
-  --references deployment/trustee/ecs-tdx-platform.references.json
-```
+For a separately deployed Trustee, configure its management public key and ACLs
+using [the example](kbs-config.example.toml), then connect from the trusted driver
+host with `./cos trustee connect --url ... --ca ... --admin-key ...` as described
+in the [deployment runbook](../../docs/deployment.md#existing-or-separately-deployed-trustee).
+This does not start local AS/KBS containers. The private management key stays on T.
 
 The registrar verifies every reference by querying BuiltIn RVPS. It accepts
 public image/platform digests; current initdata authorization comes from
@@ -74,8 +65,10 @@ AAEL event.
 `plugin="resource"` and three-element resource-path array. It checks the signed
 EAR vector, non-debug TDX status, canonical initdata and the exact current
 per-role resource binding; workspace keys require the workload role. KBS trusts
-the existing CA and rejects header-supplied JWKs. Its remote administrative API
-is disabled; trusted local files/API own policy and reference publication.
+the configured AS signer trust root and rejects unendorsed header-supplied JWKs.
+Administrative APIs require the configured management identity. The PoC certificate
+script may share a CA; independently managed deployments can separate AS signing,
+KBS TLS and registry TLS material.
 
 Follow the [deployment runbook](../../docs/deployment.md) for installation and
 recovery. Policy-denial tests must identify the actual `PolicyDeny` error;

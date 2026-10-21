@@ -41,3 +41,9 @@ with synthetic claims. [Agent-task checks](e2e/README.md) cover application beha
 Real attestation, resource release, network enforcement and volume lifecycle
 require the [deployment checks](../docs/deployment.md#10-verify-both-confidential-roles).
 Fixture digests must never become deployed approval references.
+
+The core CI workflow runs `bash tests/run-core.sh` after `cargo fetch --locked`.
+It covers driver lifecycle and trusted launch behavior, plus deployment contracts
+and Trustee API timeout/recovery using a stateful test peer. It does not allocate
+cloud resources. The complete `./cos build test` suite additionally checks the
+CAA/CSI patches, policy engine and chart handoff.
