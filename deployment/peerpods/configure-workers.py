@@ -26,6 +26,11 @@ def main():
     for name, instance in selected(cloud):
         execute(cloud, instance, command, 'Kata profile configuration and verification', timeout=300)
         run(['kubectl', 'wait', '--for=condition=Ready', 'node/' + name, '--timeout=180s'])
+        config = json.loads(run(['kubectl', '--request-timeout=30s', 'get', '--raw',
+                                 '/api/v1/nodes/' + name + '/proxy/configz'], capture_output=True).stdout)
+        require(config['kubeletconfig']['runtimeRequestTimeout'] == '10m0s',
+                f'Worker {name} has not applied the 600-second kubelet runtime request timeout.')
+        print(f'{name}: effective kubelet runtime request timeout is 600 seconds.', flush=True)
     runtime = json.loads(run(['kubectl', 'get', 'runtimeclass', 'kata-remote', '-o', 'json'], capture_output=True).stdout)
     require(runtime['handler'] == 'kata-remote' and
             runtime.get('overhead', {}).get('podFixed') == {'cpu': '250m', 'memory': '120Mi'},

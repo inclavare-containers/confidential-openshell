@@ -290,8 +290,11 @@ DaemonSets and controller/webhook deployments.
 
 Finds the active Kata profile, merges required guest-pull, shared-filesystem and
 timeout settings, sets the private pause image and verifies the installed shim.
-Preserves unrelated settings and backs up changed files. Restarts containerd when
-needed, waits for the node and verifies a CRI pull. Marks `kata-remote` attachable.
+Sets the kubelet request timeout to the same 600 seconds: guest image pulls run
+inside container creation and otherwise inherit kubelet's shorter default deadline.
+Uses [ACK's custom kubelet arguments file](https://help.aliyun.com/en/ack/ack-managed-and-ack-dedicated/user-guide/customize-the-kubelet-configurations-of-a-node-pool), preserves other arguments and backs up
+changed files. Restarts containerd/kubelet when needed, waits for the node,
+reads back the effective kubelet setting and verifies a CRI pull. Marks `kata-remote` attachable.
 Repeat after kata-deploy upgrades or selecting new workers.
 
 ### Workspace CSI

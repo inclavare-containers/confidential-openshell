@@ -91,6 +91,39 @@ class WorkerSelection(unittest.TestCase):
 
 
 class WorkerProfile(unittest.TestCase):
+    def test_kubelet_deadline_preserves_other_arguments_and_environment(self):
+        for value in ('"--max-pods=110 --runtime-request-timeout=2m --v=3"',
+                      '--max-pods=110 --runtime-request-timeout 2m --v=3'):
+            original = '# ACK custom options\nOTHER="keep this"\nKUBELET_CUSTOMIZED_ARGS=' + value + '\n'
+            merged = profile.kubelet_timeout(original)
+            self.assertTrue(merged.startswith('# ACK custom options\nOTHER="keep this"\n'))
+            assignment = merged.split('KUBELET_CUSTOMIZED_ARGS=', 1)[1].strip()
+            self.assertEqual(profile.shlex.split(json.loads(assignment)),
+                             ['--max-pods=110', '--v=3', '--runtime-request-timeout=600s'])
+            self.assertEqual(profile.kubelet_timeout(merged), merged)
+
+    def test_kubelet_deadline_handles_empty_configuration_and_quoted_arguments(self):
+        merged = profile.kubelet_timeout('')
+        self.assertEqual(profile.kubelet_timeout(merged), merged)
+        arguments = "--resolv-conf='/etc/custom directory/resolv.conf'"
+        merged = profile.kubelet_timeout('KUBELET_CUSTOMIZED_ARGS=' + json.dumps(arguments) + '\n')
+        self.assertEqual(profile.shlex.split(json.loads(merged.split('=', 1)[1])),
+                         ['--resolv-conf=/etc/custom directory/resolv.conf', '--runtime-request-timeout=600s'])
+
+    def test_invalid_custom_arguments_stop_before_any_write(self):
+        with self.assertRaises(SystemExit):
+            profile.kubelet_timeout('KUBELET_CUSTOMIZED_ARGS="unterminated\n')
+        with self.assertRaises(SystemExit):
+            profile.kubelet_timeout('KUBELET_CUSTOMIZED_ARGS="--runtime-request-timeout"\n')
+
+    def test_new_custom_arguments_file_is_private_and_repeatable(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'kubelet-customized-args.conf'
+            text = profile.kubelet_timeout('')
+            self.assertTrue(profile.replace(path, text))
+            self.assertFalse(profile.replace(path, text))
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
     def test_merge_preserves_unrelated_containerd_settings_and_is_idempotent(self):
         original = '''version = 3
 imports = ["/etc/containerd/conf.d/*.toml"]
