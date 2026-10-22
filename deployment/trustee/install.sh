@@ -15,7 +15,8 @@ id openshell-gateway >/dev/null 2>&1 || useradd --system \
 install -d -m 0750 -o root -g openshell-gateway \
   /etc/trustee /etc/trustee/tls /opt/trustee \
   /opt/trustee/attestation-service /opt/trustee/attestation-service/storage
-install -d -m 0700 /opt/trustee/attestation-service/storage/attestation_service_policy \
+install -d -m 0700 -o root -g root /opt/trustee/attestation-service/storage/attestation_service_policy \
+  /opt/trustee/kbs/storage \
   /opt/trustee/kbs/storage/kbs
 install -d -m 0750 -o root -g openshell-gateway /etc/openshell-confidential
 if [[ ! -f /etc/openshell-confidential/trustee-admin.key ]]; then
