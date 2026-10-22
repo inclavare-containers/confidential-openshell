@@ -42,6 +42,8 @@ STEPS = {
     'workers select': ('Select the ACK workers for Kata and CAA', 'deployment/peerpods/select-workers.py', [], 'trustee certificates'),
     'trustee certificates': ('Create the Trustee CA, server certificate and AS signer', 'deployment/trustee/create-certificates.sh', [], 'trustee install'),
     'trustee install': ('Install the official Trustee containers and service units', 'deployment/trustee/install.sh', [], 'trustee start'),
+    'trustee reports': ('Enable passive appraisal collection on the Trustee host', 'deployment/trustee/configure-reports.py', ['trustee'], 'gateway reports'),
+    'gateway reports': ('Enable historical appraisal display in driver conditions', 'deployment/trustee/configure-reports.py', ['gateway'], None),
     'trustee connect': ('Connect to an existing dedicated Trustee using its admin identity', 'deployment/trustee/configure-client.py', [], 'deploy initdata'),
     'trustee start': ('Start Trustee, register references and check anonymous denial', 'deployment/trustee/start.sh', [], 'deploy initdata'),
     'deploy initdata': ('Generate the public base initdata', 'deployment/guest/install-initdata.sh', [], 'registry start'),
@@ -193,7 +195,7 @@ def run_step(name, args):
             following = 'release install' if (ROOT / '.git').exists() else 'host cloud-tools'
         print(f'Next: ./cos {following}', flush=True)
     else:
-        print('Gateway operator login checked. Continue with docs/first-agent.md.', flush=True)
+        print('Step complete. See docs/attestation-records.md.' if name == 'gateway reports' else 'Gateway operator login checked. Continue with docs/first-agent.md.', flush=True)
     return code
 
 
@@ -225,7 +227,7 @@ def main():
     name = ' '.join(args[:2])
     if name not in STEPS:
         raise SystemExit('Unknown step. Run ./cos --help for the available commands.')
-    if not name.startswith(('host ', 'build ', 'release ')) and not (set(args) & {'--help', '-h'}) and not configuration():
+    if name not in {'trustee reports', 'gateway reports'} and not name.startswith(('host ', 'build ', 'release ')) and not (set(args) & {'--help', '-h'}) and not configuration():
         raise SystemExit('Configure the trusted service address and cloud identity first: ./cos deploy configure.')
     return run_step(name, args[2:])
 

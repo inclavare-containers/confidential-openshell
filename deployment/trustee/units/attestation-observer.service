@@ -1,0 +1,29 @@
+[Unit]
+Description=Passive Trustee attestation record observer
+After=network.target
+Before=kbs.service
+
+[Service]
+DynamicUser=yes
+StateDirectory=openshell-attestation-observer
+StateDirectoryMode=0700
+RuntimeDirectory=openshell-attestation-observer
+RuntimeDirectoryMode=0700
+BindReadOnlyPaths=/opt/trustee/kbs/storage/kbs_protocol_session:/run/openshell-attestation-observer/sessions
+BindReadOnlyPaths=/etc/trustee/tls/as-token-public.pem:/run/openshell-attestation-observer/as-public.pem
+InaccessiblePaths=/opt/trustee /etc/trustee /etc/openshell-confidential
+ExecStart=/usr/local/bin/openshell-attestation-observer --sessions /run/openshell-attestation-observer/sessions --output /var/lib/openshell-attestation-observer/reports --as-public-key /run/openshell-attestation-observer/as-public.pem
+Restart=on-failure
+RestartSec=2
+UMask=0077
+LimitCORE=0
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

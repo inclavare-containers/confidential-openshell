@@ -76,6 +76,10 @@ struct Args {
     #[arg(long, env = "OPENSHELL_TRUSTEE_CONFIG")]
     trustee_config: PathBuf,
 
+    /// Display passive historical Trustee appraisals in native sandbox conditions.
+    #[arg(long, env = "OPENSHELL_ATTESTATION_REPORTS", default_value_t = false)]
+    attestation_reports: bool,
+
     /// Operator-owned JSON policy; omitted means driver config disabled and labels required.
     #[arg(
         long,
@@ -350,6 +354,7 @@ async fn main() -> Result<()> {
             kbs_policy_output: args.kbs_policy_output,
             as_policy_output: args.as_policy_output,
             trustee_config: args.trustee_config,
+            attestation_reports: args.attestation_reports,
         },
     )
     .await

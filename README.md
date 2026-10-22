@@ -22,6 +22,8 @@ New-cluster deployment creates its VPC and vSwitches; existing-cluster attachmen
 has a separate path. The build and service roles can share one machine. An
 existing compatible PodVM image and references can be reused without rebuilding.
 
+Optional [attestation records](docs/attestation-records.md) expose dated Trustee appraisals through native sandbox conditions.
+
 See [architecture](docs/architecture.md) for trust boundaries and [tests](tests/README.md)
 for verification coverage. Component READMEs describe internals.
 

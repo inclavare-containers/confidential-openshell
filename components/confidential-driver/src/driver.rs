@@ -750,6 +750,7 @@ pub struct ConfidentialDriverSettings {
     pub kbs_policy_output: PathBuf,
     pub as_policy_output: PathBuf,
     pub trustee_config: PathBuf,
+    pub attestation_reports: bool,
 }
 
 /// Use the gateway's native TLS endpoint; its CA and scoped launch JWT are sealed.
@@ -781,6 +782,7 @@ fn validate_confidential_gateway_endpoint(endpoint: &str) -> Result<(), Kubernet
 }
 
 struct ConfidentialProfile {
+    reports: Option<Arc<crate::attestation::Reports>>,
     bootstrap_timeout: Duration,
     store: BootstrapStore,
     initdata: GuestInitdata,
@@ -1643,6 +1645,9 @@ impl KubernetesComputeDriver {
             ));
         }
         let confidential = Arc::new(ConfidentialProfile {
+            reports: confidential_settings.attestation_reports.then(|| {
+                crate::attestation::Reports::new(confidential_settings.trustee_config.clone())
+            }),
             bootstrap_timeout: confidential_settings.bootstrap_timeout,
             initdata: GuestInitdata::load(&confidential_settings.initdata_base)
                 .and_then(|base| base.with_registry_ca(&confidential_settings.policy_registry_ca))
@@ -2417,6 +2422,41 @@ impl KubernetesComputeDriver {
         Ok(())
     }
 
+    async fn sandbox_with_attestation(
+        &self,
+        client: &Client,
+        namespace: &str,
+        obj: DynamicObject,
+    ) -> Result<(String, Sandbox), String> {
+        let uid = obj.metadata.uid.clone().unwrap_or_default();
+        let (name, mut sandbox) =
+            sandbox_from_object_with_sandbox_runtime_readiness(client, namespace, obj).await?;
+        if let Some(status) = sandbox.status.as_mut() {
+            // These names are owned by T, even when the optional feature is off.
+            status
+                .conditions
+                .retain(|c| !crate::attestation::TYPES.contains(&c.r#type.as_str()));
+            if let Some(profile) = &self.confidential
+                && let Some(reports) = &profile.reports
+            {
+                let profile = profile.clone();
+                let id = sandbox.id.clone();
+                let namespace = namespace.to_owned();
+                let bindings = tokio::task::spawn_blocking(move || {
+                    profile.store.attestation_bindings(&id, &namespace, &uid)
+                })
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or_default();
+                status
+                    .conditions
+                    .extend(reports.conditions(&bindings).await);
+            }
+        }
+        Ok((name, sandbox))
+    }
+
     pub async fn get_sandbox(&self, sandbox_id: &str) -> Result<Option<Sandbox>, String> {
         info!(
             sandbox_id = %sandbox_id,
@@ -2440,7 +2480,7 @@ impl KubernetesComputeDriver {
                     .namespace
                     .clone()
                     .unwrap_or_else(|| self.config.namespace.clone());
-                sandbox_from_object_with_sandbox_runtime_readiness(&self.client, &ns, obj)
+                self.sandbox_with_attestation(&self.client, &ns, obj)
                     .await
                     .map(|(_, sandbox)| Some(sandbox))
             }
@@ -2493,9 +2533,7 @@ impl KubernetesComputeDriver {
                         .namespace
                         .clone()
                         .unwrap_or_else(|| self.config.namespace.clone());
-                    match sandbox_from_object_with_sandbox_runtime_readiness(&self.client, &ns, obj)
-                        .await
-                    {
+                    match self.sandbox_with_attestation(&self.client, &ns, obj).await {
                         Ok((_, sandbox)) => sandboxes.push(sandbox),
                         Err(err) => {
                             warn!(object_name = %name, error = %err, "skipping unrecognized Sandbox in list");
@@ -6298,6 +6336,7 @@ impl KubernetesComputeDriver {
         let (tx, rx) = mpsc::channel(256);
         self.spawn_sandbox_runtime_periodic_reconcile(tx.clone());
         let readiness_client = self.watch_client.clone();
+        let driver = self.clone();
 
         tokio::spawn(async move {
             let mut sandbox_name_to_id = std::collections::HashMap::<String, String>::new();
@@ -6307,7 +6346,7 @@ impl KubernetesComputeDriver {
                 tokio::select! {
                     event = sandbox_stream.next() => match event {
                         Some(Event::Apply(obj) | Event::InitApply(obj)) => {
-                            if let Ok((kube_name, sandbox)) = sandbox_from_object_with_sandbox_runtime_readiness(&readiness_client, &namespace, obj).await {
+                            if let Ok((kube_name, sandbox)) = driver.sandbox_with_attestation(&readiness_client, &namespace, obj).await {
                                 update_indexes(&mut sandbox_name_to_id, &mut agent_pod_to_id, &kube_name, &sandbox);
                                 let event = WatchSandboxesEvent {
                                     payload: Some(watch_sandboxes_event::Payload::Sandbox(
@@ -6629,7 +6668,7 @@ where
                     Some(Event::Apply(obj) | Event::InitApply(obj)) => {
                         let ns = obj.metadata.namespace.clone()
                             .unwrap_or_else(|| default_namespace.clone());
-                        if let Ok((_kube_name, sandbox)) = sandbox_from_object_with_sandbox_runtime_readiness(&readiness_client, &ns, obj).await {
+                        if let Ok((_kube_name, sandbox)) = driver.sandbox_with_attestation(&readiness_client, &ns, obj).await {
                             let event = WatchSandboxesEvent {
                                 payload: Some(watch_sandboxes_event::Payload::Sandbox(
                                     WatchSandboxesSandboxEvent { sandbox: Some(sandbox) }
@@ -9729,6 +9768,7 @@ mod tests {
             config: KubernetesComputeConfig::default(),
             operator_allowlist: None,
             confidential: Some(Arc::new(ConfidentialProfile {
+                reports: None,
                 bootstrap_timeout: SANDBOX_RUNTIME_BOOTSTRAP_GRACE,
                 store,
                 initdata: GuestInitdata::load(&base).unwrap(),
@@ -10180,6 +10220,7 @@ mod tests {
         )
         .unwrap();
         driver.confidential = Some(Arc::new(ConfidentialProfile {
+            reports: None,
             bootstrap_timeout: SANDBOX_RUNTIME_BOOTSTRAP_GRACE,
             store,
             initdata: GuestInitdata::load(&base).unwrap(),
@@ -11586,6 +11627,64 @@ mod tests {
             stream.next().await.is_none(),
             "source closure must be preserved"
         );
+    }
+
+    #[tokio::test]
+    async fn outward_snapshots_strip_cloud_supplied_attestation_conditions() {
+        let mut object = sandbox_object_for_test("uid", "sandbox-id");
+        object
+            .metadata
+            .labels
+            .as_mut()
+            .unwrap()
+            .insert(LABEL_MANAGED_BY.into(), LABEL_MANAGED_BY_VALUE.into());
+        object
+            .metadata
+            .labels
+            .as_mut()
+            .unwrap()
+            .insert(LABEL_SANDBOX_NAME.into(), "sandbox-name".into());
+        object
+            .metadata
+            .labels
+            .as_mut()
+            .unwrap()
+            .insert(LABEL_SANDBOX_WORKSPACE.into(), "workspace".into());
+        object.data = serde_json::json!({"status": {"conditions": [
+            {"type": "WorkloadAttestation", "status": "True", "reason": "Forged", "message": "untrusted"},
+            {"type": "SupervisorAttestation", "status": "True", "reason": "Forged", "message": "untrusted"},
+            {"type": "Other", "status": "Unknown", "reason": "Unrelated", "message": "keep"}
+        ]}});
+        let driver = KubernetesComputeDriver::new_for_test(KubernetesComputeConfig::default());
+        let assert_conditions = |sandbox: &Sandbox| {
+            let conditions = &sandbox.status.as_ref().unwrap().conditions;
+            assert!(
+                conditions
+                    .iter()
+                    .all(|c| !crate::attestation::TYPES.contains(&c.r#type.as_str()))
+            );
+            assert!(conditions.iter().any(|c| c.r#type == "Other"));
+        };
+        // The same snapshot path is used by get/list and both watch modes.
+        let (_, snapshot) = driver
+            .sandbox_with_attestation(&driver.client, "sandbox-namespace", object.clone())
+            .await
+            .unwrap();
+        assert_conditions(&snapshot);
+        let stream = futures::stream::iter([Event::Apply(object)])
+            .chain(futures::stream::pending())
+            .boxed();
+        let mut outward = cluster_wide_watch_stream(
+            stream,
+            "default".into(),
+            driver.watch_client.clone(),
+            driver,
+        );
+        let event = outward.next().await.unwrap().unwrap();
+        let Some(watch_sandboxes_event::Payload::Sandbox(event)) = event.payload else {
+            panic!("expected sandbox");
+        };
+        assert_conditions(&event.sandbox.unwrap());
     }
 
     #[tokio::test(start_paused = true)]

@@ -15,6 +15,10 @@ name = "openshell-driver-confidential-kubernetes"
 path = "src/main.rs"
 
 [dependencies]
+openshell-attestation-observer = { path = "../attestation-observer" }
+reqwest = { workspace = true }
+rustls = { workspace = true }
+jsonwebtoken = { workspace = true }
 openshell-core = { path = "../../repos/openshell/crates/openshell-core", default-features = false }
 openshell-isolation-interface = { path = "../../repos/openshell/crates/openshell-isolation-interface" }
 openshell-sandbox-backend = { path = "../../repos/openshell/crates/openshell-sandbox-backend" }

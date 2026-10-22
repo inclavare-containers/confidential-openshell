@@ -3,7 +3,7 @@
 
 [workspace]
 resolver = "2"
-members = ["components/confidential-driver"]
+members = ["components/confidential-driver", "components/attestation-observer"]
 
 [workspace.package]
 version = "0.1.0"

@@ -26,6 +26,7 @@ if [[ "$PODVM_MODE" == import ]]; then
   GUEST_ARTIFACTS+=(--artifact "guest-image=$PODVM_QCOW2")
 fi
 python3 deployment/build/manifest.py --profile release \
+  --artifact attestation-observer=artifacts/openshell-attestation-observer \
   --artifact driver=artifacts/openshell-driver-confidential-kubernetes \
   --artifact kata-shim=artifacts/containerd-shim-kata-v2 \
   "${GUEST_ARTIFACTS[@]}" \
@@ -38,7 +39,7 @@ for repo in openshell cloud-api-adaptor caa-csi-block-driver; do
   git -C "repos/$repo" archive --format=tar HEAD > "$HANDOFF/source/$repo.tar"
 done
 cp artifacts/build-manifest.json "$HANDOFF/"
-cp artifacts/openshell-driver-confidential-kubernetes artifacts/containerd-shim-kata-v2 \
+cp artifacts/openshell-driver-confidential-kubernetes artifacts/openshell-attestation-observer artifacts/containerd-shim-kata-v2 \
   "$PODVM_REFERENCE_VALUES" artifacts/images/caa.tar artifacts/images/csi.tar \
   artifacts/images/peerpod-controller.tar \
   "$HANDOFF/outputs/"

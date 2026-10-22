@@ -1958,6 +1958,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-attestation-observer"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "hex",
+ "jsonwebtoken",
+ "prost",
+ "protoc-bin-vendored",
+ "rcgen",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "openshell-core"
 version = "0.1.0"
 dependencies = [
@@ -2011,11 +2032,13 @@ dependencies = [
  "hex",
  "http",
  "http-body-util",
+ "jsonwebtoken",
  "k8s-openapi",
  "kube",
  "kube-runtime",
  "miette",
  "notify",
+ "openshell-attestation-observer",
  "openshell-core",
  "openshell-isolation-interface",
  "openshell-otel",
@@ -2028,7 +2051,9 @@ dependencies = [
  "prost-types",
  "rand 0.9.5",
  "rcgen",
+ "reqwest",
  "ring",
+ "rustls",
  "serde",
  "serde_json",
  "sha2",

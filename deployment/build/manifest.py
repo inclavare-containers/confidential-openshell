@@ -11,6 +11,7 @@ import tarfile
 
 ROOT = Path(__file__).resolve().parents[2]
 LAYOUTS = {
+    'attestation-observer': r'openshell-attestation-observer',
     'driver': r'openshell-driver-confidential-kubernetes',
     'kata-shim': r'containerd-shim-kata-v2',
     'guest-payload': r'guest-payload.tar',

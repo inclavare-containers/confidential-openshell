@@ -412,6 +412,70 @@ impl BootstrapStore {
         })
     }
 
+    /// Display-only snapshot of T-owned bindings. Never takes the publication lock.
+    /// Concurrent deletion/restart yields no binding, not an authorization decision.
+    pub(super) fn attestation_bindings(
+        &self,
+        sandbox_id: &str,
+        namespace: &str,
+        uid: &str,
+    ) -> Result<Vec<Binding>> {
+        validate_workspace_identity(namespace, uid)?;
+        let owner = workspace_hash(namespace, uid);
+        if self
+            .state
+            .join("pending-revocations")
+            .join(format!("{owner}.json"))
+            .exists()
+            || self.has_pending_delete_for_sandbox(sandbox_id)?
+        {
+            return Ok(Vec::new());
+        }
+        let path = self
+            .state
+            .join("active-attempts")
+            .join(format!("{owner}.json"));
+        if !path.try_exists()? {
+            return Ok(Vec::new());
+        }
+        let active: ActiveAttempt = serde_json::from_slice(&read_private(&path)?)?;
+        if active.sandbox_id != sandbox_id || active.sandbox_cr_uid != uid {
+            return Ok(Vec::new());
+        }
+        let mut selected = std::collections::BTreeMap::<String, Binding>::new();
+        for entry in fs::read_dir(self.state.join("bindings"))? {
+            let binding: Binding = serde_json::from_slice(&read_regular(&entry?.path())?)?;
+            if binding.sandbox_id != sandbox_id
+                || binding.sandbox_cr_uid != uid
+                || binding.generation != active.generation
+                || binding.attempt_id != active.attempt
+            {
+                continue;
+            }
+            if self.tombstone(&binding.identity_sha256).exists()
+                || self.revoking(&binding.identity_sha256).exists()
+            {
+                continue;
+            }
+            if let Some(previous) = selected.get(&binding.role)
+                && previous.initdata_sha384 != binding.initdata_sha384
+            {
+                return Err(StoreError::Conflict);
+            }
+            selected.insert(binding.role.clone(), binding);
+        }
+        if serde_json::from_slice::<ActiveAttempt>(&read_private(&path)?)? != active {
+            return Ok(Vec::new());
+        }
+        Ok(selected
+            .into_values()
+            .filter(|b| {
+                !self.tombstone(&b.identity_sha256).exists()
+                    && !self.revoking(&b.identity_sha256).exists()
+            })
+            .collect())
+    }
+
     /// Locate authorizations from T, even when Kubernetes is unreachable or
     /// annotations have been removed. The caller holds the sandbox lifecycle gate.
     pub(super) fn revoke_owned_sandbox(
@@ -2186,6 +2250,69 @@ pathlib.Path(args[args.index('--output') + 1]).write_text('package policy\ndefau
             )
             .unwrap();
         }
+    }
+
+    #[test]
+    fn report_binding_snapshot_rejects_other_uid_attempt_and_revocation() {
+        let (_temp, store) = fixture();
+        store
+            .record_attempt("reports", "ns", "uid", GENERATION, ATTEMPT)
+            .unwrap();
+        store
+            .publish_file(
+                BootstrapRole::Workload,
+                GENERATION,
+                "reports",
+                "uid",
+                ATTEMPT,
+                "tls.key",
+                b"test",
+                INITDATA,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .attestation_bindings("reports", "ns", "uid")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .attestation_bindings("reports", "ns", "replacement-uid")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .attestation_bindings("other", "ns", "uid")
+                .unwrap()
+                .is_empty()
+        );
+        let path = store
+            .state
+            .join("active-attempts")
+            .join(format!("{}.json", workspace_hash("ns", "uid")));
+        let original = read_private(&path).unwrap();
+        let mut active: ActiveAttempt = serde_json::from_slice(&original).unwrap();
+        active.attempt = "c".repeat(64);
+        atomic_replace(&path, &serde_json::to_vec(&active).unwrap()).unwrap();
+        assert!(
+            store
+                .attestation_bindings("reports", "ns", "uid")
+                .unwrap()
+                .is_empty()
+        );
+        atomic_replace(&path, &original).unwrap();
+        store
+            .revoke_attempt(BootstrapRole::Workload, GENERATION, "reports", ATTEMPT)
+            .unwrap();
+        assert!(
+            store
+                .attestation_bindings("reports", "ns", "uid")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

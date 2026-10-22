@@ -16,7 +16,7 @@ python3 deployment/build/manifest.py --check-test-sources > "$fixture/source-man
 python3 tests/check-layout.py
 components/confidential-driver/controlled-diff.sh
 cargo fmt --all -- --check
-OPENSHELL_INITDATA_FIXTURE_OUT="$fixture/initdata" cargo test --offline --locked -p openshell-driver-confidential-kubernetes
+OPENSHELL_INITDATA_FIXTURE_OUT="$fixture/initdata" cargo test --offline --locked -p openshell-driver-confidential-kubernetes -p openshell-attestation-observer
 python3 tests/check-driver-initdata.py "$fixture/initdata"
 (cd tests && go test -mod=readonly ./policy -count=1)
 PYTHONPATH=deployment/runtime python3 -m unittest discover -s tests/contracts -v
