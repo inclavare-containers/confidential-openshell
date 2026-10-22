@@ -122,7 +122,7 @@ pub fn summarize(token: &str, key: &DecodingKey, observed_at: u64) -> Result<Rep
     let measurements = ["mr_td", "rtmr_0", "rtmr_1", "rtmr_2", "rtmr_3"]
         .into_iter()
         .filter_map(|name| {
-            evidence[name]
+            evidence["quote"]["body"][name]
                 .as_str()
                 .filter(|s| is_digest(s))
                 .map(|v| (name.to_owned(), v.to_owned()))

@@ -28,7 +28,7 @@ def signed(key, digest):
     claims = {'iat': int(time.time()) - 600, 'exp': int(time.time()) - 300, 'submods': {'cpu0': {
         'ear.status': 'affirming', 'ear.appraisal-policy-id': 'default',
         'ear.trustworthiness-vector': {'hardware': 2, 'configuration': 2, 'executables': 3, 'file-system': 2},
-        'ear.veraison.annotated-evidence': {'tdx': {'tcb_status': 'UpToDate', 'mr_td': 'b' * 96,
+        'ear.veraison.annotated-evidence': {'tdx': {'tcb_status': 'UpToDate', 'quote': {'body': {'mr_td': 'b' * 96}},
             'uefi_event_logs': [{'type_name': 'EV_EVENT_TAG', 'details': {'unicode_name': 'AAEL',
                 'data': {'domain': 'confidentialcontainers.org', 'operation': 'initdata', 'content': digest}}}]}}
     }}}
@@ -163,6 +163,7 @@ def check(kbs_root, as_root, observer, cli=None):
                 time.sleep(.1)
             assert value['report']['initdata_sha384'] == 'a' * 96
             assert value['report']['token_expires_at'] < time.time()
+            assert value['report']['measurements']['mr_td'] == 'b' * 96
             assert token not in json.dumps(value)
             checks['signed_expired_ear_reduced_and_queried_over_tls'] = True
             before = {p.name: p.read_bytes() for p in sessions.iterdir()}

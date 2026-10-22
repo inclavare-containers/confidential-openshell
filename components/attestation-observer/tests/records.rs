@@ -12,7 +12,7 @@ fn claims() -> Value {
     json!({"iat": 100, "exp": 200, "submods": {"cpu0": {
         "ear.status": "affirming", "ear.appraisal-policy-id": "default",
         "ear.trustworthiness-vector": {"hardware": 2},
-        "ear.veraison.annotated-evidence": {"tdx": {"tcb_status": "UpToDate", "mr_td": "b".repeat(96),
+        "ear.veraison.annotated-evidence": {"tdx": {"tcb_status": "UpToDate", "quote": {"body": {"mr_td": "b".repeat(96)}},
             "uefi_event_logs": [{"type_name":"EV_EVENT_TAG", "details": {"unicode_name": "AAEL",
                 "data": {"operation": "initdata", "domain": "confidentialcontainers.org", "content": "a".repeat(96)}}}]}}
     }}})
