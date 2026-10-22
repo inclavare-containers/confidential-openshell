@@ -65,7 +65,10 @@ The stock CLI carries the report as a JSON string in `message`. There is no new
 TUI tab or CLI command. Get, list and watch use the same driver conditions.
 Queries run in the background, so the first snapshot may be `Unknown`; subsequent
 snapshots pick up the report. The default scan interval is five seconds and the
-driver refresh interval is ten seconds.
+driver refresh interval is ten seconds. When enabled, the driver publishes
+read-only watch snapshots every five seconds so the stock Gateway's sandbox
+store receives fresh collection status even while a sandbox is idle. This
+display publisher does not run lifecycle reconciliation.
 
 Each condition includes the role, Sandbox CR UID, generation, attempt, expected
 initdata SHA-384 and the reduced appraisal. The driver resolves these identities

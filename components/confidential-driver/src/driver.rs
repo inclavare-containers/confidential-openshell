@@ -324,6 +324,7 @@ fn admission_error(error: tonic::Status) -> KubernetesDriverError {
     }
 }
 const SANDBOX_RUNTIME_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
+const ATTESTATION_REPORT_PUBLISH_INTERVAL: Duration = Duration::from_secs(5);
 /// Bound how long a crash-interrupted, fail-closed bootstrap may remain stranded.
 const SANDBOX_RUNTIME_BOOTSTRAP_GRACE: Duration = Duration::from_mins(5);
 
@@ -6276,6 +6277,7 @@ impl KubernetesComputeDriver {
         &self,
         tx: mpsc::Sender<Result<WatchSandboxesEvent, KubernetesDriverError>>,
     ) {
+        self.spawn_attestation_report_updates(tx.clone());
         let driver = self.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(SANDBOX_RUNTIME_RECONCILE_INTERVAL);
@@ -6286,6 +6288,46 @@ impl KubernetesComputeDriver {
                     _ = interval.tick() => {
                         driver.reconcile_pending_sandbox_deletions().await;
                         driver.reconcile_sandbox_runtime_resources().await;
+                        if let Ok(sandboxes) = driver.list_sandboxes().await {
+                            for sandbox in sandboxes {
+                                if tx.send(Ok(WatchSandboxesEvent {
+                                    payload: Some(watch_sandboxes_event::Payload::Sandbox(
+                                        WatchSandboxesSandboxEvent { sandbox: Some(sandbox) },
+                                    )),
+                                })).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    () = tx.closed() => return,
+                }
+            }
+        });
+    }
+
+    fn spawn_attestation_report_updates(
+        &self,
+        tx: mpsc::Sender<Result<WatchSandboxesEvent, KubernetesDriverError>>,
+    ) {
+        if !self
+            .confidential
+            .as_ref()
+            .is_some_and(|profile| profile.reports.is_some())
+        {
+            return;
+        }
+        // The stock Gateway serves its watch-driven sandbox store. Refresh display
+        // snapshots before collection status expires, independently of lifecycle
+        // reconciliation. This task only reads sandboxes and passive reports.
+        let driver = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(ATTESTATION_REPORT_PUBLISH_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
                         if let Ok(sandboxes) = driver.list_sandboxes().await {
                             for sandbox in sandboxes {
                                 if tx.send(Ok(WatchSandboxesEvent {
