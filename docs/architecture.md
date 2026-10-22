@@ -54,6 +54,13 @@ references. New-UKI-derived RTMR1, full RTMR2, replay of all four quoted RTMRs,
 non-debug attributes and exactly one current initdata AAEL entry remain required.
 These controlled values are not a general production firmware approval process.
 
+Resource isolation is between guest roles. The upstream AA/CDH REST service is
+available to programs inside each guest, including access to quotes and resources
+authorized for that role. A workload program can obtain its own workspace key;
+this design does not isolate that key from programs inside the workload guest.
+KBS rejects resources bound to the other role. Provider credentials are delivered
+to the supervisor and remain outside the workload's resource bindings.
+
 ```mermaid
 flowchart LR
   subgraph Trusted[T: Trusted user domain, including build B]
