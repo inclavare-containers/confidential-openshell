@@ -324,7 +324,6 @@ fn admission_error(error: tonic::Status) -> KubernetesDriverError {
     }
 }
 const SANDBOX_RUNTIME_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
-const ATTESTATION_REPORT_PUBLISH_INTERVAL: Duration = Duration::from_secs(5);
 /// Bound how long a crash-interrupted, fail-closed bootstrap may remain stranded.
 const SANDBOX_RUNTIME_BOOTSTRAP_GRACE: Duration = Duration::from_mins(5);
 
@@ -2444,15 +2443,20 @@ impl KubernetesComputeDriver {
                 let profile = profile.clone();
                 let id = sandbox.id.clone();
                 let namespace = namespace.to_owned();
+                let binding_uid = uid.clone();
                 let bindings = tokio::task::spawn_blocking(move || {
-                    profile.store.attestation_bindings(&id, &namespace, &uid)
+                    profile
+                        .store
+                        .attestation_bindings(&id, &namespace, &binding_uid)
                 })
                 .await
                 .ok()
                 .and_then(Result::ok);
-                status
-                    .conditions
-                    .extend(reports.conditions(bindings.as_deref(), should_run).await);
+                status.conditions.extend(
+                    reports
+                        .conditions(&sandbox.id, &uid, bindings.as_deref(), should_run)
+                        .await,
+                );
             }
         }
         Ok((name, sandbox))
@@ -6310,26 +6314,40 @@ impl KubernetesComputeDriver {
         &self,
         tx: mpsc::Sender<Result<WatchSandboxesEvent, KubernetesDriverError>>,
     ) {
-        if !self
+        let Some(reports) = self
             .confidential
             .as_ref()
-            .is_some_and(|profile| profile.reports.is_some())
-        {
+            .and_then(|profile| profile.reports.as_ref())
+        else {
             return;
-        }
-        // The stock Gateway serves its watch-driven sandbox store. Refresh display
-        // snapshots before collection status expires, independently of lifecycle
-        // reconciliation. This task only reads sandboxes and passive reports.
+        };
+        let mut changes = reports.subscribe();
+        // Reports owns its polling. Only changed conditions request a fresh snapshot;
+        // the existing 30-second reconcile remains the recovery path for lost events.
         let driver = self.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(ATTESTATION_REPORT_PUBLISH_INTERVAL);
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            interval.tick().await;
+            let mut last_sent = std::collections::HashMap::new();
             loop {
                 tokio::select! {
-                    _ = interval.tick() => {
-                        if let Ok(sandboxes) = driver.list_sandboxes().await {
-                            for sandbox in sandboxes {
+                    change = changes.recv() => {
+                        match change {
+                            Ok(id) => {
+                                let sandbox = match driver.get_sandbox(&id).await {
+                                    Ok(Some(sandbox)) => sandbox,
+                                    Ok(None) => {
+                                        driver.forget_attestation(&id).await;
+                                        last_sent.remove(&id);
+                                        continue;
+                                    }
+                                    Err(error) => {
+                                        warn!(sandbox_id = %id, %error, "could not publish attestation update; periodic reconcile will retry");
+                                        continue;
+                                    }
+                                };
+                                let fingerprint: Vec<_> = sandbox.status.iter().flat_map(|s| &s.conditions)
+                                    .filter(|c| crate::attestation::TYPES.contains(&c.r#type.as_str()))
+                                    .cloned().collect();
+                                if last_sent.get(&id) == Some(&fingerprint) { continue; }
                                 if tx.send(Ok(WatchSandboxesEvent {
                                     payload: Some(watch_sandboxes_event::Payload::Sandbox(
                                         WatchSandboxesSandboxEvent { sandbox: Some(sandbox) },
@@ -6337,13 +6355,26 @@ impl KubernetesComputeDriver {
                                 })).await.is_err() {
                                     return;
                                 }
+                                if last_sent.len() >= 1024 { last_sent.clear(); }
+                                last_sent.insert(id, fingerprint);
                             }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                // The next normal reconcile republishes all current results.
+                                last_sent.clear();
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                         }
                     }
                     () = tx.closed() => return,
                 }
             }
         });
+    }
+
+    async fn forget_attestation(&self, sandbox_id: &str) {
+        if let Some(reports) = self.confidential.as_ref().and_then(|p| p.reports.as_ref()) {
+            reports.forget(sandbox_id).await;
+        }
     }
 
     // Kept `async` to match the gRPC handler signature in `grpc.rs`, which awaits this method.
@@ -6405,6 +6436,7 @@ impl KubernetesComputeDriver {
                                 && let Ok(sandbox_id) = sandbox_id_from_object(&obj)
                             {
                                 remove_indexes(&mut sandbox_name_to_id, &mut agent_pod_to_id, &sandbox_id);
+                                driver.forget_attestation(&sandbox_id).await;
                                 let event = WatchSandboxesEvent {
                                     payload: Some(watch_sandboxes_event::Payload::Deleted(
                                         WatchSandboxesDeletedEvent { sandbox_id }
@@ -6725,6 +6757,7 @@ where
                         if is_openshell_managed(&obj)
                             && let Ok(sandbox_id) = sandbox_id_from_object(&obj)
                         {
+                            driver.forget_attestation(&sandbox_id).await;
                             let event = WatchSandboxesEvent {
                                 payload: Some(watch_sandboxes_event::Payload::Deleted(
                                     WatchSandboxesDeletedEvent { sandbox_id }

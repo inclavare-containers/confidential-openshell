@@ -4,6 +4,9 @@ After=network.target
 Before=kbs.service
 
 [Service]
+Type=notify
+NotifyAccess=main
+TimeoutStartSec=30
 DynamicUser=yes
 StateDirectory=openshell-attestation-observer
 StateDirectoryMode=0700
@@ -24,6 +27,16 @@ PrivateTmp=yes
 PrivateDevices=yes
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 CapabilityBoundingSet=
+IPAddressDeny=any
+IPAddressAllow=localhost
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
 
 [Install]
 WantedBy=multi-user.target

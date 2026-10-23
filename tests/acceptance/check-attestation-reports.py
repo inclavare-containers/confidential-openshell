@@ -58,6 +58,7 @@ def native_cli(cli, condition_path, area):
     # here is a fixture, while KBS, observer, driver query and CLI are real code.
     public = public_pb.SandboxCondition(type=condition.type, status=condition.status,
         reason=condition.reason, message=condition.message)
+    public.transition_time.CopyFrom(condition.transition_time)
     sandbox = public_pb.Sandbox(metadata={'name': 'report-fixture'}, status={
         'phase': public_pb.SANDBOX_PHASE_READY, 'conditions': [public]})
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
@@ -79,12 +80,14 @@ def native_cli(cli, condition_path, area):
         displayed = next(c for c in value['conditions'] if c['type'] == 'WorkloadAttested')
         assert displayed['message'] == condition.message
         assert displayed['status'] == 'True' and displayed['reason'] == 'Attested'
+        assert displayed['last_transition_time']
         assert displayed['message'].startswith('Intel TDX · verified by Trustee · TCB up to date · ref ')
         completed = subprocess.run([str(cli), '--gateway-endpoint', f'http://127.0.0.1:{port}',
             'sandbox', 'get', 'report-fixture'], env=environment, capture_output=True, text=True, timeout=20)
         assert completed.returncode == 0, completed.stderr
         lines = [line for line in completed.stdout.splitlines() if 'WorkloadAttested' in line]
         assert len(lines) == 1 and condition.message in lines[0], completed.stdout
+        assert 'Last transition:' in completed.stdout
     finally:
         server.stop(0).wait()
 
@@ -125,6 +128,9 @@ def check(kbs_root, as_root, observer, cli=None):
             processes.append(process)
             return process
         try:
+            # A malformed observer key must not block the KBS plugin connection.
+            observer_public = (area / 'as-public.pem').read_bytes()
+            (area / 'as-public.pem').write_bytes(b'invalid observer verification key')
             plugin = launch('observer', [str(observer), '--sessions', str(sessions), '--output', str(area / 'reports'),
                 '--as-public-key', str(area / 'as-public.pem'), '--listen', f'127.0.0.1:{plugin_port}', '--interval-seconds', '1'])
             launch('as', h.h.release_command(as_root / 'usr/local/bin/grpc-as', as_root) + ['--config-file', str(area / 'as.json'), '--socket', f'127.0.0.1:{as_port}'])
@@ -140,6 +146,9 @@ def check(kbs_root, as_root, observer, cli=None):
                 except RuntimeError: time.sleep(.1)
             else: raise AssertionError('KBS plugin not ready')
             assert value['report'] is None
+            assert not value['collection']['available']
+            checks['invalid_observer_key_does_not_block_kbs_startup'] = True
+            (area / 'as-public.pem').write_bytes(observer_public)
             checks['official_external_plugin_registered_missing_is_null'] = True
             opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=client.context))
             def anonymous(path, data=None):

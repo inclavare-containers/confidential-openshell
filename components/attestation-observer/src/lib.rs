@@ -51,6 +51,76 @@ pub struct Report {
     pub tcb_status: Option<String>,
     pub trustworthiness: BTreeMap<String, i64>,
     pub measurements: BTreeMap<String, String>,
+    /// Newer equivalent attestations advance this watermark without moving ref.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_attested_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_changed_at: Option<u64>,
+}
+
+impl Report {
+    pub fn conclusive(&self) -> bool {
+        matches!(
+            self.appraisal.as_str(),
+            "affirming" | "warning" | "contraindicated"
+        )
+    }
+
+    pub fn latest_time(&self) -> u64 {
+        self.latest_attested_at.unwrap_or(self.attested_at)
+    }
+
+    pub fn status(&self) -> &'static str {
+        match self.appraisal.as_str() {
+            "affirming" | "warning" => "True",
+            "contraindicated" => "False",
+            _ => "Unknown",
+        }
+    }
+
+    pub fn equivalent(&self, other: &Self) -> bool {
+        self.initdata_sha384 == other.initdata_sha384
+            && self.appraisal == other.appraisal
+            && self.policy_id == other.policy_id
+            && self.tee == other.tee
+            && self.tcb_status == other.tcb_status
+            && self.trustworthiness == other.trustworthiness
+            && self.measurements == other.measurements
+    }
+}
+
+/// Keep a representative signed record, plus a watermark to reject late evidence.
+/// Persisting these fields also keeps ref and transition time stable after restart.
+pub fn merge_report(previous: Option<&Report>, mut incoming: Report) -> Option<Report> {
+    if !incoming.conclusive() {
+        return None;
+    }
+    let latest = incoming.latest_time();
+    if let Some(old) = previous.filter(|r| r.conclusive()) {
+        if latest <= old.latest_time() {
+            return None;
+        }
+        // A driver may miss an intermediate True -> False -> True transition.
+        // An already-reduced observer report carries the durable status time;
+        // do not merge it as if it were just one raw reattestation.
+        if incoming.status_changed_at.is_some() {
+            return Some(incoming);
+        }
+        if old.equivalent(&incoming) {
+            let mut retained = old.clone();
+            retained.latest_attested_at = Some(latest);
+            retained.status_changed_at = Some(old.status_changed_at.unwrap_or(old.attested_at));
+            return Some(retained);
+        }
+        if old.status() == incoming.status() {
+            incoming.status_changed_at = Some(old.status_changed_at.unwrap_or(old.attested_at));
+        }
+    }
+    incoming.latest_attested_at = Some(latest);
+    incoming
+        .status_changed_at
+        .get_or_insert(incoming.attested_at);
+    Some(incoming)
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -145,6 +215,8 @@ pub fn summarize(token: &str, key: &DecodingKey, observed_at: u64) -> Result<Rep
         tcb_status: bounded_text(evidence.get("tcb_status")),
         trustworthiness,
         measurements,
+        latest_attested_at: None,
+        status_changed_at: None,
     })
 }
 
@@ -174,8 +246,14 @@ struct State {
 pub struct Observer {
     sessions: PathBuf,
     output: PathBuf,
-    key: DecodingKey,
+    key: KeySource,
     state: Arc<RwLock<State>>,
+}
+
+#[derive(Clone)]
+enum KeySource {
+    Static(DecodingKey),
+    File(PathBuf),
 }
 
 impl Observer {
@@ -184,9 +262,31 @@ impl Observer {
         output: PathBuf,
         public_key: &[u8],
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let key = DecodingKey::from_ec_pem(public_key)?;
+        Self::open(
+            sessions,
+            output,
+            KeySource::Static(DecodingKey::from_ec_pem(public_key)?),
+        )
+    }
+
+    /// Key/configuration failures degrade collection without taking down the plugin.
+    pub fn with_key_file(
+        sessions: PathBuf,
+        output: PathBuf,
+        public_key: PathBuf,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::open(sessions, output, KeySource::File(public_key))
+    }
+
+    fn open(
+        sessions: PathBuf,
+        output: PathBuf,
+        key: KeySource,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         fs::create_dir_all(&output)?;
         fs::set_permissions(&output, fs::Permissions::from_mode(0o700))?;
+        fs::create_dir_all(output.join("by-ref"))?;
+        fs::set_permissions(output.join("by-ref"), fs::Permissions::from_mode(0o700))?;
         let mut state = State::default();
         // Only our reduced reports are persisted, never bearer tokens or cookies.
         for entry in fs::read_dir(&output)?.flatten() {
@@ -201,6 +301,7 @@ impl Observer {
             if let Ok(report) = read_bounded(&path)
                 .and_then(|v| serde_json::from_slice::<Report>(&v).map_err(std::io::Error::other))
                 && report.initdata_sha384 == digest
+                && report.conclusive()
             {
                 state.reports.insert(digest.to_owned(), report);
             }
@@ -220,6 +321,11 @@ impl Observer {
         let scanned_at = now();
         let scanned =
             tokio::task::spawn_blocking(move || -> std::io::Result<(Vec<Report>, usize)> {
+                let key = match key {
+                    KeySource::Static(key) => key,
+                    KeySource::File(path) => DecodingKey::from_ec_pem(&read_bounded(&path)?)
+                        .map_err(std::io::Error::other)?,
+                };
                 let mut reports = Vec::new();
                 let mut ignored = 0;
                 for entry in fs::read_dir(sessions)? {
@@ -256,23 +362,35 @@ impl Observer {
             last_scan_at: Some(scanned_at),
             ignored_records,
         };
+        // Stable ordering matters when several sessions for one digest arrive together.
+        let mut reports = reports;
+        reports.sort_by_key(|r| r.attested_at);
         for report in reports {
-            if state
-                .reports
-                .get(&report.initdata_sha384)
-                .is_some_and(|old| old.attested_at >= report.attested_at)
-            {
+            let previous = state.reports.get(&report.initdata_sha384);
+            let Some(report) = merge_report(previous, report) else {
                 continue;
-            }
+            };
             let saved = (|| -> std::io::Result<()> {
-                let mut tmp = tempfile::NamedTempFile::new_in(&self.output)?;
-                serde_json::to_writer(&mut tmp, &report)?;
-                tmp.flush()?;
-                tmp.as_file().sync_all()?;
-                tmp.persist(self.output.join(format!("{}.json", report.initdata_sha384)))
-                    .map_err(std::io::Error::other)?;
-                fs::File::open(&self.output)?.sync_all()?;
-                Ok(())
+                // Archive semantic transitions, not every token renewal. Old displayed
+                // refs remain searchable even while a driver has not polled the update.
+                for archived in previous.into_iter().chain(std::iter::once(&report)) {
+                    if archived.ear_sha256.len() != 64
+                        || !archived.ear_sha256.bytes().all(|b| b.is_ascii_hexdigit())
+                    {
+                        return Err(std::io::Error::other("invalid record fingerprint"));
+                    }
+                    let path = self
+                        .output
+                        .join("by-ref")
+                        .join(format!("{}.json", archived.ear_sha256));
+                    if !path.exists() {
+                        persist_report(&path, archived)?;
+                    }
+                }
+                persist_report(
+                    &self.output.join(format!("{}.json", report.initdata_sha384)),
+                    &report,
+                )
             })();
             if saved.is_err() {
                 state.collection.available = false;
@@ -284,12 +402,30 @@ impl Observer {
 
     pub async fn observation(&self, digest: &str) -> Observation {
         let state = self.state.read().await;
+        let mut collection = state.collection.clone();
+        // The endpoint can be healthy while its scanner is stalled. Clients consume
+        // this explicit health result instead of ticking public conditions themselves.
+        collection.available &= collection
+            .last_scan_at
+            .is_some_and(|t| now().saturating_sub(t) <= 30);
         Observation {
             schema: 1,
-            collection: state.collection.clone(),
+            collection,
             report: state.reports.get(digest).cloned(),
         }
     }
+}
+
+fn persist_report(path: &Path, report: &Report) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("missing parent"))?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    serde_json::to_writer(&mut tmp, report)?;
+    tmp.flush()?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path).map_err(std::io::Error::other)?;
+    fs::File::open(parent)?.sync_all()
 }
 
 #[tonic::async_trait]

@@ -1,157 +1,317 @@
-//! Optional history display. This module never supplies lifecycle or authorization inputs.
+//! Optional history display. Never supplies lifecycle or authorization inputs.
+mod client;
+
 use crate::bootstrap::Binding;
-use jsonwebtoken::{Algorithm, EncodingKey, Header};
-use openshell_attestation_observer::{Collection, Observation, Report, is_digest, now};
+use openshell_attestation_observer::{Observation, Report, is_digest, merge_report, now};
 use openshell_core::proto::compute::v1::DriverCondition as SandboxCondition;
-use serde::Deserialize;
-use serde_json::json;
 use std::{
     collections::HashMap,
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::{Duration, Instant},
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
 };
-use tokio::sync::{Mutex, Semaphore};
+use tokio::{
+    sync::{Mutex, Notify, Semaphore, broadcast},
+    time::Instant,
+};
 
 pub const TYPES: [&str; 2] = ["SupervisorAttested", "WorkloadAttested"];
-// Strip both generations from cloud snapshots, including when display is off.
 pub const RESERVED_TYPES: [&str; 4] = [
     TYPES[0],
     TYPES[1],
     "SupervisorAttestation",
     "WorkloadAttestation",
 ];
-const REFRESH: Duration = Duration::from_secs(10);
+const PENDING_WINDOW: Duration = Duration::from_mins(5);
+const PENDING_REFRESH: Duration = Duration::from_secs(5);
+const SETTLED_REFRESH: Duration = Duration::from_mins(1);
+const VIEW_LEASE: Duration = Duration::from_mins(10);
 const MAX_ENTRIES: usize = 1024;
 
-#[derive(Default)]
+#[derive(Clone, PartialEq, Eq)]
+struct Identity {
+    generation: String,
+    attempt: String,
+    digest: String,
+}
+
 struct Entry {
-    started: Option<Instant>,
-    fetching: bool,
-    collection: Option<Collection>,
+    identity: Option<Identity>,
+    first_seen: Instant,
+    next_query: Instant,
+    job: Option<u64>,
     report: Option<Report>,
-    error: Option<&'static str>,
+    unavailable: bool,
+    condition: SandboxCondition,
 }
 
 impl Entry {
+    fn new(kind: &str, identity: Option<Identity>) -> Self {
+        Self {
+            identity,
+            first_seen: Instant::now(),
+            next_query: Instant::now(),
+            job: None,
+            report: None,
+            unavailable: false,
+            condition: pending(kind),
+        }
+    }
+
+    fn refresh(&mut self, kind: &str, running: bool, binding_known: bool) -> bool {
+        let mut next = if !running {
+            condition(kind, "Unknown", "NotRunning", "no running guest")
+        } else if !binding_known {
+            unavailable(kind, "cannot read the current guest binding")
+        } else if let Some(report) = &self.report {
+            attested(kind, report)
+        } else if self.unavailable {
+            unavailable(kind, "cannot read Trustee records")
+        } else if self.first_seen.elapsed() >= PENDING_WINDOW {
+            unavailable(kind, "no Trustee record captured for this attempt")
+        } else {
+            pending(kind)
+        };
+        // Known results carry the observer's durable status time. For Unknown,
+        // changing a reason (pending/unavailable) is not a status transition.
+        if next.status == "Unknown" && next.status == self.condition.status {
+            next.transition_time = self.condition.transition_time;
+        }
+        let changed = next != self.condition;
+        self.condition = next;
+        changed
+    }
+
     fn observe(&mut self, observation: Observation) {
-        self.collection = Some(observation.collection);
-        self.error = None;
-        // Attested describes a completed event for this attempt. A missed scan,
-        // expired session or unspecified appraisal cannot undo that event.
-        if let Some(report) = observation.report
-            && matches!(
-                report.appraisal.as_str(),
-                "affirming" | "warning" | "contraindicated"
-            )
-            && self
-                .report
-                .as_ref()
-                .is_none_or(|old| report.attested_at > old.attested_at)
+        self.unavailable = !observation.collection.available;
+        if let Some(incoming) = observation.report
+            && let Some(report) = merge_report(self.report.as_ref(), incoming)
         {
             self.report = Some(report);
+        }
+    }
+
+    fn retry_after(&self) -> Duration {
+        if self.report.is_none() && self.first_seen.elapsed() < PENDING_WINDOW {
+            PENDING_REFRESH + Duration::from_millis(u64::from(rand::random::<u16>()) % 1000)
+        } else {
+            SETTLED_REFRESH + Duration::from_secs(u64::from(rand::random::<u8>()) % 16)
+        }
+    }
+}
+
+struct View {
+    uid: String,
+    running: bool,
+    binding_known: bool,
+    last_seen: Instant,
+    roles: [Entry; 2],
+}
+
+impl View {
+    fn new(uid: &str) -> Self {
+        Self {
+            uid: uid.into(),
+            running: true,
+            binding_known: true,
+            last_seen: Instant::now(),
+            roles: std::array::from_fn(|i| Entry::new(TYPES[i], None)),
         }
     }
 }
 
 pub struct Reports {
-    config: PathBuf,
-    entries: Mutex<HashMap<String, Entry>>,
+    client: client::Client,
+    views: Mutex<HashMap<String, View>>,
     slots: Arc<Semaphore>,
+    sequence: AtomicU64,
+    changes: broadcast::Sender<String>,
+    wake: Arc<Notify>,
 }
 
 impl Reports {
-    pub(super) fn new(config: PathBuf) -> Arc<Self> {
+    fn build(config: PathBuf) -> Arc<Self> {
         Arc::new(Self {
-            config,
-            entries: Mutex::new(HashMap::new()),
+            client: client::Client::new(config),
+            views: Mutex::default(),
             slots: Arc::new(Semaphore::new(8)),
+            sequence: AtomicU64::new(1),
+            changes: broadcast::channel(256).0,
+            wake: Arc::new(Notify::new()),
         })
     }
 
-    /// Return immediately with the previous result; network IO runs separately.
+    pub(super) fn new(config: PathBuf) -> Arc<Self> {
+        let reports = Self::build(config);
+        let weak = Arc::downgrade(&reports);
+        let wake = reports.wake.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! { _ = tick.tick() => {}, () = wake.notified() => {} }
+                let Some(reports) = weak.upgrade() else {
+                    return;
+                };
+                reports.poll_due().await;
+            }
+        });
+        reports
+    }
+
+    pub(super) fn subscribe(&self) -> broadcast::Receiver<String> {
+        self.changes.subscribe()
+    }
+
+    pub(super) async fn forget(&self, sandbox_id: &str) {
+        self.views.lock().await.remove(sandbox_id);
+    }
+
+    /// Register only trusted bindings. Network IO and retries run independently
+    /// of Get/List/watch; unchanged query results emit no watch notification.
     pub(super) async fn conditions(
-        self: &Arc<Self>,
+        &self,
+        sandbox_id: &str,
+        uid: &str,
         bindings: Option<&[Binding]>,
         should_run: bool,
     ) -> Vec<SandboxCondition> {
-        let mut conditions = Vec::new();
-        for (role, kind) in ["supervisor", "workload"].into_iter().zip(TYPES) {
-            if !should_run {
-                conditions.push(condition(kind, "Unknown", "NotRunning", "no running guest"));
-                continue;
-            }
-            let Some(bindings) = bindings else {
-                conditions.push(unavailable(kind, "cannot read the current guest binding"));
-                continue;
-            };
-            let binding = bindings
+        let mut views = self.views.lock().await;
+        if !views.contains_key(sandbox_id)
+            && views.len() >= MAX_ENTRIES
+            && let Some(oldest) = views
                 .iter()
-                .find(|b| b.role == role && is_digest(&b.initdata_sha384));
-            let Some(binding) = binding else {
-                conditions.push(pending(kind));
-                continue;
-            };
-            let digest = binding.initdata_sha384.clone();
-            let mut entries = self.entries.lock().await;
-            if entries.len() >= MAX_ENTRIES
-                && !entries.contains_key(&digest)
-                && let Some(oldest) = entries
-                    .iter()
-                    .filter(|(_, e)| !e.fetching)
-                    .min_by_key(|(_, e)| e.started)
-                    .map(|(k, _)| k.clone())
-            {
-                entries.remove(&oldest);
-            }
-            let entry = entries.entry(digest.clone()).or_default();
-            if !entry.fetching && entry.started.is_none_or(|t| t.elapsed() >= REFRESH) {
-                // No queued tasks: a full pool is retried on the next snapshot.
-                if let Ok(permit) = self.slots.clone().try_acquire_owned() {
-                    entry.fetching = true;
-                    entry.started = Some(Instant::now());
-                    let this = self.clone();
-                    tokio::spawn(async move {
-                        let result = tokio::time::timeout(
-                            Duration::from_secs(3),
-                            query(&this.config, &digest),
-                        )
-                        .await;
-                        let mut entries = this.entries.lock().await;
-                        let entry = entries.entry(digest).or_default();
-                        entry.fetching = false;
-                        match result {
-                            Ok(Ok(observation)) => entry.observe(observation),
-                            _ => entry.error = Some("ReportQueryUnavailable"),
-                        }
-                        drop(permit);
-                    });
-                }
-            }
-            if let Some(report) = &entry.report {
-                conditions.push(attested(kind, report));
-                continue;
-            }
-            let available = entry.error.is_none()
-                && entry.collection.as_ref().is_some_and(|collection| {
-                    collection.available
-                        && collection
-                            .last_scan_at
-                            .is_some_and(|t| now().saturating_sub(t) <= 30)
-                })
-                && entry
-                    .started
-                    .is_some_and(|t| t.elapsed() <= Duration::from_secs(30));
-            conditions.push(
-                if available || (entry.collection.is_none() && entry.error.is_none()) {
-                    pending(kind)
-                } else {
-                    unavailable(kind, "cannot read Trustee records")
-                },
-            );
+                .min_by_key(|(_, v)| v.last_seen)
+                .map(|(id, _)| id.clone())
+        {
+            views.remove(&oldest);
         }
-        conditions
+        let view = views
+            .entry(sandbox_id.into())
+            .or_insert_with(|| View::new(uid));
+        if view.uid != uid {
+            *view = View::new(uid);
+        }
+        view.last_seen = Instant::now();
+        if view.running != should_run {
+            view.roles = std::array::from_fn(|i| Entry::new(TYPES[i], None));
+        }
+        view.running = should_run;
+        view.binding_known = bindings.is_some();
+        for (i, role) in ["supervisor", "workload"].into_iter().enumerate() {
+            let entry = &mut view.roles[i];
+            if !should_run {
+                if entry.identity.is_some() {
+                    *entry = Entry::new(TYPES[i], None);
+                }
+            } else if let Some(bindings) = bindings {
+                let identity = bindings
+                    .iter()
+                    .find(|b| {
+                        b.role == role
+                            && b.sandbox_id == sandbox_id
+                            && b.sandbox_cr_uid == uid
+                            && is_digest(&b.initdata_sha384)
+                    })
+                    .map(|b| Identity {
+                        generation: b.generation.clone(),
+                        attempt: b.attempt_id.clone(),
+                        digest: b.initdata_sha384.clone(),
+                    });
+                if entry.identity != identity {
+                    *entry = Entry::new(TYPES[i], identity);
+                }
+            } else {
+                // Retain history for recovery, but do not assert that it belongs to
+                // the current run until the trusted binding can be read again.
+                entry.job = None;
+            }
+            entry.refresh(TYPES[i], view.running, view.binding_known);
+        }
+        let result = view.roles.iter().map(|e| e.condition.clone()).collect();
+        drop(views);
+        self.wake.notify_one();
+        result
     }
+
+    async fn poll_due(self: &Arc<Self>) {
+        let mut views = self.views.lock().await;
+        views.retain(|_, v| v.last_seen.elapsed() < VIEW_LEASE);
+        for (id, view) in views.iter_mut() {
+            if !view.running || !view.binding_known {
+                continue;
+            }
+            let mut changed = false;
+            for (i, entry) in view.roles.iter_mut().enumerate() {
+                changed |= entry.refresh(TYPES[i], true, true);
+                let Some(identity) = entry.identity.as_ref() else {
+                    continue;
+                };
+                if entry.job.is_some() || Instant::now() < entry.next_query {
+                    continue;
+                }
+                let Ok(permit) = self.slots.clone().try_acquire_owned() else {
+                    continue;
+                };
+                let job = self.sequence.fetch_add(1, Ordering::Relaxed);
+                entry.job = Some(job);
+                let (id, uid, digest) = (id.clone(), view.uid.clone(), identity.digest.clone());
+                let reports = self.clone();
+                tokio::spawn(async move {
+                    let result =
+                        tokio::time::timeout(Duration::from_secs(3), reports.client.query(&digest))
+                            .await
+                            .unwrap_or(Err("query timed out"));
+                    reports.complete(&id, &uid, i, job, result).await;
+                    drop(permit);
+                });
+            }
+            if changed {
+                let _ = self.changes.send(id.clone());
+            }
+        }
+    }
+
+    async fn complete(
+        &self,
+        id: &str,
+        uid: &str,
+        role: usize,
+        job: u64,
+        result: Result<Observation, &'static str>,
+    ) {
+        let mut views = self.views.lock().await;
+        let Some(view) = views.get_mut(id) else {
+            return;
+        };
+        if view.uid != uid || !view.running || !view.binding_known {
+            return;
+        }
+        let entry = &mut view.roles[role];
+        if entry.job != Some(job) {
+            return;
+        }
+        entry.job = None;
+        match result {
+            Ok(observation) => entry.observe(observation),
+            Err(_) => entry.unavailable = true,
+        }
+        entry.next_query = Instant::now() + entry.retry_after();
+        if entry.refresh(TYPES[role], true, true) {
+            let _ = self.changes.send(id.into());
+        }
+    }
+}
+
+fn timestamp(seconds: u64) -> Option<prost_types::Timestamp> {
+    // Protobuf Timestamp is limited to years 0001..9999.
+    (seconds <= 253_402_300_799).then_some(prost_types::Timestamp {
+        seconds: i64::try_from(seconds).ok()?,
+        nanos: 0,
+    })
 }
 
 fn condition(
@@ -165,7 +325,7 @@ fn condition(
         status: status.into(),
         reason: reason.into(),
         message: message.into(),
-        transition_time: None,
+        transition_time: timestamp(now()),
     }
 }
 
@@ -174,7 +334,7 @@ fn pending(kind: &str) -> SandboxCondition {
         kind,
         "Unknown",
         "AttestationPending",
-        "waiting for the guest to attest to Trustee",
+        "waiting for a Trustee record for this attempt",
     )
 }
 
@@ -183,437 +343,57 @@ fn unavailable(kind: &str, message: &str) -> SandboxCondition {
 }
 
 fn attested(kind: &str, report: &Report) -> SandboxCondition {
-    // A reference to the signed appraisal record, not an image/reference-value hash.
     let reference: String = report.ear_sha256.chars().take(8).collect();
-    if report.appraisal == "contraindicated" {
-        return condition(
+    let mut result = if report.appraisal == "contraindicated" {
+        condition(
             kind,
             "False",
             "AttestationRejected",
             format!("Trustee rejected the evidence (appraisal: contraindicated) · ref {reference}"),
-        );
-    }
-    let warning = report.appraisal == "warning";
-    let tcb = match report.tcb_status.as_deref() {
-        Some("UpToDate") => "TCB up to date".to_owned(),
-        Some(status) if !warning => format!("TCB {status} (allowed by appraisal policy)"),
-        Some(status) => format!("TCB {status}"),
-        None => "TCB status unavailable".to_owned(),
-    };
-    let reason = if warning || report.tcb_status.as_deref() != Some("UpToDate") {
-        "AttestedWithWarning"
+        )
     } else {
-        "Attested"
+        let warning = report.appraisal == "warning";
+        let tcb = match report.tcb_status.as_deref() {
+            Some("UpToDate") => "up to date",
+            Some("OutOfDate") => "out of date",
+            Some("ConfigurationNeeded") => "configuration needed",
+            Some("SWHardeningNeeded") => "SW hardening needed",
+            Some("ConfigurationAndSWHardeningNeeded") => "configuration and SW hardening needed",
+            Some("OutOfDateConfigurationNeeded") => "out of date, configuration needed",
+            Some("Revoked") => "revoked",
+            Some(status) => status,
+            None => "status unavailable",
+        };
+        let allowed = if !warning
+            && report.tcb_status.is_some()
+            && report.tcb_status.as_deref() != Some("UpToDate")
+        {
+            " (allowed by appraisal policy)"
+        } else {
+            ""
+        };
+        let reason = if warning || report.tcb_status.as_deref() != Some("UpToDate") {
+            "AttestedWithWarning"
+        } else {
+            "Attested"
+        };
+        let appraisal = if warning {
+            " · Trustee appraisal warning"
+        } else {
+            ""
+        };
+        condition(
+            kind,
+            "True",
+            reason,
+            format!(
+                "Intel TDX · verified by Trustee · TCB {tcb}{allowed}{appraisal} · ref {reference}"
+            ),
+        )
     };
-    let appraisal = if warning {
-        " · Trustee appraisal warning"
-    } else {
-        ""
-    };
-    condition(
-        kind,
-        "True",
-        reason,
-        format!("Intel TDX · verified by Trustee · {tcb}{appraisal} · ref {reference}"),
-    )
-}
-
-#[derive(Deserialize)]
-struct Config {
-    kbs_url: String,
-    ca_cert: PathBuf,
-    admin_key: PathBuf,
-}
-
-async fn query(config: &Path, digest: &str) -> Result<Observation, &'static str> {
-    if !is_digest(digest) {
-        return Err("invalid digest");
-    }
-    let settings: Config = serde_json::from_slice(
-        &tokio::fs::read(config)
-            .await
-            .map_err(|_| "configuration unavailable")?,
-    )
-    .map_err(|_| "invalid configuration")?;
-    let mut url = reqwest::Url::parse(&settings.kbs_url).map_err(|_| "invalid origin")?;
-    if url.scheme() != "https"
-        || url.host_str().is_none()
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.path() != "/"
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        return Err("expected HTTPS origin");
-    }
-    url.set_path(&format!("/kbs/v0/external/attestation-reports/{digest}"));
-    let ca = tokio::fs::read(settings.ca_cert)
-        .await
-        .map_err(|_| "CA unavailable")?;
-    let key = tokio::fs::read(settings.admin_key)
-        .await
-        .map_err(|_| "admin identity unavailable")?;
-    let timestamp = now();
-    let jwt = jsonwebtoken::encode(&Header::new(Algorithm::ES256), &json!({
-        "iss": "confidential-openshell-driver", "aud": "kbs-admin", "role": "confidential-openshell",
-        "nbf": timestamp.saturating_sub(10), "exp": timestamp + 60
-    }), &EncodingKey::from_ec_pem(&key).map_err(|_| "invalid admin identity")?).map_err(|_| "signing failed")?;
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .tls_built_in_root_certs(false)
-        .add_root_certificate(reqwest::Certificate::from_pem(&ca).map_err(|_| "invalid CA")?)
-        .timeout(Duration::from_secs(2))
-        .build()
-        .map_err(|_| "client unavailable")?;
-    let mut response = client
-        .get(url)
-        .bearer_auth(jwt)
-        .send()
-        .await
-        .map_err(|_| "query unavailable")?;
-    if response.status() != reqwest::StatusCode::OK {
-        return Err("query rejected");
-    }
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|_| "response unavailable")? {
-        if bytes.len() + chunk.len() > 65536 {
-            return Err("oversized response");
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    let observation: Observation =
-        serde_json::from_slice(&bytes).map_err(|_| "invalid response")?;
-    if observation.schema != 1
-        || observation
-            .report
-            .as_ref()
-            .is_some_and(|r| r.initdata_sha384 != digest)
-    {
-        return Err("mismatched response");
-    }
-    Ok(observation)
+    result.transition_time = timestamp(report.status_changed_at.unwrap_or(report.attested_at));
+    result
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use prost::Message;
-    use std::collections::BTreeMap;
-
-    fn binding(digest: &str) -> Binding {
-        Binding {
-            resource_path: String::new(),
-            initdata_sha384: digest.into(),
-            role: "workload".into(),
-            generation: "generation".into(),
-            sandbox_id: "sandbox".into(),
-            sandbox_cr_uid: "uid".into(),
-            attempt_id: "attempt".into(),
-            key: String::new(),
-            resource_sha256: String::new(),
-            identity_sha256: String::new(),
-        }
-    }
-    fn observation() -> Observation {
-        Observation {
-            schema: 1,
-            collection: Collection {
-                available: true,
-                last_scan_at: Some(now()),
-                ignored_records: 0,
-            },
-            report: Some(Report {
-                initdata_sha384: "a".repeat(96),
-                attested_at: now() - 600,
-                token_expires_at: now() - 300,
-                observed_at: now(),
-                ear_sha256: "b".repeat(64),
-                appraisal: "affirming".into(),
-                policy_id: "default".into(),
-                tee: "tdx".into(),
-                tcb_status: Some("UpToDate".into()),
-                trustworthiness: BTreeMap::default(),
-                measurements: BTreeMap::default(),
-            }),
-        }
-    }
-
-    fn entry(observation: Observation) -> Entry {
-        let mut entry = Entry {
-            started: Some(Instant::now()),
-            ..Entry::default()
-        };
-        entry.observe(observation);
-        entry
-    }
-
-    #[test]
-    fn appraisal_and_tcb_have_distinct_one_line_results() {
-        for (appraisal, tcb, status, reason, text) in [
-            (
-                "affirming",
-                Some("UpToDate"),
-                "True",
-                "Attested",
-                "TCB up to date",
-            ),
-            (
-                "affirming",
-                Some("OutOfDate"),
-                "True",
-                "AttestedWithWarning",
-                "TCB OutOfDate (allowed by appraisal policy)",
-            ),
-            (
-                "warning",
-                Some("UpToDate"),
-                "True",
-                "AttestedWithWarning",
-                "Trustee appraisal warning",
-            ),
-            (
-                "warning",
-                Some("OutOfDate"),
-                "True",
-                "AttestedWithWarning",
-                "TCB OutOfDate · Trustee appraisal warning",
-            ),
-            (
-                "affirming",
-                None,
-                "True",
-                "AttestedWithWarning",
-                "TCB status unavailable",
-            ),
-            (
-                "contraindicated",
-                Some("UpToDate"),
-                "False",
-                "AttestationRejected",
-                "Trustee rejected the evidence",
-            ),
-        ] {
-            let mut report = observation().report.unwrap();
-            report.appraisal = appraisal.into();
-            report.tcb_status = tcb.map(str::to_owned);
-            let condition = attested(TYPES[1], &report);
-            assert_eq!(
-                (condition.status.as_str(), condition.reason.as_str()),
-                (status, reason)
-            );
-            assert!(condition.message.contains(text), "{}", condition.message);
-            assert!(condition.message.ends_with(" · ref bbbbbbbb"));
-            assert_eq!(condition.message.lines().count(), 1);
-            assert!(!condition.message.contains("boot image not approved"));
-            if appraisal == "warning" {
-                assert!(!condition.message.contains("allowed by"));
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn history_survives_outages_but_never_crosses_attempts_or_stop() {
-        let reports = Reports::new(PathBuf::from("/not-configured"));
-        let digest = "a".repeat(96);
-        let bindings = [binding(&digest)];
-        reports
-            .entries
-            .lock()
-            .await
-            .insert(digest.clone(), entry(observation()));
-        let original = reports.conditions(Some(&bindings), true).await;
-        assert_eq!(original[1].status, "True"); // Expired EAR remains history.
-        reports.entries.lock().await.get_mut(&digest).unwrap().error =
-            Some("ReportQueryUnavailable");
-        assert_eq!(reports.conditions(Some(&bindings), true).await, original);
-        let mut entries = reports.entries.lock().await;
-        let cached = entries.get_mut(&digest).unwrap();
-        cached.error = None;
-        cached.collection.as_mut().unwrap().last_scan_at = Some(now() - 60);
-        drop(entries);
-        assert_eq!(reports.conditions(Some(&bindings), true).await, original);
-        for appraisal in [None, Some("none")] {
-            let mut fresh = observation();
-            if let Some(appraisal) = appraisal {
-                fresh.report.as_mut().unwrap().appraisal = appraisal.into();
-                fresh.report.as_mut().unwrap().attested_at += 1;
-            } else {
-                fresh.report = None;
-            }
-            reports
-                .entries
-                .lock()
-                .await
-                .get_mut(&digest)
-                .unwrap()
-                .observe(fresh);
-            assert_eq!(reports.conditions(Some(&bindings), true).await, original);
-        }
-        // Revoked/absent bindings must not reuse cached reports.
-        assert!(
-            reports
-                .conditions(Some(&[]), true)
-                .await
-                .iter()
-                .all(|c| c.reason == "AttestationPending")
-        );
-        assert_eq!(
-            reports
-                .conditions(Some(&[binding(&"c".repeat(96))]), true)
-                .await[1]
-                .reason,
-            "AttestationPending"
-        );
-        // Even if an old binding is still present during stop, hide its report.
-        assert!(
-            reports
-                .conditions(Some(&bindings), false)
-                .await
-                .iter()
-                .all(|c| c.reason == "NotRunning" && c.message == "no running guest")
-        );
-        assert!(
-            reports
-                .conditions(None, true)
-                .await
-                .iter()
-                .all(|c| c.reason == "AttestationStatusUnavailable")
-        );
-    }
-
-    #[tokio::test]
-    async fn pending_and_unavailable_only_apply_before_a_result() {
-        let reports = Reports::new(PathBuf::from("/not-configured"));
-        let digest = "a".repeat(96);
-        let bindings = [binding(&digest)];
-        let mut empty = observation();
-        empty.report = None;
-        reports
-            .entries
-            .lock()
-            .await
-            .insert(digest.clone(), entry(empty));
-        assert_eq!(
-            reports.conditions(Some(&bindings), true).await[1].reason,
-            "AttestationPending"
-        );
-        reports
-            .entries
-            .lock()
-            .await
-            .get_mut(&digest)
-            .unwrap()
-            .collection
-            .as_mut()
-            .unwrap()
-            .last_scan_at = Some(now() - 60);
-        assert_eq!(
-            reports.conditions(Some(&bindings), true).await[1].reason,
-            "AttestationStatusUnavailable"
-        );
-        reports.entries.lock().await.get_mut(&digest).unwrap().error =
-            Some("ReportQueryUnavailable");
-        assert_eq!(
-            reports.conditions(Some(&bindings), true).await[1].reason,
-            "AttestationStatusUnavailable"
-        );
-        reports
-            .entries
-            .lock()
-            .await
-            .get_mut(&digest)
-            .unwrap()
-            .observe(observation());
-        assert_eq!(
-            reports.conditions(Some(&bindings), true).await[1].reason,
-            "Attested"
-        );
-    }
-
-    #[test]
-    fn newer_explicit_rejection_replaces_success_and_old_records_do_not_replace_it() {
-        let mut cached = entry(observation());
-        let mut rejected = observation();
-        rejected.report.as_mut().unwrap().attested_at += 1;
-        rejected.report.as_mut().unwrap().appraisal = "contraindicated".into();
-        cached.observe(rejected);
-        cached.observe(observation());
-        assert_eq!(
-            attested(TYPES[1], cached.report.as_ref().unwrap()).status,
-            "False"
-        );
-    }
-
-    #[tokio::test]
-    async fn role_appraisals_are_independent() {
-        let reports = Reports::new(PathBuf::from("/not-configured"));
-        let mut supervisor = binding(&"d".repeat(96));
-        supervisor.role = "supervisor".into();
-        let workload = binding(&"a".repeat(96));
-        let mut entries = reports.entries.lock().await;
-        for binding in [&supervisor, &workload] {
-            let mut observation = observation();
-            let report = observation.report.as_mut().unwrap();
-            report.initdata_sha384.clone_from(&binding.initdata_sha384);
-            if binding.role == "workload" {
-                report.appraisal = "warning".into();
-            }
-            entries.insert(binding.initdata_sha384.clone(), entry(observation));
-        }
-        drop(entries);
-        let conditions = reports
-            .conditions(Some(&[workload, supervisor]), true)
-            .await;
-        assert_eq!(conditions.len(), 2);
-        assert_eq!(conditions[0].r#type, "SupervisorAttested");
-        assert_eq!(conditions[0].reason, "Attested");
-        assert_eq!(conditions[1].r#type, "WorkloadAttested");
-        assert_eq!(conditions[1].status, "True");
-        assert_eq!(conditions[1].reason, "AttestedWithWarning");
-    }
-
-    #[tokio::test]
-    async fn unavailable_configuration_returns_without_waiting_for_query() {
-        let reports = Reports::new(PathBuf::from("/not-configured"));
-        let conditions = tokio::time::timeout(
-            Duration::from_millis(100),
-            reports.conditions(Some(&[binding(&"a".repeat(96))]), true),
-        )
-        .await
-        .unwrap();
-        assert_eq!(conditions[1].reason, "AttestationPending");
-    }
-
-    #[tokio::test]
-    #[ignore = "requires the temporary released-KBS fixture from check-attestation-reports.py"]
-    async fn released_kbs_attestation_report_query() {
-        let config = PathBuf::from(std::env::var("OPENSHELL_TEST_REPORT_CONFIG").unwrap());
-        let observation = query(&config, &"a".repeat(96)).await.unwrap();
-        assert_eq!(observation.report.as_ref().unwrap().appraisal, "affirming");
-        let reports = Reports::new(config);
-        reports
-            .entries
-            .lock()
-            .await
-            .insert("a".repeat(96), entry(observation));
-        let conditions = reports
-            .conditions(Some(&[binding(&"a".repeat(96))]), true)
-            .await;
-        assert_eq!(conditions[1].status, "True");
-        // The unchanged compute-driver protocol carries the one-line message.
-        let encoded = conditions[1].encode_to_vec();
-        if let Ok(path) = std::env::var("OPENSHELL_TEST_REPORT_CONDITION") {
-            std::fs::write(path, &encoded).unwrap();
-        }
-        let decoded = SandboxCondition::decode(encoded.as_slice()).unwrap();
-        assert_eq!(decoded.r#type, "WorkloadAttested");
-        assert_eq!(decoded.reason, "Attested");
-        assert!(
-            decoded
-                .message
-                .starts_with("Intel TDX · verified by Trustee · TCB up to date · ref ")
-        );
-    }
-}
+mod tests;

@@ -48,6 +48,29 @@ class Configuration(unittest.TestCase):
 
 
 class Installation(unittest.TestCase):
+    def test_sessions_are_not_exposed_under_an_unsafe_parent(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            parent = root / 'storage'
+            parent.mkdir(mode=0o700)
+            for mode in (0o755, 0o750, 0o770):
+                parent.chmod(mode)
+                with self.subTest(mode=mode), self.assertRaisesRegex(ValueError, 'owned by root with mode 0700'):
+                    reports.prepare_sessions(parent / 'sessions')
+                self.assertFalse((parent / 'sessions').exists())
+            parent.chmod(0o700)
+            link = root / 'link'
+            link.symlink_to(parent, target_is_directory=True)
+            with self.assertRaises(ValueError):
+                reports.prepare_sessions(link / 'sessions')
+            if os.geteuid() == 0:
+                os.chown(parent, 65534, 65534)
+                try:
+                    with self.assertRaises(ValueError):
+                        reports.prepare_sessions(parent / 'sessions')
+                finally:
+                    os.chown(parent, 0, 0)
+
     def test_private_parent_stays_private_under_operator_umask(self):
         with tempfile.TemporaryDirectory() as temp:
             parent = Path(temp)

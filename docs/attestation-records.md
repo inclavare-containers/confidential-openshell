@@ -20,8 +20,12 @@ After installing that release and the normal Trustee/Gateway services:
 
 These commands restart the corresponding running service. Enable the Trustee
 side during a maintenance window: official KBS connects to configured external
-plugins at startup and cannot start until the observer is reachable. Systemd
-starts the observer before KBS. A later observer outage makes report queries
+plugins at startup and cannot start until the observer is reachable. The observer
+uses `Type=notify` and signals readiness after binding its loopback listener;
+systemd waits for that signal before starting KBS. An invalid or unreadable AS
+verification key degrades collection while keeping the plugin available, and is
+retried on later scans. Other fatal startup failures can still prevent KBS startup.
+A later observer outage makes report queries
 unavailable; it does not add a runtime dependency to KBS resource authorization.
 
 For an existing remote Trustee, its administrator runs the Trustee step there.
@@ -66,31 +70,53 @@ Each role has one condition with a short, plain-text `message`. There is no
 additional summary condition, TUI tab or CLI command. Ready keeps its existing
 lifecycle meaning; these records do not gate it. Get, list and watch use the same driver conditions.
 Queries run in the background, so the first snapshot may be `Unknown`; subsequent
-snapshots pick up the report. The default scan interval is five seconds and the
-driver refresh interval is ten seconds. When enabled, the driver publishes
-read-only watch snapshots every five seconds so the stock Gateway's sandbox
-store receives fresh collection status even while a sandbox is idle. This
-display publisher does not run lifecycle reconciliation.
+snapshots pick up the report. The observer scans every five seconds. Reports
+queries independently of sandbox reads: initially about every five seconds with
+jitter, then every 60–75 seconds after a conclusion or the capture window expires. The HTTP client,
+CA and parsed admin key are reused; changes to the configuration, CA or key
+invalidate the cached client. Each query signs a fresh short-lived admin JWT.
+
+Only a changed public condition notifies the watch publisher, which reads that
+sandbox and sends its current status. Equivalent results do not read Kubernetes
+or write the Gateway. There is no five-second full-list publisher. The existing
+30-second lifecycle reconcile still republishes snapshots and recovers lost
+notifications; this change does not remove those pre-existing writes. Watch
+reconnection also receives the normal initial snapshots. Queries have an
+eight-request concurrency bound; removed or suspended bindings stop polling, and
+unobserved sandbox cache entries expire after ten minutes (at most 1024 entries).
 
 | Situation | Status | Reason | Message example |
 | --- | --- | --- | --- |
-| Starting, no conclusive record yet | Unknown | AttestationPending | waiting for the guest to attest to Trustee |
+| Starting, no conclusive record yet | Unknown | AttestationPending | waiting for a Trustee record for this attempt |
 | Affirming appraisal, TCB UpToDate | True | Attested | Intel TDX · verified by Trustee · TCB up to date · ref 4bc4f817 |
-| Affirming appraisal, TCB OutOfDate | True | AttestedWithWarning | Intel TDX · verified by Trustee · TCB OutOfDate (allowed by appraisal policy) · ref 4bc4f817 |
+| Affirming appraisal, TCB OutOfDate | True | AttestedWithWarning | Intel TDX · verified by Trustee · TCB out of date (allowed by appraisal policy) · ref 4bc4f817 |
 | Warning appraisal | True | AttestedWithWarning | Intel TDX · verified by Trustee · TCB up to date · Trustee appraisal warning · ref 4bc4f817 |
 | Signed contraindicated appraisal | False | AttestationRejected | Trustee rejected the evidence (appraisal: contraindicated) · ref 4bc4f817 |
 | Cannot collect records before a result is known | Unknown | AttestationStatusUnavailable | cannot read Trustee records |
+| Capture window elapsed without a record | Unknown | AttestationStatusUnavailable | no Trustee record captured for this attempt |
 | Stopped/suspended | Unknown | NotRunning | no running guest |
 
 `ref` is the first eight hexadecimal characters of the signed EAR's SHA-256
 fingerprint, for locating the observer record. It is not a UKI measurement or
-reference baseline. Missing TCB information is displayed as `TCB status
+reference baseline. On the Trustee host, search both current and archived records
+(the entire pipeline needs root access; a short prefix may match multiple files):
+
+```sh
+sudo sh -c 'grep -l '\''"ear_sha256":"4bc4f817'\'' /var/lib/openshell-attestation-observer/reports/*.json /var/lib/openshell-attestation-observer/reports/by-ref/*.json 2>/dev/null | xargs -r jq .'
+```
+
+Missing TCB information is displayed as `TCB status
 unavailable` with `AttestedWithWarning`; it is never presented as up to date.
 An affirming appraisal allows the quoted TCB under the appraisal policy; this
 does not assert that KBS released any resource. A warning is not labelled as a
 policy allowance. Detailed rejection causes are not currently available in the
 reduced report, so the driver does not invent a cause such as an unapproved image.
-Failures that produce no signed record remain pending, not rejected.
+Failures that produce no signed record are never inferred to be rejection.
+The capture window is five minutes from the driver's first observation of the
+role/binding, not the Guest's authentication deadline. It resets on driver restart
+or a changed binding. After that window a missing record becomes unavailable;
+low-frequency retries continue and a later valid record can recover it. Ready is
+not used to fabricate an attestation result for either role.
 
 The driver matches Sandbox CR UID, generation, attempt and measured initdata
 SHA-384 using its private binding records. It strips both the old
@@ -100,12 +126,24 @@ previous attempts or replacement UIDs cannot satisfy the current binding.
 An absent/revoked binding while a guest is expected to run is pending; an
 unreadable binding is unavailable. Stopped guests show NotRunning.
 
-Once a conclusive result is known, query errors, stale scans and missing or
-unspecified records do not erase it. A newer signed conclusive appraisal can
-replace it, including a rejection. Observer history survives observer restarts;
+Once a conclusive result is known, query errors, unhealthy scans and missing or
+unspecified records do not erase it. Binding-read failures retain history in the
+cache but display Unknown until the same trusted binding is confirmed again.
+A newer signed appraisal with a changed TCB, policy ID, appraisal, trustworthiness
+or measurements replaces the representative record, including a rejection.
+Equivalent reattestations advance a persisted timestamp watermark while retaining
+the representative EAR fingerprint. `none` never replaces a conclusive record.
+Observer history survives observer restarts;
 the driver's query cache is temporary and refills after a driver restart.
 Attested describes a past event for the current attempt. It does not establish
 current VM liveness or prove a secret was delivered.
+
+`transition_time` is supplied for both successful and rejected conditions. The
+observer persists the signed time at which the True/False status changed; updates
+to reason/message alone preserve that time. Unknown conditions use the time the
+driver first observed their status. A duplicate attestation does not move the
+displayed ref or transition time. These are historical observations, not fresh
+bearer credentials.
 
 `attested_at`, `token_expires_at`, `observed_at` and `last_scan_at` are Unix seconds.
 An expired EAR is intentionally accepted as a historical record after signature
@@ -126,8 +164,12 @@ Stock sessions expire roughly five minutes after authentication and are cleaned
 periodically. An observer outage can miss a session permanently. No quote refresh,
 extra `/auth`, `/attest` or resource request is made to fill gaps. Absence is not
 proof of rejection: KBS need not save a failed appraisal as an attested session.
-Partial session writes are retried. A report is kept per initdata digest, choosing
-the latest EAR issue time; reduced history grows as new bindings are observed.
+Partial session writes are retried. A representative conclusive report and latest
+equivalent-attestation watermark are kept per initdata digest. Semantic transitions
+are also archived as `by-ref/<ear-sha256>.json`, so a previously displayed ref
+remains searchable. Only reduced records are archived, not bearer tokens.
+History grows with new bindings and semantic changes; include both directories
+in the operator's retention policy.
 
 Rotate the observer's public verification key with the AS signer and restart the
 observer. Already reduced records remain historical observations made with the
@@ -140,6 +182,22 @@ Disable with `./cos gateway reports --disable`, then
 `./cos trustee reports --disable`. These remove display/registration and stop the
 observer while retaining its reduced history. Disabling Trustee registration
 also restarts a running KBS.
+
+If the plugin prevents KBS from starting, disable it on the Trustee host and
+explicitly start KBS (`try-restart` used by the normal installer does not start an
+inactive service):
+
+```sh
+sudo ./cos trustee reports --disable
+sudo systemctl reset-failed kbs.service
+sudo systemctl start kbs.service
+```
+
+The installer refuses to expose sessions unless the storage parent is a real
+root-owned directory with mode 0700. Session files are readable only through the
+observer's narrow read-only mount or by root through that private parent. The
+observer unit restricts network access to loopback and applies syscall, kernel,
+namespace and executable-memory restrictions.
 
 ## Validation
 

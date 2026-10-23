@@ -24,11 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("the plugin must listen on Trustee's loopback interface".into());
     }
     tracing_subscriber::fmt().init();
-    let observer = Observer::new(
-        args.sessions,
-        args.output,
-        &std::fs::read(args.as_public_key)?,
-    )?;
+    let observer = Observer::with_key_file(args.sessions, args.output, args.as_public_key)?;
     let poller = observer.clone();
     let task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(args.interval_seconds));
@@ -38,13 +34,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             poller.scan().await;
         }
     });
+    let listener = tokio::net::TcpListener::bind(args.listen).await?;
+    notify_ready()?;
     let result = tonic::transport::Server::builder()
         .add_service(KbsPluginServer::new(observer))
-        .serve_with_shutdown(args.listen, async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
+        .serve_with_incoming_shutdown(
+            tokio_stream::wrappers::TcpListenerStream::new(listener),
+            async {
+                let _ = tokio::signal::ctrl_c().await;
+            },
+        )
         .await;
     task.abort();
     result?;
+    Ok(())
+}
+
+fn notify_ready() -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::{
+        linux::net::SocketAddrExt,
+        unix::net::{SocketAddr, UnixDatagram},
+    };
+    let Some(path) = std::env::var_os("NOTIFY_SOCKET") else {
+        return Ok(());
+    };
+    let bytes = path.as_os_str().as_bytes();
+    let address = if bytes.first() == Some(&b'@') {
+        SocketAddr::from_abstract_name(&bytes[1..])?
+    } else {
+        SocketAddr::from_pathname(path)?
+    };
+    UnixDatagram::unbound()?.send_to_addr(b"READY=1", &address)?;
     Ok(())
 }

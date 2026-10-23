@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import tomllib
@@ -69,6 +70,11 @@ def install_binary(source, target):
 
 
 def prepare_sessions(path):
+    # World-readable session files are safe only beneath this private, root-owned
+    # parent. Check before creating/exposing the namespace to the observer.
+    parent = path.parent.lstat()
+    if not stat.S_ISDIR(parent.st_mode) or parent.st_uid != 0 or stat.S_IMODE(parent.st_mode) != 0o700:
+        raise ValueError('KBS storage parent must be a real directory owned by root with mode 0700.')
     if not path.exists():
         path.mkdir(mode=0o755)
         # ./cos uses umask 077; only this namespace is readable through the bind.
