@@ -6324,9 +6324,10 @@ impl KubernetesComputeDriver {
         let mut changes = reports.subscribe();
         // Reports owns its polling. Only changed conditions request a fresh snapshot;
         // the existing 30-second reconcile remains the recovery path for lost events.
+        // Publish every notification: other watch producers can change the public
+        // snapshot, so a publisher-local last-sent cache cannot safely deduplicate it.
         let driver = self.clone();
         tokio::spawn(async move {
-            let mut last_sent = std::collections::HashMap::new();
             loop {
                 tokio::select! {
                     change = changes.recv() => {
@@ -6336,7 +6337,6 @@ impl KubernetesComputeDriver {
                                     Ok(Some(sandbox)) => sandbox,
                                     Ok(None) => {
                                         driver.forget_attestation(&id).await;
-                                        last_sent.remove(&id);
                                         continue;
                                     }
                                     Err(error) => {
@@ -6344,10 +6344,6 @@ impl KubernetesComputeDriver {
                                         continue;
                                     }
                                 };
-                                let fingerprint: Vec<_> = sandbox.status.iter().flat_map(|s| &s.conditions)
-                                    .filter(|c| crate::attestation::TYPES.contains(&c.r#type.as_str()))
-                                    .cloned().collect();
-                                if last_sent.get(&id) == Some(&fingerprint) { continue; }
                                 if tx.send(Ok(WatchSandboxesEvent {
                                     payload: Some(watch_sandboxes_event::Payload::Sandbox(
                                         WatchSandboxesSandboxEvent { sandbox: Some(sandbox) },
@@ -6355,12 +6351,9 @@ impl KubernetesComputeDriver {
                                 })).await.is_err() {
                                     return;
                                 }
-                                if last_sent.len() >= 1024 { last_sent.clear(); }
-                                last_sent.insert(id, fingerprint);
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                                 // The next normal reconcile republishes all current results.
-                                last_sent.clear();
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                         }

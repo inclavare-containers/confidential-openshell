@@ -23,8 +23,12 @@ side during a maintenance window: official KBS connects to configured external
 plugins at startup and cannot start until the observer is reachable. The observer
 uses `Type=notify` and signals readiness after binding its loopback listener;
 systemd waits for that signal before starting KBS. An invalid or unreadable AS
-verification key degrades collection while keeping the plugin available, and is
-retried on later scans. Other fatal startup failures can still prevent KBS startup.
+verification key degrades collection while keeping the plugin available. Later
+scans can recover after an in-place repair of an already mounted key. The unit
+also starts with unavailable collection when a session directory or key mount
+source is missing. After creating a missing source, restart the observer to
+establish its mount; atomic key replacement also requires a restart (see upkeep
+below). Other fatal startup failures can still prevent KBS startup.
 A later observer outage makes report queries
 unavailable; it does not add a runtime dependency to KBS resource authorization.
 
@@ -123,8 +127,9 @@ SHA-384 using its private binding records. It strips both the old
 `SupervisorAttestation` / `WorkloadAttestation` names and the new names from
 Kubernetes-supplied conditions, including when this feature is off. Reports from
 previous attempts or replacement UIDs cannot satisfy the current binding.
-An absent/revoked binding while a guest is expected to run is pending; an
-unreadable binding is unavailable. Stopped guests show NotRunning.
+An absent/revoked binding while a guest is expected to run is pending within the
+five-minute capture window, then unavailable. An unreadable binding is
+unavailable immediately. Stopped guests show NotRunning.
 
 Once a conclusive result is known, query errors, unhealthy scans and missing or
 unspecified records do not erase it. Binding-read failures retain history in the
@@ -172,7 +177,10 @@ History grows with new bindings and semantic changes; include both directories
 in the operator's retention policy.
 
 Rotate the observer's public verification key with the AS signer and restart the
-observer. Already reduced records remain historical observations made with the
+observer. The key is a single-file bind mount: replacing it atomically with rename
+leaves the running observer reading the old inode until restart. Scanner retries
+alone only see changes written in place to the mounted inode. Already reduced
+records remain historical observations made with the
 previous configured key. The normal units store these reports under
 `/var/lib/openshell-attestation-observer/reports`; back up or remove that history
 according to operator retention needs while the observer is stopped. Never copy
@@ -223,3 +231,21 @@ With `grpcio-tools` installed in the test environment, add
 output too. That check passes the production driver's encoded condition through
 a loopback Gateway fixture using the unchanged upstream protobufs; the Gateway
 in this specific test is simulated.
+
+On a host running systemd, use this separate root-only acceptance test with
+`cryptography` and `grpcio-tools` installed in the selected Python environment:
+
+```sh
+sudo /path/to/python3 tests/acceptance/check-attestation-systemd.py \
+  --observer /path/to/openshell-attestation-observer \
+  --output /path/to/systemd-result.json
+```
+
+It starts the production unit with temporary fixture paths and all its hardening
+directives, then removes its temporary service/state. It checks notify readiness,
+real plugin queries, non-root identity, read-only mounts, missing mount sources,
+history retention, in-place key repair and atomic key rotation. Existing Trustee
+and sandbox services are untouched. The receipt includes `systemd-analyze verify`
+and `systemd-analyze security` output (or its absence on older systemd versions).
+This verifies runtime compatibility and the targeted mount behavior; the security
+score is informational, not an exhaustive test of every syscall/network restriction.

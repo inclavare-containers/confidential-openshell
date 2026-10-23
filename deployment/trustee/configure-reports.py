@@ -69,12 +69,13 @@ def install_binary(source, target):
             os.unlink(name)
 
 
-def prepare_sessions(path):
+def prepare_sessions(path, *, owner_uid=0):
     # World-readable session files are safe only beneath this private, root-owned
     # parent. Check before creating/exposing the namespace to the observer.
     parent = path.parent.lstat()
-    if not stat.S_ISDIR(parent.st_mode) or parent.st_uid != 0 or stat.S_IMODE(parent.st_mode) != 0o700:
-        raise ValueError('KBS storage parent must be a real directory owned by root with mode 0700.')
+    if not stat.S_ISDIR(parent.st_mode) or parent.st_uid != owner_uid or stat.S_IMODE(parent.st_mode) != 0o700:
+        owner = 'root' if owner_uid == 0 else f'UID {owner_uid}'
+        raise ValueError(f'KBS storage parent must be a real directory owned by {owner} with mode 0700.')
     if not path.exists():
         path.mkdir(mode=0o755)
         # ./cos uses umask 077; only this namespace is readable through the bind.

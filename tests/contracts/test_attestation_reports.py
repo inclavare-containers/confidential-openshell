@@ -55,21 +55,31 @@ class Installation(unittest.TestCase):
             parent.mkdir(mode=0o700)
             for mode in (0o755, 0o750, 0o770):
                 parent.chmod(mode)
-                with self.subTest(mode=mode), self.assertRaisesRegex(ValueError, 'owned by root with mode 0700'):
-                    reports.prepare_sessions(parent / 'sessions')
+                with self.subTest(mode=mode), self.assertRaisesRegex(ValueError, 'with mode 0700'):
+                    reports.prepare_sessions(parent / 'sessions', owner_uid=os.geteuid())
                 self.assertFalse((parent / 'sessions').exists())
             parent.chmod(0o700)
             link = root / 'link'
             link.symlink_to(parent, target_is_directory=True)
             with self.assertRaises(ValueError):
-                reports.prepare_sessions(link / 'sessions')
+                reports.prepare_sessions(link / 'sessions', owner_uid=os.geteuid())
+            with self.assertRaises(ValueError):
+                reports.prepare_sessions(parent / 'sessions', owner_uid=os.geteuid() + 1)
+            self.assertFalse((parent / 'sessions').exists())
+
+    def test_production_default_requires_root_owner(self):
+        with tempfile.TemporaryDirectory() as temp:
+            namespace = Path(temp) / 'sessions'
             if os.geteuid() == 0:
-                os.chown(parent, 65534, 65534)
-                try:
-                    with self.assertRaises(ValueError):
-                        reports.prepare_sessions(parent / 'sessions')
-                finally:
-                    os.chown(parent, 0, 0)
+                reports.prepare_sessions(namespace)
+                self.assertTrue(namespace.is_dir())
+                os.chown(temp, 65534, 65534)
+            try:
+                with self.assertRaisesRegex(ValueError, 'owned by root with mode 0700'):
+                    reports.prepare_sessions(namespace)
+            finally:
+                if os.geteuid() == 0:
+                    os.chown(temp, 0, 0)
 
     def test_private_parent_stays_private_under_operator_umask(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -77,7 +87,7 @@ class Installation(unittest.TestCase):
             namespace = parent / 'kbs_protocol_session'
             previous = os.umask(0o077)
             try:
-                reports.prepare_sessions(namespace)
+                reports.prepare_sessions(namespace, owner_uid=os.geteuid())
             finally:
                 os.umask(previous)
             self.assertEqual(parent.stat().st_mode & 0o777, 0o700)
@@ -86,7 +96,7 @@ class Installation(unittest.TestCase):
             record.write_text('synthetic')
             record.chmod(0o600)
             with self.assertRaises(ValueError):
-                reports.prepare_sessions(namespace)
+                reports.prepare_sessions(namespace, owner_uid=os.geteuid())
 
     def test_reinstall_atomically_replaces_executable(self):
         with tempfile.TemporaryDirectory() as temp:
