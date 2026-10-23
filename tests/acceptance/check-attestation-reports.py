@@ -76,9 +76,15 @@ def native_cli(cli, condition_path, area):
             'sandbox', 'get', 'report-fixture', '--output', 'json'], env=environment, capture_output=True, text=True, timeout=20)
         if completed.returncode: raise RuntimeError('native CLI failed: ' + completed.stderr[-2000:])
         value = json.loads(completed.stdout)
-        displayed = next(c for c in value['conditions'] if c['type'] == 'WorkloadAttestation')
+        displayed = next(c for c in value['conditions'] if c['type'] == 'WorkloadAttested')
         assert displayed['message'] == condition.message
-        assert json.loads(displayed['message'])['report']['appraisal'] == 'affirming'
+        assert displayed['status'] == 'True' and displayed['reason'] == 'Attested'
+        assert displayed['message'].startswith('Intel TDX · verified by Trustee · TCB up to date · ref ')
+        completed = subprocess.run([str(cli), '--gateway-endpoint', f'http://127.0.0.1:{port}',
+            'sandbox', 'get', 'report-fixture'], env=environment, capture_output=True, text=True, timeout=20)
+        assert completed.returncode == 0, completed.stderr
+        lines = [line for line in completed.stdout.splitlines() if 'WorkloadAttested' in line]
+        assert len(lines) == 1 and condition.message in lines[0], completed.stdout
     finally:
         server.stop(0).wait()
 

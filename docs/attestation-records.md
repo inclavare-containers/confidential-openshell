@@ -51,18 +51,20 @@ verification key through read-only mounts. KBS's private storage parent remains
 mode 0700; resource keys and AS private keys are not exposed to the observer.
 
 For a driver managed outside these units, set `OPENSHELL_ATTESTATION_REPORTS=true`
-or pass `--attestation-reports`. Configuration or network errors become `Unknown`.
+or pass `--attestation-reports`. Before a result is known, configuration or network
+errors become `Unknown`. An already observed result is retained for its attempt.
 
 ## Read
 
 ```sh
 openshell sandbox get NAME --output json |
-  jq '.conditions[] | select(.type == "SupervisorAttestation" or .type == "WorkloadAttestation") |
-      {type, status, reason, detail: (.message | fromjson)}'
+  jq '.conditions[] | select(.type == "SupervisorAttested" or .type == "WorkloadAttested") |
+      {type, status, reason, message}'
 ```
 
-The stock CLI carries the report as a JSON string in `message`. There is no new
-TUI tab or CLI command. Get, list and watch use the same driver conditions.
+Each role has one condition with a short, plain-text `message`. There is no
+additional summary condition, TUI tab or CLI command. Ready keeps its existing
+lifecycle meaning; these records do not gate it. Get, list and watch use the same driver conditions.
 Queries run in the background, so the first snapshot may be `Unknown`; subsequent
 snapshots pick up the report. The default scan interval is five seconds and the
 driver refresh interval is ten seconds. When enabled, the driver publishes
@@ -70,27 +72,45 @@ read-only watch snapshots every five seconds so the stock Gateway's sandbox
 store receives fresh collection status even while a sandbox is idle. This
 display publisher does not run lifecycle reconciliation.
 
-Each condition includes the role, Sandbox CR UID, generation, attempt, expected
-initdata SHA-384 and the reduced appraisal. The driver resolves these identities
-from its own private binding records and replaces any same-named conditions
-supplied by Kubernetes. Reports from previous attempts or replacement UIDs are
-not used for the current binding. After stop/revoke there is no active binding:
-the native condition becomes `Unknown / NoActiveBinding`. Observer history is
-retained by digest and survives an observer restart; the driver's query cache
-is temporary and refills after restart.
+| Situation | Status | Reason | Message example |
+| --- | --- | --- | --- |
+| Starting, no conclusive record yet | Unknown | AttestationPending | waiting for the guest to attest to Trustee |
+| Affirming appraisal, TCB UpToDate | True | Attested | Intel TDX · verified by Trustee · TCB up to date · ref 4bc4f817 |
+| Affirming appraisal, TCB OutOfDate | True | AttestedWithWarning | Intel TDX · verified by Trustee · TCB OutOfDate (allowed by appraisal policy) · ref 4bc4f817 |
+| Warning appraisal | True | AttestedWithWarning | Intel TDX · verified by Trustee · TCB up to date · Trustee appraisal warning · ref 4bc4f817 |
+| Signed contraindicated appraisal | False | AttestationRejected | Trustee rejected the evidence (appraisal: contraindicated) · ref 4bc4f817 |
+| Cannot collect records before a result is known | Unknown | AttestationStatusUnavailable | cannot read Trustee records |
+| Stopped/suspended | Unknown | NotRunning | no running guest |
 
-`True / HistoricalAppraisalAffirming` means the observer found a signed affirming
-EAR for that binding. `False / HistoricalAppraisalNotAffirming` describes an
-observed warning or contraindicated appraisal. Missing records, unsigned or
-unrecognized data, an unavailable observer, stale collection status and an
-unspecified appraisal all produce `Unknown`. A previously cached report may
-remain in the message during an outage, with `Unknown` status. None of these
-conditions establishes current VM liveness or proves a secret was delivered.
+`ref` is the first eight hexadecimal characters of the signed EAR's SHA-256
+fingerprint, for locating the observer record. It is not a UKI measurement or
+reference baseline. Missing TCB information is displayed as `TCB status
+unavailable` with `AttestedWithWarning`; it is never presented as up to date.
+An affirming appraisal allows the quoted TCB under the appraisal policy; this
+does not assert that KBS released any resource. A warning is not labelled as a
+policy allowance. Detailed rejection causes are not currently available in the
+reduced report, so the driver does not invent a cause such as an unapproved image.
+Failures that produce no signed record remain pending, not rejected.
+
+The driver matches Sandbox CR UID, generation, attempt and measured initdata
+SHA-384 using its private binding records. It strips both the old
+`SupervisorAttestation` / `WorkloadAttestation` names and the new names from
+Kubernetes-supplied conditions, including when this feature is off. Reports from
+previous attempts or replacement UIDs cannot satisfy the current binding.
+An absent/revoked binding while a guest is expected to run is pending; an
+unreadable binding is unavailable. Stopped guests show NotRunning.
+
+Once a conclusive result is known, query errors, stale scans and missing or
+unspecified records do not erase it. A newer signed conclusive appraisal can
+replace it, including a rejection. Observer history survives observer restarts;
+the driver's query cache is temporary and refills after a driver restart.
+Attested describes a past event for the current attempt. It does not establish
+current VM liveness or prove a secret was delivered.
 
 `attested_at`, `token_expires_at`, `observed_at` and `last_scan_at` are Unix seconds.
 An expired EAR is intentionally accepted as a historical record after signature
 verification. Its expiration does not turn history into a current credential.
-The summary contains appraisal/policy, TDX TCB status, selected measurements,
+The observer's admin-authenticated report contains appraisal/policy, TDX TCB status, selected measurements,
 trustworthiness values and a SHA-256 fingerprint of the EAR. It excludes the
 raw EAR, session cookie, public-key payload, evidence body and secret values.
 

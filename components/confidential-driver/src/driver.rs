@@ -1737,7 +1737,7 @@ impl KubernetesComputeDriver {
                 resource_admission: self.config.resource_admission.clone(),
             }
             .acknowledgement(),
-            driver_name: "kubernetes".to_string(),
+            driver_name: "confidential".to_string(),
             driver_version: openshell_core::VERSION.to_string(),
             default_image: self.config.default_image.clone(),
             gateway_manages_lifecycle: false,
@@ -1762,7 +1762,7 @@ impl KubernetesComputeDriver {
             rootfs_tar_max_bytes: 0,
             extension: Some(openshell_core::extension_protocol::extension_metadata(
                 openshell_core::extension_protocol::ExtensionFamily::Compute,
-                "openshell/kubernetes",
+                "confidential-openshell/confidential",
                 openshell_core::VERSION,
                 [],
             )),
@@ -2430,13 +2430,14 @@ impl KubernetesComputeDriver {
         obj: DynamicObject,
     ) -> Result<(String, Sandbox), String> {
         let uid = obj.metadata.uid.clone().unwrap_or_default();
+        let should_run = sandbox_runtime_should_run(&obj);
         let (name, mut sandbox) =
             sandbox_from_object_with_sandbox_runtime_readiness(client, namespace, obj).await?;
         if let Some(status) = sandbox.status.as_mut() {
             // These names are owned by T, even when the optional feature is off.
             status
                 .conditions
-                .retain(|c| !crate::attestation::TYPES.contains(&c.r#type.as_str()));
+                .retain(|c| !crate::attestation::RESERVED_TYPES.contains(&c.r#type.as_str()));
             if let Some(profile) = &self.confidential
                 && let Some(reports) = &profile.reports
             {
@@ -2448,11 +2449,10 @@ impl KubernetesComputeDriver {
                 })
                 .await
                 .ok()
-                .and_then(Result::ok)
-                .unwrap_or_default();
+                .and_then(Result::ok);
                 status
                     .conditions
-                    .extend(reports.conditions(&bindings).await);
+                    .extend(reports.conditions(bindings.as_deref(), should_run).await);
             }
         }
         Ok((name, sandbox))
@@ -11695,6 +11695,8 @@ mod tests {
         object.data = serde_json::json!({"status": {"conditions": [
             {"type": "WorkloadAttestation", "status": "True", "reason": "Forged", "message": "untrusted"},
             {"type": "SupervisorAttestation", "status": "True", "reason": "Forged", "message": "untrusted"},
+            {"type": "WorkloadAttested", "status": "True", "reason": "Forged", "message": "untrusted"},
+            {"type": "SupervisorAttested", "status": "True", "reason": "Forged", "message": "untrusted"},
             {"type": "Other", "status": "Unknown", "reason": "Unrelated", "message": "keep"}
         ]}});
         let driver = KubernetesComputeDriver::new_for_test(KubernetesComputeConfig::default());
@@ -11703,7 +11705,7 @@ mod tests {
             assert!(
                 conditions
                     .iter()
-                    .all(|c| !crate::attestation::TYPES.contains(&c.r#type.as_str()))
+                    .all(|c| !crate::attestation::RESERVED_TYPES.contains(&c.r#type.as_str()))
             );
             assert!(conditions.iter().any(|c| c.r#type == "Other"));
         };
@@ -15276,11 +15278,9 @@ mod tests {
     #[tokio::test]
     async fn capabilities_report_static_resource_support() {
         let driver = KubernetesComputeDriver::new_for_test(KubernetesComputeConfig::default());
-        let resources = driver
-            .capabilities()
-            .unwrap()
-            .resource_capabilities
-            .unwrap();
+        let capabilities = driver.capabilities().unwrap();
+        assert_eq!(capabilities.driver_name, "confidential");
+        let resources = capabilities.resource_capabilities.unwrap();
         assert!(resources.cpu.unwrap().limit_supported);
         assert!(resources.memory.unwrap().limit_supported);
         let gpu = resources.gpu.unwrap();

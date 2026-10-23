@@ -11,7 +11,7 @@ Environment=XDG_STATE_HOME=/var/lib/openshell-confidential/data
 Environment=KUBECONFIG=/etc/openshell-confidential/kubeconfig
 Environment=OPENSHELL_DB_URL=sqlite:/var/lib/openshell-confidential/data/openshell.db
 Environment=OPENSHELL_TELEMETRY_ENABLED=false
-ExecStart=/usr/local/bin/openshell-gateway --config /etc/openshell-confidential/gateway.toml --compute-driver kubernetes --compute-driver-socket /run/openshell-confidential/driver.sock
+ExecStart=/usr/local/bin/openshell-gateway --config /etc/openshell-confidential/gateway.toml --compute-driver confidential --compute-driver-socket /run/openshell-confidential/driver.sock
 Restart=on-failure
 RestartSec=2
 UMask=0077

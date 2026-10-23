@@ -8,7 +8,7 @@ name = "confidential-ack"
 bind_address = "0.0.0.0:9443"
 health_bind_address = "127.0.0.1:17671"
 log_level = "info"
-compute_driver = "kubernetes"
+compute_driver = "confidential"
 policy_validation_failure_mode = "fail_closed"
 
 [openshell.gateway.tls]
@@ -32,7 +32,7 @@ kid_path = "/var/lib/openshell-confidential/tls/jwt/kid"
 gateway_id = "confidential-ack"
 ttl_secs = 3600
 
-[openshell.drivers.kubernetes]
+[openshell.drivers.confidential]
 namespace = "openshell"
 workspace_mode = "shared"
 gateway_id = "confidential-ack"
