@@ -4078,7 +4078,13 @@ impl KubernetesComputeDriver {
                     .namespace
                     .as_deref()
                     .unwrap_or(&self.config.namespace);
-                if sandbox_runtime_control_availability(&self.client, namespace, sandbox_id).await
+                if sandbox_runtime_control_availability(
+                    &self.client,
+                    namespace,
+                    sandbox_id,
+                    &object,
+                )
+                .await
                     == SandboxRuntimeControlAvailability::Available
                     && sandbox_runtime_bootstrap_is_ready_to_complete(&object)
                 {
@@ -5375,7 +5381,13 @@ impl KubernetesComputeDriver {
                 }
             }
             if sandbox_runtime_bootstrap_in_progress(&object) {
-                if sandbox_runtime_control_availability(&self.client, namespace, &sandbox_id).await
+                if sandbox_runtime_control_availability(
+                    &self.client,
+                    namespace,
+                    &sandbox_id,
+                    &object,
+                )
+                .await
                     == SandboxRuntimeControlAvailability::Available
                     && sandbox_runtime_bootstrap_is_ready_to_complete(&object)
                 {
@@ -5489,7 +5501,8 @@ impl KubernetesComputeDriver {
                 }
             }
             let availability =
-                sandbox_runtime_control_availability(&self.client, namespace, &sandbox_id).await;
+                sandbox_runtime_control_availability(&self.client, namespace, &sandbox_id, &object)
+                    .await;
             if desired_running && availability == SandboxRuntimeControlAvailability::Unavailable {
                 warn!(
                     sandbox_id,
@@ -5877,23 +5890,7 @@ impl KubernetesComputeDriver {
                 .await;
         }
         let names = SandboxRuntimeNames::new(sandbox_id);
-        let services = Api::<Service>::namespaced(self.client.clone(), namespace);
-        let service_exists =
-            tokio::time::timeout(KUBE_API_TIMEOUT, services.get_opt(&names.boundary_service))
-                .await
-                .map_err(|_| {
-                    KubernetesDriverError::Message(
-                        "timed out reading sandbox-runtime boundary Service".to_string(),
-                    )
-                })?
-                .map_err(KubernetesDriverError::from_kube)?
-                .is_some();
-        if !service_exists {
-            return Err(KubernetesDriverError::Precondition(format!(
-                "sandbox-runtime boundary Service {} is missing and its allocated address cannot be safely reconstructed",
-                names.boundary_service
-            )));
-        }
+        // The generation-specific Service was checked by verify_sandbox_runtime_control_path.
         let pods = Api::<Pod>::namespaced(self.client.clone(), namespace);
         tokio::time::timeout(
             KUBE_API_TIMEOUT,
@@ -7041,7 +7038,15 @@ async fn sandbox_runtime_control_availability(
     client: &Client,
     namespace: &str,
     sandbox_id: &str,
+    object: &DynamicObject,
 ) -> SandboxRuntimeControlAvailability {
+    let mode = match sandbox_runtime_control_connection(object) {
+        Ok(mode) => mode,
+        Err(error) => {
+            warn!(sandbox_id, %error, "sandbox-runtime control mode is invalid");
+            return SandboxRuntimeControlAvailability::Unavailable;
+        }
+    };
     let names = SandboxRuntimeNames::new(sandbox_id);
     let pods = Api::<Pod>::namespaced(client.clone(), namespace);
     let services = Api::<Service>::namespaced(client.clone(), namespace);
@@ -7052,7 +7057,7 @@ async fn sandbox_runtime_control_availability(
     ));
     let service = Box::pin(tokio::time::timeout(
         KUBE_API_TIMEOUT,
-        services.get_opt(&names.boundary_service),
+        services.get_opt(names.control_service(mode)),
     ));
     let fence = Box::pin(tokio::time::timeout(
         KUBE_API_TIMEOUT,
@@ -9384,7 +9389,7 @@ async fn generation_control_availability(
 ) -> SandboxRuntimeControlAvailability {
     match supervisor_placement(object) {
         Ok(SupervisorPlacement::Dedicated) => {
-            sandbox_runtime_control_availability(client, namespace, sandbox_id).await
+            sandbox_runtime_control_availability(client, namespace, sandbox_id, object).await
         }
         Ok(SupervisorPlacement::Shared { route }) => {
             shared_instance_control_availability(client, shared, namespace, sandbox_id, &route)
@@ -15347,6 +15352,91 @@ mod tests {
         let gpu = resources.gpu.unwrap();
         assert!(gpu.default_selection_supported);
         assert!(gpu.count_selection_supported);
+    }
+
+    #[tokio::test]
+    async fn control_availability_uses_only_the_generation_service() {
+        use SandboxRuntimeControlAvailability::{Available, Unavailable};
+        for mode in [
+            KubernetesControlConnection::RuntimeInitiated,
+            KubernetesControlConnection::SupervisorInitiated,
+        ] {
+            for missing in [false, true] {
+                let names = SandboxRuntimeNames::new("sandbox-1");
+                let expected_service = format!(
+                    "/api/v1/namespaces/openshell/services/{}",
+                    names.control_service(mode)
+                );
+                let object: DynamicObject = serde_json::from_value(serde_json::json!({
+                    "apiVersion": "agents.x-k8s.io/v1beta1", "kind": "Sandbox",
+                    "metadata": {"annotations": {
+                        ANNOTATION_SANDBOX_RUNTIME_GENERATION: "gen-1",
+                        ANNOTATION_SANDBOX_RUNTIME_CONTROL_GENERATION: "gen-1",
+                        ANNOTATION_SANDBOX_RUNTIME_CONTROL_CONNECTION: mode.as_str()
+                    }}
+                }))
+                .unwrap();
+                let service = tower::service_fn(
+                    move |request: http::Request<kube::client::Body>| {
+                        let expected = expected_service.clone();
+                        async move {
+                            assert_eq!(request.method(), http::Method::GET);
+                            let path = request.uri().path();
+                            let response = if path.contains("/services/") {
+                                assert_eq!(
+                                    path, expected,
+                                    "must not require the other mode's Service"
+                                );
+                                if missing {
+                                    kube_test_not_found("services", "missing")
+                                } else {
+                                    kube_test_response(
+                                        http::StatusCode::OK,
+                                        serde_json::json!({"apiVersion":"v1","kind":"Service","metadata":{}}),
+                                    )
+                                }
+                            } else if path.ends_with("/pods/os-supervisor-sandbox-1") {
+                                kube_test_response(
+                                    http::StatusCode::OK,
+                                    serde_json::json!({"apiVersion":"v1","kind":"Pod","metadata":{},"status":{"conditions":[{"type":"Ready","status":"True"}]}}),
+                                )
+                            } else {
+                                assert!(path.contains("/networkpolicies/"));
+                                kube_test_response(
+                                    http::StatusCode::OK,
+                                    serde_json::json!({"apiVersion":"networking.k8s.io/v1","kind":"NetworkPolicy","metadata":{}}),
+                                )
+                            };
+                            Ok::<_, std::convert::Infallible>(response)
+                        }
+                    },
+                );
+                let client = Client::new(service, "openshell");
+                assert_eq!(
+                    sandbox_runtime_control_availability(
+                        &client,
+                        "openshell",
+                        "sandbox-1",
+                        &object
+                    )
+                    .await,
+                    if missing { Unavailable } else { Available }
+                );
+                // Companion reconciliation must not repeat a legacy Service read.
+                let mut driver =
+                    KubernetesComputeDriver::new_for_test(KubernetesComputeConfig::default());
+                driver.client = client;
+                driver
+                    .reconcile_sandbox_runtime_supervisor(
+                        "sandbox-1",
+                        "openshell",
+                        true,
+                        Some("cr-uid"),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
     }
 
     #[test]
