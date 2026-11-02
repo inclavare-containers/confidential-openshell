@@ -1,24 +1,27 @@
-From 45d82509eb3f2845b8c9ef008184f719b2f40924 Mon Sep 17 00:00:00 2001
+From c2c459843f6d65620a58e48f92b93bd4de062f3e Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
-Date: Mon, 2 Nov 2026 16:30:24 +0800
-Subject: [PATCH] feat(alibabacloud): attach and retain ESSD data disks
+Date: Tue, 3 Nov 2026 01:07:30 +0800
+Subject: [PATCH 03/10] feat(alibabacloud): attach and retain ESSD data disks
 
+Apply retained-disk lock restrictions only when data disks are attached.
+
+Co-authored-by: Codex <codex@openai.com>
 ---
- .../alibabacloud/delete_instance_test.go      | 467 ++++++++++++++++++
- src/cloud-providers/alibabacloud/provider.go  | 219 ++++++--
+ .../alibabacloud/delete_instance_test.go      | 481 ++++++++++++++++++
+ src/cloud-providers/alibabacloud/provider.go  | 222 ++++++--
  src/cloud-providers/alibabacloud/volumes.go   | 380 ++++++++++++++
- .../alibabacloud/volumes_test.go              | 253 ++++++++++
- 4 files changed, 1284 insertions(+), 35 deletions(-)
+ .../alibabacloud/volumes_test.go              | 253 +++++++++
+ 4 files changed, 1301 insertions(+), 35 deletions(-)
  create mode 100644 src/cloud-providers/alibabacloud/delete_instance_test.go
  create mode 100644 src/cloud-providers/alibabacloud/volumes.go
  create mode 100644 src/cloud-providers/alibabacloud/volumes_test.go
 
 diff --git a/src/cloud-providers/alibabacloud/delete_instance_test.go b/src/cloud-providers/alibabacloud/delete_instance_test.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..b821bc900c275729d20c18dc9bbdfe025e36e4ca
+index 0000000000000000000000000000000000000000..33d1d66e71661f7672fb3db4f8c3a76b3abbcb62
 --- /dev/null
 +++ b/src/cloud-providers/alibabacloud/delete_instance_test.go
-@@ -0,0 +1,467 @@
+@@ -0,0 +1,481 @@
 +// (C) Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -323,8 +326,8 @@ index 0000000000000000000000000000000000000000..b821bc900c275729d20c18dc9bbdfe02
 +	if err := p.DeleteInstance(context.Background(), "i-peerpod"); err != nil {
 +		t.Fatalf("DeleteInstance() error = %v", err)
 +	}
-+	if client.deleteCalls != 0 {
-+		t.Fatalf("DeleteInstance calls = %d after preflight established absence", client.deleteCalls)
++	if client.deleteCalls != 1 {
++		t.Fatalf("DeleteInstance calls = %d; expected one idempotent not-found response", client.deleteCalls)
 +	}
 +}
 +
@@ -486,8 +489,22 @@ index 0000000000000000000000000000000000000000..b821bc900c275729d20c18dc9bbdfe02
 +	}
 +
 +}
++
++func TestDeleteEphemeralInstanceDoesNotApplyRetainedDiskLocks(t *testing.T) {
++	client := &fakeCleanupECSClient{
++		instanceID: "i-ephemeral", instanceExists: true,
++		operationLocks: []string{"Security", "FutureLock"},
++	}
++	provider := newCleanupTestProvider(client)
++	if err := provider.DeleteInstance(context.Background(), "i-ephemeral"); err != nil {
++		t.Fatal(err)
++	}
++	if client.deleteCalls != 1 || client.instanceExists {
++		t.Fatalf("ephemeral instance was not deleted: calls=%d exists=%v", client.deleteCalls, client.instanceExists)
++	}
++}
 diff --git a/src/cloud-providers/alibabacloud/provider.go b/src/cloud-providers/alibabacloud/provider.go
-index b52fc17de242bfed6da4d718f2426b7ba9df8d77..9347069ae6fb55039765186d33715806808511c6 100644
+index b52fc17de242bfed6da4d718f2426b7ba9df8d77..ee602f66c0cb88c2f24950b353803e334911e238 100644
 --- a/src/cloud-providers/alibabacloud/provider.go
 +++ b/src/cloud-providers/alibabacloud/provider.go
 @@ -5,11 +5,13 @@ package alibabacloud
@@ -642,7 +659,7 @@ index b52fc17de242bfed6da4d718f2426b7ba9df8d77..9347069ae6fb55039765186d33715806
  	if err != nil {
  		logger.Printf("failed to get IPs for the instance : %v ", err)
  		return instance, err
-@@ -368,35 +404,33 @@ func (p *alibabaCloudProvider) CreateInstance(ctx context.Context, podName, sand
+@@ -368,35 +404,36 @@ func (p *alibabaCloudProvider) CreateInstance(ctx context.Context, podName, sand
  }
  
  func (p *alibabaCloudProvider) DeleteInstance(ctx context.Context, instanceID string) error {
@@ -672,9 +689,12 @@ index b52fc17de242bfed6da4d718f2426b7ba9df8d77..9347069ae6fb55039765186d33715806
 +	if err != nil {
 +		return fmt.Errorf("validate retained data disks for instance %s: %w", instanceID, err)
 +	}
-+	instanceAbsent, err := p.validateInstanceRetainedDiskSafety(cleanupCtx, instanceID)
-+	if err != nil {
-+		return err
++	instanceAbsent := false
++	if len(diskIDs) != 0 {
++		instanceAbsent, err = p.validateInstanceRetainedDiskSafety(cleanupCtx, instanceID)
++		if err != nil {
++			return err
++		}
 +	}
  
 -			logger.Printf("failed to delete an instance: %v and the response is %v", err, resp)
@@ -698,7 +718,7 @@ index b52fc17de242bfed6da4d718f2426b7ba9df8d77..9347069ae6fb55039765186d33715806
  
  	p.eipsMu.Lock()
  	eipID := p.eips[instanceID]
-@@ -413,6 +447,121 @@ func (p *alibabaCloudProvider) DeleteInstance(ctx context.Context, instanceID st
+@@ -413,6 +450,121 @@ func (p *alibabaCloudProvider) DeleteInstance(ctx context.Context, instanceID st
  	return nil
  }
  

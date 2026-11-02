@@ -55,7 +55,7 @@ def main():
     peer['kata-deploy']['kubectlImage'] = {'reference': image('kata_kubectl'), 'tag': ''}
     csi = yaml.safe_load((ROOT / 'deployment/peerpods/csi-values.example.yaml').read_text())
     csi['image']['repository'], csi['image']['tag'] = split('caa-csi-block-driver')
-    csi['sidecarImages'].update(provisioner=image('csi_provisioner'), nodeDriverRegistrar=image('csi_node_registrar'), resizer=image('csi_resizer'))
+    csi['sidecarImages'].update(provisioner=image('csi_provisioner'), nodeDriverRegistrar=image('csi_node_registrar'))
     csi['controller']['state']['storageClassName'] = cloud.config['csi_storage_class']
     csi['alibabacloud'].update(region=cloud.region, zoneId=state['zone_id'], clusterId=state['cluster_id'])
     csi['alibabacloud']['rrsa'].update(roleArn=state['ram_roles']['csi'], oidcProviderArn=state['rrsa']['oidc_arn'])

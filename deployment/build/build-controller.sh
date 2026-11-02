@@ -29,8 +29,8 @@ with tarfile.open(work / 'manager.layer.tar', 'w', format=tarfile.USTAR_FORMAT) 
     with binary.open('rb') as source:
         archive.addfile(entry, source)
 PY
-CONTROLLER_REPOSITORY=$(jq -er '.build_outputs.peerpod_ctrl.repository' "$ROOT/deployment/runtime/artifacts.lock.json")
-PEERPOD_CTRL_TAG=$(jq -er '.build_outputs.peerpod_ctrl.tag' "$ROOT/deployment/runtime/artifacts.lock.json")
+CONTROLLER_REPOSITORY=$(jq -er '.build.peerpod_ctrl.repository' "$ROOT/deployment/runtime/artifacts.lock.json")
+PEERPOD_CTRL_TAG=$(jq -er '.build.peerpod_ctrl.tag' "$ROOT/deployment/runtime/artifacts.lock.json")
 CONTROLLER_RUNTIME=$(jq -er '.images.peerpod_ctrl_runtime' "$ROOT/deployment/runtime/artifacts.lock.json")
 mkdir -p "$ROOT/artifacts/images"
 CONTROLLER_IMAGE_ARCHIVE="$ROOT/artifacts/images/peerpod-controller.tar"

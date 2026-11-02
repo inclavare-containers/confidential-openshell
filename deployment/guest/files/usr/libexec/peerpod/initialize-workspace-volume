@@ -115,7 +115,7 @@ def main():
             raise ValueError('workspace initialization mapper already exists')
         # No detached --header: metadata lives on the retained encrypted disk.
         run('cryptsetup', '--batch-mode', 'luksFormat', '--type', 'luks2',
-            '--cipher', 'aes-xts-plain64', '--sector-size', '4096',
+            '--cipher', 'aes-xts-plain64', '--key-size', '512', '--sector-size', '4096',
             '--key-file', '-', device, key=key)
         run('cryptsetup', 'luksOpen', '--key-file', '-', device, mapper, key=key)
         try:

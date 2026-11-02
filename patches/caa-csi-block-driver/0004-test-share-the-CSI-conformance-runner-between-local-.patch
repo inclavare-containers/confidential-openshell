@@ -1,9 +1,10 @@
-From 370703ddc9683d78b75090bce4c4794e7d39e802 Mon Sep 17 00:00:00 2001
+From 66a04ffa778df27793ff0837b7a421ef1f654e38 Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
-Date: Mon, 2 Nov 2026 16:33:07 +0800
+Date: Tue, 3 Nov 2026 01:05:58 +0800
 Subject: [PATCH 4/5] test: share the CSI conformance runner between local and
  CI checks
 
+Co-authored-by: Codex <codex@openai.com>
 ---
  .github/workflows/csi-sanity.yaml | 108 +++---------------------------
  hack/run-csi-sanity.sh            |  46 +++++++++----

@@ -1,16 +1,19 @@
-From d22aa83d6596ac810106a91f33cbf2fcdb6a871c Mon Sep 17 00:00:00 2001
+From 290285eb7ee3e8c62afc9f8beaf5517def0cd5ca Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
-Date: Mon, 2 Nov 2026 16:33:07 +0800
+Date: Tue, 3 Nov 2026 01:05:58 +0800
 Subject: [PATCH 1/5] feat(alibabacloud): provision ESSD with existing provider
  interfaces
 
+Co-authored-by: Codex <codex@openai.com>
 ---
- cmd/main.go                                |   1 +
- go.mod                                     |  15 ++
- go.sum                                     | 238 ++++++++++++++++++
- pkg/provider/alibabacloud/provider.go      | 270 +++++++++++++++++++++
- pkg/provider/alibabacloud/provider_test.go | 111 +++++++++
- 5 files changed, 635 insertions(+)
+ cmd/main.go                                   |   1 +
+ go.mod                                        |  15 +
+ go.sum                                        | 238 +++++++++++++++
+ pkg/provider/alibabacloud/credentials_test.go |  80 +++++
+ pkg/provider/alibabacloud/provider.go         | 280 ++++++++++++++++++
+ pkg/provider/alibabacloud/provider_test.go    | 142 +++++++++
+ 6 files changed, 756 insertions(+)
+ create mode 100644 pkg/provider/alibabacloud/credentials_test.go
  create mode 100644 pkg/provider/alibabacloud/provider.go
  create mode 100644 pkg/provider/alibabacloud/provider_test.go
 
@@ -381,12 +384,12 @@ index cc2887e532c39e56ce0adf70ad2def946de31c21..12aac17abde8e105059d06f4616953cb
  gopkg.in/yaml.v3 v3.0.1/go.mod h1:K4uyk7z7BCEPqu6E+C64Yfv1cQ7kz7rIZviUmN+EgEM=
 +honnef.co/go/tools v0.0.0-20190102054323-c2f93a96b099/go.mod h1:rf3lG4BRIbNafJWhAfAdb/ePZxsR/4RtNHQocxwk9r4=
 +honnef.co/go/tools v0.0.0-20190523083050-ea95bdfd59fc/go.mod h1:rf3lG4BRIbNafJWhAfAdb/ePZxsR/4RtNHQocxwk9r4=
-diff --git a/pkg/provider/alibabacloud/provider.go b/pkg/provider/alibabacloud/provider.go
+diff --git a/pkg/provider/alibabacloud/credentials_test.go b/pkg/provider/alibabacloud/credentials_test.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..1814c5750e9a7332a832ee78c853ddada83ad56a
+index 0000000000000000000000000000000000000000..2e5b4eaa49b0032e734417068035aedf6f2f9afe
 --- /dev/null
-+++ b/pkg/provider/alibabacloud/provider.go
-@@ -0,0 +1,270 @@
++++ b/pkg/provider/alibabacloud/credentials_test.go
+@@ -0,0 +1,80 @@
 +// (C) Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -394,10 +397,98 @@ index 0000000000000000000000000000000000000000..1814c5750e9a7332a832ee78c853ddad
 +
 +import (
 +	"context"
++	"crypto/tls"
++	"crypto/x509"
++	"encoding/json"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++func TestSDKCredentialCacheSurvivesProviderRecreation(t *testing.T) {
++	var stsCalls, ecsCalls atomic.Int64
++	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		_ = r.ParseForm()
++		w.Header().Set("Content-Type", "application/json")
++		if r.FormValue("Action") == "AssumeRoleWithOIDC" {
++			stsCalls.Add(1)
++			_ = json.NewEncoder(w).Encode(map[string]any{"Credentials": map[string]string{
++				"AccessKeyId": "fixture-id", "AccessKeySecret": "fixture-secret", "SecurityToken": "fixture-token",
++				"Expiration": time.Now().Add(time.Hour).UTC().Format("2006-01-02T15:04:05Z"),
++			}})
++			return
++		}
++		if r.Header.Get("x-acs-action") != "DescribeDisks" {
++			t.Errorf("unexpected local operation: %s", r.Header.Get("x-acs-action"))
++			w.WriteHeader(http.StatusBadRequest)
++			return
++		}
++		ecsCalls.Add(1)
++		_, _ = w.Write([]byte(`{"TotalCount":0,"Disks":{"Disk":[]}}`))
++	}))
++	defer server.Close()
++	roots := x509.NewCertPool()
++	roots.AddCert(server.Certificate())
++	config := &tls.Config{RootCAs: roots, ServerName: server.Certificate().DNSNames[0], MinVersion: tls.VersionTLS12}
++	transport := http.DefaultTransport.(*http.Transport).Clone()
++	transport.Proxy = nil
++	transport.TLSClientConfig = config
++	transport.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
++		return (&net.Dialer{}).DialContext(ctx, network, server.Listener.Addr().String())
++	}
++	transport.DialTLSContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
++		return (&tls.Dialer{Config: config}).DialContext(ctx, network, server.Listener.Addr().String())
++	}
++	previous := http.DefaultTransport
++	http.DefaultTransport = transport
++	t.Cleanup(func() { http.DefaultTransport = previous; transport.CloseIdleConnections() })
++	for _, name := range []string{"ALIBABA_CLOUD_ACCESS_KEY_ID", "ALIBABA_CLOUD_ACCESS_KEY_SECRET", "ALIBABA_CLOUD_SECURITY_TOKEN", "ALIBABA_CLOUD_CREDENTIALS_URI"} {
++		t.Setenv(name, "")
++	}
++	token := filepath.Join(t.TempDir(), "token")
++	if err := os.WriteFile(token, []byte("fixture-oidc-token"), 0600); err != nil {
++		t.Fatal(err)
++	}
++	t.Setenv("ALIBABA_CLOUD_OIDC_TOKEN_FILE", token)
++	t.Setenv("ALIBABA_CLOUD_OIDC_PROVIDER_ARN", "fixture-provider")
++	t.Setenv("ALIBABA_CLOUD_ROLE_ARN", "fixture-role")
++	for range 3 {
++		p, err := NewAlibabaCloudProvider(map[string]string{"region": "cn-beijing", "clusterId": "fixture"})
++		if err != nil {
++			t.Fatal(err)
++		}
++		if _, err := p.VolumeExists(context.Background(), "pvc-fixture"); err != nil {
++			t.Fatal(err)
++		}
++	}
++	if stsCalls.Load() != 1 || ecsCalls.Load() != 3 {
++		t.Fatalf("credential cache not reused: STS=%d ECS=%d", stsCalls.Load(), ecsCalls.Load())
++	}
++}
+diff --git a/pkg/provider/alibabacloud/provider.go b/pkg/provider/alibabacloud/provider.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..d4248c4e39eea3d12636c3711878e61ccf517ae3
+--- /dev/null
++++ b/pkg/provider/alibabacloud/provider.go
+@@ -0,0 +1,280 @@
++// (C) Copyright Confidential Containers Contributors
++// SPDX-License-Identifier: Apache-2.0
++
++package alibabacloud
++
++import (
++	"context"
++	"crypto/sha256"
 +	"encoding/json"
 +	"errors"
 +	"fmt"
 +	"net/http"
++	"sync"
 +	"time"
 +
 +	openapi "github.com/alibabacloud-go/darabonba-openapi/v2/utils"
@@ -426,6 +517,13 @@ index 0000000000000000000000000000000000000000..1814c5750e9a7332a832ee78c853ddad
 +	sdk    openapi.Config
 +}
 +
++// CSI constructs a provider for each RPC. Credential identity is fixed by the
++// controller process environment; retain the SDK object so its normal refresh
++// cache survives those provider instances. Product/region settings stay local.
++var defaultCredential = sync.OnceValues(func() (credentials.Credential, error) {
++	return credentials.NewCredential(nil)
++})
++
 +func init() {
 +	provider.RegisterProvider("alibabacloud", func(params map[string]string) (provider.BlockVolumeProvider, error) {
 +		return NewAlibabaCloudProvider(params)
@@ -439,7 +537,7 @@ index 0000000000000000000000000000000000000000..1814c5750e9a7332a832ee78c853ddad
 +	if params["clusterId"] == "" {
 +		return nil, errors.New("clusterId is required")
 +	}
-+	credential, err := credentials.NewCredential(nil)
++	credential, err := defaultCredential()
 +	if err != nil {
 +		return nil, err
 +	}
@@ -494,6 +592,7 @@ index 0000000000000000000000000000000000000000..1814c5750e9a7332a832ee78c853ddad
 +	}
 +	response, err := client.CreateDiskWithOptions(&ecs.CreateDiskRequest{
 +		RegionId: tea.String(p.config.Region), ZoneId: tea.String(p.config.Zone),
++		ClientToken:  tea.String(fmt.Sprintf("%x", sha256.Sum256([]byte(p.config.ClusterID+"\x00"+volumeID)))),
 +		DiskCategory: tea.String("cloud_essd"), PerformanceLevel: tea.String("PL0"), Size: tea.Int32(size),
 +		Tag: []*ecs.CreateDiskRequestTag{
 +			{Key: tea.String(volumeTagKey), Value: tea.String(volumeID)},
@@ -659,10 +758,10 @@ index 0000000000000000000000000000000000000000..1814c5750e9a7332a832ee78c853ddad
 +}
 diff --git a/pkg/provider/alibabacloud/provider_test.go b/pkg/provider/alibabacloud/provider_test.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..118fd42eda686184362c0859cf150976aeb9b914
+index 0000000000000000000000000000000000000000..403f45b9503b24fc58fb8851d958e7ad2aa2022f
 --- /dev/null
 +++ b/pkg/provider/alibabacloud/provider_test.go
-@@ -0,0 +1,111 @@
+@@ -0,0 +1,142 @@
 +// (C) Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -706,6 +805,9 @@ index 0000000000000000000000000000000000000000..118fd42eda686184362c0859cf150976
 +		w.Header().Set("Content-Type", "application/json")
 +		switch r.Header.Get("x-acs-action") {
 +		case "CreateDisk":
++			if len(r.Form.Get("ClientToken")) != 64 {
++				t.Error("CreateDisk lacks a stable native idempotency token")
++			}
 +			if r.Form.Get("Size") != "20" || r.Form.Get("PerformanceLevel") != "PL0" || r.Form.Get("Tag.1.Value") != "pvc-test" {
 +				t.Errorf("unexpected create parameters: %v", r.Form)
 +			}
@@ -772,5 +874,33 @@ index 0000000000000000000000000000000000000000..118fd42eda686184362c0859cf150976
 +		if err := p.DeleteVolume(ctx, "pvc-test"); err != nil {
 +			t.Fatal(err)
 +		}
++	}
++}
++
++func TestCreateDiskRetryReusesTokenWithoutCrossClusterCollision(t *testing.T) {
++	var tokens []string
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		_ = r.ParseForm()
++		w.Header().Set("Content-Type", "application/json")
++		if r.Header.Get("x-acs-action") == "CreateDisk" {
++			tokens = append(tokens, r.Form.Get("ClientToken"))
++			w.WriteHeader(http.StatusInternalServerError)
++			_, _ = w.Write([]byte(`{"Code":"InternalError","Message":"unknown create outcome"}`))
++			return
++		}
++		_, _ = w.Write([]byte(`{"TotalCount":0,"Disks":{"Disk":[]}}`))
++	}))
++	defer server.Close()
++	for _, identity := range [][2]string{{"cluster-a", "pvc-a"}, {"cluster-a", "pvc-a"}, {"cluster-b", "pvc-a"}, {"cluster-a", "pvc-b"}} {
++		p := &AlibabaCloudProvider{config: Config{Region: "cn-beijing", Zone: "cn-beijing-i", ClusterID: identity[0]}, sdk: openapi.Config{
++			Endpoint: tea.String(strings.TrimPrefix(server.URL, "http://")), Protocol: tea.String("http"),
++			AccessKeyId: tea.String("test-id"), AccessKeySecret: tea.String("test-secret"),
++		}}
++		if _, err := p.CreateVolume(context.Background(), identity[1], gib); err == nil {
++			t.Fatal("ambiguous create unexpectedly succeeded")
++		}
++	}
++	if len(tokens) != 4 || tokens[0] == "" || tokens[0] != tokens[1] || tokens[0] == tokens[2] || tokens[0] == tokens[3] {
++		t.Fatalf("retry/cluster/volume token scope is incorrect: %v", tokens)
 +	}
 +}

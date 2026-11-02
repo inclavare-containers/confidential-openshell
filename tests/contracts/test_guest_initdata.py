@@ -53,6 +53,18 @@ class GuestContract(unittest.TestCase):
                 files = validate(fixture(role))
                 self.assertEqual(files['workspace-required.env'], b'ENCRYPTED_VOLUMES_REQUIRED=false\n')
 
+    def test_cloud_init_transport_newline_preserves_measurement(self):
+        data = fixture('workload')
+        data['policy.rego'] += '\n\n'
+        original = validate(data)
+        for ending in (b'\n', b'\r\n'):
+            with self.subTest(ending=ending):
+                result = validate(data, lambda p: (p / 'initdata').write_bytes((p / 'initdata').read_bytes() + ending))
+                self.assertEqual(result['initdata.digest'], original['initdata.digest'])
+                self.assertEqual(result['policy.rego'], original['policy.rego'])
+        with self.assertRaises(ValueError):
+            validate(data, lambda p: (p / 'initdata').write_bytes((p / 'initdata').read_bytes() + b' '))
+
     def test_registry_trust_is_independent_of_kbs_trust(self):
         data = fixture('workload')
         other = CA.replace('YQ==', 'Yg==')

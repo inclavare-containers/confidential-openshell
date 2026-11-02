@@ -1,15 +1,33 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From df7477244a278d1bd91fe554296e8fc14da85f6b Mon Sep 17 00:00:00 2001
 From: Codex <codex@openai.com>
-Date: Wed, 14 Oct 2026 09:00:00 +0800
-Subject: [PATCH 08/11] Verify measured sealed volumes and native initdata binding
+Date: Tue, 3 Nov 2026 01:07:30 +0800
+Subject: [PATCH 08/10] Verify measured sealed volumes and native initdata
+ binding
 
 Retain fail-closed sealed volume verification before the guest agent.
 Use the existing process-user-data binary to bind exact initdata with the
 released native AA ttrpc API, enforcing one canonical SHA384 TCG2 event
 and rejecting disabled measurement, digest mismatch or duplicate events.
 
-Signed-off-by: Codex <codex@openai.com>
+Reject injected cloud volumes in the measured confidential ephemeral profile before device preparation.
+
 ---
+ .../cmd/agent-protocol-forwarder/main.go      |  14 +-
+ .../cmd/process-user-data/main.go             |  13 +
+ .../pkg/forwarder/interceptor/cdh_client.go   |  14 +-
+ .../pkg/forwarder/interceptor/cloud_volume.go |   3 +
+ .../interceptor/cloud_volume_test.go          |   9 +
+ .../pkg/forwarder/interceptor/interceptor.go  |  72 +++++
+ .../forwarder/interceptor/sealed_volume.go    | 281 ++++++++++++++++++
+ .../interceptor/sealed_volume_test.go         | 169 +++++++++++
+ src/cloud-api-adaptor/pkg/userdata/measure.go | 166 +++++++++++
+ .../pkg/userdata/measure_test.go              | 164 ++++++++++
+ 10 files changed, 902 insertions(+), 3 deletions(-)
+ create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/sealed_volume.go
+ create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/sealed_volume_test.go
+ create mode 100644 src/cloud-api-adaptor/pkg/userdata/measure.go
+ create mode 100644 src/cloud-api-adaptor/pkg/userdata/measure_test.go
+
 diff --git a/src/cloud-api-adaptor/cmd/agent-protocol-forwarder/main.go b/src/cloud-api-adaptor/cmd/agent-protocol-forwarder/main.go
 index e36fccec497aae4204e0258abfe3768f2ae87462..edcae7839f31058255666b5e57482565b5cce11d 100644
 --- a/src/cloud-api-adaptor/cmd/agent-protocol-forwarder/main.go
@@ -91,6 +109,40 @@ index 008dd7eff58ce9d81b73d7b84d2975fddcf9580a..05186fb60ec2cdb2995b0e574726597c
 +	}
 +	return resp.GetPlaintext(), nil
 +}
+diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume.go
+index 18a5f0ebb9d5d40b3570b33ee70e82cc8276e26e..accab0940263537008c904386e3b8cdeb08b75ff 100644
+--- a/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume.go
++++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume.go
+@@ -139,6 +139,9 @@ func (i *interceptor) prepareCloudVolumes(ctx context.Context, req *pb.CreateCon
+ 	if err != nil {
+ 		return nil, fmt.Errorf("corrupt cloud_volumes annotation (pod would start without volumes): %w", err)
+ 	}
++	if i.sealedGate != nil && !i.requireEncryptedVolumes && len(volumes) != 0 {
++		return nil, errors.New("cloud volumes are not permitted by the confidential ephemeral profile")
++	}
+ 	var workspace *workspacePolicy
+ 	if i.requireEncryptedVolumes && len(volumes) != 0 {
+ 		if i.workspace == nil {
+diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume_test.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume_test.go
+index a97fcb6472fe936f7f8e5c1e506a2f6eb58fbc2a..836f79e4f1f9758965340bbfa415b5c452a0462f 100644
+--- a/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume_test.go
++++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume_test.go
+@@ -188,6 +188,15 @@ func TestValidateReusableCloudMountRequiresSecurityOptions(t *testing.T) {
+ 	require.ErrorContains(t, err, "option noexec=false, expected true")
+ }
+ 
++func TestConfidentialEphemeralRejectsCloudVolumeBeforePreparation(t *testing.T) {
++	i := &interceptor{sealedGate: &sealedVolumeGate{}}
++	// A nil request would panic if device preparation or OCI inspection were reached.
++	prepared, err := i.prepareCloudVolumes(context.Background(), nil,
++		`{"vol-0":{"mount_point":"/data","fs_type":"ext4","lun":"0","disk_id":"d-untrusted","readonly":false}}`)
++	require.ErrorContains(t, err, "confidential ephemeral profile")
++	require.Empty(t, prepared)
++}
++
+ func TestWorkspaceMapperEncryptionParameters(t *testing.T) {
+ 	valid := "/dev/mapper/caa-vol-0 is active.\n  type: LUKS2\n  cipher: aes-xts-plain64\n  keysize: 512 [bits]\n  sector size: 4096 [bytes]\n"
+ 	require.NoError(t, validateWorkspaceMapperStatus(valid))
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
 index cec0fdd51bcc01db3be492b72fde05d44732e14c..05c99966802b0a81ee5eeb66bb4df88c085c9c74 100644
 --- a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go

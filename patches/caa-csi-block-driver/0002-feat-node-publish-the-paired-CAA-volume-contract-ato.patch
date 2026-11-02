@@ -1,9 +1,10 @@
-From 95d20d742db872158848005203eaafaca68ba67e Mon Sep 17 00:00:00 2001
+From 52054dd07b642dd2ff18d28fa902ca374b399a6b Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
-Date: Mon, 2 Nov 2026 16:33:07 +0800
+Date: Tue, 3 Nov 2026 01:05:58 +0800
 Subject: [PATCH 2/5] feat(node): publish the paired CAA volume contract
  atomically
 
+Co-authored-by: Codex <codex@openai.com>
 ---
  pkg/driver/directvolume.go                | 260 ++++++++++++
  pkg/driver/directvolume_test.go           | 482 ++++++++++++++++++++++

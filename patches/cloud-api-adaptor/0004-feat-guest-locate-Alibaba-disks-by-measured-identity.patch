@@ -1,22 +1,25 @@
-From 25826aa24ffd856ba881956a56b24217440015c7 Mon Sep 17 00:00:00 2001
+From 90eebe692a108b70b7fc693dd0856fcef91af21d Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
-Date: Mon, 2 Nov 2026 16:30:24 +0800
-Subject: [PATCH] feat-guest-locate-Alibaba-Cloud-data-disks-by-identi
+Date: Tue, 3 Nov 2026 01:07:30 +0800
+Subject: [PATCH 04/10] feat(guest): locate Alibaba disks by measured identity
 
+Use kernel device numbers and backing links without source-name fallbacks.
+
+Co-authored-by: Codex <codex@openai.com>
 ---
- .../forwarder/interceptor/alibaba_device.go   | 201 ++++++++++++++++
- .../interceptor/alibaba_device_test.go        | 217 ++++++++++++++++++
- .../pkg/forwarder/interceptor/interceptor.go  |  25 +-
- 3 files changed, 440 insertions(+), 3 deletions(-)
+ .../forwarder/interceptor/alibaba_device.go   | 175 +++++++++++++++
+ .../interceptor/alibaba_device_test.go        | 199 ++++++++++++++++++
+ .../pkg/forwarder/interceptor/interceptor.go  |  25 ++-
+ 3 files changed, 396 insertions(+), 3 deletions(-)
  create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/alibaba_device.go
  create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/alibaba_device_test.go
 
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/alibaba_device.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/alibaba_device.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..23660164025f8d50ef34c003c2bd0c32a648ef9a
+index 0000000000000000000000000000000000000000..413fd32c5e4f7777b727a643556c4d0e06634f7d
 --- /dev/null
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/alibaba_device.go
-@@ -0,0 +1,201 @@
+@@ -0,0 +1,175 @@
 +// (C) Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -133,36 +136,20 @@ index 0000000000000000000000000000000000000000..23660164025f8d50ef34c003c2bd0c32
 +		_, critical := criticalMounts[mount.Mountpoint]
 +		return !critical, false
 +	})
-+	if err == nil {
-+		for _, mount := range mounts {
-+			// The source may be /dev/root, UUID=..., or another alias. Resolve
-+			// the kernel device number so a partition maps to its whole disk.
-+			devicePath, resolveErr := filepath.EvalSymlinks(fmt.Sprintf("/sys/dev/block/%d:%d", mount.Major, mount.Minor))
-+			if resolveErr == nil {
-+				rootDevice := filepath.Base(devicePath)
-+				if sysfsPathBelongsToDisk(devicePath, devName) ||
-+					blockDeviceGraphContains("/sys/class/block", rootDevice, devName) {
-+					return true
-+				}
-+			}
-+			if strings.HasPrefix(filepath.Clean(mount.Source), "/dev/"+devName) {
-+				return true
-+			}
-+		}
-+	}
-+
-+	// Retain the source-name fallback for minimal images without /sys/dev.
-+	data, err := os.ReadFile("/proc/mounts")
 +	if err != nil {
-+		return false
++		return true
 +	}
-+	for _, line := range strings.Split(string(data), "\n") {
-+		fields := strings.Fields(line)
-+		if len(fields) < 2 || !strings.HasPrefix(fields[0], "/dev/"+devName) {
++	for _, mount := range mounts {
++		// Resolve kernel device numbers; source strings can be /dev/root or
++		// UUID aliases. Major zero denotes a non-block-backed filesystem.
++		if mount.Major == 0 {
 +			continue
 +		}
-+		switch fields[1] {
-+		case "/", "/boot", "/boot/efi", "/usr", "/var":
++		devicePath, err := filepath.EvalSymlinks(fmt.Sprintf("/sys/dev/block/%d:%d", mount.Major, mount.Minor))
++		if err != nil {
++			return true
++		}
++		if blockDeviceGraphContains("/sys/class/block", filepath.Base(devicePath), devName) {
 +			return true
 +		}
 +	}
@@ -208,22 +195,12 @@ index 0000000000000000000000000000000000000000..23660164025f8d50ef34c003c2bd0c32
 +	}
 +	return visit(start)
 +}
-+
-+func sysfsPathBelongsToDisk(path, devName string) bool {
-+	parts := strings.Split(filepath.Clean(path), string(filepath.Separator))
-+	for _, part := range parts {
-+		if part == devName {
-+			return true
-+		}
-+	}
-+	return false
-+}
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/alibaba_device_test.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/alibaba_device_test.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..2a9fcaa12675f416c3215f5a08a8aae7cbc35974
+index 0000000000000000000000000000000000000000..a76665ddac158e34e391256ff94b698b777fe25c
 --- /dev/null
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/alibaba_device_test.go
-@@ -0,0 +1,217 @@
+@@ -0,0 +1,199 @@
 +// (C) Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -373,24 +350,6 @@ index 0000000000000000000000000000000000000000..2a9fcaa12675f416c3215f5a08a8aae7
 +	for _, diskID := range []string{"", "vol-123", "/subscriptions/disk"} {
 +		if isAlibabaDiskIdentity(diskID) {
 +			t.Errorf("%q was misclassified as Alibaba Cloud", diskID)
-+		}
-+	}
-+}
-+
-+func TestSysfsPathBelongsToDisk(t *testing.T) {
-+	tests := []struct {
-+		path string
-+		disk string
-+		want bool
-+	}{
-+		{path: "/sys/devices/pci/block/vda/vda1", disk: "vda", want: true},
-+		{path: "/sys/devices/pci/nvme/nvme0/nvme0n1", disk: "nvme0n1", want: true},
-+		{path: "/sys/devices/pci/block/nvme0n1/nvme0n1p1", disk: "nvme0n1", want: true},
-+		{path: "/sys/devices/pci/block/vdb/vdb1", disk: "vda", want: false},
-+	}
-+	for _, test := range tests {
-+		if got := sysfsPathBelongsToDisk(test.path, test.disk); got != test.want {
-+			t.Errorf("sysfsPathBelongsToDisk(%q, %q) = %t, want %t", test.path, test.disk, got, test.want)
 +		}
 +	}
 +}

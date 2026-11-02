@@ -3,7 +3,7 @@
 Run OpenShell coding agents in Alibaba Cloud Intel TDX guests, with attestation-gated
 credentials and encrypted persistent workspaces.
 
-The main profile uses native OpenShell v0.1.3, official CoCo 0.22 AA/CDH and Trustee,
+The main profile uses native OpenShell v0.1.6, official CoCo 0.22 AA/CDH and Trustee,
 and the upstream Ubuntu UKI image flow on ACK/PeerPods. A local confidential
 Kubernetes driver connects these components; OpenShell keeps its native protocol
 and user commands.
@@ -29,7 +29,7 @@ for verification coverage. Component READMEs describe internals.
 
 | Component | Source and integration |
 | --- | --- |
-| Gateway, CLI and supervisor | Unmodified official OpenShell v0.1.3 |
+| Gateway, CLI and supervisor | Unmodified official OpenShell v0.1.6 |
 | AA/CDH and Trustee | Official CoCo v0.22.0 release images/binaries; TDX attester selected through upstream build inputs |
 | Guest | Official CAA Ubuntu mkosi/UKI flow plus measured OpenShell bootstrap, ECS clock configuration and encrypted-volume initialization hooks |
 | Confidential ComputeDriver | Derivative of the pinned Kubernetes driver; shared modules compile from upstream, local code seals and authorizes bootstrap/workspace resources |

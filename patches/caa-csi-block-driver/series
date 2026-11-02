@@ -2,4 +2,4 @@
 0002-feat-node-publish-the-paired-CAA-volume-contract-ato.patch
 0003-feat-deploy-separate-controller-credentials-and-node.patch
 0004-test-share-the-CSI-conformance-runner-between-local-.patch
-0005-build-pin-the-runtime-base-manifest-index.patch
+0005-build-pin-supported-build-and-runtime-base-indexes.patch

@@ -8,7 +8,7 @@ Keep private values, credentials and runtime state outside the checkout.
 The PeerPod manager needs the Alibaba Cloud backend. Its official runtime supplies
 the CA bundle; [Dockerfile.controller](Dockerfile.controller) replaces only
 `/manager`. `images.peerpod_ctrl_runtime` in the [runtime lock](../runtime/artifacts.lock.json)
-is the base image; `build_outputs.peerpod_ctrl` records the built output. Set
+is the base image; `build.peerpod_ctrl` supplies the local repository and tag. Set
 `resourceCtrl.image` to the digest published in your trusted registry. Fresh
 builds must record their own binary/archive/image hashes.
 

@@ -4,7 +4,7 @@ Install the locked Go and Rust toolchains. Reuse matching installations and veri
 source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 require_root
 need rustup python3 jq curl tar
-GO_VERSION=$(jq -er .build_outputs.caa.go_version "$LOCK")
+GO_VERSION=$(jq -er .build.caa.go_version "$LOCK")
 if [[ $(/usr/local/go/bin/go version 2>/dev/null || true) != "go version go$GO_VERSION linux/amd64" ]]; then
     [[ ! -e /usr/local/go ]] || die '/usr/local/go contains a different installation; move it aside before continuing.'
     mkdir -p "$TOOL_CACHE"

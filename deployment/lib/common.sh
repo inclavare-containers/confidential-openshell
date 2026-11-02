@@ -71,7 +71,7 @@ verify_handoff() { (cd "$HANDOFF" && sha256sum -c SHA256SUMS); }
 build_tags() {
     CAA_TAG="caa-$(jq -er '."cloud-api-adaptor".result_tree[:8]' deployment/build/sources.lock.json)"
     CSI_TAG="csi-$(jq -er '."caa-csi-block-driver".result_tree[:8]' deployment/build/sources.lock.json)"
-    PEERPOD_CTRL_TAG=$(jq -er .build_outputs.peerpod_ctrl.tag "$LOCK")
+    PEERPOD_CTRL_TAG=$(jq -er .build.peerpod_ctrl.tag "$LOCK")
 }
 load_selection() {
     local selection="$HANDOFF/selection.json"

@@ -8,7 +8,7 @@ set -euo pipefail
 CAA_SOURCE="$PWD/.local/build-sources/cloud-api-adaptor"
 CAA_TREE=$(git -C "$CAA_SOURCE" write-tree)
 CAA_UPSTREAM_COMMIT=$(git -C "$CAA_SOURCE" rev-parse HEAD)
-CAA_VERSION=$(jq -er .build_outputs.caa.build_args.VERSION deployment/runtime/artifacts.lock.json)
+CAA_VERSION=$(jq -er .build.caa.build_args.VERSION deployment/runtime/artifacts.lock.json)
 CAA_RUNTIME=$(jq -er .images.caa deployment/runtime/artifacts.lock.json)
 CAA_TAG="caa-$(printf '%s' "$CAA_TREE" | cut -c1-8)"
 printf 'CAA_TAG=%s\n' "$CAA_TAG"

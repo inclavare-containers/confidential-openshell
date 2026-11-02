@@ -111,7 +111,7 @@ def assert_resources(resources):
     node_pod = node['spec']['template']['spec']
     control = {c['name']: c for c in control_pod['containers']}
     nodes = {c['name']: c for c in node_pod['containers']}
-    require(set(control) == {'csi-provisioner', 'csi-resizer', 'caa-csi-block-controller'}, 'controller sidecar split changed')
+    require(set(control) == {'csi-provisioner', 'caa-csi-block-controller'}, 'controller sidecar split changed')
     require(set(nodes) == {'node-driver-registrar', 'caa-csi-block-driver'}, 'node must not run provisioner/controller')
     driver = control['caa-csi-block-controller']
     require('--component=controller' in driver['args'] and '--volume-store-dir=/var/lib/caa-csi-block/volumes' in driver['args'],
@@ -119,7 +119,6 @@ def assert_resources(resources):
     require('--leader-election=true' in control['csi-provisioner']['args'], 'provisioner leader election missing')
     require('--component=node' in nodes['caa-csi-block-driver']['args'] and '--nodeid=$(KUBE_NODE_NAME)' in nodes['caa-csi-block-driver']['args'],
             'node mode/identity missing')
-    require('--csi-address=/csi/csi.sock' in control['csi-resizer']['args'], 'resizer is not connected to controller')
     node_role = one('ClusterRole', 'caa-csi-block-node')
     require(node_role['rules'] == [{'apiGroups': [''], 'resources': ['nodes'], 'verbs': ['get']}],
             'node topology lookup must not gain controller privileges')

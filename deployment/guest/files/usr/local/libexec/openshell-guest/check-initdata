@@ -36,7 +36,9 @@ def main():
     encoded = regular(PARENT / "initdata")
     if not 0 < len(encoded) <= MAX_ENCODED:
         raise ValueError("initdata size is invalid")
-    packed = base64.b64decode(encoded, validate=True)
+    # cloud-init's YAML block scalar appends a transport newline. Never trim
+    # the decoded TOML: AA measures its exact bytes, including trailing lines.
+    packed = base64.b64decode(encoded.rstrip(b"\r\n"), validate=True)
     with gzip.GzipFile(fileobj=io.BytesIO(packed)) as gz:
         raw = gz.read(MAX_TOML + 1)
     if not 0 < len(raw) <= MAX_TOML:

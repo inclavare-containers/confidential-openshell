@@ -79,8 +79,7 @@
     "csi_provisioner": "registry.k8s.io/sig-storage/csi-provisioner@sha256:6de50bacfd72627ffe4209e3db8ad7391d04ea6fb741bf51feab6c5dcfd80002",
     "csi_node_registrar": "registry.k8s.io/sig-storage/csi-node-driver-registrar@sha256:cd21e19cd8bbd5bc56f1b4f1398a436e7897da2995d6d036c9729be3f4e456e6",
     "registry": "docker.io/library/registry@sha256:46faa9a1ae6813194b53921a370f2f4f8c5e1aae228a89bceafef5847a6a3278",
-    "alpine": "docker.io/library/alpine@sha256:b58899f069c47216f6002a6850143dc6fae0d35eb8b0df9300bbe6327b9c2171",
-    "csi_resizer": "registry.k8s.io/sig-storage/csi-resizer@sha256:be6a7de1d43dba90710b61bd3d0d8f568654a6adadaeea9188cf4cd3554cbb87"
+    "alpine": "docker.io/library/alpine@sha256:b58899f069c47216f6002a6850143dc6fae0d35eb8b0df9300bbe6327b9c2171"
   },
   "sources": {
     "trustee": {
@@ -89,47 +88,16 @@
       "commit": "512fed65642015b849f38fb13bfdec7806639987"
     }
   },
-  "build_outputs": {
+  "build": {
     "peerpod_ctrl": {
       "repository": "openshell/peerpod-ctrl",
-      "tag": "upstream-v0.23-alibabacloud-delete-idempotent-20261012",
-      "image_digest": "sha256:f3a9c12970b775b2c511f65b33867dad49cd71740db08b9e6397b03c4de23f6c",
-      "source": "cloud-api-adaptor",
-      "source_commit": "e3e0f00480b41c08e3e4dbc6b64aba7722fb65f9",
-      "source_patch_component": "peerpod-ctrl",
-      "source_result_tree": "d1b7afc25c3aa2d62adcc8bed8e1117b191a3304",
-      "source_patch_sha256": "e0fc8c0b2f3cc714c4504f1f3617211e5c52974151fd39a977b5e194d98e859c",
-      "integration_source_commit": "06b40cca2e08daeb0a2ac003f087f796803b5582",
-      "go_version": "1.26.7",
-      "build_args": {
-        "BUILTIN_CLOUD_PROVIDERS": "alibabacloud",
-        "GOFLAGS": "-tags=alibabacloud",
-        "CGO_ENABLED": "0"
-      },
-      "binary_sha256": "c5ea2b53620b6c522a8caaa5a85516ce8e150e7367b3788cf5ae3da9caa4ecb1",
-      "archive_sha256": "74996702659a584f024b581f9d57c3603283f2e98e8dc71e9022f48aeaaa3cd3"
+      "tag": "v0.23.0-alibabacloud"
     },
     "caa": {
-      "repository": "openshell/cloud-api-adaptor",
-      "tag": "caa-55dfcbef-upstream-main-20261014",
-      "image_digest": "sha256:704ac4d877658fabf6030d32878d6a1fcafcde81dd7fa0c1cd8837cb0a7c258c",
-      "runtime_image": "quay.io/confidential-containers/cloud-api-adaptor@sha256:0d6fff9437a1bd663f9740bc58f76f135cd33308593238f00b4f26347d800d8e",
-      "source": "cloud-api-adaptor",
-      "source_commit": "e3e0f00480b41c08e3e4dbc6b64aba7722fb65f9",
-      "source_result_tree": "55dfcbef3e00f67954062d1b38cb9d88b0ef2795",
-      "integration_source_commit": "8e3caff1d1e24617b1a88bb5405d6e33b6aa2550",
       "go_version": "1.26.7",
       "build_args": {
-        "RELEASE_BUILD": "true",
-        "BUILTIN_CLOUD_PROVIDERS": "alibabacloud",
-        "CGO_ENABLED": "0",
-        "VERSION": "v0.23.0-dev",
-        "COMMIT": "e3e0f00480b41c08e3e4dbc6b64aba7722fb65f9"
-      },
-      "packaging_recipe": "deployment/build/Dockerfile.caa",
-      "packaging_recipe_sha256": "536987135b71bddfbbf1ad1a6c206c184c3f616679df75bbabd4b7fbd97b9aef",
-      "binary_sha256": "87d8dffc243c7ec44aaad06e9efe94afa4be8e0612a4119eb60dfcf727020029",
-      "archive_sha256": "9a01215a392000154a5bdd5c54b5c0690aadebd86ddbbb93d4d7f4451e940b60"
+        "VERSION": "v0.23.0-dev"
+      }
     }
   }
 }

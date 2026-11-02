@@ -7,8 +7,8 @@ components. Exact bases and result trees are authoritative in the
 
 | Component | Ordered series | Required behavior |
 | --- | --- | --- |
-| CAA | [11 patches](cloud-api-adaptor/series) | Immutable direct-volume metadata; Alibaba VPC and retained ESSD attachment/deletion; bounded userdata and host credential exclusion; guest disk discovery, stock CDH encrypted-device unlock, a measured embedded-LUKS initializer, sealed mounts and on-link Pod routes |
-| CSI | [5 patches](caa-csi-block-driver/series) | Alibaba ESSD through existing provider interfaces; atomic v1 metadata and delegated fsGroup for the paired CAA; separate controller/node deployment; shared conformance runner and pinned runtime base |
+| CAA | [10 patches](cloud-api-adaptor/series) | Immutable direct-volume metadata; Alibaba VPC and retained ESSD attachment/deletion; bounded userdata and host credential exclusion; guest disk discovery, stock CDH encrypted-device unlock, a measured embedded-LUKS initializer, sealed mounts and on-link Pod routes |
+| CSI | [5 patches](caa-csi-block-driver/series) | Alibaba ESSD through existing provider interfaces; atomic v1 metadata and delegated fsGroup for the paired CAA; separate controller/node deployment; shared conformance runner and pinned build/runtime bases |
 | PeerPod controller | [1 independent backport](peerpod-ctrl/README.md) | Confirm exact instance absence after an otherwise unhandled Alibaba deletion failure, preserving other errors and existing IAM scope |
 | Kata host Go shim | [1 patch](kata-containers/README.md) | Preserve `NoNewPrivileges` in exec requests; use the released guest agent and genpolicy unchanged |
 
@@ -34,7 +34,10 @@ The local CSI build uses one paired v1 metadata contract. It does not carry the
 legacy writer, format-migration switches, a pending-create journal, additional
 provider interfaces or a separate credential-refresh coordinator. Completed
 volume records and tag recovery use the pinned upstream implementation. Alibaba
-storage is scoped by cluster/driver tags and uses ESSD PL0.
+storage is scoped by cluster/driver tags and uses ESSD PL0. Disk creation carries a stable
+cluster/volume ClientToken. Per-RPC providers share the SDK credential object so its native
+refresh cache survives; credential identity remains the controller process configuration.
+The Alibaba profile omits the unused resizer, while upstream provider profiles retain it.
 
 CAA uses ECS ClientToken for instance-create retries and queries current cloud
 attachments during deletion instead of maintaining a second operation/attachment
@@ -47,3 +50,13 @@ them would respectively break no-new-privileges exec requests and exact-instance
 cleanup after a tag-conditioned deletion race. OpenShell's v0.1.6 source imports
 and existing confidential wrappers remain pinned; no upstream release is rolled
 back by this simplification.
+
+The initdata transport uses upstream cloud-config generation. The guest strips only outer
+base64 transport CR/LF before strict decoding; decoded TOML and its SHA-384 measurement
+remain byte-for-byte unchanged. The native AA adapter retains the published ttrpc subset:
+it uses the existing protobuf/ttrpc dependencies without vendoring a generated protocol
+library. AA performs the actual
+measurement; canonical eventlog checks prevent duplicate extension.
+
+Patch authorship is retained. AI-attributed sign-off lines are removed; these local overlays
+do not substitute for a contributor's DCO certification when submitting upstream.

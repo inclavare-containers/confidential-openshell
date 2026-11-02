@@ -77,12 +77,14 @@ required before accepting the image.
 For persistent workspaces, the driver adds measured `workspace.toml` with the
 stable KBS key URI and trusted cloud disk IDs. APF resolves and checks the disk
 identity. A fresh disk must be an unused, partition-free whole disk, entirely
-zero-filled and explicitly authorized for initialization. The small initializer
+zero-filled and explicitly authorized for initialization on the first sandbox creation.
+Restart sets `allow_initialize=false`, so a substituted blank disk is rejected. The small initializer
 receives exactly 32 CDH-released key bytes on stdin and calls Ubuntu's standard
 cryptsetup to create an embedded LUKS2 header plus ext4, then closes it. Existing
 LUKS disks are never initialized or repaired. Upstream CDH SecureMount opens
-`sourceType=encrypted,targetType=device`; APF mounts the filesystem and enforces the
-requested read-only mode across the raw device, mapper and filesystem. CDH's ephemeral detached-header `sourceType=empty` is
+`sourceType=encrypted,targetType=device`; APF verifies the active kernel mapping uses
+LUKS2, AES-XTS with a 512-bit key and 4096-byte sectors before mounting, including reused
+mappers. It enforces the requested read-only mode across the raw device, mapper and filesystem. CDH's ephemeral detached-header `sourceType=empty` is
 not used for retained disks. Stop/Start keeps the same ESSD, header and KBS key.
 
 Image/reference changes require the [two-role deployment checks](../../docs/deployment.md#10-verify-both-confidential-roles),

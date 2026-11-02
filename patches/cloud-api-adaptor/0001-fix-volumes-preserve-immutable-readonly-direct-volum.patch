@@ -1,6 +1,6 @@
-From 2526696476d900053fb83dd1a4d8a8e249f56d7c Mon Sep 17 00:00:00 2001
+From c943155eb188ff85441d48bf99f51d492198ab33 Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
-Date: Wed, 26 Aug 2026 12:09:18 +0800
+Date: Tue, 3 Nov 2026 01:07:30 +0800
 Subject: [PATCH 01/10] fix(volumes): preserve immutable readonly direct-volume
  plans
 
