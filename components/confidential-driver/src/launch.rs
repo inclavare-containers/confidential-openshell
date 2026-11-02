@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 // Commands can contain sensitive arguments; do not derive Debug.
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
-pub(crate) struct LaunchIntent {
+pub struct LaunchIntent {
     pub sandbox_id: String,
     pub namespace: String,
     pub sandbox_cr_uid: String,

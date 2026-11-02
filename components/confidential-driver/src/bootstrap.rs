@@ -28,7 +28,7 @@ use thiserror::Error;
 const SIGNER_URI: &str = "kbs:///default/bootstrap-signer/key";
 
 #[derive(Debug, Error)]
-pub(super) enum StoreError {
+pub enum StoreError {
     #[error("invalid bootstrap identity or digest: {0}")]
     Invalid(&'static str),
     #[error("bootstrap identity has been revoked")]
@@ -50,10 +50,10 @@ pub(super) enum StoreError {
     #[error("bootstrap cleanup remains pending: {0}")]
     Cleanup(String),
 }
-pub(super) type Result<T> = std::result::Result<T, StoreError>;
+pub type Result<T> = std::result::Result<T, StoreError>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum BootstrapRole {
+pub enum BootstrapRole {
     Workload,
     Supervisor,
 }
@@ -69,7 +69,7 @@ impl BootstrapRole {
 /// The descriptor is safe to place in a Kubernetes Secret data value. The
 /// resource URI identifies raw bytes served by Trustee after attestation.
 #[derive(Clone, Debug)]
-pub(super) struct PublishedSecret {
+pub struct PublishedSecret {
     pub(super) sealed_descriptor: String,
     #[cfg(test)]
     pub(super) resource_uri: String,
@@ -80,13 +80,13 @@ pub(super) struct PublishedSecret {
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct PlannedSecret {
+pub struct PlannedSecret {
     pub(super) resource_uri: String,
     pub(super) resource_path: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub(super) struct Binding {
+pub struct Binding {
     pub(super) resource_path: String,
     pub(super) initdata_sha384: String,
     pub(super) role: String,
@@ -100,7 +100,7 @@ pub(super) struct Binding {
 }
 
 #[derive(Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub(super) struct WorkspaceBinding {
+pub struct WorkspaceBinding {
     pub(super) resource_path: String,
     pub(super) initdata_sha384: String,
     pub(super) namespace: String,
@@ -110,14 +110,14 @@ pub(super) struct WorkspaceBinding {
 }
 
 #[derive(Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub(super) struct WorkspaceVolume {
+pub struct WorkspaceVolume {
     pub(super) pvc_name: String,
     pub(super) pv_uid_or_name: Option<String>,
     pub(super) cloud_disk_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub(super) struct WorkspaceVolumeJournal {
+pub struct WorkspaceVolumeJournal {
     pub(super) namespace: String,
     pub(super) sandbox_cr_uid: String,
     pub(super) identity_sha256: String,
@@ -125,7 +125,7 @@ pub(super) struct WorkspaceVolumeJournal {
 }
 
 #[derive(Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub(super) struct WorkspaceOwner {
+pub struct WorkspaceOwner {
     pub(super) sandbox_id: String,
     pub(super) namespace: String,
     pub(super) sandbox_cr_uid: String,
@@ -145,7 +145,7 @@ struct WorkloadEnvironment {
 /// Durable deletion fence. Identities are captured while the old CR UID is
 /// still known, so retries cannot revoke a replacement CR's new attempt.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub(super) struct PendingDelete {
+pub struct PendingDelete {
     pub(super) sandbox_id: String,
     pub(super) namespace: String,
     pub(super) sandbox_cr_uid: String,
@@ -160,7 +160,7 @@ struct ActiveAttempt {
     attempt: String,
 }
 
-pub(super) struct BootstrapStore {
+pub struct BootstrapStore {
     repository: PathBuf,
     state: PathBuf,
     signing_key: PathBuf,
@@ -313,6 +313,7 @@ impl BootstrapStore {
 
     /// Stable URI planning for generation of measured initdata before bytes
     /// are published. No state is written and no trust decision is made.
+    #[allow(clippy::unused_self)] // Keep planning paired with the store publishing API.
     pub(super) fn plan_file(
         &self,
         role: BootstrapRole,
@@ -332,6 +333,7 @@ impl BootstrapStore {
         })
     }
 
+    #[allow(clippy::unused_self)] // Keep planning paired with the store publishing API.
     pub(super) fn plan_workspace_key(
         &self,
         namespace: &str,
@@ -1206,7 +1208,7 @@ impl BootstrapStore {
         let binding_path = self.binding(&id);
         let digest = hex::encode(Sha256::digest(plaintext));
         let binding = Binding {
-            resource_path: resource_path.clone(),
+            resource_path,
             initdata_sha384: expected_initdata_sha384.to_owned(),
             role: role.as_str().to_owned(),
             generation: generation.to_owned(),
@@ -1229,13 +1231,13 @@ impl BootstrapStore {
                 return Err(StoreError::Revoked);
             }
             let new_binding = !binding_path.exists();
-            if !new_binding {
+            if new_binding {
+                atomic_new(&binding_path, &serde_json::to_vec(&binding)?)?;
+            } else {
                 let prior: Binding = serde_json::from_slice(&read_regular(&binding_path)?)?;
                 if prior != binding {
                     return Err(StoreError::Conflict);
                 }
-            } else {
-                atomic_new(&binding_path, &serde_json::to_vec(&binding)?)?;
             }
             let was_unserved = !resource.exists();
             let operation = (|| {
@@ -1260,7 +1262,7 @@ impl BootstrapStore {
             #[cfg(test)]
             resource_uri: uri,
             #[cfg(test)]
-            resource_path,
+            resource_path: binding.resource_path,
             #[cfg(test)]
             binding_path,
         })
@@ -1767,7 +1769,7 @@ impl BootstrapStore {
 
 /// Private staging names; these are not Trustee storage-backend filenames.
 /// The caller supplies a canonical resource key; URI and binding formats stay unchanged.
-pub(super) fn staged_resource_key(resource_key: &str) -> String {
+pub fn staged_resource_key(resource_key: &str) -> String {
     resource_key
         .strip_prefix("default/")
         .expect("owned resource namespace")
@@ -1785,15 +1787,14 @@ fn validate(
     validate_generation(generation)?;
     validate_attempt(attempt)?;
     validate_sandbox(sandbox)?;
-    if let Some(key) = key {
-        if key.is_empty()
+    if let Some(key) = key
+        && (key.is_empty()
             || key.len() > 253
             || !key
                 .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
-        {
-            return Err(StoreError::Invalid("Secret data key"));
-        }
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_')))
+    {
+        return Err(StoreError::Invalid("Secret data key"));
     }
     if let Some(digest) = digest {
         validate_digest(digest)?;
@@ -2028,7 +2029,7 @@ mod tests {
         let renderer = tmp.path().join("renderer.py");
         fs::write(
             &renderer,
-            r#"import json, pathlib, sys
+            r"import json, pathlib, sys
 args = sys.argv
 if pathlib.Path(__file__).with_name('fail').exists():
     sys.exit(2)
@@ -2040,7 +2041,7 @@ pathlib.Path(args[args.index('--as-policy-output') + 1]).write_text('package pol
 if pathlib.Path(__file__).with_name('fail_after_as').exists():
     sys.exit(3)
 pathlib.Path(args[args.index('--output') + 1]).write_text('package policy\ndefault allow = false\n')
-"#,
+",
         )
         .unwrap();
         let store = BootstrapStore::open_with_policies(
@@ -2146,7 +2147,7 @@ pathlib.Path(args[args.index('--output') + 1]).write_text('package policy\ndefau
                 .load_workload_environment("sandbox-env", "ns", "another-uid")
                 .is_err()
         );
-        let mut changed = environment.clone();
+        let mut changed = environment;
         changed.insert("TOKEN".into(), "replaced".into());
         assert!(matches!(
             store.record_workload_environment("sandbox-env", "ns", "uid", &changed),
@@ -3188,12 +3189,13 @@ pathlib.Path(args[args.index('--output') + 1]).write_text('package policy\ndefau
 
     #[test]
     fn production_renderer_accepts_store_bindings_and_rejects_mutation() {
-        let renderer = std::env::var_os("KBS_POLICY_RENDERER")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
+        let renderer = std::env::var_os("KBS_POLICY_RENDERER").map_or_else(
+            || {
                 Path::new(env!("CARGO_MANIFEST_DIR"))
                     .join("../../deployment/trustee/render-kbs-policy.py")
-            });
+            },
+            PathBuf::from,
+        );
         assert!(
             renderer.is_file(),
             "production KBS policy renderer is missing: {}",
@@ -3231,9 +3233,9 @@ pathlib.Path(args[args.index('--output') + 1]).write_text('package policy\ndefau
         store
             .ensure_workspace_key("workspace", "cr-uid-2", INITDATA)
             .unwrap();
-        let rendered = fs::read_to_string(&policy).unwrap();
-        assert!(rendered.contains(&published.resource_path));
-        assert!(rendered.contains("resource/default/workspace/"));
+        let policy_text = fs::read_to_string(&policy).unwrap();
+        assert!(policy_text.contains(&published.resource_path));
+        assert!(policy_text.contains("resource/default/workspace/"));
         assert!(fs::read_to_string(&as_policy).unwrap().contains(INITDATA));
         let original_binding = read_regular(&published.binding_path).unwrap();
         let mut binding: serde_json::Value = serde_json::from_slice(&original_binding).unwrap();

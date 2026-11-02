@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "platform": "linux/amd64",
-  "openshell_version": "0.1.3",
+  "openshell_version": "0.1.6",
   "tools": {
     "aliyun": {
       "version": "3.5.1",
@@ -39,12 +39,12 @@
   },
   "downloads": {
     "gateway": {
-      "url": "https://github.com/NVIDIA/OpenShell/releases/download/v0.1.3/openshell-gateway-x86_64-unknown-linux-gnu.tar.gz",
-      "sha256": "da8dce943fe01cce90243b2bf2587c71a243e4d641a4b616528829b681ced198"
+      "url": "https://github.com/NVIDIA/OpenShell/releases/download/v0.1.6/openshell-gateway-x86_64-unknown-linux-gnu.tar.gz",
+      "sha256": "811265a55993beb333905a5b560764a40aa9177250171f711dce8ba820f7eff8"
     },
     "cli": {
-      "url": "https://github.com/NVIDIA/OpenShell/releases/download/v0.1.3/openshell-x86_64-unknown-linux-musl.tar.gz",
-      "sha256": "ed08ea7874c47f22d6e5dcc4b27d9ef1ef5d2060f83035b35ff725d5160830a3"
+      "url": "https://github.com/NVIDIA/OpenShell/releases/download/v0.1.6/openshell-x86_64-unknown-linux-musl.tar.gz",
+      "sha256": "2951c67366f3e3584ed9cec8d49b9f0b0eefc8cacea8b0582ac164590492f136"
     },
     "agent_sandbox_manifest": {
       "url": "https://github.com/kubernetes-sigs/agent-sandbox/releases/download/v1.0.2/sandbox.yaml",
@@ -60,10 +60,10 @@
     }
   },
   "images": {
-    "sandbox": "ghcr.io/nvidia/openshell/sandbox@sha256:e939e4672da34d4f6eb2d649d0a5c6a0d7b782b95c2f433e986ec35550ced631",
+    "sandbox": "ghcr.io/nvidia/openshell/sandbox@sha256:1038eb5c1f191fa3c34684fd7041b891c78ec570979d487f36e06e08f91bfb63",
     "workload": "ghcr.io/nvidia/openshell-community/sandboxes/base@sha256:c2a43bb0d765774e2790b3babfb20997bb2eac7b4bf4c6d7d8661e99817bf904",
     "pause": "registry.k8s.io/pause@sha256:8d4106c88ec0bd28001e34c975d65175d994072d65341f62a8ab0754b0fafe10",
-    "supervisor": "ghcr.io/nvidia/openshell/supervisor@sha256:1da55431d1b36e71ac881a93edd5b6743d179faf9b008a31963d2c3db50637a9",
+    "supervisor": "ghcr.io/nvidia/openshell/supervisor@sha256:ce859a7d77ee515d3fe0b3c7dc61286516f402eb1d25c761d806d9ae5ed96c0b",
     "trustee_as": "ghcr.io/confidential-containers/attestation-service@sha256:5b3908adfc47568ec24ab4a88a0e0bf3c8fe0a47d4c44ebfa08c16c86eebc890",
     "trustee_kbs": "ghcr.io/confidential-containers/key-broker-service@sha256:69551b909005a28fd4f02c31ed774ff030551bac73bfe30df9360d222b674822",
     "caa": "quay.io/confidential-containers/cloud-api-adaptor@sha256:0d6fff9437a1bd663f9740bc58f76f135cd33308593238f00b4f26347d800d8e",

@@ -1,6 +1,6 @@
 # Deploy
 
-Deploy native OpenShell 0.1.3 with CoCo 0.22, Trustee, ACK and Intel TDX.
+Deploy native OpenShell 0.1.6 with CoCo 0.22, Trustee, ACK and Intel TDX.
 Complete [build](build.md), including release installation, first. Run the commands
 below as root from `/opt/confidential-openshell` on the **trusted service host**.
 It hosts Gateway, driver and the private registry; Trustee can run here or on a

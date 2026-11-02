@@ -19,7 +19,9 @@ openshell-attestation-observer = { path = "../attestation-observer" }
 reqwest = { workspace = true }
 rustls = { workspace = true }
 jsonwebtoken = { workspace = true }
-openshell-core = { path = "../../repos/openshell/crates/openshell-core", default-features = false }
+openshell-core = { path = "../../repos/openshell/crates/openshell-core", default-features = false, features = ["jwt"] }
+openshell-crypto = { path = "../../repos/openshell/crates/openshell-crypto", default-features = false, features = ["aws-lc", "tls-kube"] }
+openshell-supervisor-control = { path = "../../repos/openshell/crates/openshell-supervisor-control" }
 openshell-isolation-interface = { path = "../../repos/openshell/crates/openshell-isolation-interface" }
 openshell-sandbox-backend = { path = "../../repos/openshell/crates/openshell-sandbox-backend" }
 openshell-otel = { path = "../../repos/openshell/crates/openshell-otel" }
@@ -49,6 +51,13 @@ sha2 = { workspace = true }
 base64 = { workspace = true }
 flate2 = "1.1.9"
 toml = { workspace = true }
+bytes = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+tokio-rustls = { workspace = true }
+tower = { workspace = true, features = ["timeout"] }
 time = "0.3"
 fs2 = "0.4"
 hex = "0.4"

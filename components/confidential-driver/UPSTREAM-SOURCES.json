@@ -1,24 +1,25 @@
 {
   "schema": 1,
   "upstream_repository": "https://github.com/NVIDIA/OpenShell",
-  "upstream_tag": "v0.1.3",
-  "upstream_commit": "e1f3c82caa3ed3b65de22889ae7ef32a774878ef",
+  "upstream_tag": "v0.1.6",
+  "upstream_commit": "ac7f615cd12d5cc49cb16eb1f5f10ffeb1e90f47",
   "upstream_crate": "crates/openshell-driver-kubernetes",
   "license": "Apache-2.0",
   "files_sha256": {
-    "src/config.rs": "8e9eff27c5557ce319c18461639ce38a7ab081d49e90b36874338cf6c83a0767",
-    "src/driver.rs": "4bb1d6883980536104b27db7dfc9578f00efd28778194e944386ac2c3175a806",
-    "src/grpc.rs": "c54bc88575829cd1eba6e3eb238feb52a61770908fe9909c4a5d26eddc00369d",
-    "src/isolation.rs": "5b8cdc7d67ba469c3ce751065818d99c9e4c9819491264b6c3be5807bed52edc",
-    "src/lib.rs": "494c2fdfb3445383da49e3c61ebbe462f197bd7c3b9f97c1c983d42ac62f4426",
+    "src/config.rs": "6fa362f62749710b724a328af4f39318d6dc4ec3b005d1df34cc4ba1b5c3dec0",
+    "src/driver.rs": "fa86ab8b88d270def10826cb8ed7010da09ac87352c7e1b2a8c959c39caff1d5",
+    "src/grpc.rs": "99845435d1ed3bcc78d1bb90ce5aa6787466c800ecac1ced076576433282a282",
+    "src/isolation.rs": "1f9ae70383f64370141b9da06022208a32cc7dc4b455feb0d9a0a10bfb10aa06",
+    "src/lib.rs": "82fa7599a1d17b91512863caeda431e780d8fc706c086d8c9177386f54ceff8c",
     "src/lifecycle.rs": "d82ac086c7912796ec3a58e038f2ff7043a59393d79fce995164216ad49100a0",
-    "src/lifecycle_tests.rs": "4cde47ebd9db5be70b381dbf505e091938c0e9de574da383ca7c21adb5b30580",
-    "src/main.rs": "755b1a628190eade4df88fddced0e0c9bc9c32f9d3237dae25689dbabdf02202",
+    "src/lifecycle_tests.rs": "84429b1350f12bf7b2db88424871789839bf433339cadd9d9dbfbb67754a8cce",
+    "src/main.rs": "a67136ee719b3f222206199f95dd258209e4ab894ffe8840edb840a8506f5acc",
     "src/otel_tracing.rs": "9b6ba6144447fe6634040b223ef33d94f052dfc5702aab5f3c9afc2cd4971a82",
     "src/resource_admission.rs": "edd3ce491a58dc21aeb22837ce00dcc4dcf62f29d314dcb6639843eff4112e41",
-    "src/sandbox_runtime.rs": "dfd598596489ccc05f366ece925ed8eb3b0b607ed47f22a52cd04de35a3165fa",
-    "Cargo.toml": "899aec7ff24155f9c3d6805c1bf73674add61ee1f2fd4861d1e21a7e8e75b440",
-    "README.md": "5acdc8e77d9b3640f7dd1cdd864d6945c7621e4e31d2158f55d32b9f937a54ea"
+    "src/sandbox_runtime.rs": "ca69ddb8e778d5d14520f4315bb17ecdad1804384b62d37e7f51b9f563575673",
+    "Cargo.toml": "fabff11612112db2da2a52d062cffc81e0ef655179ad13d8fb0726b3d969aaf2",
+    "README.md": "dee6cf2f5bf987763b100567da302bf721c253a2441f78a00e9035a85cc20593",
+    "src/shared_supervisor.rs": "fdb184d773c961cd20c009f8b5254b9df04a1e46006b69988dee272eaf56244b"
   },
   "local_entrypoint": "components/confidential-driver",
   "compiled_upstream_modules": [
@@ -26,7 +27,8 @@
     "grpc",
     "otel_tracing",
     "resource_admission",
-    "lifecycle"
+    "lifecycle",
+    "shared_supervisor"
   ],
   "diff_command": "components/confidential-driver/controlled-diff.sh",
   "compiled_upstream_delegates": {

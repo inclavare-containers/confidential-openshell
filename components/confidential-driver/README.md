@@ -1,6 +1,6 @@
 # Confidential Kubernetes compute driver
 
-This standalone binary implements the OpenShell v0.1.3 `ComputeDriver` contract for a
+This standalone binary implements the OpenShell v0.1.6 `ComputeDriver` contract for a
 supervisor/workload pair running in attested Pod VMs. It is a controlled derivative of
 NVIDIA's Kubernetes driver, with project-owned bootstrap publication and lifecycle
 integration. See [source provenance](UPSTREAM.md), the

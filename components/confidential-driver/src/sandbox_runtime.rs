@@ -3,6 +3,8 @@
 
 //! Reuse native runtime resources and keep confidential supervisor state in guest memory.
 
+// Shared-supervisor renderers remain in the unmodified upstream module.
+#[allow(dead_code)]
 #[path = "../../../repos/openshell/crates/openshell-driver-kubernetes/src/sandbox_runtime.rs"]
 mod upstream;
 pub use upstream::*;

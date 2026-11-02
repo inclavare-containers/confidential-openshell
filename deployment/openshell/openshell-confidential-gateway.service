@@ -1,5 +1,5 @@
 [Unit]
-Description=OpenShell v0.1.3 upstream Gateway for confidential ACK
+Description=OpenShell v0.1.6 upstream Gateway for confidential ACK
 After=network-online.target openshell-confidential-driver.service
 Requires=openshell-confidential-driver.service
 

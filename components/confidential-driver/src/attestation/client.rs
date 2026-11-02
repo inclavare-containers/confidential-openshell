@@ -178,7 +178,7 @@ mod tests {
         let path = area.path().join("config.json");
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         std::fs::write(&ca, cert.cert.pem()).unwrap();
-        std::fs::write(&key, cert.key_pair.serialize_pem()).unwrap();
+        std::fs::write(&key, cert.signing_key.serialize_pem()).unwrap();
         let config = json!({"kbs_url":"https://localhost:1234", "ca_cert":ca, "admin_key":key});
         std::fs::write(&path, config.to_string()).unwrap();
         let client = Client::new(path.clone());
@@ -195,7 +195,7 @@ mod tests {
         }
         std::fs::write(&key, "invalid rotated key").unwrap();
         assert!(client.transport().await.is_err());
-        std::fs::write(&key, cert.key_pair.serialize_pem()).unwrap();
+        std::fs::write(&key, cert.signing_key.serialize_pem()).unwrap();
         assert!(client.transport().await.is_ok());
     }
 }

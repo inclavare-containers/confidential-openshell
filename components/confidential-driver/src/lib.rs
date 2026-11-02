@@ -20,11 +20,17 @@ pub mod otel_tracing;
 #[path = "../../../repos/openshell/crates/openshell-driver-kubernetes/src/resource_admission.rs"]
 mod resource_admission;
 mod sandbox_runtime;
+// Reuse native placement/readiness types; this external driver does not start
+// the upstream shared-supervisor credential writer.
+#[allow(dead_code)]
+#[path = "../../../repos/openshell/crates/openshell-driver-kubernetes/src/shared_supervisor.rs"]
+mod shared_supervisor;
 
 pub use config::{
     DEFAULT_GATEWAY_ID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, DEFAULT_WORKSPACE_STORAGE_SIZE,
-    KubernetesComputeConfig, KubernetesImagePullPolicy, KubernetesSandboxRuntimeConfig,
-    ManagedSshIngressConfig, WorkspaceMode, managed_namespace_prefix,
+    KubernetesComputeConfig, KubernetesControlConnection, KubernetesImagePullPolicy,
+    KubernetesSandboxRuntimeConfig, ManagedSshIngressConfig, SharedSupervisorConfig,
+    SupervisorTopology, WorkspaceMode, managed_namespace_prefix,
 };
 pub use driver::{ConfidentialDriverSettings, KubernetesComputeDriver, KubernetesDriverError};
 pub use grpc::ComputeDriverService;

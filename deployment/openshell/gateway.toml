@@ -16,7 +16,7 @@ cert_path = "/var/lib/openshell-confidential/tls/server/tls.crt"
 key_path = "/var/lib/openshell-confidential/tls/server/tls.key"
 client_ca_path = "/var/lib/openshell-confidential/tls/ca.crt"
 
-# OpenShell v0.1.3 verifies operator client certificates independently of the
+# OpenShell v0.1.6 verifies operator client certificates independently of the
 # compute driver. The operator private key stays on the trusted host; guests
 # receive the public server CA and sandbox-scoped launch credentials only.
 [openshell.gateway.mtls_auth]

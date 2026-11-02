@@ -1,14 +1,14 @@
 # Upstream provenance and controlled delta
 
-This crate derives from NVIDIA OpenShell's Apache-2.0 `openshell-driver-kubernetes` at v0.1.3,
-commit `e1f3c82caa3ed3b65de22889ae7ef32a774878ef`. The original
+This crate derives from NVIDIA OpenShell's Apache-2.0 `openshell-driver-kubernetes` at v0.1.6,
+commit `ac7f615cd12d5cc49cb16eb1f5f10ffeb1e90f47`. The original
 [crate README](../../repos/openshell/crates/openshell-driver-kubernetes/README.md) and
 [NVIDIA copyright and Apache-2.0 license](../../repos/openshell/LICENSE) are retained in the
 pinned submodule. Derived Rust files retain their copyright and SPDX headers. The repository
 uses the pinned source directly.
 
 [UPSTREAM-SOURCES.json](UPSTREAM-SOURCES.json) records SHA-256 for every upstream Rust source,
-crate manifest and README. It identifies five directly imported modules and the
+crate manifest and README. It identifies directly imported modules and the
 `sandbox_runtime`/`isolation` implementations delegated through local wrappers. Tests in those
 imported implementations compile with this crate. `driver.rs` and `main.rs` remain local
 derivations; `confidential.rs` and the private `bootstrap.rs` resource publisher are

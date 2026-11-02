@@ -24,8 +24,8 @@ impl KubernetesSandboxRuntimeNetworkFenceSpec {
             boundary_port: self.boundary_port,
         }
         .provision();
-        // Supervisor control uses outbound connections and replies; isolate new
-        // inbound connections even without a namespace-wide default deny policy.
+        // Deny unsolicited supervisor ingress even without a namespace default
+        // deny. Runtime-initiated control adds a separate, pair-scoped allowance.
         let spec = fence
             .supervisor_policy
             .spec
