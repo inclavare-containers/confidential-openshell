@@ -68,9 +68,13 @@ credential rotation.
 Persistent workspaces use one private 32-byte key for the namespace and Sandbox CR UID. Owner
 and PVC/PV/cloud-disk journals are recorded before release and support recovery after CR
 deletion. A measured initializer formats a new LUKS volume with stock cryptsetup; released CDH
-SecureMount reopens it. Ephemeral workloads receive no workspace key or encrypted-volume
-manifest. Delete records a durable UID-specific marker, withdraws KBS resources, issues
-UID-preconditioned deletion, and succeeds only after the CR and both role Pods are absent. A
+SecureMount reopens it. Only the first creation permits blank-disk initialization; restart
+refuses it. Before mounting, APF checks the active kernel mapping for LUKS2,
+AES-XTS with a 512-bit key and 4096-byte sectors. Ephemeral workloads receive no workspace
+key or encrypted-volume manifest and reject injected cloud volumes. Explicit delete first
+withdraws every T-owned authorization for that sandbox, even if Kubernetes is unavailable.
+Cleanup records a durable UID-specific marker, issues UID-preconditioned deletion, and
+succeeds only after the CR and both role Pods are absent. A
 replaced CR or Secret is not adopted for cleanup. Failed revocation remains retryable.
 
 Stop/delete remove serving copies and authorization while retaining the private workspace key
@@ -98,7 +102,14 @@ bootstrap tests. Use the
 attestation, CDH unseal, KBS release and lifecycle behavior.
 
 Restart uses the private launch template, command and identity, not CR annotations.
-Stop records and withdraws authorization from T-owned attempt/owner records before
+Stop and explicit delete withdraw authorization from T-owned attempt/owner records before
 waiting for Kubernetes. Failed remote revocation remains pending and is retried at
 startup and during reconciliation; failure is not reported as successful withdrawal.
 Busy lifecycle gates are skipped by background reconciliation and revisited later.
+
+Create and restart share generation installation and release checks. Restart rebuilds the
+bootstrap init container from the current trusted runtime image configuration while retaining
+the saved business container image and command. Lifecycle serialization uses the deployed
+single driver's shared gates and durable trusted attempt records; Kubernetes attempt
+annotations do not elect a writer or authorize secret publication. Completed revocations are
+no-ops, and interrupted batches retry one policy publication before retiring their markers.

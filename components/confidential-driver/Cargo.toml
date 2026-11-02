@@ -66,12 +66,8 @@ ring = "0.17"
 [dev-dependencies]
 openshell-otel-test-support = { path = "../../repos/openshell/crates/openshell-otel-test-support" }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
-bytes = { workspace = true }
-http = { workspace = true }
-http-body-util = { workspace = true }
 temp-env = "0.3"
 tokio = { workspace = true, features = ["test-util"] }
-tower = { workspace = true }
 tempfile = "3"
 
 [lints]

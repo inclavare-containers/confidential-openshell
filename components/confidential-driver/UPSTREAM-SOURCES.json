@@ -30,7 +30,7 @@
     "lifecycle",
     "shared_supervisor"
   ],
-  "diff_command": "components/confidential-driver/controlled-diff.sh",
+  "provenance_command": "components/confidential-driver/check-upstream-provenance.sh",
   "compiled_upstream_delegates": {
     "isolation": "src/isolation.rs",
     "sandbox_runtime": "src/sandbox_runtime.rs"

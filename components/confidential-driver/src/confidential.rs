@@ -116,6 +116,7 @@ impl GuestInitdata {
         namespace: &str,
         keys: &[&str],
         workspace_key_uri: Option<&str>,
+        allow_workspace_initialize: bool,
         generated_policy: Option<&str>,
     ) -> Result<RenderedInitdata, String> {
         let mut resources = BTreeMap::new();
@@ -194,7 +195,7 @@ impl GuestInitdata {
                 );
             }
             let config = toml::Value::try_from(serde_json::json!({
-                "version": "0.1.0", "key_uri": uri, "allow_initialize": true,
+                "version": "0.1.0", "key_uri": uri, "allow_initialize": allow_workspace_initialize,
                 "encryption_type": "luks2", "filesystem_type": "ext4", "disk_ids": disk_ids,
             }))
             .map_err(|error| format!("serialize measured workspace configuration: {error}"))?;
@@ -366,6 +367,7 @@ mod tests {
                 "sandbox",
                 WORKLOAD_KEYS,
                 Some(&workspace_uri),
+                true,
                 workload_policy.as_deref(),
             )
             .expect("render workload");
@@ -392,6 +394,7 @@ mod tests {
                     "sandbox",
                     WORKLOAD_KEYS,
                     Some(&workspace_uri),
+                    false,
                     Some("package agent_policy\ndefault allow = false\n")
                 )
                 .is_err()
@@ -412,6 +415,7 @@ mod tests {
                     "sandbox",
                     WORKLOAD_KEYS,
                     Some(&not_bound),
+                    false,
                     Some("package agent_policy\ndefault allow = false\n")
                 )
                 .is_err()
@@ -429,6 +433,7 @@ mod tests {
                 "sandbox",
                 &supervisor_keys,
                 None,
+                false,
                 supervisor_policy.as_deref(),
             )
             .expect("render supervisor");
@@ -480,10 +485,19 @@ mod tests {
                 "sandbox",
                 WORKLOAD_KEYS,
                 Some(&workspace_uri),
+                false,
                 None,
             )
             .expect("render rotated workload");
         assert_ne!(workload.digest, rotated.digest);
+        assert_eq!(workspace["allow_initialize"].as_bool(), Some(true));
+        let restarted: toml::Value = toml::from_str(
+            toml::from_str::<toml::Value>(&rotated.raw).unwrap()["data"]["workspace.toml"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(restarted["allow_initialize"].as_bool(), Some(false));
         let ephemeral = source
             .render(
                 &store,
@@ -495,6 +509,7 @@ mod tests {
                 "sandbox",
                 WORKLOAD_KEYS,
                 None,
+                false,
                 None,
             )
             .expect("render ephemeral workload");

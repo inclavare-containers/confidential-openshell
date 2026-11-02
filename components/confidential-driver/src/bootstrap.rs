@@ -26,6 +26,9 @@ use std::{
 use thiserror::Error;
 
 const SIGNER_URI: &str = "kbs:///default/bootstrap-signer/key";
+// The management client has its own 120s request budget. Bound the whole
+// renderer process group as well, including startup and lock acquisition.
+const PUBLICATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(150);
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -291,21 +294,7 @@ impl BootstrapStore {
             return Err(error);
         }
         store.with_lock(|| {
-            for item in fs::read_dir(store.state.join("revoking"))? {
-                let path = item?.path();
-                let identity = path
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .ok_or(StoreError::UnsafePath)?;
-                if identity.len() != 64
-                    || !identity
-                        .bytes()
-                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-                {
-                    return Err(StoreError::UnsafePath);
-                }
-                store.revoke_identity(identity)?;
-            }
+            store.revoke_identities(std::iter::empty())?;
             store.refresh_policy()
         })?;
         Ok(store)
@@ -808,26 +797,12 @@ impl BootstrapStore {
             if self.read_pending_delete(&path)? != *marker {
                 return Err(StoreError::Conflict);
             }
-            let mut errors = Vec::new();
-            if let Err(error) = self.finish_revocations() {
-                errors.push(error.to_string());
-            }
-            if let Err(error) = self.deauthorize_workspace_identity(&workspace_hash(
-                &marker.namespace,
-                &marker.sandbox_cr_uid,
-            )) {
-                errors.push(error.to_string());
-            }
-            for identity in &marker.bootstrap_identities {
-                if let Err(error) = self.revoke_identity(identity) {
-                    errors.push(error.to_string());
-                }
-            }
-            if errors.is_empty() {
-                Ok(())
-            } else {
-                Err(StoreError::Cleanup(errors.join("; ")))
-            }
+            self.revoke_identities(marker.bootstrap_identities.iter().cloned().chain(
+                std::iter::once(format!(
+                    "workspace-{}",
+                    workspace_hash(&marker.namespace, &marker.sandbox_cr_uid)
+                )),
+            ))
         })
     }
 
@@ -1056,6 +1031,9 @@ impl BootstrapStore {
         let planned = self.plan_workspace_key(namespace, sandbox_cr_uid)?;
         let id = workspace_hash(namespace, sandbox_cr_uid);
         self.with_lock(|| {
+            if self.revoking(&format!("workspace-{id}")).exists() {
+                return Err(StoreError::Revoked);
+            }
             if let Some(expected) = attempt {
                 let record: ActiveAttempt = serde_json::from_slice(&read_private(
                     &self
@@ -1341,7 +1319,7 @@ impl BootstrapStore {
             return Err(StoreError::Policy);
         }
         let identity = identity_hash(role, generation, sandbox_id, attempt_id);
-        self.with_lock(|| self.revoke_identity(&identity))
+        self.with_lock(|| self.revoke_identities([identity]))
     }
 
     /// Withdraw a CR's bootstrap identities without touching a replacement
@@ -1353,10 +1331,6 @@ impl BootstrapStore {
             return Err(StoreError::Policy);
         }
         self.with_lock(|| {
-            let mut errors = Vec::new();
-            if let Err(error) = self.finish_revocations() {
-                errors.push(error.to_string());
-            }
             let mut identities = std::collections::BTreeSet::new();
             for item in fs::read_dir(self.state.join("bindings"))? {
                 let record: Binding = serde_json::from_slice(&read_regular(&item?.path())?)?;
@@ -1379,20 +1353,79 @@ impl BootstrapStore {
                     }
                 }
             }
-            for identity in identities {
-                if let Err(error) = self.revoke_identity(&identity) {
-                    errors.push(error.to_string());
-                }
-            }
-            if errors.is_empty() {
-                Ok(())
-            } else {
-                Err(StoreError::Cleanup(errors.join("; ")))
-            }
+            self.revoke_identities(identities)
         })
     }
 
-    fn revoke_identity(&self, identity: &str) -> Result<()> {
+    // Stage every serving cut before publishing one policy update. Keep each
+    // existing revocation marker until that update succeeds, including retries
+    // after the bindings themselves have already been removed.
+    fn revoke_identities(&self, identities: impl IntoIterator<Item = String>) -> Result<()> {
+        let mut identities: std::collections::BTreeSet<_> = identities.into_iter().collect();
+        for item in fs::read_dir(self.state.join("revoking"))? {
+            let name = item?
+                .file_name()
+                .into_string()
+                .map_err(|_| StoreError::UnsafePath)?;
+            let digest = name.strip_prefix("workspace-").unwrap_or(&name);
+            if digest.len() != 64
+                || !digest
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            {
+                return Err(StoreError::UnsafePath);
+            }
+            identities.insert(name);
+        }
+        let mut completed = Vec::new();
+        let mut errors = Vec::new();
+        for identity in identities {
+            match self.stage_identity_revocation(&identity) {
+                Ok(true) => completed.push(identity),
+                Ok(false) => {}
+                Err(error) => errors.push(error.to_string()),
+            }
+        }
+        if !completed.is_empty() {
+            match self.refresh_policy() {
+                Ok(()) => {
+                    for identity in completed {
+                        fs::remove_file(self.revoking(&identity))?;
+                    }
+                    sync_dir(&self.state.join("revoking"))?;
+                }
+                Err(error) => errors.push(error.to_string()),
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(StoreError::Cleanup(errors.join("; ")))
+        }
+    }
+
+    fn stage_identity_revocation(&self, identity: &str) -> Result<bool> {
+        if let Some(id) = identity.strip_prefix("workspace-") {
+            let serving = self.workspace_resource(id);
+            let binding = self.workspace_binding(id);
+            let marker = self.revoking(identity);
+            if !serving.exists() && !binding.exists() && !marker.exists() {
+                return Ok(false);
+            }
+            if !marker.exists() {
+                atomic_new(&marker, b"revoking\n")?;
+            }
+            for path in [serving, binding] {
+                if path.exists() {
+                    fs::remove_file(&path)?;
+                    sync_dir(path.parent().unwrap())?;
+                }
+            }
+            return Ok(true);
+        }
+        if self.tombstone(identity).exists() && !self.revoking(identity).exists() {
+            return Ok(false);
+        }
         let revoking = self.revoking(identity);
         if !revoking.exists() {
             atomic_new(&revoking, b"revoking\n")?;
@@ -1443,33 +1476,7 @@ impl BootstrapStore {
         sync_dir(&self.repository)?;
         sync_dir(&self.state.join("bindings"))?;
         sync_dir(&self.state.join("descriptors"))?;
-        self.refresh_policy()?;
-        fs::remove_file(revoking)?;
-        sync_dir(&self.state.join("revoking"))?;
-        Ok(())
-    }
-
-    fn finish_revocations(&self) -> Result<()> {
-        let mut identities = Vec::new();
-        for item in fs::read_dir(self.state.join("revoking"))? {
-            let path = item?.path();
-            let identity = path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .ok_or(StoreError::UnsafePath)?;
-            if identity.len() != 64
-                || !identity
-                    .bytes()
-                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-            {
-                return Err(StoreError::UnsafePath);
-            }
-            identities.push(identity.to_owned());
-        }
-        for identity in identities {
-            self.revoke_identity(&identity)?;
-        }
-        Ok(())
+        Ok(true)
     }
 
     pub(super) fn binding_directory(&self) -> PathBuf {
@@ -1600,17 +1607,7 @@ impl BootstrapStore {
     }
 
     fn deauthorize_workspace_identity(&self, id: &str) -> Result<()> {
-        let serving = self.workspace_resource(id);
-        if serving.exists() {
-            fs::remove_file(&serving)?;
-            sync_dir(serving.parent().unwrap())?;
-        }
-        let binding = self.workspace_binding(id);
-        if binding.exists() {
-            fs::remove_file(&binding)?;
-            sync_dir(binding.parent().unwrap())?;
-        }
-        self.refresh_policy()
+        self.revoke_identities([format!("workspace-{id}")])
     }
 
     fn withdraw_failed_publication(&self, binding: &Path, serving: &Path) -> Result<()> {
@@ -1626,9 +1623,18 @@ impl BootstrapStore {
     }
 
     fn refresh_policy(&self) -> Result<()> {
+        self.refresh_policy_with_timeout(PUBLICATION_TIMEOUT)
+    }
+
+    fn refresh_policy_with_timeout(&self, timeout: std::time::Duration) -> Result<()> {
         let (script, output, as_output) = self.policy.as_ref().ok_or(StoreError::Policy)?;
-        let mut command = Command::new("python3");
+        // GNU timeout terminates the renderer and its children, and reaps the
+        // process even if it ignores TERM. Coreutils is part of the Ubuntu host.
+        let mut command = Command::new("timeout");
         command
+            .arg("--kill-after=5s")
+            .arg(format!("{}s", timeout.as_secs_f64()))
+            .arg("python3")
             .arg(script)
             .arg("--bindings-dir")
             .arg(self.binding_directory())
@@ -1650,6 +1656,10 @@ impl BootstrapStore {
         let result = command.output()?;
         if result.status.success() {
             Ok(())
+        } else if result.status.code() == Some(124) || result.status.code() == Some(137) {
+            Err(StoreError::Publication(
+                "policy refresh timed out".to_owned(),
+            ))
         } else if self.trustee_config.is_some() {
             Err(StoreError::Publication(
                 String::from_utf8_lossy(&result.stderr)
@@ -1673,7 +1683,21 @@ impl BootstrapStore {
                 .truncate(false)
                 .mode(0o600)
                 .open(self.state.join(".lock"))?;
-            lock.lock_exclusive()?;
+            let deadline = std::time::Instant::now() + PUBLICATION_TIMEOUT;
+            loop {
+                match lock.try_lock_exclusive() {
+                    Ok(()) => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= deadline {
+                            return Err(StoreError::Publication(
+                                "bootstrap store lock timed out".to_owned(),
+                            ));
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
             let result = op();
             FileExt::unlock(&lock)?;
             result
@@ -2031,6 +2055,8 @@ mod tests {
             &renderer,
             r"import json, pathlib, sys
 args = sys.argv
+counter = pathlib.Path(__file__).with_name('renderer-calls')
+counter.write_text(str(int(counter.read_text()) + 1) if counter.exists() else '1')
 if pathlib.Path(__file__).with_name('fail').exists():
     sys.exit(2)
 digests = set()
@@ -2053,6 +2079,58 @@ pathlib.Path(args[args.index('--output') + 1]).write_text('package policy\ndefau
         )
         .unwrap();
         (tmp, store)
+    }
+
+    #[test]
+    fn policy_process_deadline_is_enforced() {
+        let (tmp, store) = fixture();
+        fs::write(
+            tmp.path().join("renderer.py"),
+            "import time\ntime.sleep(30)\n",
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        let error = store
+            .refresh_policy_with_timeout(std::time::Duration::from_millis(50))
+            .unwrap_err();
+        assert!(error.to_string().contains("timed out"), "{error}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn workspace_revocation_retries_publication_and_skips_completed_work() {
+        let (tmp, store) = fixture();
+        store
+            .record_workspace_owner("sandbox-workspace", "ns", "uid")
+            .unwrap();
+        store
+            .record_workspace_volume("ns", "uid", "pvc", None, None)
+            .unwrap();
+        store.ensure_workspace_key("ns", "uid", INITDATA).unwrap();
+        fs::write(tmp.path().join("fail"), b"fail").unwrap();
+        assert!(store.deauthorize_workspace_key("ns", "uid").is_err());
+        assert!(
+            !store
+                .workspace_resource(&workspace_hash("ns", "uid"))
+                .exists()
+        );
+        assert!(matches!(
+            store.ensure_workspace_key("ns", "uid", INITDATA),
+            Err(StoreError::Revoked)
+        ));
+        fs::remove_file(tmp.path().join("fail")).unwrap();
+        let calls_before: usize = fs::read_to_string(tmp.path().join("renderer-calls"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        store.deauthorize_workspace_key("ns", "uid").unwrap();
+        store.deauthorize_workspace_key("ns", "uid").unwrap();
+        let calls_after: usize = fs::read_to_string(tmp.path().join("renderer-calls"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(calls_after, calls_before + 1);
+        store.ensure_workspace_key("ns", "uid", INITDATA).unwrap();
     }
 
     #[test]
@@ -2325,6 +2403,7 @@ pathlib.Path(args[args.index('--output') + 1]).write_text('package policy\ndefau
             agent_uid: 1000, agent_gid: 1000, volume_claim_templates: serde_json::Value::Null,
             workload: serde_json::from_value(serde_json::json!({"apiVersion":"v1", "kind":"Pod",
                 "spec":{"containers":[{"name":"agent", "image":"approved", "command":["native"]}],
+                    "initContainers":[{"name":"openshell-sandbox-bootstrap", "image":"runtime-old"}, {"name":"workspace-init", "image":"approved"}],
                     "volumes":[{"name":"openshell-sandbox-bootstrap", "secret":{"secretName":"old"}}]}})).unwrap(),
         };
         store.record_launch(&launch).unwrap();
@@ -2345,9 +2424,24 @@ pathlib.Path(args[args.index('--output') + 1]).write_text('package policy\ndefau
         .unwrap();
         let restored = store.load_launch("sandbox-launch", "ns", "uid").unwrap();
         assert!(restored == launch);
-        let pod = restored.workload_for_generation("new", &["pull-new".into()]);
+        let config = crate::config::KubernetesComputeConfig {
+            sandbox_runtime_image: "runtime-new".into(),
+            ..Default::default()
+        };
+        let pod = restored
+            .workload_for_generation("new", &["pull-new".into()], &config)
+            .unwrap();
         let spec = pod.spec.unwrap();
         assert_eq!(spec.containers[0].command, Some(vec!["native".into()]));
+        assert_eq!(spec.containers[0].image.as_deref(), Some("approved"));
+        let init = spec.init_containers.unwrap();
+        assert_eq!(init[0].image.as_deref(), Some("runtime-new"));
+        assert_eq!(
+            init[0].command,
+            Some(vec!["/openshell-sandbox".into(), "bootstrap".into()])
+        );
+        assert_eq!(init[1].name, "workspace-init");
+        assert_eq!(init[1].image.as_deref(), Some("approved"));
         assert_eq!(
             spec.volumes.unwrap()[0]
                 .secret
@@ -2710,6 +2804,10 @@ pathlib.Path(args[args.index('--output') + 1]).write_text('package policy\ndefau
                 &"b".repeat(96),
             )
             .unwrap();
+        let calls_before: usize = fs::read_to_string(tmp.path().join("renderer-calls"))
+            .unwrap()
+            .parse()
+            .unwrap();
         fs::write(tmp.path().join("fail"), b"fail").unwrap();
         assert!(matches!(
             store.revoke_sandbox_uid("sandbox-stop", "old-uid"),
@@ -2735,6 +2833,16 @@ pathlib.Path(args[args.index('--output') + 1]).write_text('package policy\ndefau
         );
         fs::remove_file(tmp.path().join("fail")).unwrap();
         store.revoke_sandbox_uid("sandbox-stop", "old-uid").unwrap();
+        store.revoke_sandbox_uid("sandbox-stop", "old-uid").unwrap();
+        let calls_after: usize = fs::read_to_string(tmp.path().join("renderer-calls"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            calls_after,
+            calls_before + 2,
+            "one publication per batch plus the failed attempt"
+        );
     }
 
     #[test]
@@ -2934,7 +3042,7 @@ pathlib.Path(args[args.index('--output') + 1]).write_text('package policy\ndefau
         fs::write(tmp.path().join("fail"), b"1").unwrap();
         assert!(matches!(
             store.revoke_attempt(role, GENERATION, "sandbox-2", ATTEMPT),
-            Err(StoreError::Policy)
+            Err(StoreError::Cleanup(_))
         ));
         assert!(!store.resource(id).exists());
         let identity = identity_hash(role, GENERATION, "sandbox-2", ATTEMPT);

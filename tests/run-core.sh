@@ -5,7 +5,7 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
 python3 -c 'import sys, cryptography, yaml, tomllib; assert sys.version_info >= (3, 11)'
 python3 tests/check-layout.py
-components/confidential-driver/controlled-diff.sh
+components/confidential-driver/check-upstream-provenance.sh
 cargo fmt --all -- --check
 cargo test --offline --locked -p openshell-driver-confidential-kubernetes
 PYTHONPATH="${PYTHONPATH:+$PYTHONPATH:}deployment/runtime" python3 -m unittest discover -s tests/contracts -v

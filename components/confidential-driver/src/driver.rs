@@ -313,7 +313,6 @@ const KUBE_API_TIMEOUT: Duration = Duration::from_secs(30);
 const OPENSHIFT_SCC_ALLOCATOR_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// A controller may update Sandbox status between our GET and UID-guarded DELETE.
 /// Bound retries so a constantly changing or independently modified CR stays fenced.
-const SANDBOX_DELETE_CONFLICT_RETRIES: usize = 3;
 fn admission_error(error: tonic::Status) -> KubernetesDriverError {
     match error.code() {
         tonic::Code::InvalidArgument => {
@@ -958,6 +957,7 @@ impl KubernetesComputeDriver {
         namespace: &str,
         keys: &[&str],
         workspace_key_uri: Option<&str>,
+        allow_workspace_initialize: bool,
         generated_policy: Option<&str>,
     ) -> Result<crate::confidential::RenderedInitdata, KubernetesDriverError> {
         let profile = self.confidential_profile()?;
@@ -973,6 +973,7 @@ impl KubernetesComputeDriver {
                 namespace,
                 keys,
                 workspace_key_uri,
+                allow_workspace_initialize,
                 generated_policy,
             )
             .map_err(KubernetesDriverError::Precondition)
@@ -992,6 +993,7 @@ impl KubernetesComputeDriver {
         namespace: &str,
         keys: &[&str],
         workspace_key_uri: Option<&str>,
+        allow_workspace_initialize: bool,
     ) -> Result<crate::confidential::RenderedInitdata, KubernetesDriverError> {
         use tokio::io::AsyncWriteExt as _;
         Self::validate_actual_pod_image_refs(pod)?;
@@ -1101,6 +1103,7 @@ impl KubernetesComputeDriver {
             namespace,
             keys,
             workspace_key_uri,
+            allow_workspace_initialize,
             Some(&policy),
         )?;
         let updated = pods
@@ -3293,6 +3296,7 @@ impl KubernetesComputeDriver {
             namespace,
             &supervisor_keys,
             None,
+            false,
             None,
         )?;
         let workload_initdata = self.render_confidential_initdata(
@@ -3304,6 +3308,7 @@ impl KubernetesComputeDriver {
             namespace,
             WORKLOAD_KEYS,
             workspace_key_uri.as_deref(),
+            true,
             None,
         )?;
         patch_dynamic_object_with_uid_retry(&sandbox_api.api, cr_name, cr_uid, |version| {
@@ -3315,67 +3320,12 @@ impl KubernetesComputeDriver {
             })
         })
         .await?;
-        let client_tls = self.read_client_tls_material().await?;
-        let namespace_uid = Api::<Namespace>::all(self.client.clone())
-            .get(namespace)
-            .await
-            .map_err(KubernetesDriverError::from_kube)?
-            .metadata
-            .uid
-            .ok_or_else(|| {
-                KubernetesDriverError::Message("sandbox namespace has no UID".to_string())
-            })?;
         let dependent_owner = sandbox_runtime_sandbox_owner_reference(
             cr_name,
             cr_uid,
             &sandbox_api.resource.api_version,
             false,
         );
-        let services: Api<Service> = Api::namespaced(self.client.clone(), namespace);
-        self.ensure_sandbox_runtime_service(
-            namespace,
-            names,
-            &sandbox.id,
-            KubernetesControlConnection::SupervisorInitiated,
-            dependent_owner.clone(),
-        )
-        .await?;
-        let control_policy = self
-            .ensure_sandbox_runtime_control_policy(
-                namespace,
-                names,
-                &sandbox.id,
-                dependent_owner.clone(),
-            )
-            .await?;
-        let service = services
-            .create(
-                &PostParams::default(),
-                &boundary_service(
-                    namespace,
-                    names,
-                    &sandbox.id,
-                    self.config.sandbox_runtime.boundary_port,
-                    KubernetesControlConnection::RuntimeInitiated,
-                    dependent_owner.clone(),
-                ),
-            )
-            .await
-            .map_err(KubernetesDriverError::from_kube)?;
-        let service_ip: std::net::IpAddr = service
-            .spec
-            .and_then(|spec| spec.cluster_ip)
-            .filter(|ip| ip != "None")
-            .ok_or_else(|| {
-                KubernetesDriverError::Message("boundary Service has no ClusterIP".to_string())
-            })?
-            .parse()
-            .map_err(|error| {
-                KubernetesDriverError::Message(format!(
-                    "invalid boundary Service ClusterIP: {error}"
-                ))
-            })?;
-
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
         let expected_supervisor = supervisor_pod(
             namespace,
@@ -3434,126 +3384,12 @@ impl KubernetesComputeDriver {
             KubernetesDriverError::Message("supervisor Pod has no UID".to_string())
         })?;
 
-        let policies: Api<NetworkPolicy> = Api::namespaced(self.client.clone(), namespace);
-        let fence = policies
-            .get(&names.workload_policy)
-            .await
-            .map_err(KubernetesDriverError::from_kube)?;
-        let fence_uid = fence.metadata.uid.ok_or_else(|| {
-            KubernetesDriverError::Message("workload NetworkPolicy has no UID".to_string())
-        })?;
-        let fence_generation = fence.metadata.generation.ok_or_else(|| {
-            KubernetesDriverError::Message("workload NetworkPolicy has no generation".to_string())
-        })?;
-        let fence_resource_version = fence.metadata.resource_version.ok_or_else(|| {
-            KubernetesDriverError::Message(
-                "workload NetworkPolicy has no resourceVersion".to_string(),
-            )
-        })?;
-
         // Release the Sandbox CR only far enough for the controller to create
         // the workload Pod. The Pod remains unschedulable because its template
         // carries the OpenShell scheduling gate and references a Secret that
         // does not exist yet.
         patch_dynamic_object_with_uid_retry(&sandbox_api.api, cr_name, cr_uid, |version| {
             sandbox_operating_state_patch(&sandbox_api.resource.version, version, true)
-        })
-        .await?;
-
-        let workload_pod = self
-            .wait_for_bootstrap_workload_pod(&pods, cr_name, cr_uid)
-            .await?;
-        self.record_workspace_volumes(
-            &sandbox.id,
-            namespace,
-            cr_uid,
-            &workload_pod,
-            workspace_key_uri.is_some(),
-        )
-        .await?;
-        let admission_object = sandbox_api
-            .api
-            .get(cr_name)
-            .await
-            .map_err(KubernetesDriverError::from_kube)?;
-        self.admit_stored_resources(&admission_object)
-            .await
-            .map_err(admission_error)?;
-        Self::validate_capability_free_workload_pod(
-            &workload_pod,
-            cr_uid,
-            &sandbox.id,
-            agent_uid,
-            agent_gid,
-            &names.sandbox_secret,
-        )?;
-        let workload_pod_uid =
-            workload_pod.metadata.uid.clone().ok_or_else(|| {
-                KubernetesDriverError::Message("workload Pod has no UID".to_string())
-            })?;
-        let workload_pod_name = workload_pod.metadata.name.clone().ok_or_else(|| {
-            KubernetesDriverError::Message("workload Pod has no name".to_string())
-        })?;
-        let supervisor_pod = pods
-            .get(&names.supervisor_pod)
-            .await
-            .map_err(KubernetesDriverError::from_kube)?;
-        if supervisor_pod.metadata.uid.as_deref() != Some(&supervisor_uid) {
-            return Err(KubernetesDriverError::Precondition(
-                "supervisor Pod UID changed during confidential bootstrap".to_string(),
-            ));
-        }
-        let supervisor_initdata = self
-            .generate_and_patch_initdata(
-                &pods,
-                &supervisor_pod,
-                &expected_supervisor,
-                BootstrapRole::Supervisor,
-                generation,
-                &sandbox.id,
-                cr_uid,
-                bootstrap_attempt,
-                namespace,
-                &supervisor_keys,
-                None,
-            )
-            .await?;
-        let workload_initdata = self
-            .generate_and_patch_initdata(
-                &pods,
-                &workload_pod,
-                &expected_workload,
-                BootstrapRole::Workload,
-                generation,
-                &sandbox.id,
-                cr_uid,
-                bootstrap_attempt,
-                namespace,
-                WORKLOAD_KEYS,
-                workspace_key_uri.as_deref(),
-            )
-            .await?;
-        patch_dynamic_object_with_uid_retry(&sandbox_api.api, cr_name, cr_uid, |version| {
-            serde_json::json!({"metadata": {"resourceVersion": version},
-            "spec": {"podTemplate": {"metadata": {"annotations": {
-                INITDATA_ANNOTATION: workload_initdata.annotation,
-            }}}}})
-        })
-        .await?;
-        patch_dynamic_object_with_uid_retry(&sandbox_api.api, cr_name, cr_uid, |version| {
-            serde_json::json!({
-                "metadata": {
-                    "resourceVersion": version,
-                    "annotations": {
-                        ANNOTATION_SANDBOX_RUNTIME_WORKLOAD_UID: workload_pod_uid.clone(),
-                        ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_UID: supervisor_uid.clone(),
-                        ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_UID: fence_uid.clone(),
-                        ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_GENERATION: fence_generation.to_string(),
-                        ANNOTATION_SANDBOX_RUNTIME_CONTROL_POLICY_UID: control_policy.uid.clone(),
-                        ANNOTATION_SANDBOX_RUNTIME_CONTROL_POLICY_GENERATION: control_policy.generation.to_string(),
-                    }
-                }
-            })
         })
         .await?;
 
@@ -3567,185 +3403,25 @@ impl KubernetesComputeDriver {
                 )
             })
             .and_then(|spec| decode_launch_authentication(&spec.launch_authentication))?;
-        let host_gateway_ip = self.config.host_gateway_ip.parse().ok();
-        let session_id = launch_authentication.supervisor.session_id;
-        let tls = generate_sandbox_tls_material(session_id)
-            .map_err(|error| KubernetesDriverError::Message(error.to_string()))?;
-        let verification_keys =
-            gateway_verification_keys(&launch_authentication.verification_keys)?;
-        let proxy_ca = generate_proxy_ca_material().map_err(KubernetesDriverError::Message)?;
-        let workload_identity = ResolvedWorkloadIdentity::new(
+        self.install_sandbox_runtime_generation(
+            namespace,
+            cr_name,
+            sandbox_api,
+            &sandbox.id,
+            cr_uid,
+            names,
+            generation,
+            bootstrap_attempt,
+            workspace_key_uri.is_some(),
+            true,
+            &supervisor_uid,
+            &expected_supervisor,
             agent_uid,
             agent_gid,
-            Vec::new(),
-            "kubernetes-config".to_string(),
-            format!("sandbox:{cr_uid}"),
-        )
-        .map_err(|error| KubernetesDriverError::Message(error.to_string()))?;
-        let provisioned = KubernetesSandboxRuntimeBoundarySpec {
-            boundary_id: sandbox.id.clone(),
-            generation: launch_authentication
-                .supervisor
-                .runtime_generation
-                .to_string(),
-            session_id,
-            session_rotation: launch_authentication.supervisor.session_rotation,
-            auth_epoch: launch_authentication.supervisor.auth_epoch,
-            gateway_id: launch_authentication.gateway_id,
-            verification_keys,
-            namespace_uid,
-            sandbox_resource_uid: cr_uid.to_string(),
-            workload_pod_uid: workload_pod_uid.clone(),
-            workload_pod_uid_path: PathBuf::from(SANDBOX_POD_UID_PATH),
-            supervisor: KubernetesSupervisorClaim::Pod(supervisor_uid.clone()),
-            egress_policy_uid: fence_uid.clone(),
-            egress_policy_resource_version: fence_resource_version.clone(),
-            control_path: self.sandbox_runtime_control_path(
-                namespace,
-                names,
-                service_ip,
-                Some(&control_policy),
-            ),
-            sandbox_tls: SandboxTlsServerConfig {
-                certificate_chain_path: PathBuf::from(BOUNDARY_CERTIFICATE_PATH),
-                private_key_path: PathBuf::from(BOUNDARY_PRIVATE_KEY_PATH),
-            },
-            supervisor_tls: SandboxTlsClientConfig {
-                server_name: tls.server_name.clone(),
-                trust_anchor_pem: tls.trust_anchor_pem.clone(),
-            },
-            host_gateway_ip,
-            workload_identity,
             child_env,
-        }
-        .provision()
-        .map_err(|error| KubernetesDriverError::Message(error.to_string()))?;
-        let descriptor = provisioned
-            .runtime_descriptor
-            .backend_descriptor()
-            .map_err(|error| KubernetesDriverError::Message(error.to_string()))?;
-        let workload_owner = runtime_pod_owner(&workload_pod_name, &workload_pod_uid);
-        let supervisor_owner = runtime_pod_owner(&names.supervisor_pod, &supervisor_uid);
-        let mut sandbox_secret = sandbox_bootstrap_secret(
-            namespace,
-            names,
-            &sandbox.id,
-            provisioned
-                .boundary_config
-                .encode()
-                .map_err(|error| KubernetesDriverError::Message(error.to_string()))?,
-            tls.certificate_chain_pem.into_bytes(),
-            tls.private_key_pem.into_bytes(),
-            workload_owner.clone(),
-        );
-        let mut supervisor_secret = supervisor_bootstrap_secret(
-            namespace,
-            names,
-            &sandbox.id,
-            descriptor.payload,
-            serde_json::to_vec(&launch_authentication.supervisor).map_err(|error| {
-                KubernetesDriverError::Message(format!("encode supervisor auth bundle: {error}"))
-            })?,
-            proxy_ca.certificate_pem.into_bytes(),
-            proxy_ca.private_key_pem.into_bytes(),
-            upstream_proxy_ca_bundle.clone(),
-            client_tls,
-            supervisor_owner.clone(),
-        );
-        self.seal_bootstrap_secret(
-            &mut sandbox_secret,
-            BootstrapRole::Workload,
-            generation,
-            &sandbox.id,
-            cr_uid,
-            bootstrap_attempt,
-            &workload_initdata.digest,
-            WORKLOAD_KEYS,
-        )?;
-        self.seal_bootstrap_secret(
-            &mut supervisor_secret,
-            BootstrapRole::Supervisor,
-            generation,
-            &sandbox.id,
-            cr_uid,
-            bootstrap_attempt,
-            &supervisor_initdata.digest,
-            &supervisor_keys,
-        )?;
-        if workspace_key_uri.is_some() {
-            self.confidential_profile()?
-                .store
-                .ensure_workspace_key_for_attempt(
-                    namespace,
-                    cr_uid,
-                    &workload_initdata.digest,
-                    bootstrap_attempt,
-                )
-                .map_err(|error| {
-                    KubernetesDriverError::Message(format!(
-                        "authorize confidential workspace key: {error}"
-                    ))
-                })?;
-        }
-        let secrets = Api::<Secret>::namespaced(self.client.clone(), namespace);
-        secrets
-            .create(&PostParams::default(), &sandbox_secret)
-            .await
-            .map_err(KubernetesDriverError::from_kube)?;
-        secrets
-            .create(&PostParams::default(), &supervisor_secret)
-            .await
-            .map_err(KubernetesDriverError::from_kube)?;
-        self.create_generation_image_pull_secrets(
-            namespace,
-            names,
-            &sandbox.id,
-            vec![workload_owner, supervisor_owner],
+            &launch_authentication,
         )
         .await?;
-
-        let supervisor_release_version = Self::verify_measured_pod_before_release(
-            &pods,
-            &names.supervisor_pod,
-            &supervisor_uid,
-            &supervisor_initdata.annotation,
-            &supervisor_pod,
-        )
-        .await?;
-        let workload_release_version = Self::verify_measured_pod_before_release(
-            &pods,
-            &workload_pod_name,
-            &workload_pod_uid,
-            &workload_initdata.annotation,
-            &workload_pod,
-        )
-        .await?;
-        pods.patch(
-            &names.supervisor_pod,
-            &PatchParams::default(),
-            &Patch::Merge(&serde_json::json!({"metadata": {"resourceVersion": supervisor_release_version}, "spec": {"schedulingGates": []}})),
-        )
-        .await
-        .map_err(KubernetesDriverError::from_kube)?;
-        pods.patch(
-            &workload_pod_name,
-            &PatchParams::default(),
-            &Patch::Merge(&serde_json::json!({"metadata": {"resourceVersion": workload_release_version}, "spec": {"schedulingGates": []}})),
-        )
-        .await
-        .map_err(KubernetesDriverError::from_kube)?;
-        patch_dynamic_object_with_uid_retry(&sandbox_api.api, cr_name, cr_uid, |version| {
-            sandbox_runtime_bootstrap_phase_patch(version, SandboxRuntimeBootstrapPhase::Released)
-        })
-        .await?;
-        spawn_sandbox_runtime_bootstrap_completion(
-            pods.clone(),
-            sandbox_api.api.clone(),
-            names.supervisor_pod.clone(),
-            cr_name.to_string(),
-            Some(cr_uid.to_string()),
-            self.bootstrap_timeout(),
-        );
         // Return while the CR remains explicitly bootstrapping. The gateway
         // can now commit the sandbox configuration required by a policy-less
         // control process without deadlocking behind this driver call. Only
@@ -3771,6 +3447,7 @@ impl KubernetesComputeDriver {
         generation: &str,
         bootstrap_attempt: &str,
         persistent_workspace: bool,
+        allow_workspace_initialize: bool,
         supervisor_uid: &str,
         expected_supervisor: &Pod,
         agent_uid: u32,
@@ -3793,7 +3470,8 @@ impl KubernetesComputeDriver {
             .workload_for_generation(
                 &names.sandbox_secret,
                 &self.generation_image_pull_secret_names(names),
-            );
+                &self.config,
+            )?;
         let workspace_key_uri = if persistent_workspace {
             Some(
                 self.confidential_profile()?
@@ -3912,7 +3590,7 @@ impl KubernetesComputeDriver {
             .map_err(KubernetesDriverError::from_kube)?;
         if supervisor_pod.metadata.uid.as_deref() != Some(supervisor_uid) {
             return Err(KubernetesDriverError::Precondition(
-                "supervisor Pod UID changed during confidential restart".to_string(),
+                "supervisor Pod UID changed during confidential bootstrap".to_string(),
             ));
         }
         let supervisor_initdata = self
@@ -3928,6 +3606,7 @@ impl KubernetesComputeDriver {
                 namespace,
                 &supervisor_keys,
                 None,
+                false,
             )
             .await?;
         let workload_initdata = self
@@ -3943,6 +3622,7 @@ impl KubernetesComputeDriver {
                 namespace,
                 WORKLOAD_KEYS,
                 workspace_key_uri.as_deref(),
+                allow_workspace_initialize,
             )
             .await?;
         patch_dynamic_object_with_uid_retry(&sandbox_api.api, cr_name, cr_uid, |version| {
@@ -4197,82 +3877,6 @@ impl KubernetesComputeDriver {
                     ))
                 }
             })?;
-        if let Some(profile) = &self.confidential {
-            // Fence any concurrent bootstrap before removing Pods. The CAS
-            // makes a racing start either lose or become the attempt this
-            // stop tombstones. Publishing after this tombstone is rejected
-            // by the private store even if a stale task keeps running.
-            loop {
-                let current = agent_sandbox_api
-                    .api
-                    .get(&kube_name)
-                    .await
-                    .map_err(KubernetesDriverError::from_kube)?;
-                if current.metadata.uid.as_deref() != Some(cr_uid.as_str()) {
-                    return Err(KubernetesDriverError::Precondition(
-                        "Sandbox CR UID changed during stop".to_string(),
-                    ));
-                }
-                let attempt = current
-                    .metadata
-                    .annotations
-                    .as_ref()
-                    .and_then(|a| a.get(ANNOTATION_CONFIDENTIAL_BOOTSTRAP_ATTEMPT))
-                    .cloned();
-                let generation = sandbox_runtime_generation(&current).map(str::to_string);
-                let Some(attempt) = attempt else {
-                    break;
-                };
-                let version = current
-                    .metadata
-                    .resource_version
-                    .as_deref()
-                    .ok_or_else(|| {
-                        KubernetesDriverError::Precondition(
-                            "Sandbox CR lacks resourceVersion".to_string(),
-                        )
-                    })?;
-                match agent_sandbox_api
-                    .api
-                    .patch(
-                        &kube_name,
-                        &PatchParams::default(),
-                        &Patch::Merge(&serde_json::json!({"metadata": {
-                            "resourceVersion": version,
-                            "annotations": {ANNOTATION_CONFIDENTIAL_BOOTSTRAP_ATTEMPT: null}
-                        }})),
-                    )
-                    .await
-                {
-                    Ok(updated) if updated.metadata.uid.as_deref() == Some(cr_uid.as_str()) => {
-                        if let Some(generation) = generation {
-                            for role in [BootstrapRole::Workload, BootstrapRole::Supervisor] {
-                                if let Err(error) = profile.store.revoke_attempt(
-                                    role,
-                                    &generation,
-                                    sandbox_id,
-                                    &attempt,
-                                ) {
-                                    cleanup_errors.push(format!(
-                                        "fence confidential bootstrap during stop: {error}"
-                                    ));
-                                }
-                            }
-                        }
-                        break;
-                    }
-                    Ok(_) => {
-                        return Err(KubernetesDriverError::Precondition(
-                            "Sandbox CR UID changed during stop attempt fence".to_string(),
-                        ));
-                    }
-                    Err(error) if is_kube_resource_version_conflict(&error) => {
-                        tokio::task::yield_now().await;
-                    }
-                    Err(error) => return Err(KubernetesDriverError::from_kube(error)),
-                }
-            }
-        }
         if phase != Some(SandboxRuntimeBootstrapPhase::Suspending) {
             let current = agent_sandbox_api
                 .api
@@ -4564,7 +4168,8 @@ impl KubernetesComputeDriver {
         let expected_workload = trusted_launch.workload_for_generation(
             &names.sandbox_secret,
             &self.generation_image_pull_secret_names(&names),
-        );
+            &self.config,
+        )?;
         let persistent_workspace = expected_workload.spec.as_ref().is_some_and(|spec| {
             spec.volumes
                 .iter()
@@ -4605,6 +4210,7 @@ impl KubernetesComputeDriver {
             &namespace,
             &supervisor_keys,
             None,
+            false,
             None,
         )?;
         let workload_initdata = self.render_confidential_initdata(
@@ -4616,59 +4222,11 @@ impl KubernetesComputeDriver {
             &namespace,
             WORKLOAD_KEYS,
             workspace_key_uri.as_deref(),
+            false,
             None,
         )?;
-        // A resourceVersion precondition elects one concurrent restart as the
-        // owner of this attempt before it may create Pods or publish KBS data.
-        let current = sandbox_api
-            .api
-            .get(cr_name)
-            .await
-            .map_err(KubernetesDriverError::from_kube)?;
-        if current.metadata.uid.as_deref() != Some(cr_uid) {
-            return Err(KubernetesDriverError::Precondition(
-                "Sandbox CR UID changed before bootstrap attempt CAS".to_string(),
-            ));
-        }
-        let expected_old_attempt = object
-            .metadata
-            .annotations
-            .as_ref()
-            .and_then(|annotations| annotations.get(ANNOTATION_CONFIDENTIAL_BOOTSTRAP_ATTEMPT));
-        let actual_old_attempt = current
-            .metadata
-            .annotations
-            .as_ref()
-            .and_then(|annotations| annotations.get(ANNOTATION_CONFIDENTIAL_BOOTSTRAP_ATTEMPT));
-        if actual_old_attempt != expected_old_attempt {
-            return Err(KubernetesDriverError::Precondition(
-                "confidential bootstrap attempt changed concurrently".to_string(),
-            ));
-        }
-        let resource_version = current.metadata.resource_version.ok_or_else(|| {
-            KubernetesDriverError::Precondition("Sandbox CR lacks resourceVersion".to_string())
-        })?;
-        let elected = sandbox_api
-            .api
-            .patch(
-                cr_name,
-                &PatchParams::default(),
-                &Patch::Merge(&serde_json::json!({
-                    "metadata": {
-                        "resourceVersion": resource_version,
-                        "annotations": {
-                            ANNOTATION_CONFIDENTIAL_BOOTSTRAP_ATTEMPT: bootstrap_attempt,
-                        }
-                    }
-                })),
-            )
-            .await
-            .map_err(KubernetesDriverError::from_kube)?;
-        if elected.metadata.uid.as_deref() != Some(cr_uid) {
-            return Err(KubernetesDriverError::Precondition(
-                "Sandbox CR UID changed during bootstrap attempt CAS".to_string(),
-            ));
-        }
+        // The lifecycle gate serializes local start/stop/delete. Kubernetes
+        // annotations are observations, not authority for a trusted attempt.
         self.confidential_profile()?
             .store
             .revoke_owned_sandbox(sandbox_id, Some(cr_uid))
@@ -4689,8 +4247,6 @@ impl KubernetesComputeDriver {
                     "record trusted restart attempt: {error}"
                 ))
             })?;
-        // Only the resourceVersion CAS winner may remove old resources or
-        // revoke old bindings. A losing restart must not delete its winner.
         self.create_sandbox_runtime_fence(&namespace, &names)
             .await?;
         self.delete_sandbox_runtime_supervisor_pod_for_uid(sandbox_id, &namespace, cr_uid)
@@ -4826,6 +4382,7 @@ impl KubernetesComputeDriver {
                 generation.as_str(),
                 &bootstrap_attempt,
                 persistent_workspace,
+                false,
                 &supervisor_uid,
                 &expected_supervisor,
                 agent_uid,
@@ -5126,7 +4683,20 @@ impl KubernetesComputeDriver {
     pub async fn delete_sandbox(&self, sandbox_id: &str) -> Result<bool, String> {
         let _lifecycle_guard = self.lifecycle_lock(sandbox_id).lock_owned().await;
         let span_status = openshell_otel::ErrorStatusGuard::current();
-        let result = self.delete_sandbox_inner(sandbox_id, None).await;
+        let result = async {
+            // Explicit deletion revokes every trusted incarnation before any
+            // Kubernetes access. A missing or substituted CR cannot retain keys.
+            if let Some(profile) = &self.confidential {
+                profile
+                    .store
+                    .revoke_owned_sandbox(sandbox_id, None)
+                    .map_err(|error| {
+                        format!("revoke confidential sandbox {sandbox_id}: {error}")
+                    })?;
+            }
+            self.delete_sandbox_inner(sandbox_id, None).await
+        }
+        .await;
         span_status.finish(result)
     }
 
@@ -5211,136 +4781,135 @@ impl KubernetesComputeDriver {
             .await?;
         let selector = self.sandbox_lookup_selector(sandbox_id);
         let lp = ListParams::default().labels(&selector);
-        let (kube_name, obj_namespace, mut preconditions, pod_name, current_attempt) =
-            match tokio::time::timeout(KUBE_API_TIMEOUT, lookup_api.api.list(&lp)).await {
-                Ok(Ok(list)) => {
-                    if let Some(obj) = list.items.into_iter().next() {
-                        match obj.metadata.name.clone() {
-                            Some(name) => {
-                                let ns = obj
-                                    .metadata
-                                    .namespace
-                                    .clone()
-                                    .unwrap_or_else(|| self.config.namespace.clone());
-                                if expected_cr_uid.is_some_and(|expected| {
-                                    obj.metadata.uid.as_deref() != Some(expected)
-                                }) {
-                                    return Err("Sandbox CR was replaced during deletion; retry ownership review".to_string());
-                                }
-                                let pc = Preconditions {
-                                    uid: obj.metadata.uid.clone(),
-                                    resource_version: obj.metadata.resource_version.clone(),
-                                };
-                                let current_attempt = obj
-                                    .metadata
-                                    .annotations
-                                    .as_ref()
-                                    .and_then(|annotations| {
-                                        annotations.get(ANNOTATION_CONFIDENTIAL_BOOTSTRAP_ATTEMPT)
-                                    })
-                                    .and_then(|attempt| {
-                                        sandbox_runtime_generation(&obj).map(|generation| {
-                                            (generation.to_owned(), attempt.to_owned())
-                                        })
-                                    });
-                                let pod_name = obj
-                                    .metadata
-                                    .annotations
-                                    .as_ref()
-                                    .and_then(|annotations| {
-                                        annotations.get(SANDBOX_POD_NAME_ANNOTATION)
-                                    })
-                                    .cloned()
-                                    .unwrap_or_else(|| name.clone());
-                                (name, ns, pc, pod_name, current_attempt)
+        let (kube_name, obj_namespace, preconditions, pod_name) = match tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            lookup_api.api.list(&lp),
+        )
+        .await
+        {
+            Ok(Ok(list)) => {
+                if let Some(obj) = list.items.into_iter().next() {
+                    match obj.metadata.name.clone() {
+                        Some(name) => {
+                            let ns = obj
+                                .metadata
+                                .namespace
+                                .clone()
+                                .unwrap_or_else(|| self.config.namespace.clone());
+                            if expected_cr_uid.is_some_and(|expected| {
+                                obj.metadata.uid.as_deref() != Some(expected)
+                            }) {
+                                return Err("Sandbox CR was replaced during deletion; retry ownership review".to_string());
                             }
-                            None => return Ok(false),
+                            let pc = Preconditions {
+                                uid: obj.metadata.uid.clone(),
+                                resource_version: None,
+                            };
+                            let pod_name = obj
+                                .metadata
+                                .annotations
+                                .as_ref()
+                                .and_then(|annotations| {
+                                    annotations.get(SANDBOX_POD_NAME_ANNOTATION)
+                                })
+                                .cloned()
+                                .unwrap_or_else(|| name.clone());
+                            (name, ns, pc, pod_name)
                         }
-                    } else {
-                        debug!(sandbox_id = %sandbox_id, "Sandbox not found in Kubernetes (already deleted)");
-                        let mut cleanup_errors = Vec::new();
-                        let mut markers = Vec::new();
-                        if let Some(profile) = &self.confidential {
-                            markers = profile
-                                .store
-                                .pending_deletes()
-                                .map_err(|error| error.to_string())?
-                                .into_iter()
-                                .filter(|marker| marker.sandbox_id == sandbox_id)
-                                .collect();
-                            for owner in profile
-                                .store
-                                .workspace_owners()
-                                .map_err(|error| error.to_string())?
-                                .into_iter()
-                                .filter(|owner| owner.sandbox_id == sandbox_id)
-                            {
-                                if !markers.iter().any(|marker: &PendingDelete| {
-                                    marker.namespace == owner.namespace
-                                        && marker.sandbox_cr_uid == owner.sandbox_cr_uid
-                                }) {
-                                    markers.push(
-                                        profile
-                                            .store
-                                            .begin_delete(
-                                                sandbox_id,
-                                                &owner.namespace,
-                                                &owner.sandbox_cr_uid,
-                                                None,
-                                            )
-                                            .map_err(|error| error.to_string())?,
-                                    );
-                                }
-                            }
-                            for marker in &markers {
-                                if let Err(error) =
-                                    self.withdraw_sandbox_authorization_for_delete(marker)
-                                {
-                                    cleanup_errors.push(error);
-                                }
-                            }
-                        }
-                        match self.sandbox_runtime_role_pods_absent(sandbox_id).await {
-                            Ok(true) => {}
-                            Ok(false) => cleanup_errors
-                                .push("Sandbox role Pod deletion was not confirmed".to_string()),
-                            Err(error) => cleanup_errors.push(error),
-                        }
-                        return if cleanup_errors.is_empty() {
-                            if let Some(profile) = &self.confidential {
-                                for marker in &markers {
+                        None => return Ok(false),
+                    }
+                } else {
+                    debug!(sandbox_id = %sandbox_id, "Sandbox not found in Kubernetes (already deleted)");
+                    let mut cleanup_errors = Vec::new();
+                    let mut markers = Vec::new();
+                    if let Some(profile) = &self.confidential {
+                        markers = profile
+                            .store
+                            .pending_deletes()
+                            .map_err(|error| error.to_string())?
+                            .into_iter()
+                            .filter(|marker| {
+                                marker.sandbox_id == sandbox_id
+                                    && expected_cr_uid
+                                        .is_none_or(|uid| marker.sandbox_cr_uid == uid)
+                            })
+                            .collect();
+                        for owner in profile
+                            .store
+                            .workspace_owners()
+                            .map_err(|error| error.to_string())?
+                            .into_iter()
+                            .filter(|owner| {
+                                owner.sandbox_id == sandbox_id
+                                    && expected_cr_uid.is_none_or(|uid| owner.sandbox_cr_uid == uid)
+                            })
+                        {
+                            if !markers.iter().any(|marker: &PendingDelete| {
+                                marker.namespace == owner.namespace
+                                    && marker.sandbox_cr_uid == owner.sandbox_cr_uid
+                            }) {
+                                markers.push(
                                     profile
                                         .store
-                                        .finish_delete(marker)
-                                        .map_err(|error| error.to_string())?;
-                                }
+                                        .begin_delete(
+                                            sandbox_id,
+                                            &owner.namespace,
+                                            &owner.sandbox_cr_uid,
+                                            None,
+                                        )
+                                        .map_err(|error| error.to_string())?,
+                                );
                             }
-                            Ok(false)
-                        } else {
-                            Err(cleanup_errors.join("; "))
-                        };
+                        }
+                        for marker in &markers {
+                            if let Err(error) =
+                                self.withdraw_sandbox_authorization_for_delete(marker)
+                            {
+                                cleanup_errors.push(error);
+                            }
+                        }
                     }
+                    match self.sandbox_runtime_role_pods_absent(sandbox_id).await {
+                        Ok(true) => {}
+                        Ok(false) => cleanup_errors
+                            .push("Sandbox role Pod deletion was not confirmed".to_string()),
+                        Err(error) => cleanup_errors.push(error),
+                    }
+                    return if cleanup_errors.is_empty() {
+                        if let Some(profile) = &self.confidential {
+                            for marker in &markers {
+                                profile
+                                    .store
+                                    .finish_delete(marker)
+                                    .map_err(|error| error.to_string())?;
+                            }
+                        }
+                        Ok(false)
+                    } else {
+                        Err(cleanup_errors.join("; "))
+                    };
                 }
-                Ok(Err(err)) => {
-                    warn!(
-                        sandbox_id = %sandbox_id,
-                        error = %err,
-                        "Failed to list sandbox for deletion from Kubernetes"
-                    );
-                    return Err(err.to_string());
-                }
-                Err(_elapsed) => {
-                    warn!(
-                        sandbox_id = %sandbox_id,
-                        timeout_secs = KUBE_API_TIMEOUT.as_secs(),
-                        "Timed out listing sandbox for deletion from Kubernetes"
-                    );
-                    return Err(format!(
-                        "timed out after {}s waiting for Kubernetes API",
-                        KUBE_API_TIMEOUT.as_secs()
-                    ));
-                }
-            };
+            }
+            Ok(Err(err)) => {
+                warn!(
+                    sandbox_id = %sandbox_id,
+                    error = %err,
+                    "Failed to list sandbox for deletion from Kubernetes"
+                );
+                return Err(err.to_string());
+            }
+            Err(_elapsed) => {
+                warn!(
+                    sandbox_id = %sandbox_id,
+                    timeout_secs = KUBE_API_TIMEOUT.as_secs(),
+                    "Timed out listing sandbox for deletion from Kubernetes"
+                );
+                return Err(format!(
+                    "timed out after {}s waiting for Kubernetes API",
+                    KUBE_API_TIMEOUT.as_secs()
+                ));
+            }
+        };
 
         if preconditions.uid.is_none() {
             return Err("Sandbox CR lacks UID; cannot confirm deletion ownership".to_string());
@@ -5349,18 +4918,6 @@ impl KubernetesComputeDriver {
         let delete_api = self
             .supported_agent_sandbox_api(self.client.clone(), &obj_namespace)
             .await?;
-        let observed = tokio::time::timeout(KUBE_API_TIMEOUT, delete_api.api.get(&kube_name))
-            .await
-            .map_err(|_| "timed out verifying Sandbox CR before deletion".to_string())?
-            .map_err(|error| format!("verify Sandbox CR before deletion: {error}"))?;
-        if observed.metadata.uid != cr_uid {
-            return Err(
-                "Sandbox CR was replaced during deletion; retry ownership review".to_string(),
-            );
-        }
-        if let Some(resource_version) = observed.metadata.resource_version {
-            preconditions.resource_version = Some(resource_version);
-        }
         let marker = if let Some(profile) = &self.confidential {
             let cr_uid = cr_uid.as_deref().expect("checked Sandbox CR UID");
             profile
@@ -5371,158 +4928,121 @@ impl KubernetesComputeDriver {
                 })?;
             let marker = profile
                 .store
-                .begin_delete(
-                    sandbox_id,
-                    &obj_namespace,
-                    cr_uid,
-                    current_attempt
-                        .as_ref()
-                        .map(|(generation, attempt)| (generation.as_str(), attempt.as_str())),
-                )
+                .begin_delete(sandbox_id, &obj_namespace, cr_uid, None)
                 .map_err(|error| format!("fence confidential sandbox deletion: {error}"))?;
             self.withdraw_sandbox_authorization_for_delete(&marker)?;
             Some(marker)
         } else {
             None
         };
-        let mut conflict_retries = 0;
-        loop {
-            let dp = DeleteParams::default().preconditions(preconditions.clone());
-            return match tokio::time::timeout(
-                KUBE_API_TIMEOUT,
-                delete_api.api.delete(&kube_name, &dp),
-            )
-            .await
-            {
-                Ok(Ok(_response)) => {
-                    info!(sandbox_id = %sandbox_id, namespace = %obj_namespace, "Sandbox deleted from Kubernetes");
-                    {
-                        let pod_api = Api::<Pod>::namespaced(self.client.clone(), &obj_namespace);
-                        let supervisor_pod_name =
-                            SandboxRuntimeNames::new(sandbox_id).supervisor_pod;
-                        let deadline = tokio::time::Instant::now()
-                            + DEFAULT_POD_TERMINATION_GRACE_PERIOD
-                            + KUBE_API_TIMEOUT;
-                        wait_for_sandbox_role_pods_deleted(
-                            &pod_api,
-                            &pod_name,
-                            &supervisor_pod_name,
-                            deadline,
-                        )
-                        .await?;
-                        // API acceptance of DELETE does not mean the CR is gone.
-                        // Keep the unowned fence while finalizers can still leave
-                        // the controller able to reconcile a workload Pod.
-                        if !matches!(
-                            tokio::time::timeout(KUBE_API_TIMEOUT, delete_api.api.get(&kube_name))
-                                .await,
-                            Ok(Err(KubeError::Api(kube::core::ErrorResponse {
-                                code: 404,
-                                ..
-                            })))
-                        ) {
-                            warn!(sandbox_id, "Sandbox CR deletion was not confirmed");
-                            return Err("Sandbox CR deletion was not confirmed".to_string());
+        // UID is the deletion authority. Status/annotation resourceVersion
+        // churn must not delay deletion or require a second lookup.
+        let dp = DeleteParams::default().preconditions(preconditions);
+        match tokio::time::timeout(KUBE_API_TIMEOUT, delete_api.api.delete(&kube_name, &dp)).await {
+            Ok(Ok(_response)) => {
+                info!(sandbox_id = %sandbox_id, namespace = %obj_namespace, "Sandbox deleted from Kubernetes");
+                {
+                    let pod_api = Api::<Pod>::namespaced(self.client.clone(), &obj_namespace);
+                    let supervisor_pod_name = SandboxRuntimeNames::new(sandbox_id).supervisor_pod;
+                    let deadline = tokio::time::Instant::now()
+                        + DEFAULT_POD_TERMINATION_GRACE_PERIOD
+                        + KUBE_API_TIMEOUT;
+                    wait_for_sandbox_role_pods_deleted(
+                        &pod_api,
+                        &pod_name,
+                        &supervisor_pod_name,
+                        deadline,
+                    )
+                    .await?;
+                    // API acceptance of DELETE does not mean the CR is gone.
+                    // Keep the unowned fence while finalizers can still leave
+                    // the controller able to reconcile a workload Pod.
+                    if !matches!(
+                        tokio::time::timeout(KUBE_API_TIMEOUT, delete_api.api.get(&kube_name))
+                            .await,
+                        Ok(Err(KubeError::Api(kube::core::ErrorResponse {
+                            code: 404,
+                            ..
+                        })))
+                    ) {
+                        warn!(sandbox_id, "Sandbox CR deletion was not confirmed");
+                        return Err("Sandbox CR deletion was not confirmed".to_string());
+                    }
+                }
+                if !self.sandbox_runtime_role_pods_absent(sandbox_id).await? {
+                    return Err("Sandbox role Pod deletion was not confirmed".to_string());
+                }
+                if let (Some(profile), Some(marker)) = (&self.confidential, marker.as_ref()) {
+                    profile
+                        .store
+                        .finish_delete(marker)
+                        .map_err(|error| error.to_string())?;
+                }
+                Ok(true)
+            }
+            Ok(Err(KubeError::Api(err))) if err.code == 404 => {
+                debug!(sandbox_id = %sandbox_id, "Sandbox not found in Kubernetes (already deleted)");
+                if !self.sandbox_runtime_role_pods_absent(sandbox_id).await? {
+                    return Err("Sandbox role Pod deletion was not confirmed".to_string());
+                }
+                if let (Some(profile), Some(marker)) = (&self.confidential, marker.as_ref()) {
+                    profile
+                        .store
+                        .finish_delete(marker)
+                        .map_err(|error| error.to_string())?;
+                }
+                Ok(false)
+            }
+            Ok(Err(KubeError::Api(err))) if err.code == 409 && err.reason == "Conflict" => {
+                match tokio::time::timeout(KUBE_API_TIMEOUT, delete_api.api.get(&kube_name)).await {
+                    Ok(Ok(current)) if current.metadata.uid != cr_uid => Err(
+                        "Sandbox CR was replaced during deletion; retry ownership review"
+                            .to_string(),
+                    ),
+                    Ok(Err(KubeError::Api(get_err))) if get_err.code == 404 => {
+                        if !self.sandbox_runtime_role_pods_absent(sandbox_id).await? {
+                            return Err("Sandbox role Pod deletion was not confirmed".to_string());
                         }
-                    }
-                    if !self.sandbox_runtime_role_pods_absent(sandbox_id).await? {
-                        return Err("Sandbox role Pod deletion was not confirmed".to_string());
-                    }
-                    if let (Some(profile), Some(marker)) = (&self.confidential, marker.as_ref()) {
-                        profile
-                            .store
-                            .finish_delete(marker)
-                            .map_err(|error| error.to_string())?;
-                    }
-                    Ok(true)
-                }
-                Ok(Err(KubeError::Api(err))) if err.code == 404 => {
-                    debug!(sandbox_id = %sandbox_id, "Sandbox not found in Kubernetes (already deleted)");
-                    if !self.sandbox_runtime_role_pods_absent(sandbox_id).await? {
-                        return Err("Sandbox role Pod deletion was not confirmed".to_string());
-                    }
-                    if let (Some(profile), Some(marker)) = (&self.confidential, marker.as_ref()) {
-                        profile
-                            .store
-                            .finish_delete(marker)
-                            .map_err(|error| error.to_string())?;
-                    }
-                    Ok(false)
-                }
-                Ok(Err(KubeError::Api(err))) if err.code == 409 && err.reason == "Conflict" => {
-                    match tokio::time::timeout(KUBE_API_TIMEOUT, delete_api.api.get(&kube_name))
-                        .await
-                    {
-                        Ok(Ok(current)) if current.metadata.uid != cr_uid => Err(
-                            "Sandbox CR was replaced during deletion; retry ownership review"
-                                .to_string(),
-                        ),
-                        Ok(Err(KubeError::Api(get_err))) if get_err.code == 404 => {
-                            if !self.sandbox_runtime_role_pods_absent(sandbox_id).await? {
-                                return Err(
-                                    "Sandbox role Pod deletion was not confirmed".to_string()
-                                );
-                            }
-                            if let (Some(profile), Some(marker)) =
-                                (&self.confidential, marker.as_ref())
-                            {
-                                profile
-                                    .store
-                                    .finish_delete(marker)
-                                    .map_err(|error| error.to_string())?;
-                            }
-                            Ok(false)
+                        if let (Some(profile), Some(marker)) = (&self.confidential, marker.as_ref())
+                        {
+                            profile
+                                .store
+                                .finish_delete(marker)
+                                .map_err(|error| error.to_string())?;
                         }
-                        Ok(Ok(current)) => {
-                            let Some(next_version) = current.metadata.resource_version else {
-                                break Err(
-                                    "Sandbox CR lacks resourceVersion after delete conflict"
-                                        .to_string(),
-                                );
-                            };
-                            if preconditions.resource_version.as_deref() == Some(&next_version) {
-                                break Err(
-                                    "Sandbox CR delete conflict without a newer resourceVersion"
-                                        .to_string(),
-                                );
-                            }
-                            if conflict_retries == SANDBOX_DELETE_CONFLICT_RETRIES {
-                                break Err(format!(
-                                    "Sandbox CR kept changing during deletion after {SANDBOX_DELETE_CONFLICT_RETRIES} retries; pending delete remains fenced"
-                                ));
-                            }
-                            preconditions.resource_version = Some(next_version);
-                            conflict_retries += 1;
-                            continue;
-                        }
-                        Ok(Err(get_err)) => Err(format!(
-                            "verify Sandbox CR after delete conflict: {get_err}"
-                        )),
-                        Err(_) => {
-                            Err("timed out verifying Sandbox CR after delete conflict".to_string())
-                        }
+                        Ok(false)
+                    }
+                    Ok(Ok(_)) => Err(
+                        "Sandbox CR deletion conflicted; pending deletion remains fenced"
+                            .to_string(),
+                    ),
+                    Ok(Err(get_err)) => Err(format!(
+                        "verify Sandbox CR after delete conflict: {get_err}"
+                    )),
+                    Err(_) => {
+                        Err("timed out verifying Sandbox CR after delete conflict".to_string())
                     }
                 }
-                Ok(Err(err)) => {
-                    warn!(
-                        sandbox_id = %sandbox_id,
-                        error = %err,
-                        "Failed to delete sandbox from Kubernetes"
-                    );
-                    Err(err.to_string())
-                }
-                Err(_elapsed) => {
-                    warn!(
-                        sandbox_id = %sandbox_id,
-                        timeout_secs = KUBE_API_TIMEOUT.as_secs(),
-                        "Timed out deleting sandbox from Kubernetes"
-                    );
-                    Err(format!(
-                        "timed out after {}s waiting for Kubernetes API",
-                        KUBE_API_TIMEOUT.as_secs()
-                    ))
-                }
-            };
+            }
+            Ok(Err(err)) => {
+                warn!(
+                    sandbox_id = %sandbox_id,
+                    error = %err,
+                    "Failed to delete sandbox from Kubernetes"
+                );
+                Err(err.to_string())
+            }
+            Err(_elapsed) => {
+                warn!(
+                    sandbox_id = %sandbox_id,
+                    timeout_secs = KUBE_API_TIMEOUT.as_secs(),
+                    "Timed out deleting sandbox from Kubernetes"
+                );
+                Err(format!(
+                    "timed out after {}s waiting for Kubernetes API",
+                    KUBE_API_TIMEOUT.as_secs()
+                ))
+            }
         }
     }
 
@@ -5574,7 +5094,6 @@ impl KubernetesComputeDriver {
             }
         };
         let mut targets = std::collections::BTreeSet::new();
-        let mut pending_ids = std::collections::BTreeSet::new();
         for marker in pending {
             // Withdrawing private resources must not depend on Kubernetes API
             // availability. A previous renderer or filesystem failure may
@@ -5582,9 +5101,17 @@ impl KubernetesComputeDriver {
             if let Err(error) = self.withdraw_sandbox_authorization_for_delete(&marker) {
                 warn!(sandbox_id = %marker.sandbox_id, %error, "confidential deletion authorization remains pending");
             }
-            pending_ids.insert(marker.sandbox_id.clone());
             targets.insert((marker.sandbox_id, Some(marker.sandbox_cr_uid)));
         }
+        // Snapshot trusted owners before LIST: an owner created after the LIST
+        // must never become an orphan candidate from that older observation.
+        let owners = match profile.store.workspace_owners() {
+            Ok(owners) => owners,
+            Err(error) => {
+                warn!(%error, "cannot inspect confidential sandbox owner index");
+                return;
+            }
+        };
         // Older crashes or out-of-band CR deletion may leave an owner record
         // without a pending marker. Only select it when no CR with this
         // Sandbox ID exists; an active replacement UID must not be deleted.
@@ -5598,14 +5125,21 @@ impl KubernetesComputeDriver {
                 return;
             }
         };
-        let live = match lookup_api
-            .api
-            .list(&ListParams::default().labels(&self.openshell_sandbox_selector()))
-            .await
+        let live = match tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            lookup_api
+                .api
+                .list(&ListParams::default().labels(&self.openshell_sandbox_selector())),
+        )
+        .await
         {
-            Ok(list) => list,
-            Err(error) => {
+            Ok(Ok(list)) => list,
+            Ok(Err(error)) => {
                 warn!(%error, "cannot list Sandbox CRs for confidential delete recovery");
+                return;
+            }
+            Err(_) => {
+                warn!("Sandbox list timed out during confidential delete recovery");
                 return;
             }
         };
@@ -5614,17 +5148,10 @@ impl KubernetesComputeDriver {
             .iter()
             .filter_map(|object| sandbox_id_from_object(object).ok())
             .collect();
-        match profile.store.workspace_owners() {
-            Ok(owners) => {
-                for owner in owners {
-                    if !live_ids.contains(&owner.sandbox_id)
-                        && !pending_ids.contains(&owner.sandbox_id)
-                    {
-                        targets.insert((owner.sandbox_id, None));
-                    }
-                }
+        for owner in owners {
+            if !live_ids.contains(&owner.sandbox_id) {
+                targets.insert((owner.sandbox_id, Some(owner.sandbox_cr_uid)));
             }
-            Err(error) => warn!(%error, "cannot inspect confidential sandbox owner index"),
         }
         for (sandbox_id, expected_uid) in targets {
             let Ok(_guard) = self.lifecycle_lock(&sandbox_id).try_lock_owned() else {
@@ -5727,11 +5254,26 @@ impl KubernetesComputeDriver {
                 &lookup_api.resource.version,
                 live_namespace,
             );
-            let object = match live_api.api.get_opt(live_name).await {
-                Ok(Some(current)) if current.metadata.uid == object.metadata.uid => current,
-                Ok(_) => continue,
-                Err(error) => {
+            let object = match tokio::time::timeout(
+                KUBE_API_TIMEOUT,
+                live_api.api.get_opt(live_name),
+            )
+            .await
+            {
+                Ok(Ok(Some(current)))
+                    if current.metadata.uid == object.metadata.uid
+                        && sandbox_id_from_object(&current).ok().as_deref()
+                            == Some(&sandbox_id) =>
+                {
+                    current
+                }
+                Ok(Ok(_)) => continue,
+                Ok(Err(error)) => {
                     warn!(%sandbox_id, %error, "cannot refresh Sandbox CR under lifecycle lock");
+                    continue;
+                }
+                Err(_) => {
+                    warn!(%sandbox_id, "Sandbox refresh timed out under lifecycle lock");
                     continue;
                 }
             };
@@ -9813,8 +9355,7 @@ fn runnable_shared_generations(sandboxes: &[DynamicObject]) -> Vec<(&DynamicObje
 
 /// Replace the stored trusted bootstrap init container in place. Entry order
 /// must not change because `workspace-init` runs the binary it stages.
-#[cfg(test)]
-fn replace_sandbox_bootstrap_init_container(
+pub(super) fn replace_sandbox_bootstrap_init_container(
     init_containers: &mut [serde_json::Value],
     bootstrap: serde_json::Value,
 ) -> Result<(), KubernetesDriverError> {
@@ -9925,7 +9466,7 @@ const SANDBOX_BOOTSTRAP_CONTAINER_NAME: &str = "openshell-sandbox-bootstrap";
 const SANDBOX_CONTROL_ROOT: &str = "/.openshell";
 
 /// Render the trusted init container that stages the sandbox runtime binary.
-fn sandbox_bootstrap_init_container(
+pub(super) fn sandbox_bootstrap_init_container(
     image: &str,
     pull_policy: Option<crate::KubernetesImagePullPolicy>,
     uid: u32,
@@ -10312,6 +9853,7 @@ mod tests {
                 "openshell",
                 WORKLOAD_KEYS,
                 None,
+                false,
             )
             .await;
         let error = result
@@ -10879,49 +10421,10 @@ mod tests {
             http::Response<kube::client::Body>,
         )>,
     ) -> (KubernetesComputeDriver, DeleteTestSteps) {
-        let (driver, steps, _) = delete_test_driver_with_versions(steps, vec![]);
-        (driver, steps)
-    }
-
-    fn delete_test_driver_with_versions(
-        mut steps: Vec<(
-            http::Method,
-            &'static str,
-            http::Response<kube::client::Body>,
-        )>,
-        expected_delete_versions: Vec<&'static str>,
-    ) -> (
-        KubernetesComputeDriver,
-        DeleteTestSteps,
-        Arc<std::sync::Mutex<VecDeque<&'static str>>>,
-    ) {
-        if let Some(index) = steps
-            .iter()
-            .position(|(method, _, _)| *method == http::Method::DELETE)
-            && !steps[..index].iter().any(|(method, path, _)| {
-                *method == http::Method::GET
-                    && *path
-                        == "/apis/agents.x-k8s.io/v1beta1/namespaces/openshell/sandboxes/sandbox-cr"
-            })
-        {
-            steps.insert(
-                index,
-                (
-                    http::Method::GET,
-                    "/apis/agents.x-k8s.io/v1beta1/namespaces/openshell/sandboxes/sandbox-cr",
-                    kube_test_response(http::StatusCode::OK, delete_test_sandbox("old-uid")),
-                ),
-            );
-        }
         let steps = Arc::new(std::sync::Mutex::new(VecDeque::from(steps)));
         let service_steps = steps.clone();
-        let expected_delete_versions = Arc::new(std::sync::Mutex::new(VecDeque::from(
-            expected_delete_versions,
-        )));
-        let service_versions = expected_delete_versions.clone();
         let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
             let steps = service_steps.clone();
-            let expected_delete_versions = service_versions.clone();
             async move {
                 let (method, path, response) = steps
                     .lock()
@@ -10930,25 +10433,21 @@ mod tests {
                     .expect("unexpected Kubernetes delete API request");
                 assert_eq!(request.method(), method);
                 assert_eq!(request.uri().path(), path);
-                if method == http::Method::DELETE {
-                    let expected_version = expected_delete_versions.lock().unwrap().pop_front();
-                    if let Some(expected_version) = expected_version {
-                        use http_body_util::BodyExt as _;
-                        let body = request.into_body().collect().await.unwrap().to_bytes();
-                        let params: serde_json::Value = serde_json::from_slice(&body).unwrap();
-                        assert_eq!(
-                            params
-                                .pointer("/preconditions/uid")
-                                .and_then(|value| value.as_str()),
-                            Some("old-uid")
-                        );
-                        assert_eq!(
-                            params
-                                .pointer("/preconditions/resourceVersion")
-                                .and_then(|value| value.as_str()),
-                            Some(expected_version)
-                        );
-                    }
+                if method == http::Method::DELETE && path.ends_with("/sandboxes/sandbox-cr") {
+                    use http_body_util::BodyExt as _;
+                    let body = request.into_body().collect().await.unwrap().to_bytes();
+                    let params: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(
+                        params
+                            .pointer("/preconditions/uid")
+                            .and_then(|v| v.as_str()),
+                        Some("old-uid")
+                    );
+                    assert!(
+                        params
+                            .pointer("/preconditions/resourceVersion")
+                            .is_none_or(serde_json::Value::is_null)
+                    );
                 }
                 Ok::<_, std::convert::Infallible>(response)
             }
@@ -10968,7 +10467,7 @@ mod tests {
             .sandbox_api_version
             .set(SANDBOX_VERSION_V1BETA1)
             .expect("set test Sandbox API version");
-        (driver, steps, expected_delete_versions)
+        (driver, steps)
     }
 
     fn attach_delete_test_workspace(
@@ -11339,7 +10838,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_conflict_checks_uid_and_pods_before_ack() {
+    async fn delete_withdraws_trusted_authorization_when_kubernetes_is_unavailable() {
+        let (mut driver, steps) = delete_test_driver(vec![(
+            http::Method::GET,
+            "/apis/agents.x-k8s.io/v1beta1/namespaces/openshell/sandboxes",
+            kube_test_response(
+                http::StatusCode::SERVICE_UNAVAILABLE,
+                serde_json::json!({
+                    "apiVersion":"v1", "kind":"Status", "status":"Failure",
+                    "reason":"ServiceUnavailable", "message":"control plane unavailable", "code":503
+                }),
+            ),
+        )]);
+        let (temp, serving, bindings) = attach_delete_test_workspace(&mut driver);
+        let error = driver.delete_sandbox("sandbox-id").await.unwrap_err();
+        assert!(error.contains("control plane unavailable"), "{error}");
+        assert!(!serving.exists());
+        assert_eq!(std::fs::read_dir(bindings).unwrap().count(), 0);
+        assert_eq!(
+            driver
+                .confidential_profile()
+                .unwrap()
+                .store
+                .workspace_owners()
+                .unwrap()
+                .len(),
+            1,
+            "retain owner for eventual physical cleanup"
+        );
+        assert!(steps.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_conflict_preserves_pending_fence() {
         const CR_PATH: &str =
             "/apis/agents.x-k8s.io/v1beta1/namespaces/openshell/sandboxes/sandbox-cr";
         const LIST_PATH: &str = "/apis/agents.x-k8s.io/v1beta1/namespaces/openshell/sandboxes";
@@ -11372,7 +10904,7 @@ mod tests {
         ]);
         let (temp, serving, _) = attach_delete_test_workspace(&mut driver);
         let error = driver.delete_sandbox("sandbox-id").await.unwrap_err();
-        assert!(error.contains("without a newer resourceVersion"), "{error}");
+        assert!(error.contains("pending deletion remains fenced"), "{error}");
         assert!(!serving.exists());
         assert_eq!(
             driver
@@ -11387,136 +10919,6 @@ mod tests {
         );
         assert!(steps.lock().unwrap().is_empty());
         std::fs::remove_dir_all(temp).unwrap();
-
-        let (mut driver, steps) = delete_test_driver(vec![
-            (
-                http::Method::GET,
-                LIST_PATH,
-                kube_test_response(http::StatusCode::OK, list),
-            ),
-            (
-                http::Method::GET,
-                CR_PATH,
-                kube_test_response(http::StatusCode::OK, delete_test_sandbox("new-uid")),
-            ),
-            (http::Method::DELETE, CR_PATH, conflict()),
-            (
-                http::Method::GET,
-                CR_PATH,
-                kube_test_response(http::StatusCode::OK, delete_test_sandbox("new-uid")),
-            ),
-        ]);
-        let (temp, serving, bindings) = attach_delete_test_workspace(&mut driver);
-        let error = driver.delete_sandbox("sandbox-id").await.unwrap_err();
-        assert!(error.contains("replaced during deletion"), "{error}");
-        assert!(
-            serving.exists(),
-            "replacement must not revoke old UID without ownership review"
-        );
-        assert_eq!(std::fs::read_dir(bindings).unwrap().count(), 1);
-        assert_eq!(
-            steps.lock().unwrap().len(),
-            2,
-            "replacement must not be deleted"
-        );
-        std::fs::remove_dir_all(temp).unwrap();
-    }
-
-    #[tokio::test]
-    async fn delete_retries_same_uid_resource_version_churn_behind_fence() {
-        const CR_PATH: &str =
-            "/apis/agents.x-k8s.io/v1beta1/namespaces/openshell/sandboxes/sandbox-cr";
-        const LIST_PATH: &str = "/apis/agents.x-k8s.io/v1beta1/namespaces/openshell/sandboxes";
-        const WORKLOAD_PATH: &str = "/api/v1/namespaces/openshell/pods/sandbox-cr";
-        const SUPERVISOR_PATH: &str = "/api/v1/namespaces/openshell/pods/os-supervisor-sandbox-id";
-        const PODS_PATH: &str = "/api/v1/namespaces/openshell/pods";
-        let old = delete_test_sandbox("old-uid");
-        let mut observed = old.clone();
-        observed["metadata"]["resourceVersion"] = serde_json::json!("43");
-        let mut newer = old.clone();
-        newer["metadata"]["resourceVersion"] = serde_json::json!("44");
-        let (mut driver, steps, versions) = delete_test_driver_with_versions(
-            vec![
-                (
-                    http::Method::GET,
-                    LIST_PATH,
-                    kube_test_response(
-                        http::StatusCode::OK,
-                        serde_json::json!({
-                            "apiVersion":"agents.x-k8s.io/v1beta1", "kind":"SandboxList",
-                            "items":[old.clone()]
-                        }),
-                    ),
-                ),
-                (
-                    http::Method::GET,
-                    CR_PATH,
-                    kube_test_response(http::StatusCode::OK, observed),
-                ),
-                (
-                    http::Method::DELETE,
-                    CR_PATH,
-                    kube_test_response(
-                        http::StatusCode::CONFLICT,
-                        serde_json::json!({
-                            "apiVersion":"v1", "kind":"Status", "status":"Failure",
-                            "reason":"Conflict", "message":"resourceVersion changed", "code":409
-                        }),
-                    ),
-                ),
-                (
-                    http::Method::GET,
-                    CR_PATH,
-                    kube_test_response(http::StatusCode::OK, newer),
-                ),
-                (
-                    http::Method::DELETE,
-                    CR_PATH,
-                    kube_test_response(http::StatusCode::OK, old),
-                ),
-                (
-                    http::Method::GET,
-                    WORKLOAD_PATH,
-                    kube_test_not_found("pods", "sandbox-cr"),
-                ),
-                (
-                    http::Method::GET,
-                    SUPERVISOR_PATH,
-                    kube_test_not_found("pods", "os-supervisor-sandbox-id"),
-                ),
-                (
-                    http::Method::GET,
-                    CR_PATH,
-                    kube_test_not_found("sandboxes", "sandbox-cr"),
-                ),
-                (
-                    http::Method::GET,
-                    PODS_PATH,
-                    kube_test_response(
-                        http::StatusCode::OK,
-                        serde_json::json!({"apiVersion":"v1", "kind":"PodList", "items":[]}),
-                    ),
-                ),
-            ],
-            vec!["43", "44"],
-        );
-        let (temp, serving, bindings) = attach_delete_test_workspace(&mut driver);
-        assert!(driver.delete_sandbox("sandbox-id").await.unwrap());
-        assert!(!serving.exists());
-        assert_eq!(std::fs::read_dir(bindings).unwrap().count(), 0);
-        assert!(
-            driver
-                .confidential
-                .as_ref()
-                .unwrap()
-                .store
-                .pending_deletes()
-                .unwrap()
-                .is_empty()
-        );
-        assert!(steps.lock().unwrap().is_empty());
-        assert!(versions.lock().unwrap().is_empty());
-        std::fs::remove_dir_all(temp).unwrap();
     }
 
     #[tokio::test]
@@ -11525,41 +10927,35 @@ mod tests {
             "/apis/agents.x-k8s.io/v1beta1/namespaces/openshell/sandboxes/sandbox-cr";
         const LIST_PATH: &str = "/apis/agents.x-k8s.io/v1beta1/namespaces/openshell/sandboxes";
         let old = delete_test_sandbox("old-uid");
-        let (mut driver, steps, versions) = delete_test_driver_with_versions(
-            vec![
-                (
-                    http::Method::GET,
-                    LIST_PATH,
-                    kube_test_response(
-                        http::StatusCode::OK,
-                        serde_json::json!({
-                            "apiVersion":"agents.x-k8s.io/v1beta1", "kind":"SandboxList",
-                            "items":[old]
-                        }),
-                    ),
+        let (mut driver, steps) = delete_test_driver(vec![
+            (
+                http::Method::GET,
+                LIST_PATH,
+                kube_test_response(
+                    http::StatusCode::OK,
+                    serde_json::json!({
+                        "apiVersion":"agents.x-k8s.io/v1beta1", "kind":"SandboxList",
+                        "items":[old]
+                    }),
                 ),
-                (
-                    http::Method::DELETE,
-                    CR_PATH,
-                    kube_test_response(
-                        http::StatusCode::CONFLICT,
-                        serde_json::json!({
-                            "apiVersion":"v1", "kind":"Status", "status":"Failure",
-                            "reason":"Conflict", "message":"UID changed", "code":409
-                        }),
-                    ),
+            ),
+            (
+                http::Method::DELETE,
+                CR_PATH,
+                kube_test_response(
+                    http::StatusCode::CONFLICT,
+                    serde_json::json!({
+                        "apiVersion":"v1", "kind":"Status", "status":"Failure",
+                        "reason":"Conflict", "message":"UID changed", "code":409
+                    }),
                 ),
-                (
-                    http::Method::GET,
-                    CR_PATH,
-                    kube_test_response(
-                        http::StatusCode::OK,
-                        delete_test_sandbox("replacement-uid"),
-                    ),
-                ),
-            ],
-            vec!["42"],
-        );
+            ),
+            (
+                http::Method::GET,
+                CR_PATH,
+                kube_test_response(http::StatusCode::OK, delete_test_sandbox("replacement-uid")),
+            ),
+        ]);
         let (temp, serving, _) = attach_delete_test_workspace(&mut driver);
         let error = driver.delete_sandbox("sandbox-id").await.unwrap_err();
         assert!(error.contains("replaced during deletion"), "{error}");
@@ -11577,129 +10973,6 @@ mod tests {
             steps.lock().unwrap().is_empty(),
             "replacement must not be deleted"
         );
-        assert!(versions.lock().unwrap().is_empty());
-        std::fs::remove_dir_all(temp).unwrap();
-    }
-
-    #[tokio::test]
-    async fn delete_conflict_retry_budget_exhaustion_keeps_pending_fence() {
-        const CR_PATH: &str =
-            "/apis/agents.x-k8s.io/v1beta1/namespaces/openshell/sandboxes/sandbox-cr";
-        const LIST_PATH: &str = "/apis/agents.x-k8s.io/v1beta1/namespaces/openshell/sandboxes";
-        let old = delete_test_sandbox("old-uid");
-        let mut script = vec![(
-            http::Method::GET,
-            LIST_PATH,
-            kube_test_response(
-                http::StatusCode::OK,
-                serde_json::json!({
-                    "apiVersion":"agents.x-k8s.io/v1beta1", "kind":"SandboxList",
-                    "items":[old]
-                }),
-            ),
-        )];
-        for version in ["43", "44", "45", "46"] {
-            script.push((
-                http::Method::DELETE,
-                CR_PATH,
-                kube_test_response(
-                    http::StatusCode::CONFLICT,
-                    serde_json::json!({
-                        "apiVersion":"v1", "kind":"Status", "status":"Failure",
-                        "reason":"Conflict", "message":"resourceVersion changed", "code":409
-                    }),
-                ),
-            ));
-            let mut updated = delete_test_sandbox("old-uid");
-            updated["metadata"]["resourceVersion"] = serde_json::json!(version);
-            script.push((
-                http::Method::GET,
-                CR_PATH,
-                kube_test_response(http::StatusCode::OK, updated),
-            ));
-        }
-        let (mut driver, steps, versions) =
-            delete_test_driver_with_versions(script, vec!["42", "43", "44", "45"]);
-        let (temp, serving, _) = attach_delete_test_workspace(&mut driver);
-        let error = driver.delete_sandbox("sandbox-id").await.unwrap_err();
-        assert!(error.contains("after 3 retries"), "{error}");
-        assert!(!serving.exists());
-        assert_eq!(
-            driver
-                .confidential
-                .as_ref()
-                .unwrap()
-                .store
-                .pending_deletes()
-                .unwrap()
-                .len(),
-            1
-        );
-        assert!(steps.lock().unwrap().is_empty());
-        assert!(versions.lock().unwrap().is_empty());
-        std::fs::remove_dir_all(temp).unwrap();
-    }
-
-    #[tokio::test]
-    async fn delete_conflict_without_resource_version_keeps_pending_fence() {
-        const CR_PATH: &str =
-            "/apis/agents.x-k8s.io/v1beta1/namespaces/openshell/sandboxes/sandbox-cr";
-        const LIST_PATH: &str = "/apis/agents.x-k8s.io/v1beta1/namespaces/openshell/sandboxes";
-        let old = delete_test_sandbox("old-uid");
-        let mut current = old.clone();
-        current["metadata"]
-            .as_object_mut()
-            .unwrap()
-            .remove("resourceVersion");
-        let (mut driver, steps, versions) = delete_test_driver_with_versions(
-            vec![
-                (
-                    http::Method::GET,
-                    LIST_PATH,
-                    kube_test_response(
-                        http::StatusCode::OK,
-                        serde_json::json!({
-                            "apiVersion":"agents.x-k8s.io/v1beta1", "kind":"SandboxList",
-                            "items":[old]
-                        }),
-                    ),
-                ),
-                (
-                    http::Method::DELETE,
-                    CR_PATH,
-                    kube_test_response(
-                        http::StatusCode::CONFLICT,
-                        serde_json::json!({
-                            "apiVersion":"v1", "kind":"Status", "status":"Failure",
-                            "reason":"Conflict", "message":"resourceVersion changed", "code":409
-                        }),
-                    ),
-                ),
-                (
-                    http::Method::GET,
-                    CR_PATH,
-                    kube_test_response(http::StatusCode::OK, current),
-                ),
-            ],
-            vec!["42"],
-        );
-        let (temp, serving, _) = attach_delete_test_workspace(&mut driver);
-        let error = driver.delete_sandbox("sandbox-id").await.unwrap_err();
-        assert!(error.contains("lacks resourceVersion"), "{error}");
-        assert!(!serving.exists());
-        assert_eq!(
-            driver
-                .confidential
-                .as_ref()
-                .unwrap()
-                .store
-                .pending_deletes()
-                .unwrap()
-                .len(),
-            1
-        );
-        assert!(steps.lock().unwrap().is_empty());
-        assert!(versions.lock().unwrap().is_empty());
         std::fs::remove_dir_all(temp).unwrap();
     }
 
@@ -11848,8 +11121,8 @@ mod tests {
         );
         assert_eq!(
             steps.lock().unwrap().len(),
-            2,
-            "failed revocation must precede DELETE"
+            3,
+            "failed revocation must precede Kubernetes lookup"
         );
         std::fs::remove_dir_all(temp).unwrap();
     }
@@ -11904,6 +11177,19 @@ mod tests {
                 http::Method::GET,
                 LIST_PATH,
                 kube_test_response(http::StatusCode::OK, absent.clone()),
+            ),
+            (
+                http::Method::GET,
+                LIST_PATH,
+                kube_test_response(http::StatusCode::OK, absent.clone()),
+            ),
+            (
+                http::Method::GET,
+                PODS_PATH,
+                kube_test_response(
+                    http::StatusCode::OK,
+                    serde_json::json!({"apiVersion":"v1", "kind":"PodList", "items":[]}),
+                ),
             ),
             (
                 http::Method::GET,
@@ -17061,4 +16347,6 @@ mod tests {
 
         assert_eq!(init_containers, vec![bootstrap, workspace_init]);
     }
+    // Port the pinned native lifecycle regressions with only fixture adaptation.
+    include!("lifecycle_tests.rs");
 }

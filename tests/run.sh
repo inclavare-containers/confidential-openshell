@@ -14,7 +14,7 @@ for component in cloud-api-adaptor peerpod-ctrl caa-csi-block-driver; do
 done
 python3 deployment/build/manifest.py --check-test-sources > "$fixture/source-manifest.json"
 python3 tests/check-layout.py
-components/confidential-driver/controlled-diff.sh
+components/confidential-driver/check-upstream-provenance.sh
 cargo fmt --all -- --check
 OPENSHELL_INITDATA_FIXTURE_OUT="$fixture/initdata" cargo test --offline --locked -p openshell-driver-confidential-kubernetes -p openshell-attestation-observer
 python3 tests/check-driver-initdata.py "$fixture/initdata"
