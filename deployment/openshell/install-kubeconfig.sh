@@ -52,9 +52,12 @@ for check in \
   test "$(kubectl --kubeconfig /etc/openshell-confidential/kubeconfig \
     auth can-i $check)" = yes
 done
+# Match the service endpoint: native preflight validates remote driver selection.
 runuser -u openshell-gateway -- env \
   KUBECONFIG=/etc/openshell-confidential/kubeconfig \
   /usr/local/bin/openshell-gateway \
-  --config /etc/openshell-confidential/gateway.toml config preflight
+  --config /etc/openshell-confidential/gateway.toml \
+  --compute-driver confidential \
+  --compute-driver-socket /run/openshell-confidential/driver.sock config preflight
 kubectl apply -f deployment/openshell/network-fence.example.yaml
 kubectl -n openshell get networkpolicy confidential-ingress-default-deny -o yaml
