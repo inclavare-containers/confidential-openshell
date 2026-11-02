@@ -1,239 +1,30 @@
-From e52d680ccaf9f06ac3c1bdb5d9be9aef58399bcd Mon Sep 17 00:00:00 2001
+From 95d20d742db872158848005203eaafaca68ba67e Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
-Date: Wed, 26 Aug 2026 12:02:05 +0800
-Subject: [PATCH 1/5] fix(node): publish atomic readonly direct-volume metadata
+Date: Mon, 2 Nov 2026 16:33:07 +0800
+Subject: [PATCH 2/5] feat(node): publish the paired CAA volume contract
+ atomically
 
-Define the strict v1 host-to-CAA contract, derive readonly from every CSI source, and publish it with file and directory fsync. Preserve the existing upstream CDH key-reference fields without exposing credentials or adding any CryptPilot-specific metadata.
-
-Signed-off-by: Weidong Sun <sunweidong@linux.alibaba.com>
 ---
- .github/workflows/csi-sanity.yaml         | 104 +----
- hack/run-csi-sanity.sh                    |  46 ++-
- pkg/driver/directvolume.go                | 299 ++++++++++++++
- pkg/driver/directvolume_test.go           | 449 ++++++++++++++++++++++
- pkg/driver/nodeserver.go                  | 163 ++++++--
+ pkg/driver/directvolume.go                | 260 ++++++++++++
+ pkg/driver/directvolume_test.go           | 482 ++++++++++++++++++++++
+ pkg/driver/metadata_atomic.go             |  48 +++
+ pkg/driver/metadata_atomic_test.go        |  73 ++++
+ pkg/driver/nodeserver.go                  | 246 +++++++----
+ pkg/driver/nodeserver_test.go             |  32 +-
  pkg/driver/testdata/direct-volume-v1.json |   1 +
- 6 files changed, 917 insertions(+), 145 deletions(-)
+ 7 files changed, 1055 insertions(+), 87 deletions(-)
  create mode 100644 pkg/driver/directvolume.go
  create mode 100644 pkg/driver/directvolume_test.go
+ create mode 100644 pkg/driver/metadata_atomic.go
+ create mode 100644 pkg/driver/metadata_atomic_test.go
  create mode 100644 pkg/driver/testdata/direct-volume-v1.json
 
-diff --git a/.github/workflows/csi-sanity.yaml b/.github/workflows/csi-sanity.yaml
-index b2286c783dccaa68f1ff9529c050c35f8e771fc6..cae1342ce0c318fd1ef8af41ae4312227c2f4afa 100644
---- a/.github/workflows/csi-sanity.yaml
-+++ b/.github/workflows/csi-sanity.yaml
-@@ -17,105 +17,5 @@ jobs:
-         with:
-           go-version-file: go.mod
- 
--      - name: Build driver
--        run: go build -ldflags "-X main.version=test" -o csi-driver ./cmd/
--
--      - name: Install csi-sanity
--        run: go install github.com/kubernetes-csi/csi-test/v5/cmd/csi-sanity@v5.0.0
--
--      - name: Create test directories
--        run: |
--          mkdir -p /tmp/csi-test/pool /tmp/csi-test/volstore /tmp/csi-test/kata-vols
--
--      - name: Create test volume parameters
--        run: |
--          cat > /tmp/csi-test/params.yaml <<EOF
--          cloudProvider: libvirt
--          cloudProviderVolumePath: /tmp/csi-test/pool
--          EOF
--
--      - name: Create helper scripts
--        run: |
--          cat > /tmp/csi-test/create-path.sh <<'SCRIPT'
--          #!/bin/bash
--          dir=$(mktemp -d /tmp/csi-test-mnt-XXXXXX)
--          echo "$dir"
--          SCRIPT
--
--          cat > /tmp/csi-test/remove-path.sh <<'SCRIPT'
--          #!/bin/bash
--          target="$1"
--
--          if [ -z "$target" ] || [ "$target" = "/" ]; then
--            echo "refusing to remove unsafe path: '$target'" >&2
--            exit 1
--          fi
--
--          case "$target" in
--            /tmp/csi-test-mnt-*)
--              rm -rf -- "$target"
--              ;;
--            *)
--              echo "refusing to remove path outside expected test directory prefix: '$target'" >&2
--              exit 1
--              ;;
--          esac
--          SCRIPT
--
--          cat > /tmp/csi-test/check-path.sh <<'SCRIPT'
--          #!/bin/bash
--          if [ ! -e "$1" ]; then
--            echo "not_found"
--          elif [ -f "$1" ]; then
--            echo "file"
--          elif [ -d "$1" ]; then
--            echo "directory"
--          else
--            echo "other"
--          fi
--          SCRIPT
--
--          chmod +x /tmp/csi-test/*.sh
--
--      - name: Start CSI driver and run csi-sanity tests
--        run: |
--          set -eu
--
--          KATA_DIRECT_VOLUME_ROOT_PATH=/tmp/csi-test/kata-vols \
--          CSI_VOLUME_STORE_DIR=/tmp/csi-test/volstore \
--          CSI_ALLOW_HOST_STATS_FALLBACK=1 \
--          ./csi-driver \
--            --endpoint=unix:///tmp/csi-test/csi.sock \
--            --drivername=caa-csi-block.csi.confidentialcontainers.io \
--            --nodeid=test-node &
--          driver_pid=$!
--
--          trap 'kill "$driver_pid" 2>/dev/null || true; wait "$driver_pid" 2>/dev/null || true' EXIT
--
--          timeout_secs=30
--          elapsed=0
--          while [ ! -S /tmp/csi-test/csi.sock ]; do
--            if ! kill -0 "$driver_pid" 2>/dev/null; then
--              echo "CSI driver exited before creating socket"
--              wait "$driver_pid"
--            fi
--
--            if [ "$elapsed" -ge "$timeout_secs" ]; then
--              echo "Timed out waiting for CSI socket"
--              exit 1
--            fi
--
--            sleep 1
--            elapsed=$((elapsed + 1))
--          done
--
--          $(go env GOPATH)/bin/csi-sanity \
--            --csi.endpoint=unix:///tmp/csi-test/csi.sock \
--            --csi.testvolumeparameters=/tmp/csi-test/params.yaml \
--            --csi.createstagingpathcmd="/tmp/csi-test/create-path.sh" \
--            --csi.removestagingpathcmd="/tmp/csi-test/remove-path.sh" \
--            --csi.createmountpathcmd="/tmp/csi-test/create-path.sh" \
--            --csi.removemountpathcmd="/tmp/csi-test/remove-path.sh" \
--            --csi.checkpathcmd="/tmp/csi-test/check-path.sh" \
--            --ginkgo.skip="Snapshot|ListVolumes|GetCapacity|ControllerPublishVolume|ControllerUnpublishVolume|ExpandVolume|NodeExpandVolume|ModifyVolume|GroupController|volume from an existing source" \
--            --ginkgo.v
-+      - name: Build driver and run csi-sanity tests
-+        run: make test-verbose
-diff --git a/hack/run-csi-sanity.sh b/hack/run-csi-sanity.sh
-index c017049cf6d3a37f9a921781360a2ad0e630d607..d3b03f68e86796d928052ce7c23d16881d0f43cb 100755
---- a/hack/run-csi-sanity.sh
-+++ b/hack/run-csi-sanity.sh
-@@ -5,13 +5,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
- ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
- BINARY="$ROOT_DIR/bin/caa-csi-block-driver"
- TEST_DIR=$(mktemp -d /tmp/csi-sanity-XXXXXX)
-+CSI_SANITY_VERSION=v5.5.0
- 
- cleanup() {
-     if [ -n "${DRIVER_PID:-}" ] && kill -0 "$DRIVER_PID" 2>/dev/null; then
-         kill "$DRIVER_PID" 2>/dev/null || true
-         wait "$DRIVER_PID" 2>/dev/null || true
-     fi
--    rm -rf "$TEST_DIR" /tmp/csi-test-mnt-* /tmp/csi-sanity-mnt-*
-+    rm -rf "$TEST_DIR"
- }
- trap cleanup EXIT
- 
-@@ -21,13 +22,13 @@ if [ ! -x "$BINARY" ]; then
-     exit 1
- fi
- 
--if ! command -v csi-sanity &>/dev/null; then
--    echo "Installing csi-sanity..."
--    go install github.com/kubernetes-csi/csi-test/v5/cmd/csi-sanity@latest
--fi
--CSI_SANITY=$(command -v csi-sanity || echo "$(go env GOPATH)/bin/csi-sanity")
-+echo "Installing csi-sanity ${CSI_SANITY_VERSION}..."
-+go install "github.com/kubernetes-csi/csi-test/v5/cmd/csi-sanity@${CSI_SANITY_VERSION}"
-+CSI_SANITY="$(go env GOPATH)/bin/csi-sanity"
- 
--mkdir -p "$TEST_DIR"/{pool,volstore,kata-vols}
-+export KUBELET_ROOT_PATH="$TEST_DIR/kubelet"
-+export CSI_SANITY_TARGET_PATH=1
-+mkdir -p "$TEST_DIR"/{pool,volstore,kata-vols} "$KUBELET_ROOT_PATH/pods"
- 
- cat > "$TEST_DIR/params.yaml" <<EOF
- cloudProvider: libvirt
-@@ -35,18 +36,34 @@ cloudProviderVolumePath: $TEST_DIR/pool
- EOF
- 
- cat > "$TEST_DIR/create-path.sh" <<'SCRIPT'
--#!/bin/bash
--dir=$(mktemp -d /tmp/csi-sanity-mnt-XXXXXX)
--echo "$dir"
-+#!/usr/bin/env bash
-+set -euo pipefail
-+: "${KUBELET_ROOT_PATH:?}"
-+pod_dir=$(mktemp -d "$KUBELET_ROOT_PATH/pods/csi-sanity-pod-XXXXXX")
-+volume_root="$pod_dir/volumes/kubernetes.io~csi"
-+mkdir -p "$volume_root"
-+mktemp -d "$volume_root/csi-sanity-volume-XXXXXX"
- SCRIPT
- 
- cat > "$TEST_DIR/remove-path.sh" <<'SCRIPT'
--#!/bin/bash
--rm -rf "$1"
-+#!/usr/bin/env bash
-+set -euo pipefail
-+: "${KUBELET_ROOT_PATH:?}"
-+target="${1:?}"
-+case "$target" in
-+    "$KUBELET_ROOT_PATH"/pods/*/volumes/kubernetes.io~csi/*/target | \
-+        "$KUBELET_ROOT_PATH"/pods/*/volumes/kubernetes.io~csi/*)
-+        rm -rf -- "$target"
-+        ;;
-+    *)
-+        echo "refusing to remove non-canonical sanity path: $target" >&2
-+        exit 1
-+        ;;
-+esac
- SCRIPT
- 
- cat > "$TEST_DIR/check-path.sh" <<'SCRIPT'
--#!/bin/bash
-+#!/usr/bin/env bash
- if [ ! -e "$1" ]; then echo "not_found"
- elif [ -f "$1" ]; then echo "file"
- elif [ -d "$1" ]; then echo "directory"
-@@ -57,6 +74,7 @@ chmod +x "$TEST_DIR"/*.sh
- 
- KATA_DIRECT_VOLUME_ROOT_PATH="$TEST_DIR/kata-vols" \
- CSI_VOLUME_STORE_DIR="$TEST_DIR/volstore" \
-+CSI_ALLOW_HOST_STATS_FALLBACK=1 \
- "$BINARY" \
-     --endpoint="unix://$TEST_DIR/csi.sock" \
-     --drivername=caa-csi-block.csi.confidentialcontainers.io \
-@@ -73,7 +91,7 @@ echo "Driver started (PID $DRIVER_PID), running csi-sanity..."
- echo ""
- 
- SKIP="Snapshot|ListVolumes|GetCapacity|ControllerPublishVolume|ControllerUnpublishVolume"
--SKIP+="|ExpandVolume|NodeExpandVolume|NodeGetVolumeStats|ModifyVolume"
-+SKIP+="|ExpandVolume|NodeExpandVolume|ModifyVolume"
- SKIP+="|GroupController|volume from an existing source"
- 
- "$CSI_SANITY" \
 diff --git a/pkg/driver/directvolume.go b/pkg/driver/directvolume.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..39487e3d70269c539773f4b5d9c8db70386e0a91
+index 0000000000000000000000000000000000000000..c30c7bcbf8f6453532eab3fcb8badd7eee7f30e3
 --- /dev/null
 +++ b/pkg/driver/directvolume.go
-@@ -0,0 +1,299 @@
+@@ -0,0 +1,260 @@
 +// (C) Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -246,7 +37,6 @@ index 0000000000000000000000000000000000000000..39487e3d70269c539773f4b5d9c8db70
 +	"fmt"
 +	"io"
 +	"os"
-+	"path/filepath"
 +	"slices"
 +	"sort"
 +	"strconv"
@@ -493,52 +283,14 @@ index 0000000000000000000000000000000000000000..39487e3d70269c539773f4b5d9c8db70
 +		return fmt.Errorf("direct-volume metadata exceeds %d bytes", maxDirectVolumeMetadataSize)
 +	}
 +
-+	dir := filepath.Dir(path)
-+	if err := os.MkdirAll(dir, 0o700); err != nil {
-+		return fmt.Errorf("create direct-volume directory: %w", err)
-+	}
-+	temporary, err := os.CreateTemp(dir, ".mountInfo.json.*")
-+	if err != nil {
-+		return fmt.Errorf("create direct-volume temporary file: %w", err)
-+	}
-+	temporaryPath := temporary.Name()
-+	defer os.Remove(temporaryPath)
-+
-+	if err := temporary.Chmod(0o600); err != nil {
-+		temporary.Close()
-+		return fmt.Errorf("chmod direct-volume temporary file: %w", err)
-+	}
-+	if _, err := temporary.Write(data); err != nil {
-+		temporary.Close()
-+		return fmt.Errorf("write direct-volume temporary file: %w", err)
-+	}
-+	if err := temporary.Sync(); err != nil {
-+		temporary.Close()
-+		return fmt.Errorf("sync direct-volume temporary file: %w", err)
-+	}
-+	if err := temporary.Close(); err != nil {
-+		return fmt.Errorf("close direct-volume temporary file: %w", err)
-+	}
-+	if err := os.Rename(temporaryPath, path); err != nil {
-+		return fmt.Errorf("publish direct-volume metadata: %w", err)
-+	}
-+
-+	directory, err := os.Open(dir)
-+	if err != nil {
-+		return fmt.Errorf("open direct-volume directory for sync: %w", err)
-+	}
-+	defer directory.Close()
-+	if err := directory.Sync(); err != nil {
-+		return fmt.Errorf("sync direct-volume directory: %w", err)
-+	}
-+	return nil
++	return writeMountInfoAtomic(path, data)
 +}
 diff --git a/pkg/driver/directvolume_test.go b/pkg/driver/directvolume_test.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..39231f5c0364594fa3155155e96a0dea7dd87645
+index 0000000000000000000000000000000000000000..6d7c75d94899f14227d4cb02da2fe2fa4be00b4d
 --- /dev/null
 +++ b/pkg/driver/directvolume_test.go
-@@ -0,0 +1,449 @@
+@@ -0,0 +1,482 @@
 +// (C) Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -916,6 +668,39 @@ index 0000000000000000000000000000000000000000..39231f5c0364594fa3155155e96a0dea
 +	}
 +}
 +
++func TestNodeStageUsesOnlyControllerVolumeIdentity(t *testing.T) {
++	node := newNodeServer("node-1")
++	capability := publishRequest("/unused", csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER, false).VolumeCapability
++	request := &csi.NodeStageVolumeRequest{
++		VolumeId: "workspace", StagingTargetPath: "/staging/workspace",
++		VolumeCapability: capability,
++		VolumeContext:    map[string]string{"cloud-volume-path": "d-workspace"},
++	}
++	if _, err := node.NodeStageVolume(t.Context(), request); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := node.NodeStageVolume(t.Context(), request); err != nil {
++		t.Fatalf("idempotent stage: %v", err)
++	}
++	changed := *request
++	changed.VolumeContext = map[string]string{"cloud-volume-path": "d-other"}
++	if _, err := node.NodeStageVolume(t.Context(), &changed); status.Code(err) != codes.FailedPrecondition {
++		t.Fatalf("changed identity status=%v, want FailedPrecondition", status.Code(err))
++	}
++}
++
++func TestNodeStageRequiresControllerVolumeIdentity(t *testing.T) {
++	node := newNodeServer("node-1")
++	capability := publishRequest("/unused", csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER, false).VolumeCapability
++	_, err := node.NodeStageVolume(t.Context(), &csi.NodeStageVolumeRequest{
++		VolumeId: "workspace", StagingTargetPath: "/staging/workspace",
++		VolumeCapability: capability,
++	})
++	if status.Code(err) != codes.FailedPrecondition {
++		t.Fatalf("status=%v, want FailedPrecondition", status.Code(err))
++	}
++}
++
 +func TestReadDirectVolumeMetadataRejectsUnknownAndTrailingFields(t *testing.T) {
 +	path := filepath.Join(t.TempDir(), mountInfoFileName)
 +	base := `{"version":1,"volume-type":"block","volume-mode":"filesystem","device":"d-1","fstype":"ext4","readonly":true,"options":["noatime","ro"],"pod-uid":"pod-1","volume-handle":"pvc-1"}`
@@ -988,11 +773,158 @@ index 0000000000000000000000000000000000000000..39231f5c0364594fa3155155e96a0dea
 +	}
 +	return false
 +}
+diff --git a/pkg/driver/metadata_atomic.go b/pkg/driver/metadata_atomic.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..7fe9801de952003c9880a262ad79afa3b286e07c
+--- /dev/null
++++ b/pkg/driver/metadata_atomic.go
+@@ -0,0 +1,48 @@
++// (C) Copyright Confidential Containers Contributors
++// SPDX-License-Identifier: Apache-2.0
++
++package driver
++
++import (
++	"fmt"
++	"os"
++	"path/filepath"
++)
++
++func writeMountInfoAtomic(path string, data []byte) error {
++	dir := filepath.Dir(path)
++	if err := os.MkdirAll(dir, 0o700); err != nil {
++		return fmt.Errorf("create direct-volume directory: %w", err)
++	}
++	temporary, err := os.CreateTemp(dir, ".mountInfo.json.*")
++	if err != nil {
++		return fmt.Errorf("create direct-volume temporary file: %w", err)
++	}
++	temporaryPath := temporary.Name()
++	defer os.Remove(temporaryPath)
++
++	if _, err := temporary.Write(data); err != nil {
++		temporary.Close()
++		return fmt.Errorf("write direct-volume temporary file: %w", err)
++	}
++	if err := temporary.Sync(); err != nil {
++		temporary.Close()
++		return fmt.Errorf("sync direct-volume temporary file: %w", err)
++	}
++	if err := temporary.Close(); err != nil {
++		return fmt.Errorf("close direct-volume temporary file: %w", err)
++	}
++	if err := os.Rename(temporaryPath, path); err != nil {
++		return fmt.Errorf("publish direct-volume metadata: %w", err)
++	}
++
++	directory, err := os.Open(dir)
++	if err != nil {
++		return fmt.Errorf("open direct-volume directory for sync: %w", err)
++	}
++	defer directory.Close()
++	if err := directory.Sync(); err != nil {
++		return fmt.Errorf("sync direct-volume directory: %w", err)
++	}
++	return nil
++}
+diff --git a/pkg/driver/metadata_atomic_test.go b/pkg/driver/metadata_atomic_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..480e0a602e1d56710decfe28b822e0772cb7a995
+--- /dev/null
++++ b/pkg/driver/metadata_atomic_test.go
+@@ -0,0 +1,73 @@
++// (C) Copyright Confidential Containers Contributors
++// SPDX-License-Identifier: Apache-2.0
++
++package driver
++
++import (
++	"errors"
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/container-storage-interface/spec/lib/go/csi"
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/status"
++)
++
++func TestAtomicMetadataFailedRenamePreservesTarget(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "mountInfo.json")
++	if err := os.Mkdir(path, 0700); err != nil {
++		t.Fatal(err)
++	}
++	marker := filepath.Join(path, "preserve")
++	if err := os.WriteFile(marker, []byte("original"), 0600); err != nil {
++		t.Fatal(err)
++	}
++	if err := writeMountInfoAtomic(path, []byte(`{"device":"disk"}`)); err == nil {
++		t.Fatal("rename into directory should fail")
++	}
++	data, err := os.ReadFile(marker)
++	if err != nil || string(data) != "original" {
++		t.Fatalf("target changed: %q, %v", data, err)
++	}
++	leftovers, err := filepath.Glob(filepath.Join(filepath.Dir(path), ".mountInfo.json.*"))
++	if err != nil || len(leftovers) != 0 {
++		t.Fatalf("temporary files left: %v, %v", leftovers, err)
++	}
++}
++
++func TestAtomicMetadataPublishReplaysAfterNodeRestart(t *testing.T) {
++	t.Setenv("KATA_DIRECT_VOLUME_ROOT_PATH", t.TempDir())
++	kubelet := t.TempDir()
++	t.Setenv("KUBELET_ROOT_PATH", kubelet)
++	target := filepath.Join(kubelet, "pods", "pod-uid", "volumes", "kubernetes.io~csi", "volume-1", "mount")
++	request := &csi.NodePublishVolumeRequest{
++		VolumeId: "volume-1", TargetPath: target,
++		VolumeContext:    map[string]string{"cloud-volume-path": "disk-1"},
++		VolumeCapability: &csi.VolumeCapability{AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{}}},
++	}
++	for i := 0; i < 2; i++ {
++		if _, err := newNodeServer("node").NodePublishVolume(t.Context(), request); err != nil {
++			t.Fatal(err)
++		}
++	}
++	if len(request.VolumeContext) != 1 {
++		t.Fatal("publish mutated caller volume context")
++	}
++	request.VolumeContext["cloud-volume-path"] = "other-disk"
++	if _, err := newNodeServer("node").NodePublishVolume(t.Context(), request); status.Code(err) != codes.AlreadyExists {
++		t.Fatalf("expected conflict, got %v", err)
++	}
++}
++
++func TestUnpublishReturnsCleanupFailure(t *testing.T) {
++	original := removeAllPath
++	removeAllPath = func(string) error { return errors.New("injected failure") }
++	defer func() { removeAllPath = original }()
++	_, err := newNodeServer("node").NodeUnpublishVolume(t.Context(), &csi.NodeUnpublishVolumeRequest{
++		VolumeId: "volume-1", TargetPath: filepath.Join(getKubeletRootPath(), "pods", "pod-uid", "volumes", "kubernetes.io~csi", "volume-1", "mount"),
++	})
++	if status.Code(err) != codes.Internal {
++		t.Fatalf("got %v", err)
++	}
++}
 diff --git a/pkg/driver/nodeserver.go b/pkg/driver/nodeserver.go
-index a7b30edcc5cc73c4ba3d2865a9ea8d80ad8ae146..90d55e150e1e2d99262630ec294d11833f195570 100644
+index 0cb45e43da707bf75e96666b86d3c9743c79bf8b..093ceb3a8f756dd9281f28687bb4ccdc5d04ce30 100644
 --- a/pkg/driver/nodeserver.go
 +++ b/pkg/driver/nodeserver.go
-@@ -27,10 +27,14 @@ import (
+@@ -12,7 +12,6 @@ import (
+ 	"os"
+ 	"os/exec"
+ 	"path/filepath"
+-	"strconv"
+ 	"strings"
+ 	"sync"
+ 	"syscall"
+@@ -21,16 +20,18 @@ import (
+ 	"github.com/container-storage-interface/spec/lib/go/csi"
+ 	"google.golang.org/grpc/codes"
+ 	"google.golang.org/grpc/status"
+-
+-	provider "github.com/confidential-devhub/caa-csi-block-driver/pkg/provider"
+ )
  
  var nsLogger = log.New(log.Writer(), "[caa-csi/node] ", log.LstdFlags|log.Lmsgprefix)
  
@@ -1007,7 +939,7 @@ index a7b30edcc5cc73c4ba3d2865a9ea8d80ad8ae146..90d55e150e1e2d99262630ec294d1183
  )
  
  func getKataDirectVolumeRootPath() string {
-@@ -47,12 +51,11 @@ func getKataRuntimePath() string {
+@@ -47,12 +48,11 @@ func getKataRuntimePath() string {
  	return "kata-runtime"
  }
  
@@ -1025,7 +957,61 @@ index a7b30edcc5cc73c4ba3d2865a9ea8d80ad8ae146..90d55e150e1e2d99262630ec294d1183
  }
  
  type nodeServer struct {
-@@ -123,48 +126,104 @@ func (ns *nodeServer) NodePublishVolume(_ context.Context, req *csi.NodePublishV
+@@ -106,7 +106,9 @@ func cleanStaleMountInfoDirs(rootDir string) {
+ 			continue
+ 		}
+ 
+-		var info mountInfoJSON
++		// Cleanup accepts both legacy and versioned metadata. Schema migration
++		// belongs to NodePublishVolume; valid records for live targets stay put.
++		var info map[string]json.RawMessage
+ 		if err := json.Unmarshal(data, &info); err != nil {
+ 			nsLogger.Printf("startup cleanup: removing corrupt mountInfo dir %s: %v", entry.Name(), err)
+ 			if err := os.RemoveAll(dirPath); err != nil {
+@@ -141,31 +143,19 @@ func (ns *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
+ 		return nil, status.Error(codes.InvalidArgument, "Volume capability missing")
+ 	}
+ 
+-	params := req.GetVolumeContext()
+-
+-	p, err := provider.NewBlockVolumeProvider(params)
+-	if err != nil {
+-		return nil, status.Errorf(codes.Internal, "failed to create provider: %v", err)
+-	}
+-
+-	var sizeBytes int64 = 1073741824
+-	if capacityStr := params["capacity_in_bytes"]; capacityStr != "" {
+-		if parsed, err := strconv.ParseInt(capacityStr, 10, 64); err == nil && parsed > 0 {
+-			sizeBytes = parsed
+-		} else {
+-			nsLogger.Printf("WARNING: invalid capacity_in_bytes %q, using default 1GiB", capacityStr)
+-		}
+-	}
+-
+-	volInfo, err := p.CreateVolume(ctx, volumeID, sizeBytes)
+-	if err != nil {
+-		return nil, status.Errorf(codes.Internal, "provider.CreateVolume failed: %v", err)
++	devicePath := strings.TrimSpace(req.GetVolumeContext()["cloud-volume-path"])
++	if devicePath == "" {
++		return nil, status.Errorf(codes.FailedPrecondition,
++			"volume %s has no controller-provided cloud-volume-path", volumeID)
+ 	}
+-
+ 	ns.mu.Lock()
+-	ns.devices[volumeID] = volInfo.Path
+-	ns.mu.Unlock()
+-	nsLogger.Printf("NodeStageVolume: %s staged (provider=%s, path=%s)", volumeID, volInfo.Provider, volInfo.Path)
++	defer ns.mu.Unlock()
++	if existing := ns.devices[volumeID]; existing != "" && existing != devicePath {
++		return nil, status.Errorf(codes.FailedPrecondition,
++			"volume %s was already staged with cloud-volume-path %q, not %q", volumeID, existing, devicePath)
++	}
++	ns.devices[volumeID] = devicePath
++	nsLogger.Printf("NodeStageVolume: %s staged (path=%s)", volumeID, devicePath)
+ 
+ 	return &csi.NodeStageVolumeResponse{}, nil
+ }
+@@ -183,48 +173,102 @@ func (ns *nodeServer) NodePublishVolume(_ context.Context, req *csi.NodePublishV
  	if req.GetVolumeCapability() == nil {
  		return nil, status.Error(codes.InvalidArgument, "Volume capability missing")
  	}
@@ -1034,20 +1020,21 @@ index a7b30edcc5cc73c4ba3d2865a9ea8d80ad8ae146..90d55e150e1e2d99262630ec294d1183
 +		return nil, status.Errorf(codes.InvalidArgument, "target path %q is not a canonical kubelet CSI mount path", targetPath)
 +	}
  
++	contextPath := strings.TrimSpace(req.GetVolumeContext()["cloud-volume-path"])
++	// Kubelet may replay NodePublish after a node-plugin restart without
++	// replaying NodeStage first. The controller-provided cloud identity is
++	// sufficient to rebuild direct-volume metadata.
  	ns.mu.Lock()
  	devicePath := ns.devices[volumeID]
++	if devicePath == "" && contextPath != "" {
++		devicePath = contextPath
++		ns.devices[volumeID] = devicePath
++	}
  	ns.mu.Unlock()
- 
-+	if devicePath == "" {
-+		// Kubelet may replay NodePublish after a node-plugin restart without
-+		// replaying NodeStage first. The controller-provided cloud identity is
-+		// sufficient to rebuild direct-volume metadata.
-+		devicePath = strings.TrimSpace(req.GetVolumeContext()["cloud-volume-path"])
-+		if devicePath != "" {
-+			ns.mu.Lock()
-+			ns.devices[volumeID] = devicePath
-+			ns.mu.Unlock()
-+		}
+-
++	if devicePath != "" && contextPath != "" && contextPath != devicePath {
++		return nil, status.Errorf(codes.FailedPrecondition,
++			"volume %s context has cloud-volume-path %q, staged path is %q", volumeID, contextPath, devicePath)
 +	}
  	if devicePath == "" {
  		return nil, status.Errorf(codes.FailedPrecondition, "volume %s not staged (no device path)", volumeID)
@@ -1062,8 +1049,12 @@ index a7b30edcc5cc73c4ba3d2865a9ea8d80ad8ae146..90d55e150e1e2d99262630ec294d1183
  	}
 -
 -	attrib["cloud-volume-id"] = volumeID
- 	if attrib["cloud-volume-path"] == "" {
- 		attrib["cloud-volume-path"] = devicePath
+-	if attrib["cloud-volume-path"] == "" {
+-		attrib["cloud-volume-path"] = devicePath
++	attrib["cloud-volume-path"] = devicePath
++	providerName := strings.TrimSpace(attrib["cloud-provider"])
++	if providerName == "" {
++		providerName = strings.TrimSpace(attrib["cloudProvider"])
  	}
 -
 -	info := mountInfoJSON{
@@ -1071,10 +1062,6 @@ index a7b30edcc5cc73c4ba3d2865a9ea8d80ad8ae146..90d55e150e1e2d99262630ec294d1183
 -		Device:     devicePath,
 -		FsType:     "ext4",
 -		Metadata:   attrib,
-+	providerName := strings.TrimSpace(attrib["cloud-provider"])
-+	if providerName == "" {
-+		providerName = strings.TrimSpace(attrib["cloudProvider"])
-+	}
 +	if providerName != "" {
 +		attrib["cloud-provider"] = providerName
  	}
@@ -1103,13 +1090,13 @@ index a7b30edcc5cc73c4ba3d2865a9ea8d80ad8ae146..90d55e150e1e2d99262630ec294d1183
 +	}
 +	if volumeType := strings.TrimSpace(attrib["volume-type"]); volumeType != "" && volumeType != "block" {
 +		return nil, status.Errorf(codes.InvalidArgument, "volume type %q is not supported", volumeType)
- 	}
--	if err := os.WriteFile(filepath.Join(volumeDir, mountInfoFileName), data, 0600); err != nil {
--		return nil, status.Errorf(codes.Internal, "failed to write mountInfo.json: %v", err)
++	}
 +	podUID := strings.TrimSpace(attrib["csi.storage.k8s.io/pod.uid"])
 +	if podUID != "" && podUID != targetPodUID {
 +		return nil, status.Errorf(codes.InvalidArgument, "pod UID %q does not match target path pod UID %q", podUID, targetPodUID)
-+	}
+ 	}
+-	if err := os.WriteFile(filepath.Join(volumeDir, mountInfoFileName), data, 0600); err != nil {
+-		return nil, status.Errorf(codes.Internal, "failed to write mountInfo.json: %v", err)
 +	podUID = targetPodUID
 +	fsGroup, err := normalizeFSGroup(mount.GetVolumeMountGroup())
 +	if err != nil {
@@ -1149,7 +1136,7 @@ index a7b30edcc5cc73c4ba3d2865a9ea8d80ad8ae146..90d55e150e1e2d99262630ec294d1183
  
  	nsLogger.Printf("NodePublishVolume: %s published at %s (device=%s, provider=%s)",
  		volumeID, targetPath, devicePath, attrib["cloud-provider"])
-@@ -172,19 +231,65 @@ func (ns *nodeServer) NodePublishVolume(_ context.Context, req *csi.NodePublishV
+@@ -232,19 +276,65 @@ func (ns *nodeServer) NodePublishVolume(_ context.Context, req *csi.NodePublishV
  	return &csi.NodePublishVolumeResponse{}, nil
  }
  
@@ -1196,7 +1183,7 @@ index a7b30edcc5cc73c4ba3d2865a9ea8d80ad8ae146..90d55e150e1e2d99262630ec294d1183
 -	if err := os.RemoveAll(volumeDir); err != nil {
 -		nsLogger.Printf("WARNING: failed to remove kata direct volume dir %s: %v", volumeDir, err)
 +	metadataPath := filepath.Join(volumeDir, mountInfoFileName)
-+	if metadata, err := readDirectVolumeMetadata(metadataPath); err == nil {
++	if metadata, err := readDirectVolumeMetadata(metadataPath); err == nil && metadata != nil {
 +		if metadata.VolumeHandle != req.GetVolumeId() {
 +			return nil, status.Errorf(codes.FailedPrecondition,
 +				"target %s belongs to volume %s, not %s", targetPath, metadata.VolumeHandle, req.GetVolumeId())
@@ -1205,7 +1192,7 @@ index a7b30edcc5cc73c4ba3d2865a9ea8d80ad8ae146..90d55e150e1e2d99262630ec294d1183
 +			return nil, status.Errorf(codes.FailedPrecondition,
 +				"target %s belongs to pod %s, not %s", targetPath, metadata.PodUID, targetPodUID)
 +		}
-+	} else if !os.IsNotExist(err) {
++	} else if err != nil && !os.IsNotExist(err) {
 +		return nil, status.Errorf(codes.Internal, "existing mountInfo.json is invalid: %v", err)
 +	}
 +	if err := removeAllPath(volumeDir); err != nil && !os.IsNotExist(err) {
@@ -1219,6 +1206,126 @@ index a7b30edcc5cc73c4ba3d2865a9ea8d80ad8ae146..90d55e150e1e2d99262630ec294d1183
  	}
  
  	nsLogger.Printf("NodeUnpublishVolume: %s unpublished", req.GetVolumeId())
+@@ -448,31 +538,19 @@ func getVolumeStatsLocal(volumePath string) (*csi.NodeGetVolumeStatsResponse, er
+ }
+ 
+ func (ns *nodeServer) NodeGetCapabilities(_ context.Context, _ *csi.NodeGetCapabilitiesRequest) (*csi.NodeGetCapabilitiesResponse, error) {
+-	return &csi.NodeGetCapabilitiesResponse{
+-		Capabilities: []*csi.NodeServiceCapability{
+-			{
+-				Type: &csi.NodeServiceCapability_Rpc{
+-					Rpc: &csi.NodeServiceCapability_RPC{
+-						Type: csi.NodeServiceCapability_RPC_STAGE_UNSTAGE_VOLUME,
+-					},
+-				},
+-			},
+-			{
+-				Type: &csi.NodeServiceCapability_Rpc{
+-					Rpc: &csi.NodeServiceCapability_RPC{
+-						Type: csi.NodeServiceCapability_RPC_EXPAND_VOLUME,
+-					},
+-				},
+-			},
+-			{
+-				Type: &csi.NodeServiceCapability_Rpc{
+-					Rpc: &csi.NodeServiceCapability_RPC{
+-						Type: csi.NodeServiceCapability_RPC_GET_VOLUME_STATS,
+-					},
+-				},
+-			},
+-		},
+-	}, nil
++	types := []csi.NodeServiceCapability_RPC_Type{
++		csi.NodeServiceCapability_RPC_STAGE_UNSTAGE_VOLUME,
++		csi.NodeServiceCapability_RPC_EXPAND_VOLUME,
++		csi.NodeServiceCapability_RPC_GET_VOLUME_STATS,
++		csi.NodeServiceCapability_RPC_VOLUME_MOUNT_GROUP,
++	}
++	response := &csi.NodeGetCapabilitiesResponse{}
++	for _, capability := range types {
++		response.Capabilities = append(response.Capabilities, &csi.NodeServiceCapability{
++			Type: &csi.NodeServiceCapability_Rpc{Rpc: &csi.NodeServiceCapability_RPC{Type: capability}},
++		})
++	}
++	return response, nil
+ }
+ 
+ func (ns *nodeServer) NodeGetInfo(ctx context.Context, _ *csi.NodeGetInfoRequest) (*csi.NodeGetInfoResponse, error) {
+diff --git a/pkg/driver/nodeserver_test.go b/pkg/driver/nodeserver_test.go
+index d45afd466a2ac26a9b2e5500fc7796f44b217a87..9aee52908c363295ad36f282f88a749f9e8c0252 100644
+--- a/pkg/driver/nodeserver_test.go
++++ b/pkg/driver/nodeserver_test.go
+@@ -4,6 +4,7 @@
+ package driver
+ 
+ import (
++	"context"
+ 	b64 "encoding/base64"
+ 	"encoding/json"
+ 	"os"
+@@ -13,6 +14,15 @@ import (
+ 	"github.com/container-storage-interface/spec/lib/go/csi"
+ )
+ 
++// The startup cleanup also sees records written by older CSI versions.
++type legacyMountInfoJSON struct {
++	VolumeType string            `json:"volume-type"`
++	Device     string            `json:"device"`
++	FsType     string            `json:"fstype"`
++	Metadata   map[string]string `json:"metadata,omitempty"`
++	Options    []string          `json:"options,omitempty"`
++}
++
+ func TestParseKataVolumeStats(t *testing.T) {
+ 	t.Parallel()
+ 
+@@ -55,7 +65,7 @@ func TestParseKataVolumeStats(t *testing.T) {
+ 
+ // writeMountInfoDir creates a base64-encoded dir under rootDir with a
+ // mountInfo.json inside it. Returns the dir path.
+-func writeMountInfoDir(t *testing.T, rootDir, targetPath string, info *mountInfoJSON) string {
++func writeMountInfoDir(t *testing.T, rootDir, targetPath string, info *legacyMountInfoJSON) string {
+ 	t.Helper()
+ 	dirName := b64.URLEncoding.EncodeToString([]byte(targetPath))
+ 	dirPath := filepath.Join(rootDir, dirName)
+@@ -80,7 +90,7 @@ func TestCleanStaleMountInfoDirs_TargetExists(t *testing.T) {
+ 	rootDir := t.TempDir()
+ 	targetPath := t.TempDir()
+ 
+-	dirPath := writeMountInfoDir(t, rootDir, targetPath, &mountInfoJSON{
++	dirPath := writeMountInfoDir(t, rootDir, targetPath, &legacyMountInfoJSON{
+ 		VolumeType: "directvol",
+ 		Device:     "/dev/sda",
+ 		FsType:     "ext4",
+@@ -99,7 +109,7 @@ func TestCleanStaleMountInfoDirs_TargetGone(t *testing.T) {
+ 	rootDir := t.TempDir()
+ 	targetPath := filepath.Join(t.TempDir(), "gone")
+ 
+-	dirPath := writeMountInfoDir(t, rootDir, targetPath, &mountInfoJSON{
++	dirPath := writeMountInfoDir(t, rootDir, targetPath, &legacyMountInfoJSON{
+ 		VolumeType: "directvol",
+ 		Device:     "/dev/sda",
+ 		FsType:     "ext4",
+@@ -159,3 +169,19 @@ func TestCleanStaleMountInfoDirs_NonexistentRoot(t *testing.T) {
+ 
+ 	cleanStaleMountInfoDirs("/nonexistent/path/" + t.Name())
+ }
++
++func TestNodeGetCapabilitiesAdvertisesVolumeMountGroup(t *testing.T) {
++	t.Parallel()
++
++	response, err := (&nodeServer{}).NodeGetCapabilities(context.Background(), &csi.NodeGetCapabilitiesRequest{})
++	if err != nil {
++		t.Fatalf("NodeGetCapabilities failed: %v", err)
++	}
++
++	for _, capability := range response.GetCapabilities() {
++		if capability.GetRpc().GetType() == csi.NodeServiceCapability_RPC_VOLUME_MOUNT_GROUP {
++			return
++		}
++	}
++	t.Fatal("VOLUME_MOUNT_GROUP capability is not advertised")
++}
 diff --git a/pkg/driver/testdata/direct-volume-v1.json b/pkg/driver/testdata/direct-volume-v1.json
 new file mode 100644
 index 0000000000000000000000000000000000000000..c8c6d41287c8503aa4b6517494671416c440c119
@@ -1226,6 +1333,3 @@ index 0000000000000000000000000000000000000000..c8c6d41287c8503aa4b6517494671416
 +++ b/pkg/driver/testdata/direct-volume-v1.json
 @@ -0,0 +1 @@
 +{"version":1,"volume-type":"block","volume-mode":"filesystem","device":"d-workspace123","fstype":"ext4","readonly":true,"options":["noatime","ro"],"fs-group":"2000","pod-uid":"pod-uid-123","volume-handle":"pvc-workspace","metadata":{"cloud-provider":"alibabacloud","cloud-volume-path":"d-workspace123"}}
--- 
-2.43.7
-

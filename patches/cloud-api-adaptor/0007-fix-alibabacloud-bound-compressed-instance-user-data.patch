@@ -1,17 +1,14 @@
-From 956e918021b117a908a0e7444e7aedcff8328c06 Mon Sep 17 00:00:00 2001
+From a0df5d2bb0d10154bd7388155060af9453e6dd1d Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
-Date: Wed, 26 Aug 2026 12:12:22 +0800
-Subject: [PATCH 07/10] fix(alibabacloud): bound compressed instance user data
+Date: Mon, 2 Nov 2026 16:31:23 +0800
+Subject: [PATCH] fix(alibabacloud): bound compressed instance user data
 
-Compress Alibaba Cloud instance user data before CreateInstance and transparently decode it in the guest. Enforce the existing one MiB limit on both raw input and decompressed output so compression cannot bypass the guest boundary.
-
-Signed-off-by: Weidong Sun <sunweidong@linux.alibaba.com>
 ---
  .../pkg/userdata/alibabacloud_test.go         | 67 ++++++++++++++
  .../pkg/userdata/provision.go                 | 36 +++++++-
- src/cloud-providers/alibabacloud/provider.go  | 36 +++++++-
+ src/cloud-providers/alibabacloud/provider.go  | 38 +++++++-
  .../alibabacloud/userdata_test.go             | 87 +++++++++++++++++++
- 4 files changed, 222 insertions(+), 4 deletions(-)
+ 4 files changed, 223 insertions(+), 5 deletions(-)
  create mode 100644 src/cloud-api-adaptor/pkg/userdata/alibabacloud_test.go
  create mode 100644 src/cloud-providers/alibabacloud/userdata_test.go
 
@@ -153,7 +150,7 @@ index 2807a3cd02f488ee9f463d65afaddc36c057bc90..49dc5c8a0a4a16848886ed537e6b50b2
  
  func newProvider(ctx context.Context) (UserDataProvider, error) {
 diff --git a/src/cloud-providers/alibabacloud/provider.go b/src/cloud-providers/alibabacloud/provider.go
-index c51f1b1df18208c6f6f178827879319956ae199b..8a2b35b7e854ff596713a0a2751330cfc07ce651 100644
+index 9347069ae6fb55039765186d33715806808511c6..c7cc440083b22306e98c37fe24b9b67639236fa5 100644
 --- a/src/cloud-providers/alibabacloud/provider.go
 +++ b/src/cloud-providers/alibabacloud/provider.go
 @@ -4,6 +4,8 @@
@@ -163,13 +160,15 @@ index c51f1b1df18208c6f6f178827879319956ae199b..8a2b35b7e854ff596713a0a2751330cf
 +	"bytes"
 +	"compress/gzip"
  	"context"
+ 	"crypto/sha256"
  	"encoding/base64"
- 	"errors"
-@@ -30,13 +32,39 @@ import (
+@@ -31,14 +33,40 @@ import (
  var logger = log.New(log.Writer(), "[adaptor/cloud/alibabacloud] ", log.LstdFlags|log.Lmsgprefix)
  
  const (
+-	sandboxIDTagKey    = "SandboxId"
 -	maxInstanceNameLen = 63
++	sandboxIDTagKey         = "SandboxId"
 +	maxInstanceNameLen      = 63
 +	maxUserDataPayloadBytes = 16 * 1024
  
@@ -206,7 +205,7 @@ index c51f1b1df18208c6f6f178827879319956ae199b..8a2b35b7e854ff596713a0a2751330cf
  var (
  	instanceCleanupTimeout      = 10 * time.Minute
  	instanceCleanupPollInterval = 2 * time.Second
-@@ -232,8 +260,10 @@ func (p *alibabaCloudProvider) CreateInstance(ctx context.Context, podName, sand
+@@ -223,8 +251,10 @@ func (p *alibabaCloudProvider) CreateInstance(ctx context.Context, podName, sand
  		return nil, err
  	}
  

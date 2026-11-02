@@ -1,5 +1,5 @@
-2975cb6f1f00bd894d863b7e98575a1f3aa62ebf0d2047aa781f30ab129a11b4  0001-fix-node-publish-atomic-readonly-direct-volume-metad.patch
-a140d23e74c2ed7fd67839e51632279e4910330f19cbd19182aeb7ef06685ba1  0002-fix-controller-persist-resumable-volume-create-opera.patch
-9fd1e6b69ee8244eb2b20b4a1e0ae2c9546e918293106a4b72af104ca1dc401a  0003-feat-alibabacloud-add-crash-resilient-ESSD-provision.patch
-d0cd309cc45430295e1b8800287adbaecf24f75cf82f96dd8b835b8a6fd94d0d  0004-fix-node-advertise-delegated-fsGroup-support.patch
-069633876a27fec98f5eea809140f907e0a7c475ba99d53cba29e9e0ffe9df4c  0005-build-pin-the-CSI-runtime-base-image.patch
+a3270ae3d1f5ffd869eb82bdb4ca3f5815c9eca44270efc0bbc8f0723f305136  ./0001-feat-alibabacloud-provision-ESSD-with-existing-provi.patch
+c157e2321e4e3e6507cdc7809672be9adac5406a613396c7e3151ef4af72229d  ./0002-feat-node-publish-the-paired-CAA-volume-contract-ato.patch
+df6361d86d065607ce00bfca695ed2844db5dbcf1d99b48824b4d22d9d8a44b1  ./0003-feat-deploy-separate-controller-credentials-and-node.patch
+bbd8cef5c99793a96fb8d5a7a429ac63384175f34729ca46d81f5af83a568fbe  ./0004-test-share-the-CSI-conformance-runner-between-local-.patch
+4c90c8f3894d15bb8c71498da3c15018e6cee7755dfa414d48d1999aeb71ed0b  ./0005-build-pin-the-runtime-base-manifest-index.patch

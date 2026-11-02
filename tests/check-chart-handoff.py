@@ -111,14 +111,20 @@ def assert_resources(resources):
     node_pod = node['spec']['template']['spec']
     control = {c['name']: c for c in control_pod['containers']}
     nodes = {c['name']: c for c in node_pod['containers']}
-    require(set(control) == {'csi-provisioner', 'caa-csi-block-controller'}, 'controller sidecar split changed')
+    require(set(control) == {'csi-provisioner', 'csi-resizer', 'caa-csi-block-controller'}, 'controller sidecar split changed')
     require(set(nodes) == {'node-driver-registrar', 'caa-csi-block-driver'}, 'node must not run provisioner/controller')
     driver = control['caa-csi-block-controller']
     require('--component=controller' in driver['args'] and '--volume-store-dir=/var/lib/caa-csi-block/volumes' in driver['args'],
-            'controller is not using durable journal mode')
+            'controller volume store is not configured')
     require('--leader-election=true' in control['csi-provisioner']['args'], 'provisioner leader election missing')
     require('--component=node' in nodes['caa-csi-block-driver']['args'] and '--nodeid=$(KUBE_NODE_NAME)' in nodes['caa-csi-block-driver']['args'],
             'node mode/identity missing')
+    require('--csi-address=/csi/csi.sock' in control['csi-resizer']['args'], 'resizer is not connected to controller')
+    node_role = one('ClusterRole', 'caa-csi-block-node')
+    require(node_role['rules'] == [{'apiGroups': [''], 'resources': ['nodes'], 'verbs': ['get']}],
+            'node topology lookup must not gain controller privileges')
+    require(not any(m['name'] == 'node-api-access' for m in nodes['node-driver-registrar']['volumeMounts']),
+            'registrar must not receive node API token')
     require(node_pod['automountServiceAccountToken'] is False, 'node token automount must stay disabled')
     require(control_pod['serviceAccountName'] != node_pod['serviceAccountName'], 'controller/node service accounts must differ')
     node_sa = one('ServiceAccount', node_pod['serviceAccountName'])
@@ -129,8 +135,8 @@ def assert_resources(resources):
     volumes = {v['name']: v for v in control_pod['volumes']}
     mounts = {m['name']: m for m in driver['volumeMounts']}
     require(volumes['controller-state'] == {'name': 'controller-state', 'persistentVolumeClaim': {'claimName': pvc['metadata']['name']}},
-            'controller journal must use the durable PVC, not emptyDir/hostPath')
-    require(mounts['controller-state']['mountPath'] == '/var/lib/caa-csi-block', 'durable journal mount missing')
+            'controller volume store must use the PVC, not emptyDir/hostPath')
+    require(mounts['controller-state']['mountPath'] == '/var/lib/caa-csi-block', 'controller volume store mount missing')
     require(all('hostPath' not in v for v in control_pod['volumes']), 'controller must not mount worker host paths')
     env = {e['name']: e.get('value') for e in driver['env']}
     require(env['CSI_CLOUD_PROVIDER'] == 'alibabacloud', 'wrong CSI cloud provider')
@@ -148,8 +154,7 @@ def assert_resources(resources):
             'controller credentials/state leaked into node spec')
     require(storage['provisioner'] == 'caa-csi-block.csi.confidentialcontainers.io' and storage['allowVolumeExpansion'] is False
             and storage['volumeBindingMode'] == 'Immediate' and storage['reclaimPolicy'] == 'Delete', 'incorrect PeerPod StorageClass semantics')
-    expected = {'cloudProvider': 'alibabacloud', 'region': 'REGION', 'zoneId': 'ZONE', 'clusterId': 'ACK_CLUSTER_ID',
-                'diskCategory': 'cloud_essd', 'performanceLevel': 'PL0'}
+    expected = {'cloudProvider': 'alibabacloud', 'region': 'REGION', 'zoneId': 'ZONE', 'clusterId': 'ACK_CLUSTER_ID'}
     require(storage['parameters'] == expected, 'Alibaba storage parameters missing or changed')
     config = one('ConfigMap', volumes['bootstrap-params']['configMap']['name'])
     bootstrap = json.loads(config['data']['bootstrap-params.json'])

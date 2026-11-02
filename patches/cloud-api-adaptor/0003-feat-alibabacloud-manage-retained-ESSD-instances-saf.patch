@@ -1,584 +1,24 @@
-From 3488a7574c75e998dfccdb6fd568df929b0e92dd Mon Sep 17 00:00:00 2001
+From 45d82509eb3f2845b8c9ef008184f719b2f40924 Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
-Date: Wed, 26 Aug 2026 12:10:28 +0800
-Subject: [PATCH 03/10] feat(alibabacloud): manage retained ESSD instances
- safely
+Date: Mon, 2 Nov 2026 16:30:24 +0800
+Subject: [PATCH] feat(alibabacloud): attach and retain ESSD data disks
 
-Attach validated same-zone ESSD data disks as retained, non-bootable devices and reconcile ambiguous attach results. Reuse one client token across retries of a logical instance create, recover unknown success by tags, and clean up only instances and disks owned by that operation.
-
-Require the cloud to report multi-attach as explicitly disabled at planning, reconciliation and cleanup boundaries so a disk cannot enter a state that later cleanup refuses to own.
-
-Signed-off-by: Weidong Sun <sunweidong@linux.alibaba.com>
 ---
- .../alibabacloud/create_operation.go          | 183 ++++++
- .../alibabacloud/create_operation_test.go     | 355 ++++++++++++
- .../alibabacloud/delete_instance_test.go      | 547 ++++++++++++++++++
- src/cloud-providers/alibabacloud/provider.go  | 271 +++++++--
- src/cloud-providers/alibabacloud/volumes.go   | 455 +++++++++++++++
- .../alibabacloud/volumes_test.go              | 265 +++++++++
- 6 files changed, 2042 insertions(+), 34 deletions(-)
- create mode 100644 src/cloud-providers/alibabacloud/create_operation.go
- create mode 100644 src/cloud-providers/alibabacloud/create_operation_test.go
+ .../alibabacloud/delete_instance_test.go      | 467 ++++++++++++++++++
+ src/cloud-providers/alibabacloud/provider.go  | 219 ++++++--
+ src/cloud-providers/alibabacloud/volumes.go   | 380 ++++++++++++++
+ .../alibabacloud/volumes_test.go              | 253 ++++++++++
+ 4 files changed, 1284 insertions(+), 35 deletions(-)
  create mode 100644 src/cloud-providers/alibabacloud/delete_instance_test.go
  create mode 100644 src/cloud-providers/alibabacloud/volumes.go
  create mode 100644 src/cloud-providers/alibabacloud/volumes_test.go
 
-diff --git a/src/cloud-providers/alibabacloud/create_operation.go b/src/cloud-providers/alibabacloud/create_operation.go
-new file mode 100644
-index 0000000000000000000000000000000000000000..c268efa01f9982a4ce15346fc4110c078422a7f6
---- /dev/null
-+++ b/src/cloud-providers/alibabacloud/create_operation.go
-@@ -0,0 +1,183 @@
-+// (C) Copyright Confidential Containers Contributors
-+// SPDX-License-Identifier: Apache-2.0
-+
-+package alibabacloud
-+
-+import (
-+	"context"
-+	"crypto/sha256"
-+	"encoding/hex"
-+	"encoding/json"
-+	"errors"
-+	"fmt"
-+	"time"
-+
-+	ecs "github.com/alibabacloud-go/ecs-20140526/v4/client"
-+	"github.com/alibabacloud-go/tea/tea"
-+
-+	provider "github.com/confidential-containers/cloud-api-adaptor/src/cloud-providers"
-+)
-+
-+const (
-+	sandboxIDTagKey         = "SandboxId"
-+	createOperationTagKey   = "CreateOperationId"
-+	createFingerprintTagKey = "CreateRequestFingerprint"
-+	createOperationDomain   = "confidential-containers/cloud-api-adaptor/alibabacloud/create-instance/v1\x00"
-+)
-+
-+var (
-+	createReconcileTimeout  = 15 * time.Second
-+	createReconcileInterval = time.Second
-+)
-+
-+type createOperation struct {
-+	id          string
-+	clientToken string
-+	fingerprint string
-+}
-+
-+// createOperationForRequest binds Alibaba Cloud idempotency to the CRI
-+// sandbox lifetime. Retries, including retries after a provider restart, use
-+// the same ClientToken. A recreated CRI sandbox has a new sandbox ID and thus
-+// a new token.
-+func createOperationForRequest(sandboxID, fingerprint string) (createOperation, error) {
-+	if sandboxID == "" {
-+		return createOperation{}, errors.New("cannot create an Alibaba Cloud instance without a sandbox ID")
-+	}
-+	digest := sha256.Sum256([]byte(createOperationDomain + sandboxID))
-+	id := hex.EncodeToString(digest[:16])
-+	return createOperation{
-+		id: id, clientToken: "caa-" + id, fingerprint: fingerprint,
-+	}, nil
-+}
-+
-+func instanceTagValue(instance *ecs.DescribeInstancesResponseBodyInstancesInstance, key string) string {
-+	if instance == nil || instance.Tags == nil {
-+		return ""
-+	}
-+	for _, tag := range instance.Tags.Tag {
-+		if tag != nil && tea.StringValue(tag.TagKey) == key {
-+			return tea.StringValue(tag.TagValue)
-+		}
-+	}
-+	return ""
-+}
-+
-+func createRequestFingerprint(request *ecs.RunInstancesRequest, volumes []provider.CloudVolume) (string, error) {
-+	diskIDs := make([]string, len(volumes))
-+	for index, volume := range volumes {
-+		diskIDs[index] = volume.DiskID
-+	}
-+	payload, err := json.Marshal(struct {
-+		Request *ecs.RunInstancesRequest `json:"request"`
-+		Disks   []string                 `json:"disks"`
-+	}{Request: request, Disks: diskIDs})
-+	if err != nil {
-+		return "", fmt.Errorf("encode Alibaba Cloud create parameters: %w", err)
-+	}
-+	digest := sha256.Sum256(payload)
-+	return hex.EncodeToString(digest[:]), nil
-+}
-+
-+func runInstancesInstanceID(response *ecs.RunInstancesResponse) string {
-+	if response == nil || response.Body == nil || response.Body.InstanceIdSets == nil || len(response.Body.InstanceIdSets.InstanceIdSet) != 1 {
-+		return ""
-+	}
-+	return tea.StringValue(response.Body.InstanceIdSets.InstanceIdSet[0])
-+}
-+
-+func (p *alibabaCloudProvider) runInstanceForCreateOperation(ctx context.Context, sandboxID string, request *ecs.RunInstancesRequest, operation createOperation) (string, error) {
-+	request.ClientToken = tea.String(operation.clientToken)
-+	request.Tag = append(request.Tag, &ecs.RunInstancesRequestTag{
-+		Key: tea.String(createOperationTagKey), Value: tea.String(operation.id),
-+	})
-+	response, runErr := p.ecsClient.RunInstances(request)
-+	instanceID := runInstancesInstanceID(response)
-+	if runErr != nil && instanceID == "" && !isAmbiguousAlibabaCloudError(runErr) {
-+		return "", fmt.Errorf("create Alibaba Cloud instance: %w", runErr)
-+	}
-+	if instanceID != "" {
-+		return instanceID, nil
-+	}
-+
-+	if runErr != nil {
-+		logger.Printf("RunInstances outcome is unknown for operation %s; reconciling by tag", operation.id)
-+	}
-+	instanceID, err := p.reconcileCreateOperation(ctx, sandboxID, operation)
-+	if err != nil {
-+		return "", fmt.Errorf("reconcile Alibaba Cloud create operation: %w", err)
-+	}
-+	if instanceID == "" {
-+		if runErr == nil {
-+			runErr = errors.New("RunInstances returned no instance ID")
-+		}
-+		return "", fmt.Errorf("Alibaba Cloud create outcome remains unknown: %w", runErr)
-+	}
-+	return instanceID, nil
-+}
-+
-+func (p *alibabaCloudProvider) reconcileCreateOperation(ctx context.Context, sandboxID string, operation createOperation) (string, error) {
-+	reconcileCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), createReconcileTimeout)
-+	defer cancel()
-+	for {
-+		response, err := p.ecsClient.DescribeInstances(&ecs.DescribeInstancesRequest{
-+			RegionId: tea.String(p.serviceConfig.Region),
-+			PageSize: tea.Int32(10),
-+			Tag: []*ecs.DescribeInstancesRequestTag{
-+				{Key: tea.String(sandboxIDTagKey), Value: tea.String(sandboxID)},
-+				{Key: tea.String(createOperationTagKey), Value: tea.String(operation.id)},
-+			},
-+		})
-+		if err != nil {
-+			return "", err
-+		}
-+		instanceID, err := reconciledCreateInstanceID(response, sandboxID, operation)
-+		if err != nil || instanceID != "" {
-+			return instanceID, err
-+		}
-+
-+		timer := time.NewTimer(createReconcileInterval)
-+		select {
-+		case <-reconcileCtx.Done():
-+			timer.Stop()
-+			return "", nil
-+		case <-timer.C:
-+		}
-+	}
-+}
-+
-+func reconciledCreateInstanceID(response *ecs.DescribeInstancesResponse, sandboxID string, operation createOperation) (string, error) {
-+	if response == nil || response.Body == nil || response.Body.Instances == nil {
-+		return "", errors.New("DescribeInstances returned an incomplete response")
-+	}
-+	instances := response.Body.Instances.Instance
-+	if response.Body.TotalCount != nil && int(tea.Int32Value(response.Body.TotalCount)) != len(instances) {
-+		return "", fmt.Errorf("create operation %s matched %d instances but DescribeInstances returned %d", operation.id, tea.Int32Value(response.Body.TotalCount), len(instances))
-+	}
-+	if len(instances) == 0 {
-+		return "", nil
-+	}
-+	if len(instances) != 1 || instances[0] == nil {
-+		return "", fmt.Errorf("create operation %s matched %d instances", operation.id, len(instances))
-+	}
-+
-+	instance := instances[0]
-+	instanceID := tea.StringValue(instance.InstanceId)
-+	if instanceID == "" {
-+		return "", fmt.Errorf("create operation %s matched an instance without an ID", operation.id)
-+	}
-+	expectedTags := []struct {
-+		key   string
-+		value string
-+	}{
-+		{key: sandboxIDTagKey, value: sandboxID},
-+		{key: createOperationTagKey, value: operation.id},
-+		{key: createFingerprintTagKey, value: operation.fingerprint},
-+	}
-+	for _, expected := range expectedTags {
-+		if value := instanceTagValue(instance, expected.key); value != expected.value {
-+			return "", fmt.Errorf("instance %s has %s tag %q, expected %q", instanceID, expected.key, value, expected.value)
-+		}
-+	}
-+	return instanceID, nil
-+}
-diff --git a/src/cloud-providers/alibabacloud/create_operation_test.go b/src/cloud-providers/alibabacloud/create_operation_test.go
-new file mode 100644
-index 0000000000000000000000000000000000000000..6a71bac7e5a46759db4ef54cacf6504807667200
---- /dev/null
-+++ b/src/cloud-providers/alibabacloud/create_operation_test.go
-@@ -0,0 +1,355 @@
-+// (C) Copyright Confidential Containers Contributors
-+// SPDX-License-Identifier: Apache-2.0
-+
-+package alibabacloud
-+
-+import (
-+	"context"
-+	"errors"
-+	"strings"
-+	"testing"
-+	"time"
-+
-+	ecs "github.com/alibabacloud-go/ecs-20140526/v4/client"
-+	"github.com/alibabacloud-go/tea/tea"
-+
-+	provider "github.com/confidential-containers/cloud-api-adaptor/src/cloud-providers"
-+)
-+
-+type fakeCreateECSClient struct {
-+	*ecs.Client
-+	runResponses      []*ecs.RunInstancesResponse
-+	runErrors         []error
-+	runRequests       []*ecs.RunInstancesRequest
-+	describeInstances []*ecs.DescribeInstancesResponseBodyInstancesInstance
-+	describeRequests  []*ecs.DescribeInstancesRequest
-+	describeError     error
-+	describeTotal     *int32
-+}
-+
-+func (f *fakeCreateECSClient) RunInstances(request *ecs.RunInstancesRequest) (*ecs.RunInstancesResponse, error) {
-+	f.runRequests = append(f.runRequests, request)
-+	index := len(f.runRequests) - 1
-+	var response *ecs.RunInstancesResponse
-+	var err error
-+	if index < len(f.runResponses) {
-+		response = f.runResponses[index]
-+	}
-+	if index < len(f.runErrors) {
-+		err = f.runErrors[index]
-+	}
-+	return response, err
-+}
-+
-+func (f *fakeCreateECSClient) DescribeInstances(request *ecs.DescribeInstancesRequest) (*ecs.DescribeInstancesResponse, error) {
-+	f.describeRequests = append(f.describeRequests, request)
-+	if f.describeError != nil {
-+		return nil, f.describeError
-+	}
-+	return &ecs.DescribeInstancesResponse{
-+		Body: &ecs.DescribeInstancesResponseBody{
-+			TotalCount: f.describeTotal,
-+			Instances:  &ecs.DescribeInstancesResponseBodyInstances{Instance: f.describeInstances},
-+		},
-+	}, nil
-+}
-+
-+func describedCreateInstance(instanceID, sandboxID, fingerprint, operationID string) *ecs.DescribeInstancesResponseBodyInstancesInstance {
-+	values := []struct {
-+		key   string
-+		value string
-+	}{
-+		{key: sandboxIDTagKey, value: sandboxID},
-+		{key: createOperationTagKey, value: operationID},
-+		{key: createFingerprintTagKey, value: fingerprint},
-+	}
-+	tags := make([]*ecs.DescribeInstancesResponseBodyInstancesInstanceTagsTag, 0, len(values))
-+	for _, value := range values {
-+		if value.value != "" {
-+			tags = append(tags, &ecs.DescribeInstancesResponseBodyInstancesInstanceTagsTag{
-+				TagKey: tea.String(value.key), TagValue: tea.String(value.value),
-+			})
-+		}
-+	}
-+	return &ecs.DescribeInstancesResponseBodyInstancesInstance{
-+		InstanceId: tea.String(instanceID),
-+		Tags:       &ecs.DescribeInstancesResponseBodyInstancesInstanceTags{Tag: tags},
-+	}
-+}
-+
-+func newCreateTestProvider(client ecsClient) *alibabaCloudProvider {
-+	return &alibabaCloudProvider{
-+		ecsClient: client, serviceConfig: &Config{Region: "cn-hangzhou"},
-+	}
-+}
-+
-+func successfulRunInstances(instanceID string) *ecs.RunInstancesResponse {
-+	return &ecs.RunInstancesResponse{
-+		Body: &ecs.RunInstancesResponseBody{
-+			InstanceIdSets: &ecs.RunInstancesResponseBodyInstanceIdSets{
-+				InstanceIdSet: []*string{tea.String(instanceID)},
-+			},
-+		},
-+	}
-+}
-+
-+func createTestRequest(sandboxID, fingerprint string) *ecs.RunInstancesRequest {
-+	return &ecs.RunInstancesRequest{Tag: []*ecs.RunInstancesRequestTag{
-+		{Key: tea.String(sandboxIDTagKey), Value: tea.String(sandboxID)},
-+		{Key: tea.String(createFingerprintTagKey), Value: tea.String(fingerprint)},
-+	}}
-+}
-+
-+func requestTagValue(tags []*ecs.RunInstancesRequestTag, key string) string {
-+	for _, tag := range tags {
-+		if tag != nil && tea.StringValue(tag.Key) == key {
-+			return tea.StringValue(tag.Value)
-+		}
-+	}
-+	return ""
-+}
-+
-+func requestDescribeTagValue(tags []*ecs.DescribeInstancesRequestTag, key string) string {
-+	for _, tag := range tags {
-+		if tag != nil && tea.StringValue(tag.Key) == key {
-+			return tea.StringValue(tag.Value)
-+		}
-+	}
-+	return ""
-+}
-+
-+func useFastCreateReconcile(t *testing.T) {
-+	t.Helper()
-+	oldTimeout, oldInterval := createReconcileTimeout, createReconcileInterval
-+	createReconcileTimeout, createReconcileInterval = 8*time.Millisecond, time.Millisecond
-+	t.Cleanup(func() {
-+		createReconcileTimeout, createReconcileInterval = oldTimeout, oldInterval
-+	})
-+}
-+
-+func TestCreateOperationStableAcrossFreshProviders(t *testing.T) {
-+	firstClient := &fakeCreateECSClient{runResponses: []*ecs.RunInstancesResponse{successfulRunInstances("i-first")}}
-+	firstProvider := newCreateTestProvider(firstClient)
-+	secondClient := &fakeCreateECSClient{runResponses: []*ecs.RunInstancesResponse{successfulRunInstances("i-created")}}
-+	secondProvider := newCreateTestProvider(secondClient)
-+
-+	first, err := createOperationForRequest("sandbox-stable", "fingerprint")
-+	if err != nil {
-+		t.Fatal(err)
-+	}
-+	second, err := createOperationForRequest("sandbox-stable", "fingerprint")
-+	if err != nil {
-+		t.Fatal(err)
-+	}
-+	if first != second {
-+		t.Fatalf("fresh providers derived different operations: first=%+v second=%+v", first, second)
-+	}
-+	if !strings.HasPrefix(first.clientToken, "caa-") || len(first.id) != 32 {
-+		t.Fatalf("operation has unexpected Alibaba Cloud identities: %+v", first)
-+	}
-+
-+	// The provider restart does not need a speculative pre-query. Alibaba Cloud
-+	// resolves the deterministic ClientToken when RunInstances is retried.
-+	if _, err := firstProvider.runInstanceForCreateOperation(context.Background(), "sandbox-stable", createTestRequest("sandbox-stable", "fingerprint"), first); err != nil {
-+		t.Fatal(err)
-+	}
-+	if _, err := secondProvider.runInstanceForCreateOperation(context.Background(), "sandbox-stable", createTestRequest("sandbox-stable", "fingerprint"), second); err != nil {
-+		t.Fatal(err)
-+	}
-+	if len(firstClient.describeRequests) != 0 || len(secondClient.describeRequests) != 0 {
-+		t.Fatalf("successful calls performed pre-Run recovery queries: first=%d second=%d", len(firstClient.describeRequests), len(secondClient.describeRequests))
-+	}
-+	if firstToken, secondToken := tea.StringValue(firstClient.runRequests[0].ClientToken), tea.StringValue(secondClient.runRequests[0].ClientToken); firstToken != first.clientToken || firstToken != secondToken {
-+		t.Fatalf("RunInstances tokens = %q and %q, want %q", firstToken, secondToken, first.clientToken)
-+	}
-+}
-+
-+func TestCreateOperationUnknownSuccessReconcilesByIdentity(t *testing.T) {
-+	operation, err := createOperationForRequest("sandbox-unknown", "fingerprint")
-+	if err != nil {
-+		t.Fatal(err)
-+	}
-+	total := int32(1)
-+	client := &fakeCreateECSClient{
-+		runErrors:     []error{context.DeadlineExceeded},
-+		describeTotal: &total,
-+		describeInstances: []*ecs.DescribeInstancesResponseBodyInstancesInstance{
-+			describedCreateInstance("i-reconciled", "sandbox-unknown", "fingerprint", operation.id),
-+		},
-+	}
-+	p := newCreateTestProvider(client)
-+
-+	instanceID, err := p.runInstanceForCreateOperation(context.Background(), "sandbox-unknown", createTestRequest("sandbox-unknown", "fingerprint"), operation)
-+	if err != nil {
-+		t.Fatalf("runInstanceForCreateOperation() error = %v", err)
-+	}
-+	if instanceID != "i-reconciled" {
-+		t.Fatalf("instance ID = %q, want i-reconciled", instanceID)
-+	}
-+	if len(client.describeRequests) != 1 ||
-+		requestDescribeTagValue(client.describeRequests[0].Tag, sandboxIDTagKey) != "sandbox-unknown" ||
-+		requestDescribeTagValue(client.describeRequests[0].Tag, createOperationTagKey) != operation.id {
-+		t.Fatalf("reconcile query did not use immutable operation identity: %+v", client.describeRequests)
-+	}
-+	if requestTagValue(client.runRequests[0].Tag, createOperationTagKey) != operation.id {
-+		t.Fatalf("RunInstances operation tag does not match %q", operation.id)
-+	}
-+	if requestTagValue(client.runRequests[0].Tag, createFingerprintTagKey) != operation.fingerprint {
-+		t.Fatalf("RunInstances fingerprint tag does not match %q", operation.fingerprint)
-+	}
-+}
-+
-+func TestCreateOperationEmptyReconcileThenRestartRetriesSameToken(t *testing.T) {
-+	useFastCreateReconcile(t)
-+	firstClient := &fakeCreateECSClient{runErrors: []error{context.DeadlineExceeded}}
-+	firstProvider := newCreateTestProvider(firstClient)
-+	first, err := createOperationForRequest("sandbox-restart", "fingerprint")
-+	if err != nil {
-+		t.Fatal(err)
-+	}
-+	if _, err := firstProvider.runInstanceForCreateOperation(context.Background(), "sandbox-restart", createTestRequest("sandbox-restart", "fingerprint"), first); err == nil {
-+		t.Fatal("expected the empty bounded reconcile to preserve an unknown outcome")
-+	}
-+
-+	secondClient := &fakeCreateECSClient{runResponses: []*ecs.RunInstancesResponse{successfulRunInstances("i-retried")}}
-+	secondProvider := newCreateTestProvider(secondClient)
-+	second, err := createOperationForRequest("sandbox-restart", "fingerprint")
-+	if err != nil {
-+		t.Fatal(err)
-+	}
-+	if _, err := secondProvider.runInstanceForCreateOperation(context.Background(), "sandbox-restart", createTestRequest("sandbox-restart", "fingerprint"), second); err != nil {
-+		t.Fatal(err)
-+	}
-+	if first.clientToken != second.clientToken ||
-+		tea.StringValue(firstClient.runRequests[0].ClientToken) != tea.StringValue(secondClient.runRequests[0].ClientToken) {
-+		t.Fatalf("provider restart changed ClientToken: first=%q second=%q", first.clientToken, second.clientToken)
-+	}
-+}
-+
-+func TestCreateOperationChangedParametersUsesSameTokenAndFailsClosed(t *testing.T) {
-+	status := 400
-+	mismatch := &tea.SDKError{StatusCode: &status, Code: tea.String("IdempotentParameterMismatch")}
-+	client := &fakeCreateECSClient{
-+		runResponses: []*ecs.RunInstancesResponse{successfulRunInstances("i-original"), nil},
-+		runErrors:    []error{nil, mismatch},
-+	}
-+	p := newCreateTestProvider(client)
-+	first, err := createOperationForRequest("sandbox-parameters", "fingerprint-one")
-+	if err != nil {
-+		t.Fatal(err)
-+	}
-+	second, err := createOperationForRequest("sandbox-parameters", "fingerprint-two")
-+	if err != nil {
-+		t.Fatal(err)
-+	}
-+	if first.clientToken != second.clientToken || first.id != second.id {
-+		t.Fatalf("same sandbox changed operation identity: first=%+v second=%+v", first, second)
-+	}
-+	if first.fingerprint == second.fingerprint {
-+		t.Fatal("changed request did not change the reconciliation fingerprint")
-+	}
-+	if _, err := p.runInstanceForCreateOperation(context.Background(), "sandbox-parameters", createTestRequest("sandbox-parameters", first.fingerprint), first); err != nil {
-+		t.Fatal(err)
-+	}
-+	_, err = p.runInstanceForCreateOperation(context.Background(), "sandbox-parameters", createTestRequest("sandbox-parameters", second.fingerprint), second)
-+	if err == nil {
-+		t.Fatal("IdempotentParameterMismatch was accepted")
-+	}
-+	var sdkErr *tea.SDKError
-+	if !errors.As(err, &sdkErr) || tea.StringValue(sdkErr.Code) != "IdempotentParameterMismatch" {
-+		t.Fatalf("changed request error = %v", err)
-+	}
-+	if len(client.runRequests) != 2 || tea.StringValue(client.runRequests[0].ClientToken) != tea.StringValue(client.runRequests[1].ClientToken) {
-+		t.Fatal("same sandbox parameter mismatch used different ClientTokens")
-+	}
-+}
-+
-+func TestCreateOperationNewSandboxGetsNewToken(t *testing.T) {
-+	first, err := createOperationForRequest("sandbox-old", "fingerprint")
-+	if err != nil {
-+		t.Fatal(err)
-+	}
-+	second, err := createOperationForRequest("sandbox-recreated", "fingerprint")
-+	if err != nil {
-+		t.Fatal(err)
-+	}
-+	if first.clientToken == second.clientToken || first.id == second.id {
-+		t.Fatalf("new CRI sandbox reused create identity: first=%+v second=%+v", first, second)
-+	}
-+}
-+
-+func TestCreateOperationReconcileIsBounded(t *testing.T) {
-+	useFastCreateReconcile(t)
-+	operation, err := createOperationForRequest("sandbox-bounded", "fingerprint")
-+	if err != nil {
-+		t.Fatal(err)
-+	}
-+	client := &fakeCreateECSClient{runErrors: []error{context.DeadlineExceeded}}
-+	p := newCreateTestProvider(client)
-+	started := time.Now()
-+	_, err = p.runInstanceForCreateOperation(context.Background(), "sandbox-bounded", createTestRequest("sandbox-bounded", "fingerprint"), operation)
-+	if err == nil || !strings.Contains(err.Error(), "outcome remains unknown") {
-+		t.Fatalf("bounded reconcile error = %v", err)
-+	}
-+	if elapsed := time.Since(started); elapsed > time.Second {
-+		t.Fatalf("reconcile exceeded its bound: %v", elapsed)
-+	}
-+	if len(client.describeRequests) < 1 {
-+		t.Fatal("unknown RunInstances outcome was not reconciled")
-+	}
-+}
-+
-+func TestCreateOperationReconcileRejectsIdentityMismatch(t *testing.T) {
-+	operation, err := createOperationForRequest("sandbox-identity", "fingerprint")
-+	if err != nil {
-+		t.Fatal(err)
-+	}
-+	tests := []struct {
-+		name        string
-+		sandboxID   string
-+		fingerprint string
-+		operationID string
-+	}{
-+		{name: "sandbox", sandboxID: "other-sandbox", fingerprint: operation.fingerprint, operationID: operation.id},
-+		{name: "operation", sandboxID: "sandbox-identity", fingerprint: operation.fingerprint, operationID: strings.Repeat("a", 32)},
-+		{name: "fingerprint", sandboxID: "sandbox-identity", fingerprint: "other-fingerprint", operationID: operation.id},
-+		{name: "missing fingerprint", sandboxID: "sandbox-identity", operationID: operation.id},
-+	}
-+	for _, test := range tests {
-+		t.Run(test.name, func(t *testing.T) {
-+			total := int32(1)
-+			client := &fakeCreateECSClient{
-+				runErrors:     []error{context.DeadlineExceeded},
-+				describeTotal: &total,
-+				describeInstances: []*ecs.DescribeInstancesResponseBodyInstancesInstance{
-+					describedCreateInstance("i-mismatch", test.sandboxID, test.fingerprint, test.operationID),
-+				},
-+			}
-+			p := newCreateTestProvider(client)
-+			if _, err := p.runInstanceForCreateOperation(context.Background(), "sandbox-identity", createTestRequest("sandbox-identity", operation.fingerprint), operation); err == nil || !strings.Contains(err.Error(), "tag") {
-+				t.Fatalf("identity mismatch error = %v", err)
-+			}
-+		})
-+	}
-+}
-+
-+func TestCreateRequestFingerprintIncludesVolumes(t *testing.T) {
-+	request := &ecs.RunInstancesRequest{ImageId: tea.String("image-one")}
-+	first, err := createRequestFingerprint(request, []provider.CloudVolume{{DiskID: "d-one"}})
-+	if err != nil {
-+		t.Fatal(err)
-+	}
-+	second, err := createRequestFingerprint(request, []provider.CloudVolume{{DiskID: "d-two"}})
-+	if err != nil {
-+		t.Fatal(err)
-+	}
-+	if first == second {
-+		t.Fatal("volume parameter change did not change create fingerprint")
-+	}
-+}
-+
-+func TestCreateOperationRejectsEmptySandboxID(t *testing.T) {
-+	if _, err := createOperationForRequest("", "fingerprint"); err == nil {
-+		t.Fatal("empty sandbox ID was accepted")
-+	}
-+}
 diff --git a/src/cloud-providers/alibabacloud/delete_instance_test.go b/src/cloud-providers/alibabacloud/delete_instance_test.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..e08ab24db16af629f3c3f4ec1b884490a67c4767
+index 0000000000000000000000000000000000000000..b821bc900c275729d20c18dc9bbdfe025e36e4ca
 --- /dev/null
 +++ b/src/cloud-providers/alibabacloud/delete_instance_test.go
-@@ -0,0 +1,547 @@
+@@ -0,0 +1,467 @@
 +// (C) Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -627,7 +67,6 @@ index 0000000000000000000000000000000000000000..e08ab24db16af629f3c3f4ec1b884490
 +	operationLocks        []string
 +	rebindAfter           int
 +	rebindInstanceID      string
-+	omitSpecificDisk      bool
 +}
 +
 +func retainedFakeDisk(instanceID string) *fakeCleanupDisk {
@@ -709,9 +148,6 @@ index 0000000000000000000000000000000000000000..e08ab24db16af629f3c3f4ec1b884490
 +
 +	items := make([]*ecs.DescribeDisksResponseBodyDisksDisk, 0, len(diskIDs))
 +	for _, diskID := range diskIDs {
-+		if f.omitSpecificDisk && tea.StringValue(request.DiskIds) != "" {
-+			continue
-+		}
 +		disk := f.disks[diskID]
 +		if disk == nil {
 +			continue
@@ -758,15 +194,8 @@ index 0000000000000000000000000000000000000000..e08ab24db16af629f3c3f4ec1b884490
 +	return &tea.SDKError{StatusCode: tea.Int(status), Code: tea.String(code)}
 +}
 +
-+func newCleanupTestProvider(client *fakeCleanupECSClient, tracked ...string) *alibabaCloudProvider {
-+	volumes := make(map[string][]string)
-+	if tracked != nil {
-+		volumes[client.instanceID] = append([]string(nil), tracked...)
-+	}
-+	return &alibabaCloudProvider{
-+		ecsClient: client, serviceConfig: &Config{Region: "cn-hangzhou"},
-+		volumes: volumes,
-+	}
++func newCleanupTestProvider(client *fakeCleanupECSClient) *alibabaCloudProvider {
++	return &alibabaCloudProvider{ecsClient: client, serviceConfig: &Config{Region: "cn-hangzhou"}}
 +}
 +
 +func useFastCleanupTimings(t *testing.T) {
@@ -786,7 +215,7 @@ index 0000000000000000000000000000000000000000..e08ab24db16af629f3c3f4ec1b884490
 +		instanceID: "i-peerpod", instanceExists: true, releaseAfter: 3,
 +		disks: map[string]*fakeCleanupDisk{"d-workspace": retainedFakeDisk("i-peerpod")},
 +	}
-+	p := newCleanupTestProvider(client, "d-workspace")
++	p := newCleanupTestProvider(client)
 +
 +	if err := p.DeleteInstance(context.Background(), "i-peerpod"); err != nil {
 +		t.Fatalf("DeleteInstance() error = %v", err)
@@ -807,10 +236,9 @@ index 0000000000000000000000000000000000000000..e08ab24db16af629f3c3f4ec1b884490
 +func TestDeleteInstanceFailsClosedForUnsafeRetainedDisk(t *testing.T) {
 +	useFastCleanupTimings(t)
 +	tests := []struct {
-+		name    string
-+		disk    *fakeCleanupDisk
-+		tracked bool
-+		want    string
++		name string
++		disk *fakeCleanupDisk
++		want string
 +	}{
 +		{name: "DeleteWithInstance true", disk: func() *fakeCleanupDisk {
 +			disk := retainedFakeDisk("i-peerpod")
@@ -822,11 +250,6 @@ index 0000000000000000000000000000000000000000..e08ab24db16af629f3c3f4ec1b884490
 +			disk.deleteWithInstance = nil
 +			return disk
 +		}(), want: "DeleteWithInstance=false"},
-+		{name: "other instance cannot weaken retention", disk: func() *fakeCleanupDisk {
-+			disk := retainedFakeDisk("i-other")
-+			disk.deleteWithInstance = tea.Bool(true)
-+			return disk
-+		}(), tracked: true, want: "DeleteWithInstance=false"},
 +		{name: "multi-attach", disk: func() *fakeCleanupDisk {
 +			disk := retainedFakeDisk("i-peerpod")
 +			disk.multiAttach = "Enabled"
@@ -846,7 +269,7 @@ index 0000000000000000000000000000000000000000..e08ab24db16af629f3c3f4ec1b884490
 +			disk := retainedFakeDisk("i-peerpod")
 +			disk.status = "Available"
 +			return disk
-+		}(), tracked: true, want: "unexpectedly bound"},
++		}(), want: "unexpectedly bound"},
 +	}
 +	for _, test := range tests {
 +		t.Run(test.name, func(t *testing.T) {
@@ -854,12 +277,7 @@ index 0000000000000000000000000000000000000000..e08ab24db16af629f3c3f4ec1b884490
 +				instanceID: "i-peerpod", instanceExists: true,
 +				disks: map[string]*fakeCleanupDisk{"d-workspace": test.disk},
 +			}
-+			var p *alibabaCloudProvider
-+			if test.tracked {
-+				p = newCleanupTestProvider(client, "d-workspace")
-+			} else {
-+				p = newCleanupTestProvider(client)
-+			}
++			p := newCleanupTestProvider(client)
 +			err := p.DeleteInstance(context.Background(), "i-peerpod")
 +			if err == nil || !strings.Contains(err.Error(), test.want) {
 +				t.Fatalf("DeleteInstance() error = %v, want %q", err, test.want)
@@ -871,52 +289,6 @@ index 0000000000000000000000000000000000000000..e08ab24db16af629f3c3f4ec1b884490
 +	}
 +}
 +
-+func TestDeleteInstancePrunesStaleTrackedDisk(t *testing.T) {
-+	useFastCleanupTimings(t)
-+	tests := []struct {
-+		name  string
-+		disks map[string]*fakeCleanupDisk
-+	}{
-+		{name: "deleted", disks: map[string]*fakeCleanupDisk{}},
-+		{name: "rebound", disks: map[string]*fakeCleanupDisk{"d-workspace": retainedFakeDisk("i-other")}},
-+		{name: "transitioning elsewhere", disks: map[string]*fakeCleanupDisk{"d-workspace": func() *fakeCleanupDisk {
-+			disk := retainedFakeDisk("i-other")
-+			disk.status = "Attaching"
-+			return disk
-+		}()}},
-+	}
-+	for _, test := range tests {
-+		t.Run(test.name, func(t *testing.T) {
-+			client := &fakeCleanupECSClient{
-+				instanceID: "i-peerpod", instanceExists: true, disks: test.disks,
-+			}
-+			p := newCleanupTestProvider(client, "d-workspace")
-+			if err := p.DeleteInstance(context.Background(), "i-peerpod"); err != nil {
-+				t.Fatalf("DeleteInstance() error = %v", err)
-+			}
-+			if client.deleteCalls != 1 {
-+				t.Fatalf("DeleteInstance calls = %d, want one", client.deleteCalls)
-+			}
-+		})
-+	}
-+}
-+
-+func TestDeleteInstanceDoesNotPruneDiskObservedOnTarget(t *testing.T) {
-+	useFastCleanupTimings(t)
-+	client := &fakeCleanupECSClient{
-+		instanceID: "i-peerpod", instanceExists: true, omitSpecificDisk: true,
-+		disks: map[string]*fakeCleanupDisk{"d-workspace": retainedFakeDisk("i-peerpod")},
-+	}
-+	p := newCleanupTestProvider(client)
-+	err := p.DeleteInstance(context.Background(), "i-peerpod")
-+	if err == nil || !strings.Contains(err.Error(), "disappeared while validating") {
-+		t.Fatalf("DeleteInstance() error = %v", err)
-+	}
-+	if client.deleteCalls != 0 {
-+		t.Fatalf("inconsistent attached disk reached DeleteInstance %d time(s)", client.deleteCalls)
-+	}
-+}
-+
 +func TestDeleteInstanceTreatsDiskReboundDuringWaitAsComplete(t *testing.T) {
 +	useFastCleanupTimings(t)
 +	client := &fakeCleanupECSClient{
@@ -924,7 +296,7 @@ index 0000000000000000000000000000000000000000..e08ab24db16af629f3c3f4ec1b884490
 +		rebindAfter: 2, rebindInstanceID: "i-replacement",
 +		disks: map[string]*fakeCleanupDisk{"d-workspace": retainedFakeDisk("i-peerpod")},
 +	}
-+	p := newCleanupTestProvider(client, "d-workspace")
++	p := newCleanupTestProvider(client)
 +	if err := p.DeleteInstance(context.Background(), "i-peerpod"); err != nil {
 +		t.Fatalf("DeleteInstance() error = %v", err)
 +	}
@@ -934,12 +306,7 @@ index 0000000000000000000000000000000000000000..e08ab24db16af629f3c3f4ec1b884490
 +	if disk.status != "In_use" || disk.instanceID != "i-replacement" {
 +		t.Fatalf("rebound disk state = %+v", disk)
 +	}
-+	p.volumesMu.Lock()
-+	_, tracked := p.volumes["i-peerpod"]
-+	p.volumesMu.Unlock()
-+	if tracked {
-+		t.Fatal("successful rebound reconciliation retained stale volume tracking")
-+	}
++
 +}
 +
 +func TestDeleteInstanceHandlesAlreadyAbsentInstance(t *testing.T) {
@@ -952,7 +319,7 @@ index 0000000000000000000000000000000000000000..e08ab24db16af629f3c3f4ec1b884490
 +			},
 +		},
 +	}
-+	p := newCleanupTestProvider(client, "d-workspace")
++	p := newCleanupTestProvider(client)
 +	if err := p.DeleteInstance(context.Background(), "i-peerpod"); err != nil {
 +		t.Fatalf("DeleteInstance() error = %v", err)
 +	}
@@ -969,7 +336,7 @@ index 0000000000000000000000000000000000000000..e08ab24db16af629f3c3f4ec1b884490
 +			disks:          map[string]*fakeCleanupDisk{"d-workspace": retainedFakeDisk("i-peerpod")},
 +			deleteOutcomes: []fakeDeleteOutcome{{err: context.DeadlineExceeded, applied: true}},
 +		}
-+		p := newCleanupTestProvider(client, "d-workspace")
++		p := newCleanupTestProvider(client)
 +		if err := p.DeleteInstance(context.Background(), "i-peerpod"); err != nil {
 +			t.Fatalf("DeleteInstance() error = %v", err)
 +		}
@@ -984,7 +351,7 @@ index 0000000000000000000000000000000000000000..e08ab24db16af629f3c3f4ec1b884490
 +			disks:          map[string]*fakeCleanupDisk{"d-workspace": retainedFakeDisk("i-peerpod")},
 +			deleteOutcomes: []fakeDeleteOutcome{{err: context.DeadlineExceeded}, {applied: true}},
 +		}
-+		p := newCleanupTestProvider(client, "d-workspace")
++		p := newCleanupTestProvider(client)
 +		if err := p.DeleteInstance(context.Background(), "i-peerpod"); err != nil {
 +			t.Fatalf("DeleteInstance() error = %v", err)
 +		}
@@ -1001,13 +368,10 @@ index 0000000000000000000000000000000000000000..e08ab24db16af629f3c3f4ec1b884490
 +		disks:          map[string]*fakeCleanupDisk{"d-workspace": retainedFakeDisk("i-peerpod")},
 +		deleteOutcomes: []fakeDeleteOutcome{{err: fakeSDKError(403, "Forbidden")}},
 +	}
-+	p := newCleanupTestProvider(client, "d-workspace")
++	p := newCleanupTestProvider(client)
 +	err := p.DeleteInstance(context.Background(), "i-peerpod")
 +	if err == nil || !strings.Contains(err.Error(), "Forbidden") {
 +		t.Fatalf("DeleteInstance() error = %v", err)
-+	}
-+	if _, found := p.volumes["i-peerpod"]; !found {
-+		t.Fatal("definitive failure discarded retained-disk tracking")
 +	}
 +}
 +
@@ -1017,7 +381,7 @@ index 0000000000000000000000000000000000000000..e08ab24db16af629f3c3f4ec1b884490
 +		instanceID: "i-peerpod", instanceExists: true, operationLocks: []string{"security"},
 +		disks: map[string]*fakeCleanupDisk{"d-workspace": retainedFakeDisk("i-peerpod")},
 +	}
-+	p := newCleanupTestProvider(client, "d-workspace")
++	p := newCleanupTestProvider(client)
 +	err := p.DeleteInstance(context.Background(), "i-peerpod")
 +	if err == nil || !strings.Contains(err.Error(), "security-locked") {
 +		t.Fatalf("DeleteInstance() error = %v", err)
@@ -1036,7 +400,7 @@ index 0000000000000000000000000000000000000000..e08ab24db16af629f3c3f4ec1b884490
 +				disks:          map[string]*fakeCleanupDisk{"d-workspace": retainedFakeDisk("i-peerpod")},
 +				deleteOutcomes: []fakeDeleteOutcome{{err: fakeSDKError(403, code)}, {applied: true}},
 +			}
-+			p := newCleanupTestProvider(client, "d-workspace")
++			p := newCleanupTestProvider(client)
 +			if err := p.DeleteInstance(context.Background(), "i-peerpod"); err != nil {
 +				t.Fatalf("DeleteInstance() error = %v", err)
 +			}
@@ -1062,45 +426,45 @@ index 0000000000000000000000000000000000000000..e08ab24db16af629f3c3f4ec1b884490
 +	}
 +}
 +
-+func TestDeleteInstancePreservesTrackedVolumesOnDiskWaitTimeout(t *testing.T) {
++func TestDeleteInstanceReportsDiskWaitTimeout(t *testing.T) {
 +	useFastCleanupTimings(t)
 +	instanceCleanupTimeout = 20 * time.Millisecond
 +	client := &fakeCleanupECSClient{
 +		instanceID: "i-peerpod", instanceExists: true, releaseAfter: -1,
 +		disks: map[string]*fakeCleanupDisk{"d-workspace": retainedFakeDisk("i-peerpod")},
 +	}
-+	p := newCleanupTestProvider(client, "d-workspace")
++	p := newCleanupTestProvider(client)
 +
 +	err := p.DeleteInstance(context.Background(), "i-peerpod")
 +	if !errors.Is(err, context.DeadlineExceeded) {
 +		t.Fatalf("DeleteInstance() error = %v, want cleanup deadline", err)
 +	}
-+	if _, found := p.volumes["i-peerpod"]; !found {
-+		t.Fatal("disk wait timeout discarded retained-disk tracking")
-+	}
 +}
 +
-+func TestDeleteInstanceIgnoresCanceledParentWithinBoundedCleanup(t *testing.T) {
++func TestDeleteInstanceHonorsCancellation(t *testing.T) {
 +	useFastCleanupTimings(t)
 +	client := &fakeCleanupECSClient{
 +		instanceID: "i-peerpod", instanceExists: true,
 +		disks: map[string]*fakeCleanupDisk{"d-workspace": retainedFakeDisk("i-peerpod")},
 +	}
-+	p := newCleanupTestProvider(client, "d-workspace")
++	p := newCleanupTestProvider(client)
 +	ctx, cancel := context.WithCancel(context.Background())
 +	cancel()
-+	if err := p.DeleteInstance(ctx, "i-peerpod"); err != nil {
++	if err := p.DeleteInstance(ctx, "i-peerpod"); !errors.Is(err, context.Canceled) {
 +		t.Fatalf("DeleteInstance() error with canceled parent = %v", err)
++	}
++	if client.deleteCalls != 0 {
++		t.Fatal("canceled call deleted instance")
 +	}
 +}
 +
-+func TestDeleteInstanceIsIdempotentAndSerializesConcurrentCalls(t *testing.T) {
++func TestDeleteInstanceIsIdempotentUnderConcurrentCalls(t *testing.T) {
 +	useFastCleanupTimings(t)
 +	client := &fakeCleanupECSClient{
 +		instanceID: "i-peerpod", instanceExists: true, releaseAfter: 2,
 +		disks: map[string]*fakeCleanupDisk{"d-workspace": retainedFakeDisk("i-peerpod")},
 +	}
-+	p := newCleanupTestProvider(client, "d-workspace")
++	p := newCleanupTestProvider(client)
 +
 +	var wg sync.WaitGroup
 +	errorsByCall := make([]error, 2)
@@ -1120,17 +484,19 @@ index 0000000000000000000000000000000000000000..e08ab24db16af629f3c3f4ec1b884490
 +	if err := p.DeleteInstance(context.Background(), "i-peerpod"); err != nil {
 +		t.Fatalf("repeated DeleteInstance() error = %v", err)
 +	}
-+	p.deleteLocksMu.Lock()
-+	defer p.deleteLocksMu.Unlock()
-+	if len(p.deleteLocks) != 0 {
-+		t.Fatalf("delete locks leaked after calls: %v", p.deleteLocks)
-+	}
++
 +}
 diff --git a/src/cloud-providers/alibabacloud/provider.go b/src/cloud-providers/alibabacloud/provider.go
-index b52fc17de242bfed6da4d718f2426b7ba9df8d77..c51f1b1df18208c6f6f178827879319956ae199b 100644
+index b52fc17de242bfed6da4d718f2426b7ba9df8d77..9347069ae6fb55039765186d33715806808511c6 100644
 --- a/src/cloud-providers/alibabacloud/provider.go
 +++ b/src/cloud-providers/alibabacloud/provider.go
-@@ -10,6 +10,7 @@ import (
+@@ -5,11 +5,13 @@ package alibabacloud
+ 
+ import (
+ 	"context"
++	"crypto/sha256"
+ 	"encoding/base64"
+ 	"errors"
  	"fmt"
  	"log"
  	"net/netip"
@@ -1138,7 +504,15 @@ index b52fc17de242bfed6da4d718f2426b7ba9df8d77..c51f1b1df18208c6f6f1788278793199
  	"strconv"
  	"strings"
  	"sync"
-@@ -36,10 +37,22 @@ const (
+@@ -29,6 +31,7 @@ import (
+ var logger = log.New(log.Writer(), "[adaptor/cloud/alibabacloud] ", log.LstdFlags|log.Lmsgprefix)
+ 
+ const (
++	sandboxIDTagKey    = "SandboxId"
+ 	maxInstanceNameLen = 63
+ 
+ 	EnvRoleArn         = "ALIBABA_CLOUD_ROLE_ARN"
+@@ -36,6 +39,11 @@ const (
  	EnvOidcTokenFile   = "ALIBABA_CLOUD_OIDC_TOKEN_FILE"
  )
  
@@ -1147,21 +521,10 @@ index b52fc17de242bfed6da4d718f2426b7ba9df8d77..c51f1b1df18208c6f6f1788278793199
 +	instanceCleanupPollInterval = 2 * time.Second
 +)
 +
-+type instanceDeleteLock struct {
-+	mu   sync.Mutex
-+	refs int
-+}
-+
  // Make ecsClient a mockable interface
  type ecsClient interface {
  	RunInstances(
- 		params *ecs.RunInstancesRequest) (*ecs.RunInstancesResponse, error)
-+	DescribeInstances(
-+		params *ecs.DescribeInstancesRequest) (*ecs.DescribeInstancesResponse, error)
- 	DeleteInstance(
- 		params *ecs.DeleteInstanceRequest) (*ecs.DeleteInstanceResponse, error)
- 	// Describe InstanceTypes
-@@ -48,6 +61,10 @@ type ecsClient interface {
+@@ -48,6 +56,10 @@ type ecsClient interface {
  	// Describe InstanceAttribute
  	DescribeInstanceAttribute(
  		params *ecs.DescribeInstanceAttributeRequest) (*ecs.DescribeInstanceAttributeResponse, error)
@@ -1172,28 +535,17 @@ index b52fc17de242bfed6da4d718f2426b7ba9df8d77..c51f1b1df18208c6f6f1788278793199
  	// Create NIC
  	CreateNetworkInterface(
  		params *ecs.CreateNetworkInterfaceRequest) (*ecs.CreateNetworkInterfaceResponse, error)
-@@ -90,6 +107,12 @@ type alibabaCloudProvider struct {
- 	// instanceId to instance Resources
- 	eipsMu sync.Mutex
- 	eips   map[string]*string
-+
-+	volumesMu sync.Mutex
-+	volumes   map[string][]string
-+
-+	deleteLocksMu sync.Mutex
-+	deleteLocks   map[string]*instanceDeleteLock
+@@ -198,6 +210,9 @@ func (p *alibabaCloudProvider) getIPs(instanceID string, ecsClient ecsClient) ([
  }
  
- func NewProvider(config *Config) (provider.Provider, error) {
-@@ -138,6 +161,7 @@ func NewProvider(config *Config) (provider.Provider, error) {
- 		serviceConfig: config,
- 		vpcClient:     vpcClient,
- 		eips:          make(map[string]*string),
-+		volumes:       make(map[string][]string),
- 	}
+ func (p *alibabaCloudProvider) CreateInstance(ctx context.Context, podName, sandboxID string, cloudConfig cloudinit.CloudConfigGenerator, spec provider.InstanceTypeSpec) (instance *provider.Instance, err error) {
++	if sandboxID == "" {
++		return nil, errors.New("sandbox ID is required")
++	}
+ 	// Public IP address
+ 	var publicIPAddr *netip.Addr
  
- 	if err = provider.updateInstanceTypeSpecList(); err != nil {
-@@ -215,20 +239,34 @@ func (p *alibabaCloudProvider) CreateInstance(ctx context.Context, podName, sand
+@@ -215,20 +230,34 @@ func (p *alibabaCloudProvider) CreateInstance(ctx context.Context, podName, sand
  	if err != nil {
  		return nil, err
  	}
@@ -1205,7 +557,7 @@ index b52fc17de242bfed6da4d718f2426b7ba9df8d77..c51f1b1df18208c6f6f1788278793199
 -	for k, v := range p.serviceConfig.Tags {
 +	tagKeys := make([]string, 0, len(p.serviceConfig.Tags))
 +	for key := range p.serviceConfig.Tags {
-+		if key != sandboxIDTagKey && key != createOperationTagKey && key != createFingerprintTagKey {
++		if key != sandboxIDTagKey {
 +			tagKeys = append(tagKeys, key)
 +		}
 +	}
@@ -1232,7 +584,12 @@ index b52fc17de242bfed6da4d718f2426b7ba9df8d77..c51f1b1df18208c6f6f1788278793199
  	}
  
  	securityGroupIds := []*string{}
-@@ -240,7 +278,7 @@ func (p *alibabaCloudProvider) CreateInstance(ctx context.Context, podName, sand
+@@ -237,10 +266,12 @@ func (p *alibabaCloudProvider) CreateInstance(ctx context.Context, podName, sand
+ 	}
+ 
+ 	req = &ecs.RunInstancesRequest{
++		// ECS owns idempotency; retrying the same CRI sandbox uses the same token.
++		ClientToken:        tea.String(fmt.Sprintf("%x", sha256.Sum256([]byte(sandboxID)))),
  		RegionId:           tea.String(p.serviceConfig.Region),
  		MinAmount:          tea.Int32(1),
  		Amount:             tea.Int32(1),
@@ -1241,7 +598,7 @@ index b52fc17de242bfed6da4d718f2426b7ba9df8d77..c51f1b1df18208c6f6f1788278793199
  		InstanceType:       tea.String(instanceType),
  		InstanceChargeType: tea.String("PostPaid"), // pay-as-you-go
  		SecurityGroupIds:   securityGroupIds,
-@@ -269,22 +307,31 @@ func (p *alibabaCloudProvider) CreateInstance(ctx context.Context, podName, sand
+@@ -269,22 +300,23 @@ func (p *alibabaCloudProvider) CreateInstance(ctx context.Context, podName, sand
  
  	// Add block device mappings to the instance to set the root volume size
  	if p.serviceConfig.SystemDiskSize > 0 {
@@ -1255,59 +612,43 @@ index b52fc17de242bfed6da4d718f2426b7ba9df8d77..c51f1b1df18208c6f6f1788278793199
 +		logger.Printf("Setting the SystemDisk size to %d GiB with ImageId %s", p.serviceConfig.SystemDiskSize, imageID)
  	}
  
-+	fingerprint, err := createRequestFingerprint(req, spec.Volumes)
-+	if err != nil {
-+		return nil, err
-+	}
-+	req.Tag = append(req.Tag, &ecs.RunInstancesRequestTag{
-+		Key: tea.String(createFingerprintTagKey), Value: tea.String(fingerprint),
-+	})
-+	operation, err := createOperationForRequest(sandboxID, fingerprint)
-+	if err != nil {
-+		return nil, err
-+	}
  	logger.Printf("CreateInstance: name: %q", instanceName)
- 
+-
 -	result, err := p.ecsClient.RunInstances(req)
-+	instanceID, err := p.runInstanceForCreateOperation(ctx, sandboxID, req, operation)
++	response, err := p.ecsClient.RunInstances(req)
  	if err != nil {
 -		return nil, fmt.Errorf("creating instance (%v) returned error: %s", result, err)
-+		return nil, err
++		return nil, fmt.Errorf("create Alibaba Cloud instance: %w", err)
  	}
 -
 -	instanceID := *result.Body.InstanceIdSets.InstanceIdSet[0]
++	if response == nil || response.Body == nil || response.Body.InstanceIdSets == nil || len(response.Body.InstanceIdSets.InstanceIdSet) != 1 || tea.StringValue(response.Body.InstanceIdSets.InstanceIdSet[0]) == "" {
++		return nil, errors.New("RunInstances returned no unique instance ID")
++	}
++	instanceID := tea.StringValue(response.Body.InstanceIdSets.InstanceIdSet[0])
  	logger.Printf("created an instance %s for sandbox %s", instanceID, sandboxID)
  
  	// Create partial instance to return on error (allows caller to cleanup)
-@@ -318,7 +365,17 @@ func (p *alibabaCloudProvider) CreateInstance(ctx context.Context, podName, sand
+@@ -318,7 +350,11 @@ func (p *alibabaCloudProvider) CreateInstance(ctx context.Context, podName, sand
  	}
  	logger.Printf("Instance %s is ready.", instanceID)
  
 -	ips, err := p.getIPs(*result.Body.InstanceIdSets.InstanceIdSet[0], p.ecsClient)
-+	attachedDisks, attachErr := p.attachDataDisks(ctx, instanceID, spec.Volumes)
-+	if len(attachedDisks) > 0 {
-+		p.volumesMu.Lock()
-+		p.volumes[instanceID] = append([]string(nil), attachedDisks...)
-+		p.volumesMu.Unlock()
-+	}
-+	if attachErr != nil {
-+		return instance, fmt.Errorf("attaching Alibaba Cloud data disks: %w", attachErr)
++	if err := p.attachDataDisks(ctx, instanceID, spec.Volumes); err != nil {
++		return instance, fmt.Errorf("attaching Alibaba Cloud data disks: %w", err)
 +	}
 +
 +	ips, err := p.getIPs(instanceID, p.ecsClient)
  	if err != nil {
  		logger.Printf("failed to get IPs for the instance : %v ", err)
  		return instance, err
-@@ -368,35 +425,41 @@ func (p *alibabaCloudProvider) CreateInstance(ctx context.Context, podName, sand
+@@ -368,35 +404,33 @@ func (p *alibabaCloudProvider) CreateInstance(ctx context.Context, podName, sand
  }
  
  func (p *alibabaCloudProvider) DeleteInstance(ctx context.Context, instanceID string) error {
 +	if instanceID == "" {
 +		return errors.New("refusing to delete an Alibaba Cloud instance without an ID")
 +	}
-+	release := p.acquireInstanceDeleteLock(instanceID)
-+	defer release()
-+
  	logger.Printf("Deleting instance (%s)", instanceID)
 -	err := p.waitUntilTimeout(time.Duration(time.Second*30), func() (bool, error) {
 -		req := ecs.DeleteInstanceRequest{
@@ -1320,7 +661,7 @@ index b52fc17de242bfed6da4d718f2426b7ba9df8d77..c51f1b1df18208c6f6f1788278793199
 -				logger.Printf("instance %s is not in the correct state to be deleted, retrying", instanceID)
 -				return false, nil
 -			}
-+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), instanceCleanupTimeout)
++	cleanupCtx, cancel := context.WithTimeout(ctx, instanceCleanupTimeout)
 +	defer cancel()
  
 -			if *err.(*tea.SDKError).Code == "InvalidInstanceId.NotFound" {
@@ -1331,13 +672,9 @@ index b52fc17de242bfed6da4d718f2426b7ba9df8d77..c51f1b1df18208c6f6f1788278793199
 +	if err != nil {
 +		return fmt.Errorf("validate retained data disks for instance %s: %w", instanceID, err)
 +	}
-+	p.rememberInstanceVolumes(instanceID, diskIDs)
-+	instanceAbsent := false
-+	if len(diskIDs) > 0 {
-+		instanceAbsent, err = p.validateInstanceRetainedDiskSafety(cleanupCtx, instanceID)
-+		if err != nil {
-+			return err
-+		}
++	instanceAbsent, err := p.validateInstanceRetainedDiskSafety(cleanupCtx, instanceID)
++	if err != nil {
++		return err
 +	}
  
 -			logger.Printf("failed to delete an instance: %v and the response is %v", err, resp)
@@ -1358,39 +695,13 @@ index b52fc17de242bfed6da4d718f2426b7ba9df8d77..c51f1b1df18208c6f6f1788278793199
  
 -	logger.Printf("Deleted an instance %s", instanceID)
 +	logger.Printf("Deleted instance %s and reconciled cleanup for %d retained data disk(s)", instanceID, len(diskIDs))
-+	p.forgetInstanceVolumes(instanceID)
  
  	p.eipsMu.Lock()
  	eipID := p.eips[instanceID]
-@@ -413,6 +476,146 @@ func (p *alibabaCloudProvider) DeleteInstance(ctx context.Context, instanceID st
+@@ -413,6 +447,121 @@ func (p *alibabaCloudProvider) DeleteInstance(ctx context.Context, instanceID st
  	return nil
  }
  
-+func (p *alibabaCloudProvider) acquireInstanceDeleteLock(instanceID string) func() {
-+	p.deleteLocksMu.Lock()
-+	if p.deleteLocks == nil {
-+		p.deleteLocks = make(map[string]*instanceDeleteLock)
-+	}
-+	lock := p.deleteLocks[instanceID]
-+	if lock == nil {
-+		lock = &instanceDeleteLock{}
-+		p.deleteLocks[instanceID] = lock
-+	}
-+	lock.refs++
-+	p.deleteLocksMu.Unlock()
-+
-+	lock.mu.Lock()
-+	return func() {
-+		lock.mu.Unlock()
-+		p.deleteLocksMu.Lock()
-+		defer p.deleteLocksMu.Unlock()
-+		lock.refs--
-+		if lock.refs == 0 && p.deleteLocks[instanceID] == lock {
-+			delete(p.deleteLocks, instanceID)
-+		}
-+	}
-+}
-+
 +func (p *alibabaCloudProvider) forceDeleteInstance(ctx context.Context, instanceID string) error {
 +	deleteAccepted := false
 +	for {
@@ -1511,10 +822,10 @@ index b52fc17de242bfed6da4d718f2426b7ba9df8d77..c51f1b1df18208c6f6f1788278793199
  }
 diff --git a/src/cloud-providers/alibabacloud/volumes.go b/src/cloud-providers/alibabacloud/volumes.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..eaa64fad7f37d966e644e18ec4244c040c89f555
+index 0000000000000000000000000000000000000000..2375f0d0366f6102bdc84c4568e5e2fcb488d96d
 --- /dev/null
 +++ b/src/cloud-providers/alibabacloud/volumes.go
-@@ -0,0 +1,455 @@
+@@ -0,0 +1,380 @@
 +// (C) Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -1527,7 +838,6 @@ index 0000000000000000000000000000000000000000..eaa64fad7f37d966e644e18ec4244c04
 +	"fmt"
 +	"net"
 +	"regexp"
-+	"sort"
 +	"time"
 +
 +	ecs "github.com/alibabacloud-go/ecs-20140526/v4/client"
@@ -1576,25 +886,24 @@ index 0000000000000000000000000000000000000000..eaa64fad7f37d966e644e18ec4244c04
 +	return diskIDs, nil
 +}
 +
-+func (p *alibabaCloudProvider) attachDataDisks(ctx context.Context, instanceID string, volumes []provider.CloudVolume) ([]string, error) {
++func (p *alibabaCloudProvider) attachDataDisks(ctx context.Context, instanceID string, volumes []provider.CloudVolume) error {
 +	diskIDs, err := validateAlibabaDataDisks(volumes)
 +	if err != nil || len(diskIDs) == 0 {
-+		return nil, err
++		return err
 +	}
 +	zone, err := waitForAttachableInstance(ctx, p.ecsClient, instanceID)
 +	if err != nil {
-+		return nil, err
++		return err
 +	}
 +	disks, err := describeAlibabaDataDisks(ctx, p.ecsClient, p.serviceConfig.Region, diskIDs)
 +	if err != nil {
-+		return nil, err
++		return err
 +	}
-+	toAttach, alreadyAttached, err := planAlibabaDataDiskAttachments(instanceID, zone, diskIDs, disks)
++	toAttach, err := planAlibabaDataDiskAttachments(instanceID, zone, diskIDs, disks)
 +	if err != nil {
-+		return nil, err
++		return err
 +	}
 +
-+	attached := append([]string(nil), alreadyAttached...)
 +	for _, diskID := range toAttach {
 +		request := &ecs.AttachDiskRequest{
 +			InstanceId:         tea.String(instanceID),
@@ -1603,22 +912,18 @@ index 0000000000000000000000000000000000000000..eaa64fad7f37d966e644e18ec4244c04
 +			Bootable:           tea.Bool(false),
 +		}
 +		logger.Printf("Attaching retained data disk %s to instance %s", diskID, instanceID)
-+		// Once the mutating request starts, treat the disk as possibly acquired.
-+		// Cleanup safely re-describes it and is a no-op if the service rejected
-+		// the request before changing the disk.
-+		attached = append(attached, diskID)
 +		if _, err := p.ecsClient.AttachDisk(request); err != nil {
 +			if !isAmbiguousAlibabaCloudError(err) {
-+				return attached, fmt.Errorf("attach disk %s: %w", diskID, err)
++				return fmt.Errorf("attach disk %s: %w", diskID, err)
 +			}
-+			if reconcileErr := reconcileDataDiskAttach(context.WithoutCancel(ctx), p.ecsClient, p.serviceConfig.Region, instanceID, diskID); reconcileErr != nil {
-+				return attached, fmt.Errorf("attach disk %s returned %v; reconciliation failed: %w", diskID, err, reconcileErr)
++			if reconcileErr := waitForDataDiskAttachedState(ctx, p.ecsClient, p.serviceConfig.Region, instanceID, diskID); reconcileErr != nil {
++				return fmt.Errorf("attach disk %s returned %v; reconciliation failed: %w", diskID, err, reconcileErr)
 +			}
 +		} else if err := waitForDataDiskAttachedState(ctx, p.ecsClient, p.serviceConfig.Region, instanceID, diskID); err != nil {
-+			return attached, err
++			return err
 +		}
 +	}
-+	return attached, nil
++	return nil
 +}
 +
 +func waitForAttachableInstance(ctx context.Context, client ecsClient, instanceID string) (string, error) {
@@ -1723,74 +1028,24 @@ index 0000000000000000000000000000000000000000..eaa64fad7f37d966e644e18ec4244c04
 +	return disks, nil
 +}
 +
++// Query ECS instead of maintaining a second in-memory attachment journal.
 +func (p *alibabaCloudProvider) retainedDataDisksForInstanceDelete(ctx context.Context, instanceID string) ([]string, error) {
-+	p.volumesMu.Lock()
-+	tracked := append([]string(nil), p.volumes[instanceID]...)
-+	p.volumesMu.Unlock()
-+
-+	attached, err := describeAlibabaAttachedDataDisks(ctx, p.ecsClient, p.serviceConfig.Region, instanceID)
++	disks, err := describeAlibabaAttachedDataDisks(ctx, p.ecsClient, p.serviceConfig.Region, instanceID)
 +	if err != nil {
 +		return nil, err
 +	}
-+	attachedIDs := make(map[string]struct{}, len(attached))
-+	known := make(map[string]struct{}, len(tracked)+len(attached))
-+	for _, diskID := range tracked {
-+		known[diskID] = struct{}{}
-+	}
-+	for _, disk := range attached {
-+		attachedIDs[disk.id] = struct{}{}
-+		known[disk.id] = struct{}{}
-+	}
-+	if len(known) > maxAlibabaDataDisks {
-+		return nil, fmt.Errorf("instance %s has %d data disks, exceeding the supported maximum %d", instanceID, len(known), maxAlibabaDataDisks)
-+	}
-+	diskIDs := make([]string, 0, len(known))
-+	for diskID := range known {
-+		if !alibabaDataDiskIDPattern.MatchString(diskID) {
-+			return nil, fmt.Errorf("invalid Alibaba Cloud disk ID %q", diskID)
-+		}
-+		diskIDs = append(diskIDs, diskID)
-+	}
-+	sort.Strings(diskIDs)
-+	if len(diskIDs) == 0 {
-+		return nil, nil
-+	}
-+
-+	disks, err := describeAlibabaDataDisks(ctx, p.ecsClient, p.serviceConfig.Region, diskIDs)
-+	if err != nil {
-+		return nil, err
-+	}
-+	byID := make(map[string]alibabaDataDisk, len(disks))
++	ids := make([]string, 0, len(disks))
 +	for _, disk := range disks {
-+		if _, requested := known[disk.id]; !requested {
-+			return nil, fmt.Errorf("DescribeDisks returned unrequested data disk %s", disk.id)
-+		}
-+		byID[disk.id] = disk
-+	}
-+	retained := make([]string, 0, len(diskIDs))
-+	for _, diskID := range diskIDs {
-+		disk, found := byID[diskID]
-+		if !found {
-+			if _, wasAttached := attachedIDs[diskID]; wasAttached {
-+				return nil, fmt.Errorf("data disk %s disappeared while validating its attachment to instance %s", diskID, instanceID)
-+			}
-+			logger.Printf("Dropping stale tracking for data disk %s because it no longer exists", diskID)
-+			continue
-+		}
 +		_, relevant, err := classifyRetainedAlibabaDataDisk(instanceID, disk)
 +		if err != nil {
 +			return nil, err
 +		}
-+		if !relevant {
-+			if _, wasAttached := attachedIDs[diskID]; wasAttached {
-+				return nil, fmt.Errorf("data disk %s changed attachment while validating instance %s", diskID, instanceID)
-+			}
-+			logger.Printf("Dropping stale tracking for data disk %s because it is now attached to instance %s", diskID, disk.instanceID)
-+			continue
++		if !relevant || disk.instanceID != instanceID {
++			return nil, fmt.Errorf("disk %s is not attached to instance %s", disk.id, instanceID)
 +		}
-+		retained = append(retained, diskID)
++		ids = append(ids, disk.id)
 +	}
-+	return retained, nil
++	return ids, nil
 +}
 +
 +func classifyRetainedAlibabaDataDisk(instanceID string, disk alibabaDataDisk) (available, relevant bool, err error) {
@@ -1822,21 +1077,6 @@ index 0000000000000000000000000000000000000000..eaa64fad7f37d966e644e18ec4244c04
 +	default:
 +		return false, false, fmt.Errorf("disk %s is in unsupported cleanup state %q", disk.id, disk.status)
 +	}
-+}
-+
-+func (p *alibabaCloudProvider) rememberInstanceVolumes(instanceID string, diskIDs []string) {
-+	p.volumesMu.Lock()
-+	defer p.volumesMu.Unlock()
-+	if p.volumes == nil {
-+		p.volumes = make(map[string][]string)
-+	}
-+	p.volumes[instanceID] = append([]string(nil), diskIDs...)
-+}
-+
-+func (p *alibabaCloudProvider) forgetInstanceVolumes(instanceID string) {
-+	p.volumesMu.Lock()
-+	defer p.volumesMu.Unlock()
-+	delete(p.volumes, instanceID)
 +}
 +
 +func (p *alibabaCloudProvider) waitForRetainedDataDisks(ctx context.Context, instanceID string, diskIDs []string) error {
@@ -1886,7 +1126,7 @@ index 0000000000000000000000000000000000000000..eaa64fad7f37d966e644e18ec4244c04
 +	return nil
 +}
 +
-+func planAlibabaDataDiskAttachments(instanceID, zone string, diskIDs []string, disks []alibabaDataDisk) (toAttach, alreadyAttached []string, err error) {
++func planAlibabaDataDiskAttachments(instanceID, zone string, diskIDs []string, disks []alibabaDataDisk) (toAttach []string, err error) {
 +	byID := make(map[string]alibabaDataDisk, len(disks))
 +	for _, disk := range disks {
 +		byID[disk.id] = disk
@@ -1894,27 +1134,27 @@ index 0000000000000000000000000000000000000000..eaa64fad7f37d966e644e18ec4244c04
 +	for _, diskID := range diskIDs {
 +		disk, found := byID[diskID]
 +		if !found {
-+			return nil, nil, fmt.Errorf("data disk %s was not returned by DescribeDisks", diskID)
++			return nil, fmt.Errorf("data disk %s was not returned by DescribeDisks", diskID)
 +		}
 +		if disk.diskType != "data" || !disk.portable {
-+			return nil, nil, fmt.Errorf("disk %s is not a detachable data disk", diskID)
++			return nil, fmt.Errorf("disk %s is not a detachable data disk", diskID)
 +		}
 +		if disk.zone != zone {
-+			return nil, nil, fmt.Errorf("disk %s is in zone %s, instance %s is in zone %s", diskID, disk.zone, instanceID, zone)
++			return nil, fmt.Errorf("disk %s is in zone %s, instance %s is in zone %s", diskID, disk.zone, instanceID, zone)
 +		}
 +		if disk.multiAttach != "Disabled" {
-+			return nil, nil, fmt.Errorf("disk %s has unsupported multi-attach mode %q", diskID, disk.multiAttach)
++			return nil, fmt.Errorf("disk %s has unsupported multi-attach mode %q", diskID, disk.multiAttach)
 +		}
 +		switch {
 +		case disk.status == "Available" && disk.instanceID == "":
 +			toAttach = append(toAttach, diskID)
 +		case disk.status == "In_use" && disk.instanceID == instanceID && disk.hasDeleteWithInstance && !disk.deleteWithInstance:
-+			alreadyAttached = append(alreadyAttached, diskID)
++			continue
 +		default:
-+			return nil, nil, fmt.Errorf("disk %s cannot attach from state %q (instance %q)", diskID, disk.status, disk.instanceID)
++			return nil, fmt.Errorf("disk %s cannot attach from state %q (instance %q)", diskID, disk.status, disk.instanceID)
 +		}
 +	}
-+	return toAttach, alreadyAttached, nil
++	return toAttach, nil
 +}
 +
 +func waitForDataDiskAttachedState(ctx context.Context, client ecsClient, region, instanceID, diskID string) error {
@@ -1944,10 +1184,6 @@ index 0000000000000000000000000000000000000000..eaa64fad7f37d966e644e18ec4244c04
 +	}
 +}
 +
-+func reconcileDataDiskAttach(ctx context.Context, client ecsClient, region, instanceID, diskID string) error {
-+	return waitForDataDiskAttachedState(ctx, client, region, instanceID, diskID)
-+}
-+
 +func waitForDataDiskPoll(ctx context.Context) error {
 +	timer := time.NewTimer(dataDiskPollInterval)
 +	defer timer.Stop()
@@ -1972,10 +1208,10 @@ index 0000000000000000000000000000000000000000..eaa64fad7f37d966e644e18ec4244c04
 +}
 diff --git a/src/cloud-providers/alibabacloud/volumes_test.go b/src/cloud-providers/alibabacloud/volumes_test.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..10f3cdb0ec7fe3475542388ecbfec052f66b2302
+index 0000000000000000000000000000000000000000..d3625cc132e73a8614e4c2724bdd1efdf8e888f6
 --- /dev/null
 +++ b/src/cloud-providers/alibabacloud/volumes_test.go
-@@ -0,0 +1,265 @@
+@@ -0,0 +1,253 @@
 +// (C) Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -2116,24 +1352,24 @@ index 0000000000000000000000000000000000000000..10f3cdb0ec7fe3475542388ecbfec052
 +		{id: "d-new", zone: "cn-hangzhou-i", status: "Available", diskType: "data", portable: true, multiAttach: "Disabled"},
 +		{id: "d-existing", zone: "cn-hangzhou-i", status: "In_use", instanceID: "i-peerpod", diskType: "data", portable: true, multiAttach: "Disabled", hasDeleteWithInstance: true},
 +	}
-+	toAttach, alreadyAttached, err := planAlibabaDataDiskAttachments(
++	toAttach, err := planAlibabaDataDiskAttachments(
 +		"i-peerpod", "cn-hangzhou-i", []string{"d-new", "d-existing"}, disks,
 +	)
 +	if err != nil {
 +		t.Fatalf("planAlibabaDataDiskAttachments() error = %v", err)
 +	}
-+	if !reflect.DeepEqual(toAttach, []string{"d-new"}) || !reflect.DeepEqual(alreadyAttached, []string{"d-existing"}) {
-+		t.Fatalf("unexpected plan: attach=%v existing=%v", toAttach, alreadyAttached)
++	if !reflect.DeepEqual(toAttach, []string{"d-new"}) {
++		t.Fatalf("unexpected plan: attach=%v", toAttach)
 +	}
 +
 +	disks[0].zone = "cn-shanghai-a"
-+	if _, _, err := planAlibabaDataDiskAttachments("i-peerpod", "cn-hangzhou-i", []string{"d-new"}, disks); err == nil {
++	if _, err := planAlibabaDataDiskAttachments("i-peerpod", "cn-hangzhou-i", []string{"d-new"}, disks); err == nil {
 +		t.Fatal("expected a cross-zone disk to be rejected")
 +	}
 +	for _, mode := range []string{"", "Enabled"} {
 +		disks[0].zone = "cn-hangzhou-i"
 +		disks[0].multiAttach = mode
-+		if _, _, err := planAlibabaDataDiskAttachments("i-peerpod", "cn-hangzhou-i", []string{"d-new"}, disks); err == nil {
++		if _, err := planAlibabaDataDiskAttachments("i-peerpod", "cn-hangzhou-i", []string{"d-new"}, disks); err == nil {
 +			t.Fatalf("expected multi-attach mode %q to be rejected", mode)
 +		}
 +	}
@@ -2167,12 +1403,9 @@ index 0000000000000000000000000000000000000000..10f3cdb0ec7fe3475542388ecbfec052
 +	}
 +	volumes := []provider.CloudVolume{{DiskID: "d-one"}, {DiskID: "d-two"}}
 +
-+	attached, err := p.attachDataDisks(context.Background(), "i-peerpod", volumes)
++	err := p.attachDataDisks(context.Background(), "i-peerpod", volumes)
 +	if err != nil {
 +		t.Fatalf("attachDataDisks() error = %v", err)
-+	}
-+	if !reflect.DeepEqual(attached, []string{"d-one", "d-two"}) {
-+		t.Fatalf("attachDataDisks() = %v", attached)
 +	}
 +	if !reflect.DeepEqual(client.attachOrder, []string{"d-one", "d-two"}) {
 +		t.Fatalf("attach order = %v", client.attachOrder)
@@ -2193,12 +1426,9 @@ index 0000000000000000000000000000000000000000..10f3cdb0ec7fe3475542388ecbfec052
 +	client.attachApplied["d-one"] = true
 +	p := &alibabaCloudProvider{ecsClient: client, serviceConfig: &Config{Region: "cn-hangzhou"}}
 +
-+	attached, err := p.attachDataDisks(context.Background(), "i-peerpod", []provider.CloudVolume{{DiskID: "d-one"}})
++	err := p.attachDataDisks(context.Background(), "i-peerpod", []provider.CloudVolume{{DiskID: "d-one"}})
 +	if err != nil {
 +		t.Fatalf("attachDataDisks() error = %v", err)
-+	}
-+	if !reflect.DeepEqual(attached, []string{"d-one"}) {
-+		t.Fatalf("attachDataDisks() = %v", attached)
 +	}
 +}
 +
@@ -2210,19 +1440,16 @@ index 0000000000000000000000000000000000000000..10f3cdb0ec7fe3475542388ecbfec052
 +	client.attachErrors["d-one"] = &tea.SDKError{StatusCode: &status, Code: tea.String("Forbidden")}
 +	p := &alibabaCloudProvider{ecsClient: client, serviceConfig: &Config{Region: "cn-hangzhou"}}
 +
-+	attached, err := p.attachDataDisks(context.Background(), "i-peerpod", []provider.CloudVolume{{DiskID: "d-one"}})
++	err := p.attachDataDisks(context.Background(), "i-peerpod", []provider.CloudVolume{{DiskID: "d-one"}})
 +	if err == nil || !strings.Contains(err.Error(), "attach disk d-one") {
 +		t.Fatalf("attachDataDisks() error = %v", err)
-+	}
-+	if !reflect.DeepEqual(attached, []string{"d-one"}) {
-+		t.Fatalf("attachDataDisks() partial acquisition = %v", attached)
 +	}
 +	if client.disks["d-one"].status != "Available" {
 +		t.Fatalf("definitively rejected attach changed disk state: %+v", client.disks["d-one"])
 +	}
 +}
 +
-+func TestAttachDataDisksReturnsAcquisitionWhenVisibilityWaitIsCanceled(t *testing.T) {
++func TestAttachDataDisksReportsCanceledVisibilityWait(t *testing.T) {
 +	client := newFakeVolumeECSClient(map[string]*fakeAlibabaDisk{
 +		"d-one": {status: "Available", zone: "cn-hangzhou-i"},
 +	})
@@ -2230,12 +1457,9 @@ index 0000000000000000000000000000000000000000..10f3cdb0ec7fe3475542388ecbfec052
 +	client.attachHook = func(string) { cancel() }
 +	p := &alibabaCloudProvider{ecsClient: client, serviceConfig: &Config{Region: "cn-hangzhou"}}
 +
-+	attached, err := p.attachDataDisks(ctx, "i-peerpod", []provider.CloudVolume{{DiskID: "d-one"}})
++	err := p.attachDataDisks(ctx, "i-peerpod", []provider.CloudVolume{{DiskID: "d-one"}})
 +	if !errors.Is(err, context.Canceled) {
 +		t.Fatalf("attachDataDisks() error = %v, want context cancellation", err)
-+	}
-+	if !reflect.DeepEqual(attached, []string{"d-one"}) {
-+		t.Fatalf("attachDataDisks() partial acquisition = %v", attached)
 +	}
 +	if disk := client.disks["d-one"]; disk.status != "In_use" || disk.instanceID != "i-peerpod" {
 +		t.Fatalf("partially observed disk acquisition was not retained for caller cleanup: %+v", disk)

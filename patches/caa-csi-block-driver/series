@@ -1,5 +1,5 @@
-0001-fix-node-publish-atomic-readonly-direct-volume-metad.patch
-0002-fix-controller-persist-resumable-volume-create-opera.patch
-0003-feat-alibabacloud-add-crash-resilient-ESSD-provision.patch
-0004-fix-node-advertise-delegated-fsGroup-support.patch
-0005-build-pin-the-CSI-runtime-base-image.patch
+0001-feat-alibabacloud-provision-ESSD-with-existing-provi.patch
+0002-feat-node-publish-the-paired-CAA-volume-contract-ato.patch
+0003-feat-deploy-separate-controller-credentials-and-node.patch
+0004-test-share-the-CSI-conformance-runner-between-local-.patch
+0005-build-pin-the-runtime-base-manifest-index.patch

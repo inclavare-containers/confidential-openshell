@@ -79,7 +79,8 @@
     "csi_provisioner": "registry.k8s.io/sig-storage/csi-provisioner@sha256:6de50bacfd72627ffe4209e3db8ad7391d04ea6fb741bf51feab6c5dcfd80002",
     "csi_node_registrar": "registry.k8s.io/sig-storage/csi-node-driver-registrar@sha256:cd21e19cd8bbd5bc56f1b4f1398a436e7897da2995d6d036c9729be3f4e456e6",
     "registry": "docker.io/library/registry@sha256:46faa9a1ae6813194b53921a370f2f4f8c5e1aae228a89bceafef5847a6a3278",
-    "alpine": "docker.io/library/alpine@sha256:b58899f069c47216f6002a6850143dc6fae0d35eb8b0df9300bbe6327b9c2171"
+    "alpine": "docker.io/library/alpine@sha256:b58899f069c47216f6002a6850143dc6fae0d35eb8b0df9300bbe6327b9c2171",
+    "csi_resizer": "registry.k8s.io/sig-storage/csi-resizer@sha256:be6a7de1d43dba90710b61bd3d0d8f568654a6adadaeea9188cf4cd3554cbb87"
   },
   "sources": {
     "trustee": {
