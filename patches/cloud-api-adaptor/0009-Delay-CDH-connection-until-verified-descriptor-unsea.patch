@@ -1,8 +1,17 @@
-From 12383f0e57b19103d0bff328cd34eebc08a01f74 Mon Sep 17 00:00:00 2001
-From: Codex <codex@openai.com>
+From 5c24fc9ffe2135c74ef9013daac0b2bc68581ddb Mon Sep 17 00:00:00 2001
+From: Weidong Sun <sunweidong@linux.alibaba.com>
 Date: Tue, 3 Nov 2026 01:07:30 +0800
-Subject: [PATCH 09/10] Delay CDH connection until verified descriptor unseal
+Subject: [PATCH 09/10] guest: defer CDH connection until descriptor validation
 
+Opening CDH before validating a sealed descriptor makes local rejection
+depend on the availability of that service. Create the CDH client lazily
+when the validated descriptor first needs unsealing and close it after
+the request.
+
+Exercise plaintext rejection and private-mount isolation before
+forwarding CreateContainer to the Kata agent.
+
+Generated-by: OpenAI Codex
 ---
  .../pkg/forwarder/interceptor/interceptor.go  | 24 ++++++++++++-----
  .../interceptor/sealed_volume_test.go         | 27 +++++++++++++++++++

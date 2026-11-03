@@ -1,9 +1,13 @@
-From 3bd4239cf84636df48bb3e4faef078ee70e58c96 Mon Sep 17 00:00:00 2001
+From f8cf314fd2045b2fd7b5cc4b47d2b8e5421ff5a0 Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
 Date: Tue, 3 Nov 2026 01:05:58 +0800
-Subject: [PATCH 5/5] build: pin supported build and runtime base indexes
+Subject: [PATCH 5/5] build: pin supported build and runtime base images
 
-Co-authored-by: Codex <codex@openai.com>
+Pin the Go 1.26.7 Alpine 3.24 builder and Alpine 3.24.3 runtime by
+multi-platform manifest digest. Retain cross-compilation and the
+existing image layout while removing dependence on mutable base tags.
+
+Generated-by: OpenAI Codex
 ---
  Dockerfile | 6 ++++--
  1 file changed, 4 insertions(+), 2 deletions(-)

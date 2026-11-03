@@ -1,19 +1,18 @@
-Subject: [PATCH] runtime: preserve no_new_privileges in exec requests
+From 0c39886fa05637c01d859e3b8f10fcf5f061245c Mon Sep 17 00:00:00 2001
+From: Weidong Sun <sunweidong@linux.alibaba.com>
+Date: Tue, 3 Nov 2026 10:08:39 +0800
+Subject: [PATCH 1/1] runtime: preserve no_new_privileges in exec requests
 
-The containerd exec path copies the OCI process NoNewPrivileges value into
-types.Cmd, but cmdToKataProcess omits it from the guest-agent process.
-An exec process requested with no_new_privileges=true therefore reaches
-the agent with the protobuf default false.
+The containerd exec path copies OCI NoNewPrivileges into types.Cmd, but
+cmdToKataProcess omits it from the guest-agent process. The guest
+therefore receives false even when the caller requested true, and
+genpolicy can reject an otherwise approved exec or probe.
 
-The Kata genpolicy allow_process_common rule compares this field against
-the container's policy. For a container that requires true, the agent
-rejects the exec request even when its command is an approved probe.
-Exec readiness or liveness probes can consequently fail to run.
+Copy the existing value into grpc.Process and extend
+TestCmdToKataProcess to cover false and true. This preserves the caller
+setting without changing the guest agent or policy rules.
 
-Copy the existing value into grpc.Process and extend TestCmdToKataProcess
-to cover both false and true. This preserves the caller's OCI setting;
-it does not force the setting or change the guest agent or policy rules.
-
+Generated-by: OpenAI Codex
 ---
  src/runtime/virtcontainers/kata_agent.go      | 7 ++++---
  src/runtime/virtcontainers/kata_agent_test.go | 9 ++++++++-

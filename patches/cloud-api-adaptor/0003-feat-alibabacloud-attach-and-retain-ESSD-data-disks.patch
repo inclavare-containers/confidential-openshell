@@ -1,11 +1,19 @@
-From c2c459843f6d65620a58e48f92b93bd4de062f3e Mon Sep 17 00:00:00 2001
+From 3c0a6a7868dfbecb20933f64efb85d7d6b7bfeb0 Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
 Date: Tue, 3 Nov 2026 01:07:30 +0800
-Subject: [PATCH 03/10] feat(alibabacloud): attach and retain ESSD data disks
+Subject: [PATCH 03/10] alibabacloud: attach and retain ESSD data disks
 
-Apply retained-disk lock restrictions only when data disks are attached.
+Attach the requested data disks to the new instance and preserve them
+when deleting the PodVM. Use the CRI sandbox ID as the native
+RunInstances ClientToken and reconcile attachment state through ECS
+queries.
 
-Co-authored-by: Codex <codex@openai.com>
+Discover current attachments during deletion, require safe retention
+settings for attached data disks, and wait for their release. Keep
+cancellation and cloud errors visible; apply retained-disk lock checks
+only when data disks exist.
+
+Generated-by: OpenAI Codex
 ---
  .../alibabacloud/delete_instance_test.go      | 481 ++++++++++++++++++
  src/cloud-providers/alibabacloud/provider.go  | 222 ++++++--

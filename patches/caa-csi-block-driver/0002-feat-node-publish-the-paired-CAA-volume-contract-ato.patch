@@ -1,10 +1,17 @@
-From 52054dd07b642dd2ff18d28fa902ca374b399a6b Mon Sep 17 00:00:00 2001
+From 0d6fcf7f7bb9f9e37d6c10da84d1820f2e6a8274 Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
 Date: Tue, 3 Nov 2026 01:05:58 +0800
-Subject: [PATCH 2/5] feat(node): publish the paired CAA volume contract
- atomically
+Subject: [PATCH 2/5] node: publish versioned direct-volume metadata atomically
 
-Co-authored-by: Codex <codex@openai.com>
+CAA needs a complete disk and mount description before starting the
+PodVM. Publish the paired v1 mountInfo contract atomically with the Pod
+UID, volume handle, readonly flag and delegated fsGroup.
+
+Keep disk ownership with the controller and leave cloud attachment to
+CAA. Validate the metadata at the node boundary without introducing a
+second cloud-volume journal.
+
+Generated-by: OpenAI Codex
 ---
  pkg/driver/directvolume.go                | 260 ++++++++++++
  pkg/driver/directvolume_test.go           | 482 ++++++++++++++++++++++

@@ -58,5 +58,8 @@ it uses the existing protobuf/ttrpc dependencies without vendoring a generated p
 library. AA performs the actual
 measurement; canonical eventlog checks prevent duplicate extension.
 
-Patch authorship is retained. AI-attributed sign-off lines are removed; these local overlays
-do not substitute for a contributor's DCO certification when submitting upstream.
+Local patch commits use `Weidong Sun <sunweidong@linux.alibaba.com>` as their author,
+with scoped subjects and a rationale for the complete change. Existing sign-offs
+are retained, and AI assistance is recorded in `Generated-by` trailers. Metadata
+normalization preserves every intermediate source tree; upstream submission still
+uses the target project's contribution and DCO requirements.

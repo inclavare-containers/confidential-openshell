@@ -1,10 +1,17 @@
-From 66bfd9d23c6d8e7f26cc0eb6f34264a14beba6cc Mon Sep 17 00:00:00 2001
+From 621dbc9b1a446098351217081984560e19ad3ea1 Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
 Date: Tue, 3 Nov 2026 01:07:30 +0800
-Subject: [PATCH 10/10] Preserve on-link worker Pod routes in guest network
- setup
+Subject: [PATCH 10/10] podnetwork: preserve on-link routes during guest setup
+
+A Pod with a /32 address may use a gateway outside its prefix. Losing
+the on-link route flag while transferring worker network configuration
+makes that route impossible to install in the guest.
+
+Carry the flag through inspection, serialization and route replay. Cover
+the worker-to-guest path with a network-namespace regression test.
 
 Signed-off-by: Weidong Sun <sunweidong@linux.alibaba.com>
+Generated-by: OpenAI Codex
 ---
  .../pkg/podnetwork/podnetwork_test.go         | 71 +++++++++++++++++++
  .../pkg/podnetwork/podnode.go                 |  1 +

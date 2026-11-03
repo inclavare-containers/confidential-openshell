@@ -1,10 +1,20 @@
-From 290285eb7ee3e8c62afc9f8beaf5517def0cd5ca Mon Sep 17 00:00:00 2001
+From 7304e8a133a9739e80b092baa59ab98a3bd4b73d Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
 Date: Tue, 3 Nov 2026 01:05:58 +0800
-Subject: [PATCH 1/5] feat(alibabacloud): provision ESSD with existing provider
- interfaces
+Subject: [PATCH 1/5] alibabacloud: add ESSD support through the provider
+ interface
 
-Co-authored-by: Codex <codex@openai.com>
+Register an Alibaba Cloud provider using the existing block-volume
+interface and ECS SDK. Create ESSD PL0 volumes, recover them through
+cluster and driver tags, and retain the upstream volume-store lifecycle.
+
+Use a stable cluster/volume ClientToken for CreateDisk. Reuse the SDK
+credential object across provider instances so its refresh cache
+survives per-RPC construction, while bounding ECS calls and preserving
+cancellation. Cover ambiguous creation and credential reuse with
+SDK-backed tests.
+
+Generated-by: OpenAI Codex
 ---
  cmd/main.go                                   |   1 +
  go.mod                                        |  15 +

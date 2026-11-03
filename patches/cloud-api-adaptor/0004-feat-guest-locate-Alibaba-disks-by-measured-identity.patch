@@ -1,11 +1,17 @@
-From 90eebe692a108b70b7fc693dd0856fcef91af21d Mon Sep 17 00:00:00 2001
+From 449dc7637fb5b26527d99f6ba040bd896b8b57b1 Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
 Date: Tue, 3 Nov 2026 01:07:30 +0800
-Subject: [PATCH 04/10] feat(guest): locate Alibaba disks by measured identity
+Subject: [PATCH 04/10] guest: resolve Alibaba disks by their measured
+ identities
 
-Use kernel device numbers and backing links without source-name fallbacks.
+A guest device name is not a stable cloud-disk identity. Resolve Alibaba
+disk IDs through kernel serial and WWID attributes and check their
+backing devices before admitting a whole-disk mount.
 
-Co-authored-by: Codex <codex@openai.com>
+Reject ambiguous matches and the root filesystem backing disk. Use
+kernel device numbers and backing links for that check.
+
+Generated-by: OpenAI Codex
 ---
  .../forwarder/interceptor/alibaba_device.go   | 175 +++++++++++++++
  .../interceptor/alibaba_device_test.go        | 199 ++++++++++++++++++

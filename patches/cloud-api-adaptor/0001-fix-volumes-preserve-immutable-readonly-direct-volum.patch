@@ -1,14 +1,20 @@
-From c943155eb188ff85441d48bf99f51d492198ab33 Mon Sep 17 00:00:00 2001
+From 0ed7222bd6b441889780151373c59274363b3cdf Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
 Date: Tue, 3 Nov 2026 01:07:30 +0800
-Subject: [PATCH 01/10] fix(volumes): preserve immutable readonly direct-volume
- plans
+Subject: [PATCH 01/10] volumes: preserve immutable direct-volume mount plans
 
-Parse each Pod direct-volume directory once, validate and normalize the versioned metadata before VM creation, and retain one immutable attachment-to-mount mapping for later container requests. Propagate readonly, mount options, fsGroup and existing CDH references without widening the public provider CloudVolume contract.
+Container creation must use the same disk-to-mount plan that was
+accepted when the PodVM was created. Parse each Pod direct-volume
+directory once and retain an immutable normalized plan instead of
+reparsing mutable host files for each container.
 
-Reject unsafe metadata, duplicate disks and more than 64 valid volumes per Pod. Keep the latest upstream CreateContainer cancellation behavior and return independent option slices to each container.
+Validate the versioned metadata and preserve readonly, mount options,
+fsGroup and CDH references. Reject duplicate disks and oversized plans,
+and return independent option slices without expanding the public
+provider interface.
 
 Signed-off-by: Weidong Sun <sunweidong@linux.alibaba.com>
+Generated-by: OpenAI Codex
 ---
  .../pkg/adaptor/cloud/cloud.go                |  15 +-
  .../pkg/adaptor/cloud/cloud_test.go           |   8 +-

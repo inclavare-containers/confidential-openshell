@@ -1,16 +1,19 @@
-From df7477244a278d1bd91fe554296e8fc14da85f6b Mon Sep 17 00:00:00 2001
-From: Codex <codex@openai.com>
+From 19ed2e401e9121faf1d69c0ed885cf7ec25b03b6 Mon Sep 17 00:00:00 2001
+From: Weidong Sun <sunweidong@linux.alibaba.com>
 Date: Tue, 3 Nov 2026 01:07:30 +0800
-Subject: [PATCH 08/10] Verify measured sealed volumes and native initdata
- binding
+Subject: [PATCH 08/10] guest: verify sealed mounts and native initdata binding
 
-Retain fail-closed sealed volume verification before the guest agent.
-Use the existing process-user-data binary to bind exact initdata with the
-released native AA ttrpc API, enforcing one canonical SHA384 TCG2 event
-and rejecting disabled measurement, digest mismatch or duplicate events.
+Before forwarding container creation to the guest agent, match
+sealed-volume descriptors to the measured manifest and unseal their
+contents through CDH into private mounts. Reject plaintext substitution
+and attempts by other containers to mount the private secret tree.
 
-Reject injected cloud volumes in the measured confidential ephemeral profile before device preparation.
+Bind exact initdata through the native AA ttrpc API and verify one
+canonical SHA-384 TCG2 event. Reject disabled measurement, mismatched
+digests and duplicate extension. In the measured ephemeral profile,
+reject injected cloud volumes before device preparation.
 
+Generated-by: OpenAI Codex
 ---
  .../cmd/agent-protocol-forwarder/main.go      |  14 +-
  .../cmd/process-user-data/main.go             |  13 +

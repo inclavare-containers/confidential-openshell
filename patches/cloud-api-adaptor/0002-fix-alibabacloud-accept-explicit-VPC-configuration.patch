@@ -1,11 +1,14 @@
-From b869f7fc0c6bfdcfe8b24876aaff234023452447 Mon Sep 17 00:00:00 2001
+From de3513be96f2cca34efdd801c828d40fd4a1c45b Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
 Date: Tue, 3 Nov 2026 01:07:30 +0800
-Subject: [PATCH 02/10] fix(alibabacloud): accept explicit VPC configuration
+Subject: [PATCH 02/10] alibabacloud: accept an explicit VPC ID
 
-Allow deployments to provide the VPC ID directly and use metadata discovery only when it is absent. This keeps Alibaba instance creation usable in restricted networks without changing any other provider.
+VPC metadata discovery is unavailable in some restricted worker
+environments. Accept a configured VPC ID and use metadata discovery only
+when that value is absent. Leave the other cloud providers unchanged.
 
 Signed-off-by: Weidong Sun <sunweidong@linux.alibaba.com>
+Generated-by: OpenAI Codex
 ---
  src/cloud-providers/alibabacloud/manager.go   |  3 +-
  .../alibabacloud/manager_test.go              | 28 ++++++++

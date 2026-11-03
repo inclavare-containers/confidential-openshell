@@ -1,16 +1,19 @@
-From f0daae23d7370945fde04334aa92d1d11a9eb913 Mon Sep 17 00:00:00 2001
-From: Codex <codex@openai.com>
+From 90261ba7793d791b5a456f3faef78e40af2fd3a7 Mon Sep 17 00:00:00 2001
+From: Weidong Sun <sunweidong@linux.alibaba.com>
 Date: Tue, 3 Nov 2026 01:07:30 +0800
-Subject: [PATCH 05/10] feat(guest): reuse native CDH for retained encrypted
- volumes
+Subject: [PATCH 05/10] guest: mount retained encrypted volumes through CDH
 
-Use released CDH SecureMount only for embedded-header encrypted devices.
-Bind disks and keys to measured workspace policy, initialize only through
-the measured stock-cryptsetup helper, and enforce readonly at every layer.
-Track and roll back only resources acquired by this call.
+Reuse the CDH SecureMount API for retained devices with embedded LUKS
+headers. Bind disk identities and key references to measured workspace
+policy, and invoke the measured cryptsetup initializer only when that
+policy permits initialization.
 
-Before mounting a measured workspace, validate the active LUKS2 mapping uses AES-XTS-512 and 4096-byte sectors.
+Check the active LUKS2 mapping for AES-XTS with a 512-bit key and
+4096-byte sectors before exposing a measured workspace. Preserve
+readonly behavior and roll back only mounts and mappings acquired by the
+current call.
 
+Generated-by: OpenAI Codex
 ---
  .../cmd/agent-protocol-forwarder/main.go      |  26 +-
  .../cmd/agent-protocol-forwarder/main_test.go |  19 +

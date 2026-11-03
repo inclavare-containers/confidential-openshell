@@ -1,11 +1,16 @@
-From 25efa9a245e88bc20b98477965571aef9e0c7bf1 Mon Sep 17 00:00:00 2001
+From 4df64eb2e1ad6c59b9982555640fffe09efc85af Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
 Date: Tue, 3 Nov 2026 01:07:30 +0800
-Subject: [PATCH 07/10] fix(alibabacloud): bound compressed instance user data
+Subject: [PATCH 07/10] alibabacloud: bound compressed instance user data
 
-Use native cloud-config generation; verify decoded initdata bytes and SHA-384 remain unchanged.
+Encode compressed cloud-config within the ECS user-data limit and bound
+decompression when the guest retrieves it. Reject malformed or oversized
+input instead of accepting a truncated configuration.
 
-Co-authored-by: Codex <codex@openai.com>
+Keep upstream cloud-config generation and verify that transport encoding
+preserves the decoded initdata bytes and their SHA-384 digest.
+
+Generated-by: OpenAI Codex
 ---
  .../cloud/cloudconfig_transport_test.go       | 57 ++++++++++++
  .../pkg/userdata/alibabacloud_test.go         | 67 ++++++++++++++

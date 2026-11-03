@@ -1,5 +1,5 @@
-921d171c663e595f7d542f1adf40ce2a55d01ca0749781dc81b1eb3352e93ea4  ./0001-feat-alibabacloud-provision-ESSD-with-existing-provi.patch
-1f0c9e8437590606ade49983b9682ce86171ca8e2255e481796fdd9b124f7cad  ./0002-feat-node-publish-the-paired-CAA-volume-contract-ato.patch
-0aef50fa7cc63967d90187b58e09cd6a180c99f1a3e00f8b604c119c9b447342  ./0003-feat-deploy-separate-controller-credentials-and-node.patch
-9c285c915562c341a763dc11395410df5cc320fab60d7c8f06e236449fe4eaa0  ./0004-test-share-the-CSI-conformance-runner-between-local-.patch
-540b133cc12592d5a3fba92ec280db5400362e8306c9a0f6d14596bfe62bda4f  ./0005-build-pin-supported-build-and-runtime-base-indexes.patch
+51d915d9043f6a6fff23f95400db8fd54a146de36aeab54f7b3f9d6240d98a81  0001-feat-alibabacloud-provision-ESSD-with-existing-provi.patch
+f17cf968a2ffa0ed8472c7d7099730a1b5aec4f3e8510dfc86c24aa2565589d4  0002-feat-node-publish-the-paired-CAA-volume-contract-ato.patch
+36617f93f9aab650c17b3313348a423779b6b1f64b6bf12b20850162bfafb5f9  0003-feat-deploy-separate-controller-credentials-and-node.patch
+f24a07884f922375fc5b1442abc1325f9ba9bdea8a73fbb0da9452f80ad88399  0004-test-share-the-CSI-conformance-runner-between-local-.patch
+354fc067ecba1846b35c239a3060b20f8a7dbe5ea85cad91cfa69bacab77d9d0  0005-build-pin-supported-build-and-runtime-base-indexes.patch

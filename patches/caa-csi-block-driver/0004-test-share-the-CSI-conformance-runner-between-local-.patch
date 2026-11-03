@@ -1,10 +1,14 @@
-From 66a04ffa778df27793ff0837b7a421ef1f654e38 Mon Sep 17 00:00:00 2001
+From 203157d34d2685dbb157ca1d805830c3fd65842c Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
 Date: Tue, 3 Nov 2026 01:05:58 +0800
-Subject: [PATCH 4/5] test: share the CSI conformance runner between local and
- CI checks
+Subject: [PATCH 4/5] test: share the CSI conformance runner with CI
 
-Co-authored-by: Codex <codex@openai.com>
+The local and CI conformance invocations should exercise the same
+supported RPC scope. Move the shared command and skip list into the
+runner and invoke it from the workflow, retaining verbose local
+execution.
+
+Generated-by: OpenAI Codex
 ---
  .github/workflows/csi-sanity.yaml | 108 +++---------------------------
  hack/run-csi-sanity.sh            |  46 +++++++++----
