@@ -30,21 +30,30 @@ systemctl stop kbs.service as.service
 docker stop openshell-registry
 kubectl -n caa-csi-block scale deployment/caa-csi-block-controller --replicas=0
 kubectl -n caa-csi-block rollout status deployment/caa-csi-block-controller --timeout=120s
+kubectl -n caa-csi-block wait --for=delete pod \
+  -l app.kubernetes.io/name=caa-csi-block-driver,app.kubernetes.io/component=controller --timeout=120s
 kubectl -n caa-csi-block get pvc/caa-csi-block-controller-state -o yaml > "$BACKUP/csi-state-pvc.yaml"
 kubectl get pv -o yaml > "$BACKUP/pvs.yaml"
 helm -n confidential-containers-system get values peerpods -a > "$BACKUP/peerpods-values.yaml"
 helm -n confidential-containers-system get values caa-csi-block -a > "$BACKUP/csi-values.yaml"
+EXTRA_STATE=()
+for path in /etc/systemd/system/{openshell-confidential-*,as,kbs,attestation-observer}.service.d \
+  /etc/systemd/system/attestation-observer.service /var/lib/openshell-attestation-observer \
+  /var/lib/private/openshell-attestation-observer; do
+  if [[ -e "$path" ]]; then EXTRA_STATE+=("$path"); fi
+done
 tar --acls --xattrs --numeric-owner -cpf "$BACKUP/trusted-state.tar" \
   /etc/openshell-confidential /var/lib/openshell-confidential \
   /etc/trustee /opt/trustee /opt/openshell \
   /etc/systemd/system/openshell-confidential-*.service \
-  /etc/systemd/system/as.service /etc/systemd/system/kbs.service
+  /etc/systemd/system/as.service /etc/systemd/system/kbs.service "${EXTRA_STATE[@]}"
 sha256sum "$BACKUP/trusted-state.tar" > "$BACKUP/trusted-state.sha256"
 ```
 
-Stop the optional observer only if installed; include its unit/drop-ins and
-`/var/lib/openshell-attestation-observer` when preserving historical reports.
-Include all local systemd overrides for driver/Gateway/Trustee. Store the backup
+The optional observer is stopped and included when installed. The extra paths
+preserve its history and local service overrides. Add any custom state paths or
+units used by your deployment. Include the real directory beneath `/var/lib/private`
+as well as its public symlink for systemd's `DynamicUser` state. Store the backup
 on protected storage outside this host. It contains private keys, provider
 credentials, workspace keys, administration credentials and registry content.
 
@@ -78,8 +87,8 @@ printf '%s  %s\n' "$NEW_SHA256" "$NEW_HANDOFF/SHA256SUMS" | sha256sum -c -
 (cd "$NEW_HANDOFF" && sha256sum -c SHA256SUMS --quiet)
 OLD_SHA256=$(sha256sum "$HANDOFF/SHA256SUMS" | cut -d ' ' -f1)
 cp "$OPERATOR_DIR/ack-state.json" "$BACKUP/ack-state.before.json"
-mv "$HANDOFF" "$BACKUP/handoff"
-mv /opt/confidential-openshell "$BACKUP/source"
+mv -T "$HANDOFF" "$BACKUP/handoff"
+mv -T /opt/confidential-openshell "$BACKUP/source"
 install -d -m 0700 "$BACKUP/installer"
 tar -xf "$NEW_HANDOFF/source/integration.tar" -C "$BACKUP/installer"
 python3 "$BACKUP/installer/deployment/build/install-release.py" \
@@ -134,6 +143,9 @@ Reapply the changed components using the normal steps:
 
 ```bash
 ./cos cloud image
+if systemctl is-enabled --quiet attestation-observer.service; then
+  ./cos trustee reports
+fi
 ./cos trustee start
 ./cos deploy initdata
 ./cos registry start
@@ -152,7 +164,9 @@ private file. If `driver.env` differs, inspect the generated `.part` file and th
 new published digests, back up the old file, then explicitly install the reviewed
 file with `root:openshell-gateway`, mode `0640`, before repeating the step. Do not
 regenerate TLS identities, driver keys, resource records or workspace keys.
-Restart the optional observer if enabled. Start one retained sandbox and complete
+The conditional reports step installs the selected observer binary and unit when
+reports were already enabled; restarting an old binary alone does not update it.
+Start one retained sandbox and complete
 [live acceptance](live-acceptance.md), checking stable CR UID, disk, LUKS UUID and
 files with fresh role attempts. Resume the remaining sandboxes after it passes.
 
@@ -160,8 +174,12 @@ For rollback, stop all sandboxes and services again. Keep B's source, handoff,
 `ack-state.json` and configuration separately; restore A's source/handoff paths.
 In the current `ack-state.json`, restore only `handoff_sha256`, `podvm_image_id`
 and `oss_object` from A's saved file, after checking that name, region, cluster ID
-and `config_sha256` still match. Restore A's reviewed `driver.env` and rerun the
-same component installation sequence using A. **Do not restore an old trusted
+and `config_sha256` still match. Restore A's reviewed `driver.env` with ownership
+`root:openshell-gateway` and mode `0640`, then rerun the same component installation
+sequence using A. If A predates configuration preservation, its `gateway install`
+overwrites `gateway.toml`: keep the reviewed configuration separately and install
+it back with the same ownership/mode after that command and before `gateway start`.
+**Do not restore an old trusted
 state tar during a binary rollback**: doing so can revive revoked authorization
 or lose changes made after the snapshot. Keep CSI state and workspace data
 current. Retain both images until no VM uses them and rollback is no longer needed.

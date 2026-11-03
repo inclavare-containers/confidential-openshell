@@ -28,6 +28,8 @@ kubectl get pv "$PV" -o json > "$EVIDENCE/pv-before.json"
 
 If historical conditions are desired, enable `./cos trustee reports` on the
 Trustee host and `./cos gateway reports` on T before creating the sandbox.
+After enabling reports on running services, repeat `./cos gateway start` and
+`./cos gateway login` to check readiness after the service restart.
 `SupervisorAttested` and `WorkloadAttested` must refer to this CR UID and the two
 current attempts. Save their parsed message JSON, initdata digests and appraisal
 references. Conditions are a historical display, not proof of current release.
@@ -60,7 +62,7 @@ both `UpToDate` and `OutOfDate`; the probe's affirmative result is not a stronge
 production TCB requirement. Guest/policy/quote mutation regressions are separate
 negative tests; an own/cross-role comparison does not cover every rejection cause.
 
-## Workspace, permissions and a real agent task
+## Workspace and permissions
 
 Inside the sandbox shell, create a distinctive persistence marker and record
 mount/permission state:
@@ -85,22 +87,18 @@ Path('/sandbox/acceptance-before.json').write_text(json.dumps({
 PY
 ```
 
-Download the marker and JSON to the private evidence directory. Upload the public
-`tests/e2e/fixtures/project` and ask the actual harness to fix `clamp.py`, run
-`python3 test_clamp.py`, and write the requested `result.json`. Use a real provider
-response and the normal PTY. Detach with Ctrl-P/Ctrl-Q and reconnect. Download the
-result and run the non-executing oracle on T:
+Download the marker and JSON to the private evidence directory:
 
 ```bash
 openshell sandbox download "$SANDBOX" /sandbox/acceptance-marker "$EVIDENCE"
 openshell sandbox download "$SANDBOX" /sandbox/acceptance-before.json "$EVIDENCE"
-python3 tests/e2e/collect.py --work "$EVIDENCE/downloaded-project" \
-  --output "$EVIDENCE/task-check.json"
 ```
 
-Repeat the native harness workflow for OpenCode, Codex and Claude Code when
-accepting their advertised support. Keep tool success evidence and transcript
-hashes privately. Plain model text without completed edit/test calls is insufficient.
+Complete the stop/revocation check below before running a long agent task. Natural
+session tokens expire; completing a task first can make those tokens unusable as
+revocation evidence. The later task persistence check uses another native
+Stop/Start cycle.
+
 The unit fsGroup regression additionally covers differing primary GID, existing
 0600 files, changed fsGroup, symlinks and readonly requests; the default live
 workload normally has the same primary GID and fsGroup.
@@ -139,8 +137,11 @@ For a raw at-rest check, use the stopped disk's cloud snapshot to create a
 **disposable clone** in the same zone, and attach only that clone to an inspection
 VM. Record every created snapshot/disk/instance ID for cleanup. Use
 `CreateSnapshot`/`DescribeSnapshots` until `Status=accomplished`, then `CreateDisk`
-with that `SnapshotId`, and `AttachDisk` with `DeleteWithInstance=false`. Resolve
-the clone by its ECS disk serial, not by a guessed `/dev/vdX` position. Verify it
+with that `SnapshotId`. Pass the source disk's size, disk category and ESSD
+performance level explicitly; a small PL0 workspace is incompatible with the
+default PL1 size range. Use `AttachDisk` with `DeleteWithInstance=false`. Resolve
+the clone by its ECS disk serial, allowing the `d-` prefix to be
+absent, and wait for the device to appear. Do not guess a `/dev/vdX` position. Verify it
 is unmounted and not the inspector's system disk. Set that clone read-only with
 `blockdev --setro DEVICE`; do not unlock it or transfer the workspace key.
 
@@ -152,6 +153,9 @@ be absent. Keep only the result and UUID; do not publish a disk dump. A negative
 marker search alone is not cryptographic proof: combine it with the measured
 guest mapper checks and the LUKS2/AES-XTS-512/4096-byte-sector rejection tests.
 Detach/delete the clone and delete its snapshot after the check.
+If ECS still reports snapshot initialization during deletion, retain the exact
+clone ID and retry after initialization completes; do not treat that response as
+successful cleanup.
 
 ```bash
 openshell sandbox start "$SANDBOX"
@@ -163,14 +167,39 @@ python3 tests/acceptance/check-live-release.py \
 openshell sandbox connect "$SANDBOX"
 ```
 
-Inside the sandbox, check the marker hash against `acceptance-before.json`, retained
-agent results and `/sandbox` setgid/mount state. On T, confirm the same PVC/PV,
+Inside the sandbox, check the marker hash against `acceptance-before.json` and
+`/sandbox` setgid/mount state. On T, confirm the same PVC/PV,
 cloud disk and trusted workspace key identity, with new role attempts/initdata
 digests and a new workload Pod UID. Inspect the measured workload `workspace.toml`:
 `allow_initialize` must now be false. To compare LUKS UUIDs directly, repeat the
 stopped-clone inspection after this restart and compare the two recorded UUIDs.
 Never export the key to demonstrate key stability; compare a private digest of
 its trusted record in place.
+
+## Run an agent task and preserve its results
+
+Upload the public `tests/e2e/fixtures/project` and ask the actual harness to fix
+`clamp.py`, run `python3 test_clamp.py`, and write the requested `result.json`.
+Use a real provider response and the normal PTY. Detach with Ctrl-P/Ctrl-Q and
+reconnect. Download the completed project to a new private directory on T and
+run the non-executing oracle:
+
+```bash
+python3 tests/e2e/collect.py --work "$EVIDENCE/downloaded-project" \
+  --output "$EVIDENCE/task-check.json"
+```
+
+Repeat the native harness workflow for OpenCode, Codex and Claude Code when
+accepting their advertised support. Keep separate project directories, tool
+success evidence and transcript hashes. Plain model text without completed
+edit/test calls is insufficient.
+
+Stop and start the sandbox again with the native CLI. Download the retained
+projects to new directories, compare every source/test/result file hash against
+the pre-stop copies, and rerun the oracle with new output paths. Confirm the same
+CR UID, PVC/PV, disk and marker, with fresh role attempts and `allow_initialize`
+still false. Probe the fresh sessions immediately after Start. Do not use expired
+pre-task sessions as evidence that this later Stop revoked access.
 
 ## Delete and close the evidence
 

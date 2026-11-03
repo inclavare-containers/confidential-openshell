@@ -65,7 +65,7 @@ def current_bindings(state, uid):
         raise ValueError('no unique active trusted attempt; start the sandbox first')
     active = active[0]
     result = {}
-    for path in (state / 'bindings').glob('*.json'):
+    for path in sorted((state / 'bindings').glob('*.json')):
         row = json.loads(path.read_text())
         if (row['sandbox_cr_uid'], row['sandbox_id'], row['attempt_id'], row['generation']) != (
                 uid, active['sandbox_id'], active['attempt'], active['generation']):
@@ -74,8 +74,14 @@ def current_bindings(state, uid):
             continue
         # Retain only identifiers needed for the probe, never resource keys.
         record = {key: row[key] for key in ('role', 'sandbox_id', 'resource_path', 'initdata_sha384', 'attempt_id', 'generation')}
-        if row['role'] in result and result[row['role']] != record:
-            raise ValueError('conflicting current role bindings')
+        if row['role'] in result:
+            # One measured role legitimately owns several sealed bootstrap files.
+            # Select one stable resource for the allow/cross-role comparison,
+            # while rejecting inconsistent identity or measurement metadata.
+            if any(result[row['role']][key] != record[key] for key in
+                   ('role', 'sandbox_id', 'initdata_sha384', 'attempt_id', 'generation')):
+                raise ValueError('conflicting current role bindings')
+            continue
         result[row['role']] = record
     if set(result) != {'supervisor', 'workload'}:
         raise ValueError('both current role bindings are required')

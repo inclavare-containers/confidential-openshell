@@ -63,6 +63,14 @@ class LiveEvidence(unittest.TestCase):
             result = probe.current_bindings(root, 'cr-uid')
             self.assertEqual(set(result), {'supervisor', 'workload'})
             self.assertNotIn('must-not-export', json.dumps(result))
+            extra = {**row, 'resource_path': 'resource/another-workload-file'}
+            extra_path = root / 'bindings/z-workload.json'
+            extra_path.write_text(json.dumps(extra))
+            self.assertEqual(probe.current_bindings(root, 'cr-uid'), result)
+            extra_path.write_text(json.dumps({**extra, 'initdata_sha384': 'conflicting'}))
+            with self.assertRaisesRegex(ValueError, 'conflicting current role'):
+                probe.current_bindings(root, 'cr-uid')
+            extra_path.unlink()
             (root / 'revoking/workload').touch()
             with self.assertRaisesRegex(ValueError, 'both current role'):
                 probe.current_bindings(root, 'cr-uid')
