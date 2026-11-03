@@ -1,7 +1,7 @@
-From 0ed7222bd6b441889780151373c59274363b3cdf Mon Sep 17 00:00:00 2001
+From f094f22d1394c0633fea1eeb7f7b2bd87baba6c1 Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
-Date: Tue, 3 Nov 2026 01:07:30 +0800
-Subject: [PATCH 01/10] volumes: preserve immutable direct-volume mount plans
+Date: Tue, 3 Nov 2026 11:58:12 +0800
+Subject: [PATCH] volumes: preserve immutable direct-volume mount plans
 
 Container creation must use the same disk-to-mount plan that was
 accepted when the PodVM was created. Parse each Pod direct-volume
@@ -19,7 +19,7 @@ Generated-by: OpenAI Codex
  .../pkg/adaptor/cloud/cloud.go                |  15 +-
  .../pkg/adaptor/cloud/cloud_test.go           |   8 +-
  .../pkg/adaptor/k8sops/peerpod.go             |  18 +
- .../pkg/adaptor/proxy/cloud_volumes_test.go   | 240 ++++++++--
+ .../pkg/adaptor/proxy/cloud_volumes_test.go   | 240 +++++++--
  .../pkg/adaptor/proxy/factory.go              |   7 +-
  .../pkg/adaptor/proxy/proxy.go                |  43 +-
  .../pkg/adaptor/proxy/proxy_test.go           |  44 +-
@@ -28,15 +28,15 @@ Generated-by: OpenAI Codex
  .../pkg/forwarder/interceptor/interceptor.go  |  62 ++-
  .../forwarder/interceptor/interceptor_test.go |  21 +-
  src/cloud-api-adaptor/pkg/util/cloud.go       | 100 ----
- .../pkg/util/cloud_csi_test.go                | 370 +++++++++------
- .../pkg/util/direct_volume.go                 | 447 ++++++++++++++++++
+ .../pkg/util/cloud_csi_test.go                | 370 ++++++++------
+ .../pkg/util/direct_volume.go                 | 455 ++++++++++++++++++
  .../pkg/util/testdata/direct-volume-v1.json   |   1 +
- 15 files changed, 1064 insertions(+), 595 deletions(-)
+ 15 files changed, 1072 insertions(+), 595 deletions(-)
  create mode 100644 src/cloud-api-adaptor/pkg/util/direct_volume.go
  create mode 100644 src/cloud-api-adaptor/pkg/util/testdata/direct-volume-v1.json
 
 diff --git a/src/cloud-api-adaptor/pkg/adaptor/cloud/cloud.go b/src/cloud-api-adaptor/pkg/adaptor/cloud/cloud.go
-index 5a9b154c1d77e4d145a5605c5c390d3584e23f8c..f22b2f9dbc54872192868a70b79a864db31d015e 100644
+index 5a9b154c..f22b2f9d 100644
 --- a/src/cloud-api-adaptor/pkg/adaptor/cloud/cloud.go
 +++ b/src/cloud-api-adaptor/pkg/adaptor/cloud/cloud.go
 @@ -195,8 +195,17 @@ func (s *cloudService) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (r
@@ -69,7 +69,7 @@ index 5a9b154c1d77e4d145a5605c5c390d3584e23f8c..f22b2f9dbc54872192868a70b79a864d
  	daemonConfig := forwarder.Config{
  		PodNamespace: namespace,
 diff --git a/src/cloud-api-adaptor/pkg/adaptor/cloud/cloud_test.go b/src/cloud-api-adaptor/pkg/adaptor/cloud/cloud_test.go
-index 76d388e9b59860687d4f5f341531c53442a64e7e..9eb403563e3fd6564e13a2f6a476fad0559d5f40 100644
+index 76d388e9..9eb40356 100644
 --- a/src/cloud-api-adaptor/pkg/adaptor/cloud/cloud_test.go
 +++ b/src/cloud-api-adaptor/pkg/adaptor/cloud/cloud_test.go
 @@ -22,6 +22,7 @@ import (
@@ -104,7 +104,7 @@ index 76d388e9b59860687d4f5f341531c53442a64e7e..9eb403563e3fd6564e13a2f6a476fad0
  	res2, err := s.StartVM(ctx, &pb.StartVMRequest{Id: sandboxID})
  
 diff --git a/src/cloud-api-adaptor/pkg/adaptor/k8sops/peerpod.go b/src/cloud-api-adaptor/pkg/adaptor/k8sops/peerpod.go
-index 918908da115e0626dcc071a9a18522349f9f49e5..54e5fb337a24809f8cb1c9583ba2bf707c612691 100644
+index 918908da..54e5fb33 100644
 --- a/src/cloud-api-adaptor/pkg/adaptor/k8sops/peerpod.go
 +++ b/src/cloud-api-adaptor/pkg/adaptor/k8sops/peerpod.go
 @@ -91,6 +91,24 @@ func (s *PeerPodService) getPod(podname string, podns string) (*v1.Pod, error) {
@@ -133,7 +133,7 @@ index 918908da115e0626dcc071a9a18522349f9f49e5..54e5fb337a24809f8cb1c9583ba2bf70
  func (s *PeerPodService) OwnPeerPod(podname string, podns string, instanceID string) error {
  	pod, err := s.getPod(podname, podns)
 diff --git a/src/cloud-api-adaptor/pkg/adaptor/proxy/cloud_volumes_test.go b/src/cloud-api-adaptor/pkg/adaptor/proxy/cloud_volumes_test.go
-index ca8b0b9243de42c21c72d2e936b6d445c51e53e5..975727ca5a4a5c8f1bd005f7cce2f4dcd62639c6 100644
+index ca8b0b92..975727ca 100644
 --- a/src/cloud-api-adaptor/pkg/adaptor/proxy/cloud_volumes_test.go
 +++ b/src/cloud-api-adaptor/pkg/adaptor/proxy/cloud_volumes_test.go
 @@ -19,11 +19,32 @@ import (
@@ -539,7 +539,7 @@ index ca8b0b9243de42c21c72d2e936b6d445c51e53e5..975727ca5a4a5c8f1bd005f7cce2f4dc
  	req := newCreateContainerRequest("test-plain-vol").
  		withAnnotations(map[string]string{
 diff --git a/src/cloud-api-adaptor/pkg/adaptor/proxy/factory.go b/src/cloud-api-adaptor/pkg/adaptor/proxy/factory.go
-index 779e2fccad280983168cf8063bfa27880714a10a..d4e7e98115249ac9fc5dd43a0ff218581de226cc 100644
+index 779e2fcc..d4e7e981 100644
 --- a/src/cloud-api-adaptor/pkg/adaptor/proxy/factory.go
 +++ b/src/cloud-api-adaptor/pkg/adaptor/proxy/factory.go
 @@ -6,11 +6,12 @@ package proxy
@@ -567,7 +567,7 @@ index 779e2fccad280983168cf8063bfa27880714a10a..d4e7e98115249ac9fc5dd43a0ff21858
 +	return newAgentProxy(serverName, socketPath, f.pauseImage, f.tlsConfig, f.caService, f.proxyTimeout, directVolumes)
  }
 diff --git a/src/cloud-api-adaptor/pkg/adaptor/proxy/proxy.go b/src/cloud-api-adaptor/pkg/adaptor/proxy/proxy.go
-index 921bebb5ce3d0c4adc64af18690694a48bccc648..887cfdc1e91f65dcfe6aed5934698a8a9c9bd49e 100644
+index 921bebb5..887cfdc1 100644
 --- a/src/cloud-api-adaptor/pkg/adaptor/proxy/proxy.go
 +++ b/src/cloud-api-adaptor/pkg/adaptor/proxy/proxy.go
 @@ -17,6 +17,7 @@ import (
@@ -639,7 +639,7 @@ index 921bebb5ce3d0c4adc64af18690694a48bccc648..887cfdc1e91f65dcfe6aed5934698a8a
  		if err := proxyService.Close(); err != nil {
  			logger.Printf("error closing agent proxy connection: %v", err)
 diff --git a/src/cloud-api-adaptor/pkg/adaptor/proxy/proxy_test.go b/src/cloud-api-adaptor/pkg/adaptor/proxy/proxy_test.go
-index b9bbb97c27737e6236627640d4be46d69c0e7254..96431e945a19b3c277ab6627ea97549da851431d 100644
+index b9bbb97c..96431e94 100644
 --- a/src/cloud-api-adaptor/pkg/adaptor/proxy/proxy_test.go
 +++ b/src/cloud-api-adaptor/pkg/adaptor/proxy/proxy_test.go
 @@ -11,6 +11,7 @@ import (
@@ -730,7 +730,7 @@ index b9bbb97c27737e6236627640d4be46d69c0e7254..96431e945a19b3c277ab6627ea97549d
  }
  
 diff --git a/src/cloud-api-adaptor/pkg/adaptor/proxy/service.go b/src/cloud-api-adaptor/pkg/adaptor/proxy/service.go
-index abe00e7e0237c78914e77afeaa4bc3644ad32eb0..3f17eb61dc383afdace7dd815d5cf2d63d766e32 100644
+index abe00e7e..3f17eb61 100644
 --- a/src/cloud-api-adaptor/pkg/adaptor/proxy/service.go
 +++ b/src/cloud-api-adaptor/pkg/adaptor/proxy/service.go
 @@ -5,13 +5,9 @@ package proxy
@@ -985,7 +985,7 @@ index abe00e7e0237c78914e77afeaa4bc3644ad32eb0..3f17eb61dc383afdace7dd815d5cf2d6
  	res, err := s.Redirector.SetPolicy(ctx, req)
  
 diff --git a/src/cloud-api-adaptor/pkg/adaptor/proxy/service_test.go b/src/cloud-api-adaptor/pkg/adaptor/proxy/service_test.go
-index d519652379a6124f51af5dc4554eebfb1eb67d98..a712b2227f09dd6f5eced7d61f74e6ffaf8e3d16 100644
+index d5196523..a712b222 100644
 --- a/src/cloud-api-adaptor/pkg/adaptor/proxy/service_test.go
 +++ b/src/cloud-api-adaptor/pkg/adaptor/proxy/service_test.go
 @@ -5,12 +5,7 @@ package proxy
@@ -1167,7 +1167,7 @@ index d519652379a6124f51af5dc4554eebfb1eb67d98..a712b2227f09dd6f5eced7d61f74e6ff
  	require.NoError(t, err)
  
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
-index d9bb7679b3156f37776c0c5b4c711605174f6701..0273c78f692812b25bfb286ca4978cc395f01b4b 100644
+index d9bb7679..0273c78f 100644
 --- a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
 @@ -5,7 +5,6 @@ package interceptor
@@ -1341,7 +1341,7 @@ index d9bb7679b3156f37776c0c5b4c711605174f6701..0273c78f692812b25bfb286ca4978cc3
  	}
  
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor_test.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor_test.go
-index ece31ca409e7f498b191802589a073b7db39c65c..6dd222641e3b35bc54c8641376de2ad8ff8783d5 100644
+index ece31ca4..6dd22264 100644
 --- a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor_test.go
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor_test.go
 @@ -1001,7 +1001,7 @@ func TestCloudVolumesJSONParseError(t *testing.T) {
@@ -1428,7 +1428,7 @@ index ece31ca409e7f498b191802589a073b7db39c65c..6dd222641e3b35bc54c8641376de2ad8
  	t.Run("returns false for nonexistent device", func(t *testing.T) {
  		assert.False(t, hasPartitions("nonexistent_device_xyz"))
 diff --git a/src/cloud-api-adaptor/pkg/util/cloud.go b/src/cloud-api-adaptor/pkg/util/cloud.go
-index 8e555f9135b524d24962cb401810f4d3bd519df0..1e14dbec1dd9a63f4b47b8d2a9348b4fdad78096 100644
+index 8e555f91..1e14dbec 100644
 --- a/src/cloud-api-adaptor/pkg/util/cloud.go
 +++ b/src/cloud-api-adaptor/pkg/util/cloud.go
 @@ -1,17 +1,11 @@
@@ -1548,7 +1548,7 @@ index 8e555f9135b524d24962cb401810f4d3bd519df0..1e14dbec1dd9a63f4b47b8d2a9348b4f
 -	return volumes
 -}
 diff --git a/src/cloud-api-adaptor/pkg/util/cloud_csi_test.go b/src/cloud-api-adaptor/pkg/util/cloud_csi_test.go
-index 8eeaffdb56cea4f48b11fd87cbe041def82092bf..31cc45b1ce38819fdea67f792180c0768b259980 100644
+index 8eeaffdb..31cc45b1 100644
 --- a/src/cloud-api-adaptor/pkg/util/cloud_csi_test.go
 +++ b/src/cloud-api-adaptor/pkg/util/cloud_csi_test.go
 @@ -8,10 +8,9 @@ import (
@@ -1984,10 +1984,10 @@ index 8eeaffdb56cea4f48b11fd87cbe041def82092bf..31cc45b1ce38819fdea67f792180c076
  }
 diff --git a/src/cloud-api-adaptor/pkg/util/direct_volume.go b/src/cloud-api-adaptor/pkg/util/direct_volume.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..4e4ec362e766d12dca49236e2a9cb03e6bd16ba6
+index 00000000..326dac45
 --- /dev/null
 +++ b/src/cloud-api-adaptor/pkg/util/direct_volume.go
-@@ -0,0 +1,447 @@
+@@ -0,0 +1,455 @@
 +// (C) Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -2102,7 +2102,6 @@ index 0000000000000000000000000000000000000000..4e4ec362e766d12dca49236e2a9cb03e
 +
 +	result := make(map[string]CloudVolumeAnnotation, len(encoded))
 +	seenDisks := make(map[string]struct{}, len(encoded))
-+	seenLUNs := make(map[int]struct{}, len(encoded))
 +	seenTargets := make(map[string]struct{}, len(encoded))
 +	for name, raw := range encoded {
 +		if !strings.HasPrefix(name, "vol-") {
@@ -2144,17 +2143,26 @@ index 0000000000000000000000000000000000000000..4e4ec362e766d12dca49236e2a9cb03e
 +		if err := validateFSGroup(volume.FSGroup); err != nil {
 +			return nil, fmt.Errorf("cloud volume %s has invalid fs_group: %w", name, err)
 +		}
++		if (volume.EncryptType == "") != (volume.KeyID == "") {
++			return nil, fmt.Errorf("cloud volume %s must set encrypt_type and key_id together", name)
++		}
++		if volume.EncryptType != "" {
++			switch strings.ToLower(volume.EncryptType) {
++			case "luks", "luks2":
++			default:
++				return nil, fmt.Errorf("cloud volume %s has unsupported encrypt_type %q", name, volume.EncryptType)
++			}
++			if strings.TrimSpace(volume.KeyID) != volume.KeyID || strings.ContainsAny(volume.KeyID, "\t\r\n") {
++				return nil, fmt.Errorf("cloud volume %s has invalid key_id", name)
++			}
++		}
 +		if _, exists := seenDisks[volume.DiskID]; exists {
 +			return nil, fmt.Errorf("cloud volume %s duplicates disk_id %q", name, volume.DiskID)
-+		}
-+		if _, exists := seenLUNs[lun]; exists {
-+			return nil, fmt.Errorf("cloud volume %s duplicates lun %d", name, lun)
 +		}
 +		if _, exists := seenTargets[volume.MountPoint]; exists {
 +			return nil, fmt.Errorf("cloud volume %s duplicates mount_point %q", name, volume.MountPoint)
 +		}
 +		seenDisks[volume.DiskID] = struct{}{}
-+		seenLUNs[lun] = struct{}{}
 +		seenTargets[volume.MountPoint] = struct{}{}
 +		result[name] = volume
 +	}
@@ -2437,8 +2445,11 @@ index 0000000000000000000000000000000000000000..4e4ec362e766d12dca49236e2a9cb03e
 +}
 diff --git a/src/cloud-api-adaptor/pkg/util/testdata/direct-volume-v1.json b/src/cloud-api-adaptor/pkg/util/testdata/direct-volume-v1.json
 new file mode 100644
-index 0000000000000000000000000000000000000000..c8c6d41287c8503aa4b6517494671416c440c119
+index 00000000..c8c6d412
 --- /dev/null
 +++ b/src/cloud-api-adaptor/pkg/util/testdata/direct-volume-v1.json
 @@ -0,0 +1 @@
 +{"version":1,"volume-type":"block","volume-mode":"filesystem","device":"d-workspace123","fstype":"ext4","readonly":true,"options":["noatime","ro"],"fs-group":"2000","pod-uid":"pod-uid-123","volume-handle":"pvc-workspace","metadata":{"cloud-provider":"alibabacloud","cloud-volume-path":"d-workspace123"}}
+-- 
+2.43.7
+

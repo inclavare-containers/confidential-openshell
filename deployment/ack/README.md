@@ -66,3 +66,8 @@ roles are separate from the operator and image-import identities.
 Cloud resources remain billable until deleted. New ACK has deletion protection;
 disable it before deletion. State identifies generated resources. Shared import
 roles and existing-cluster resources are retained resources.
+
+Follow [operations](../../docs/operations.md#retire-owned-resources) for the ordered
+cleanup of dedicated resources and exact-ID readback. The public profile supports
+Beijing Zone I with ecs.g9i.xlarge and containerd 2.3.4; the broader placement
+table does not imply that other deployment profiles have been verified.

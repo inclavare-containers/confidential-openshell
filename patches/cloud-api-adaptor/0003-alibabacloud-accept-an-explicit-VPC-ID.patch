@@ -1,7 +1,7 @@
-From de3513be96f2cca34efdd801c828d40fd4a1c45b Mon Sep 17 00:00:00 2001
+From bb05adb253bb537c685aec9816db61a9a0a9118a Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
-Date: Tue, 3 Nov 2026 01:07:30 +0800
-Subject: [PATCH 02/10] alibabacloud: accept an explicit VPC ID
+Date: Tue, 3 Nov 2026 11:58:12 +0800
+Subject: [PATCH] alibabacloud: accept an explicit VPC ID
 
 VPC metadata discovery is unavailable in some restricted worker
 environments. Accept a configured VPC ID and use metadata discovery only
@@ -19,7 +19,7 @@ Generated-by: OpenAI Codex
  create mode 100644 src/cloud-providers/alibabacloud/provider_vpc_test.go
 
 diff --git a/src/cloud-providers/alibabacloud/manager.go b/src/cloud-providers/alibabacloud/manager.go
-index a3753a0299bb699bc89668e33df4e09d4b6f6178..c743b9ef60b623587f01d26da23db5dd501dee94 100644
+index a3753a02..c743b9ef 100644
 --- a/src/cloud-providers/alibabacloud/manager.go
 +++ b/src/cloud-providers/alibabacloud/manager.go
 @@ -34,8 +34,7 @@ func (*Manager) ParseCmd(flags *flag.FlagSet) {
@@ -34,7 +34,7 @@ index a3753a0299bb699bc89668e33df4e09d4b6f6178..c743b9ef60b623587f01d26da23db5dd
  	reg.CustomTypeWithEnv(&alibabacloudcfg.SecurityGroupIDs, "security-group-ids", "cn-beijing", "SECURITY_GROUP_IDS", "Security Group Ids to be used for the Pod VM, comma separated")
 diff --git a/src/cloud-providers/alibabacloud/manager_test.go b/src/cloud-providers/alibabacloud/manager_test.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..6cea2d65f69aaaebd1d2dcce1798c8b6bb8f6e08
+index 00000000..6cea2d65
 --- /dev/null
 +++ b/src/cloud-providers/alibabacloud/manager_test.go
 @@ -0,0 +1,28 @@
@@ -67,10 +67,10 @@ index 0000000000000000000000000000000000000000..6cea2d65f69aaaebd1d2dcce1798c8b6
 +	}
 +}
 diff --git a/src/cloud-providers/alibabacloud/provider.go b/src/cloud-providers/alibabacloud/provider.go
-index 389f2d112515b3661be9325f6bfba1e987c787a4..b52fc17de242bfed6da4d718f2426b7ba9df8d77 100644
+index 0ca9cb1d..ae86d41b 100644
 --- a/src/cloud-providers/alibabacloud/provider.go
 +++ b/src/cloud-providers/alibabacloud/provider.go
-@@ -144,7 +144,7 @@ func NewProvider(config *Config) (provider.Provider, error) {
+@@ -145,7 +145,7 @@ func NewProvider(config *Config) (provider.Provider, error) {
  		return nil, fmt.Errorf("failed to update instance type spec list: %v", err)
  	}
  
@@ -79,7 +79,7 @@ index 389f2d112515b3661be9325f6bfba1e987c787a4..b52fc17de242bfed6da4d718f2426b7b
  		return nil, fmt.Errorf("failed to get vpc id: %v", err)
  	}
  
-@@ -440,6 +440,13 @@ func (p *alibabaCloudProvider) updateVpcID() error {
+@@ -432,6 +432,13 @@ func (p *alibabaCloudProvider) updateVpcID() error {
  	return nil
  }
  
@@ -95,7 +95,7 @@ index 389f2d112515b3661be9325f6bfba1e987c787a4..b52fc17de242bfed6da4d718f2426b7b
  
 diff --git a/src/cloud-providers/alibabacloud/provider_vpc_test.go b/src/cloud-providers/alibabacloud/provider_vpc_test.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..222baecb030b322bd8f5810ad198d16d3a3617bd
+index 00000000..222baecb
 --- /dev/null
 +++ b/src/cloud-providers/alibabacloud/provider_vpc_test.go
 @@ -0,0 +1,68 @@
@@ -167,3 +167,6 @@ index 0000000000000000000000000000000000000000..222baecb030b322bd8f5810ad198d16d
 +		t.Fatalf("DescribeVSwitchAttributes calls = %d, want 1", client.describeCalls)
 +	}
 +}
+-- 
+2.43.7
+

@@ -18,9 +18,10 @@ def main():
     require(re.fullmatch(r'[^\s@]+@sha256:[0-9a-f]{64}', pause) and re.fullmatch(r'[0-9a-f]{64}', shim),
             'Publish the verified release first: ./cos registry publish.')
     source = (ROOT / 'deployment/peerpods/worker-profile.py').read_bytes()
+    runtime_version = json.loads((ROOT / 'deployment/ack/ack.example.json').read_text())['containerd_version']
     command = '\n'.join([
         '#!/bin/bash', 'set -euo pipefail',
-        'printf %s ' + shlex.quote(base64.b64encode(source).decode()) + ' | base64 -d | python3 - ' + shlex.quote(pause) + ' ' + shlex.quote(shim),
+        'printf %s ' + shlex.quote(base64.b64encode(source).decode()) + ' | base64 -d | python3 - ' + shlex.quote(pause) + ' ' + shlex.quote(shim) + ' ' + shlex.quote(runtime_version),
         '',
     ])
     for name, instance in selected(cloud):

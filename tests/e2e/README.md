@@ -32,7 +32,7 @@ already exist.
 
 These checks cover application behavior. Workspace restart must preserve the
 original sandbox identity and task files; resource cleanup must be checked
-against its recorded owner IDs. See the [deployment checks](../../docs/deployment.md#10-verify-both-confidential-roles)
+against its recorded owner IDs. See the [live acceptance procedure](../../docs/live-acceptance.md)
 for attestation, resource release and lifecycle requirements.
 
 Run the oracle regressions offline with:

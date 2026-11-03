@@ -25,15 +25,24 @@ if [[ -e "$destination" ]]; then
 fi
 git -C "$source" cat-file -e "$base^{commit}"
 mkdir -p "$root/.local/build-sources"
-GIT_LFS_SKIP_SMUDGE=1 git clone --no-hardlinks --dissociate --no-checkout "$source" "$destination"
-git -C "$destination" checkout --detach "$base"
+staging=$(mktemp -d "$root/.local/build-sources/.$component.XXXXXX")
+trap 'rm -rf -- "$staging"' EXIT
+prepared="$staging/tree"
+GIT_LFS_SKIP_SMUDGE=1 git clone --no-hardlinks --dissociate --no-checkout "$source" "$prepared"
+git -C "$prepared" checkout --detach "$base"
 (cd "$root/patches/$component" && sha256sum -c SHA256SUMS)
 while IFS= read -r patch; do
   [[ -n "$patch" && "$patch" != \#* ]] || continue
-  [[ "$patch" != */* && "$patch" == *.patch ]] || exit 1
-  git -C "$destination" apply --index "$root/patches/$component/$patch"
+  case "$patch" in
+    ../shared/*.patch)
+      [[ "${patch#../shared/}" != */* ]] || exit 1 ;;
+    *.patch) [[ "$patch" != */* ]] || exit 1 ;;
+    *) exit 1 ;;
+  esac
+  git -C "$prepared" apply --index "$root/patches/$component/$patch"
 done < "$root/patches/$component/series"
-git -C "$destination" diff --cached --check
-test "$(git -C "$destination" write-tree)" = "$expected"
-git -C "$destination" diff --quiet
+git -C "$prepared" diff --cached --check
+test "$(git -C "$prepared" write-tree)" = "$expected"
+git -C "$prepared" diff --quiet
+mv -T "$prepared" "$destination"
 printf '%s result tree %s\n' "$component" "$expected"

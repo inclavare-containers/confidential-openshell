@@ -6,8 +6,28 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def copy_handoff(source, target, expected):
+    if source == target:
+        return
+    if target.exists():
+        if hashlib.sha256((target / 'SHA256SUMS').read_bytes()).hexdigest() != expected:
+            raise SystemExit(f'{target} contains another release. Follow docs/operations.md to retain and switch it.')
+        subprocess.run(['sha256sum', '-c', 'SHA256SUMS', '--quiet'], cwd=target, check=True)
+        return
+    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=f'.{target.name}.', dir=target.parent) as temporary:
+        staged = Path(temporary) / 'handoff'
+        shutil.copytree(source, staged)
+        staged.chmod(0o700)
+        if hashlib.sha256((staged / 'SHA256SUMS').read_bytes()).hexdigest() != expected:
+            raise SystemExit('Handoff changed while copying; nothing was installed.')
+        subprocess.run(['sha256sum', '-c', 'SHA256SUMS', '--quiet'], cwd=staged, check=True)
+        staged.rename(target)
 
 
 def main():
@@ -27,15 +47,7 @@ def main():
         raise SystemExit('Handoff checksum differs from the build record; nothing was installed.')
     subprocess.run(['sha256sum', '-c', 'SHA256SUMS', '--quiet'], cwd=source, check=True)
     target = Path(os.environ.get('HANDOFF', '/var/lib/openshell-confidential/operator/handoff')).resolve()
-    if source != target:
-        if target.exists():
-            if hashlib.sha256((target / 'SHA256SUMS').read_bytes()).hexdigest() != expected:
-                raise SystemExit(f'{target} contains another release. Keep its deployment state; use a separate handoff directory.')
-            subprocess.run(['sha256sum', '-c', 'SHA256SUMS', '--quiet'], cwd=target, check=True)
-        else:
-            target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            shutil.copytree(source, target)
-            target.chmod(0o700)
+    copy_handoff(source, target, expected)
     subprocess.run(['bash', str(ROOT / 'deployment/build/unpack-release.sh'), str(target), expected], check=True)
     print('Release installed. Continue from /opt/confidential-openshell; the build checkout stays unchanged.', flush=True)
 

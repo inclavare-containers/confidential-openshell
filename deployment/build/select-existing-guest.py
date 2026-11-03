@@ -12,6 +12,7 @@ def main():
     parser.add_argument('--references', type=Path)
     parser.add_argument('--reference-sha256')
     args = parser.parse_args()
+    subprocess.run(['bash', str(Path(__file__).with_name('check-region.sh')), args.region], check=True)
     image = args.image_id or input('Publisher ECS ImageID in the selected region: ').strip()
     references = str(args.references or input('Path to the matching reference JSON from the publisher: ').strip())
     checksum = args.reference_sha256 or input('Reference SHA-256 obtained from the publisher: ').strip()

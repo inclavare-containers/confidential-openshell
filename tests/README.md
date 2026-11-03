@@ -24,7 +24,7 @@ Populate dependency caches while network access is available, then run the suite
 | `tests/contracts` | Build provenance, initdata, permissions; cloud creation/resume with mocked APIs; step failure logs, worker selection/profile preservation and atomic release extraction |
 | CAA/CSI Go tests | The maintained adapter and storage patches |
 | PeerPod provider tests | Deletion succeeds only after exact typed absence; present instances and read errors preserve failure |
-| Controller compilation | Import graph compiled with `-run '^$'`; envtest's API server/etcd suite is not run |
+| Controller finalizer | Compile import graph and test retention errors/retries with a fake client; envtest's API server/etcd suite is not run |
 | Helm and CSI handoff | Source-bound chart package, RRSA, controller/PVC/node/StorageClass settings and corrupt-input rejection |
 | `tests/e2e` | Coding-task oracle and OpenCode event checks |
 | `tests/check-layout.py` | Maintained links and script/configuration syntax |
@@ -39,7 +39,7 @@ The default suite uses no cloud API, deployed KBS, real quote or external model.
 [Optional policy-engine tests](acceptance/README.md) use official Trustee binaries
 with synthetic claims. [Agent-task checks](e2e/README.md) cover application behavior.
 Real attestation, resource release, network enforcement and volume lifecycle
-require the [deployment checks](../docs/deployment.md#10-verify-both-confidential-roles).
+require the [live acceptance procedure](../docs/live-acceptance.md).
 Fixture digests must never become deployed approval references.
 
 The core CI workflow runs `bash tests/run-core.sh` after `cargo fetch --locked`.

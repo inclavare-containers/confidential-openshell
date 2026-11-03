@@ -1,6 +1,11 @@
-# Policy-engine tests
+# Acceptance helpers
 
-These optional helpers run official Trustee 0.22 on disposable loopback endpoints
+The [live-session helper](check-live-release.py) checks naturally issued signed
+TDX sessions and current/cross-role KBS release on a deployed trusted host.
+Follow the [live procedure](../../docs/live-acceptance.md) for its prerequisites,
+private evidence, native Stop/Start and cleanup.
+
+The remaining optional helpers run official Trustee 0.22 on disposable loopback endpoints
 with synthetic signed claims and resources. They check policy loading and resource
 decisions; they do not contact deployed KBS or establish hardware attestation.
 
@@ -26,7 +31,7 @@ This checks generated AS/KBS policies, BuiltIn RVPS registration/query and signe
 synthetic EAR handling. Local CDH encrypted-device checks with a synthetic key
 cover embedded-LUKS reopen and read-only behavior, not attestation-gated release.
 
-Use the [deployment checks](../../docs/deployment.md#10-verify-both-confidential-roles)
+Use the [live acceptance procedure](../../docs/live-acceptance.md)
 for real quote/EAR verification, KBS decisions, native authorization/network
 enforcement, workspace restart and owned-resource cleanup.
 

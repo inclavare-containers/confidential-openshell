@@ -98,7 +98,7 @@ def kubelet_timeout(text):
 
 
 def main():
-    pause, shim_sha = sys.argv[1:]
+    pause, shim_sha, containerd_version = sys.argv[1:]
     observed = hashlib.sha256(Path('/opt/kata/bin/containerd-shim-kata-v2').read_bytes()).hexdigest()
     if observed != shim_sha:
         raise SystemExit('Worker shim differs from the published handoff. Check the kata-deploy rollout.')
@@ -116,9 +116,15 @@ def main():
             config = args[index + 1]
         elif arg.startswith('--config='):
             config = arg.split('=', 1)[1]
+    version = subprocess.check_output([args[0], '--version'], text=True)
+    if 'v' + containerd_version not in version.split():
+        raise SystemExit(f'Worker requires containerd {containerd_version} for the measured OCI 1.3.0 profile; found {version.strip()}.')
     path = Path(config)
     command = [args[0], '--config', config, 'config', 'dump']
     effective = tomllib.loads(subprocess.check_output(command, text=True))
+    if effective.get('version') != 3 or not all(key in effective.get('plugins', {}) for key in
+            ('io.containerd.cri.v1.runtime', 'io.containerd.cri.v1.images')):
+        raise SystemExit('Worker requires containerd config version 3 with CRI runtime and images plugins; no files changed.')
     runtime = effective['plugins']['io.containerd.cri.v1.runtime']['containerd']['runtimes']['kata-remote']
     kata_path = Path(runtime['options']['ConfigPath'])
     if not str(kata_path).startswith('/opt/kata/') or '..' in kata_path.parts:

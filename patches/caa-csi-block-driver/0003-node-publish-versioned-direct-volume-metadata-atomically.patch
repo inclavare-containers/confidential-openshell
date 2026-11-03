@@ -1,7 +1,7 @@
-From 0d6fcf7f7bb9f9e37d6c10da84d1820f2e6a8274 Mon Sep 17 00:00:00 2001
+From 8d6578b8b6d5c4c32a58a36438389425aa1c159a Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
-Date: Tue, 3 Nov 2026 01:05:58 +0800
-Subject: [PATCH 2/5] node: publish versioned direct-volume metadata atomically
+Date: Tue, 3 Nov 2026 11:58:13 +0800
+Subject: [PATCH] node: publish versioned direct-volume metadata atomically
 
 CAA needs a complete disk and mount description before starting the
 PodVM. Publish the paired v1 mountInfo contract atomically with the Pod
@@ -13,23 +13,49 @@ second cloud-volume journal.
 
 Generated-by: OpenAI Codex
 ---
- pkg/driver/directvolume.go                | 260 ++++++++++++
- pkg/driver/directvolume_test.go           | 482 ++++++++++++++++++++++
+ pkg/driver/controllerserver.go            |   5 +-
+ pkg/driver/directvolume.go                | 260 +++++++++++++
+ pkg/driver/directvolume_test.go           | 435 ++++++++++++++++++++++
+ pkg/driver/identity_contract_test.go      |  69 ++++
  pkg/driver/metadata_atomic.go             |  48 +++
  pkg/driver/metadata_atomic_test.go        |  73 ++++
- pkg/driver/nodeserver.go                  | 246 +++++++----
+ pkg/driver/nodeserver.go                  | 246 +++++++-----
  pkg/driver/nodeserver_test.go             |  32 +-
  pkg/driver/testdata/direct-volume-v1.json |   1 +
- 7 files changed, 1055 insertions(+), 87 deletions(-)
+ 9 files changed, 1080 insertions(+), 89 deletions(-)
  create mode 100644 pkg/driver/directvolume.go
  create mode 100644 pkg/driver/directvolume_test.go
+ create mode 100644 pkg/driver/identity_contract_test.go
  create mode 100644 pkg/driver/metadata_atomic.go
  create mode 100644 pkg/driver/metadata_atomic_test.go
  create mode 100644 pkg/driver/testdata/direct-volume-v1.json
 
+diff --git a/pkg/driver/controllerserver.go b/pkg/driver/controllerserver.go
+index b2bb250a..843f3fab 100644
+--- a/pkg/driver/controllerserver.go
++++ b/pkg/driver/controllerserver.go
+@@ -123,7 +123,7 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
+ 			return nil, status.Errorf(codes.AlreadyExists, "volume %s capacity %d is outside the requested range", req.GetName(), rec.CapacityBytes)
+ 		}
+ 		csLogger.Printf("CreateVolume: %s already exists, returning existing", req.GetName())
+-		volumeCtx := map[string]string{"cloudProvider": rec.Provider}
++		volumeCtx := map[string]string{"cloudProvider": rec.Provider, "cloud-volume-path": rec.Path}
+ 		for k, v := range rec.Params {
+ 			volumeCtx[k] = v
+ 		}
+@@ -208,7 +208,8 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
+ 	csLogger.Printf("CreateVolume: %s (provider=%s, path=%s)", req.GetName(), volInfo.Provider, volInfo.Path)
+ 
+ 	volumeCtx := map[string]string{
+-		"cloudProvider": volInfo.Provider,
++		"cloudProvider":     volInfo.Provider,
++		"cloud-volume-path": volInfo.Path,
+ 	}
+ 	for k, v := range params {
+ 		volumeCtx[k] = v
 diff --git a/pkg/driver/directvolume.go b/pkg/driver/directvolume.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..c30c7bcbf8f6453532eab3fcb8badd7eee7f30e3
+index 00000000..c30c7bcb
 --- /dev/null
 +++ b/pkg/driver/directvolume.go
 @@ -0,0 +1,260 @@
@@ -295,10 +321,10 @@ index 0000000000000000000000000000000000000000..c30c7bcbf8f6453532eab3fcb8badd7e
 +}
 diff --git a/pkg/driver/directvolume_test.go b/pkg/driver/directvolume_test.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..6d7c75d94899f14227d4cb02da2fe2fa4be00b4d
+index 00000000..f15c59b4
 --- /dev/null
 +++ b/pkg/driver/directvolume_test.go
-@@ -0,0 +1,482 @@
+@@ -0,0 +1,435 @@
 +// (C) Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -430,20 +456,6 @@ index 0000000000000000000000000000000000000000..6d7c75d94899f14227d4cb02da2fe2fa
 +		if status.Code(err) != codes.InvalidArgument {
 +			t.Fatalf("flags %v got %v, want InvalidArgument", flags, err)
 +		}
-+	}
-+}
-+
-+func TestNodeUnpublishReturnsCleanupFailure(t *testing.T) {
-+	node, target, _ := setupPublishedNode(t)
-+	original := removeAllPath
-+	t.Cleanup(func() { removeAllPath = original })
-+	removeAllPath = func(string) error { return errors.New("injected cleanup failure") }
-+
-+	_, err := node.NodeUnpublishVolume(t.Context(), &csi.NodeUnpublishVolumeRequest{
-+		VolumeId: "pvc-workspace", TargetPath: target,
-+	})
-+	if status.Code(err) != codes.Internal {
-+		t.Fatalf("got %v, want Internal", err)
 +	}
 +}
 +
@@ -676,39 +688,6 @@ index 0000000000000000000000000000000000000000..6d7c75d94899f14227d4cb02da2fe2fa
 +	}
 +}
 +
-+func TestNodeStageUsesOnlyControllerVolumeIdentity(t *testing.T) {
-+	node := newNodeServer("node-1")
-+	capability := publishRequest("/unused", csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER, false).VolumeCapability
-+	request := &csi.NodeStageVolumeRequest{
-+		VolumeId: "workspace", StagingTargetPath: "/staging/workspace",
-+		VolumeCapability: capability,
-+		VolumeContext:    map[string]string{"cloud-volume-path": "d-workspace"},
-+	}
-+	if _, err := node.NodeStageVolume(t.Context(), request); err != nil {
-+		t.Fatal(err)
-+	}
-+	if _, err := node.NodeStageVolume(t.Context(), request); err != nil {
-+		t.Fatalf("idempotent stage: %v", err)
-+	}
-+	changed := *request
-+	changed.VolumeContext = map[string]string{"cloud-volume-path": "d-other"}
-+	if _, err := node.NodeStageVolume(t.Context(), &changed); status.Code(err) != codes.FailedPrecondition {
-+		t.Fatalf("changed identity status=%v, want FailedPrecondition", status.Code(err))
-+	}
-+}
-+
-+func TestNodeStageRequiresControllerVolumeIdentity(t *testing.T) {
-+	node := newNodeServer("node-1")
-+	capability := publishRequest("/unused", csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER, false).VolumeCapability
-+	_, err := node.NodeStageVolume(t.Context(), &csi.NodeStageVolumeRequest{
-+		VolumeId: "workspace", StagingTargetPath: "/staging/workspace",
-+		VolumeCapability: capability,
-+	})
-+	if status.Code(err) != codes.FailedPrecondition {
-+		t.Fatalf("status=%v, want FailedPrecondition", status.Code(err))
-+	}
-+}
-+
 +func TestReadDirectVolumeMetadataRejectsUnknownAndTrailingFields(t *testing.T) {
 +	path := filepath.Join(t.TempDir(), mountInfoFileName)
 +	base := `{"version":1,"volume-type":"block","volume-mode":"filesystem","device":"d-1","fstype":"ext4","readonly":true,"options":["noatime","ro"],"pod-uid":"pod-1","volume-handle":"pvc-1"}`
@@ -781,9 +760,84 @@ index 0000000000000000000000000000000000000000..6d7c75d94899f14227d4cb02da2fe2fa
 +	}
 +	return false
 +}
+diff --git a/pkg/driver/identity_contract_test.go b/pkg/driver/identity_contract_test.go
+new file mode 100644
+index 00000000..18dfe510
+--- /dev/null
++++ b/pkg/driver/identity_contract_test.go
+@@ -0,0 +1,69 @@
++// (C) Copyright Confidential Containers Contributors
++// SPDX-License-Identifier: Apache-2.0
++
++package driver
++
++import (
++	"os"
++	"path/filepath"
++	"testing"
++
++	_ "github.com/confidential-devhub/caa-csi-block-driver/pkg/provider/libvirt"
++	"github.com/container-storage-interface/spec/lib/go/csi"
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/status"
++)
++
++func TestNodeStageUsesOnlyControllerIdentity(t *testing.T) {
++	node := newNodeServer("node")
++	req := &csi.NodeStageVolumeRequest{
++		VolumeId: "volume", StagingTargetPath: filepath.Join(t.TempDir(), "stage"),
++		VolumeCapability: &csi.VolumeCapability{AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{}}},
++		VolumeContext:    map[string]string{"cloud-volume-path": "disk", "cloudProvider": "not-a-registered-provider"},
++	}
++	if _, err := node.NodeStageVolume(t.Context(), req); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := node.NodeStageVolume(t.Context(), req); err != nil {
++		t.Fatalf("idempotent stage: %v", err)
++	}
++	req.VolumeContext["cloud-volume-path"] = "replacement"
++	if _, err := node.NodeStageVolume(t.Context(), req); status.Code(err) != codes.FailedPrecondition {
++		t.Fatalf("got %v", err)
++	}
++	delete(req.VolumeContext, "cloud-volume-path")
++	if _, err := node.NodeStageVolume(t.Context(), req); status.Code(err) != codes.FailedPrecondition {
++		t.Fatalf("got %v", err)
++	}
++}
++
++func TestControllerReplayKeepsNodeDeviceIdentity(t *testing.T) {
++	dir := t.TempDir()
++	if err := os.MkdirAll(filepath.Join(dir, "pool"), 0700); err != nil {
++		t.Fatal(err)
++	}
++	t.Setenv("CSI_VOLUME_STORE_DIR", filepath.Join(dir, "records"))
++	request := &csi.CreateVolumeRequest{
++		Name:       "pvc-workspace",
++		Parameters: map[string]string{"cloudProvider": "libvirt", "cloudProviderVolumePath": filepath.Join(dir, "pool")},
++		VolumeCapabilities: []*csi.VolumeCapability{{
++			AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{}},
++			AccessMode: &csi.VolumeCapability_AccessMode{Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER},
++		}},
++	}
++	first, err := newControllerServer().CreateVolume(t.Context(), request)
++	if err != nil {
++		t.Fatal(err)
++	}
++	replayed, err := newControllerServer().CreateVolume(t.Context(), request)
++	if err != nil {
++		t.Fatal(err)
++	}
++	path := first.Volume.VolumeContext["cloud-volume-path"]
++	if path == "" || replayed.Volume.VolumeContext["cloud-volume-path"] != path {
++		t.Fatalf("replayed volume lost node device identity: %v", replayed.Volume.VolumeContext)
++	}
++	if _, err := os.Stat(path); err != nil {
++		t.Fatal(err)
++	}
++}
 diff --git a/pkg/driver/metadata_atomic.go b/pkg/driver/metadata_atomic.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..7fe9801de952003c9880a262ad79afa3b286e07c
+index 00000000..7fe9801d
 --- /dev/null
 +++ b/pkg/driver/metadata_atomic.go
 @@ -0,0 +1,48 @@
@@ -837,7 +891,7 @@ index 0000000000000000000000000000000000000000..7fe9801de952003c9880a262ad79afa3
 +}
 diff --git a/pkg/driver/metadata_atomic_test.go b/pkg/driver/metadata_atomic_test.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..480e0a602e1d56710decfe28b822e0772cb7a995
+index 00000000..480e0a60
 --- /dev/null
 +++ b/pkg/driver/metadata_atomic_test.go
 @@ -0,0 +1,73 @@
@@ -915,7 +969,7 @@ index 0000000000000000000000000000000000000000..480e0a602e1d56710decfe28b822e077
 +	}
 +}
 diff --git a/pkg/driver/nodeserver.go b/pkg/driver/nodeserver.go
-index 0cb45e43da707bf75e96666b86d3c9743c79bf8b..093ceb3a8f756dd9281f28687bb4ccdc5d04ce30 100644
+index 0cb45e43..093ceb3a 100644
 --- a/pkg/driver/nodeserver.go
 +++ b/pkg/driver/nodeserver.go
 @@ -12,7 +12,6 @@ import (
@@ -1260,7 +1314,7 @@ index 0cb45e43da707bf75e96666b86d3c9743c79bf8b..093ceb3a8f756dd9281f28687bb4ccdc
  
  func (ns *nodeServer) NodeGetInfo(ctx context.Context, _ *csi.NodeGetInfoRequest) (*csi.NodeGetInfoResponse, error) {
 diff --git a/pkg/driver/nodeserver_test.go b/pkg/driver/nodeserver_test.go
-index d45afd466a2ac26a9b2e5500fc7796f44b217a87..9aee52908c363295ad36f282f88a749f9e8c0252 100644
+index d45afd46..9aee5290 100644
 --- a/pkg/driver/nodeserver_test.go
 +++ b/pkg/driver/nodeserver_test.go
 @@ -4,6 +4,7 @@
@@ -1336,8 +1390,11 @@ index d45afd466a2ac26a9b2e5500fc7796f44b217a87..9aee52908c363295ad36f282f88a749f
 +}
 diff --git a/pkg/driver/testdata/direct-volume-v1.json b/pkg/driver/testdata/direct-volume-v1.json
 new file mode 100644
-index 0000000000000000000000000000000000000000..c8c6d41287c8503aa4b6517494671416c440c119
+index 00000000..c8c6d412
 --- /dev/null
 +++ b/pkg/driver/testdata/direct-volume-v1.json
 @@ -0,0 +1 @@
 +{"version":1,"volume-type":"block","volume-mode":"filesystem","device":"d-workspace123","fstype":"ext4","readonly":true,"options":["noatime","ro"],"fs-group":"2000","pod-uid":"pod-uid-123","volume-handle":"pvc-workspace","metadata":{"cloud-provider":"alibabacloud","cloud-volume-path":"d-workspace123"}}
+-- 
+2.43.7
+

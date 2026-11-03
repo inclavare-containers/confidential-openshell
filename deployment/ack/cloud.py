@@ -104,7 +104,7 @@ class Cloud(Client):
         require(self.state['config_sha256'] == digest and self.state['region'] == self.region,
                 'ack.json/region changed after setup began. Use a separate OPERATOR_DIR for another deployment.')
         require(self.state['handoff_sha256'] == handoff_digest,
-                'Release handoff changed after setup began. Use a separate OPERATOR_DIR for another deployment.')
+                'Release handoff changed after setup began. Follow docs/operations.md for a stopped release update; keep existing private state.')
         # Generated IDs live in the state; the reviewed input file stays immutable.
         if self.state.get('worker_vswitch_id'):
             self.config['worker_vswitch_id'] = self.state['worker_vswitch_id']

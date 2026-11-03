@@ -1,8 +1,7 @@
-From 449dc7637fb5b26527d99f6ba040bd896b8b57b1 Mon Sep 17 00:00:00 2001
+From b277440ae8450c224c5a85c56d77635eb928c05f Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
-Date: Tue, 3 Nov 2026 01:07:30 +0800
-Subject: [PATCH 04/10] guest: resolve Alibaba disks by their measured
- identities
+Date: Tue, 3 Nov 2026 11:58:12 +0800
+Subject: [PATCH] guest: resolve Alibaba disks by their measured identities
 
 A guest device name is not a stable cloud-disk identity. Resolve Alibaba
 disk IDs through kernel serial and WWID attributes and check their
@@ -22,7 +21,7 @@ Generated-by: OpenAI Codex
 
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/alibaba_device.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/alibaba_device.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..413fd32c5e4f7777b727a643556c4d0e06634f7d
+index 00000000..413fd32c
 --- /dev/null
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/alibaba_device.go
 @@ -0,0 +1,175 @@
@@ -203,7 +202,7 @@ index 0000000000000000000000000000000000000000..413fd32c5e4f7777b727a643556c4d0e
 +}
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/alibaba_device_test.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/alibaba_device_test.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..a76665ddac158e34e391256ff94b698b777fe25c
+index 00000000..a76665dd
 --- /dev/null
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/alibaba_device_test.go
 @@ -0,0 +1,199 @@
@@ -407,7 +406,7 @@ index 0000000000000000000000000000000000000000..a76665ddac158e34e391256ff94b698b
 +	}
 +}
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
-index 0273c78f692812b25bfb286ca4978cc395f01b4b..7d89ed183fcada3871c681a219990b2e4c4ae1e7 100644
+index 0273c78f..7d89ed18 100644
 --- a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
 @@ -5,6 +5,7 @@ package interceptor
@@ -477,3 +476,6 @@ index 0273c78f692812b25bfb286ca4978cc395f01b4b..7d89ed183fcada3871c681a219990b2e
  	return "", fmt.Errorf("no data disk found for LUN %d (provider=%s) after %d attempts", lunIdx, provider, maxAttempts)
  }
  
+-- 
+2.43.7
+

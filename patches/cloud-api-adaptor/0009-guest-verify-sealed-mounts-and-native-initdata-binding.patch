@@ -1,7 +1,7 @@
-From 19ed2e401e9121faf1d69c0ed885cf7ec25b03b6 Mon Sep 17 00:00:00 2001
+From a33f68c648fac4dfc298f45f19d84a9e07c3a57c Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
-Date: Tue, 3 Nov 2026 01:07:30 +0800
-Subject: [PATCH 08/10] guest: verify sealed mounts and native initdata binding
+Date: Tue, 3 Nov 2026 11:58:13 +0800
+Subject: [PATCH] guest: verify sealed mounts and native initdata binding
 
 Before forwarding container creation to the guest agent, match
 sealed-volume descriptors to the measured manifest and unseal their
@@ -13,26 +13,33 @@ canonical SHA-384 TCG2 event. Reject disabled measurement, mismatched
 digests and duplicate extension. In the measured ephemeral profile,
 reject injected cloud volumes before device preparation.
 
+Delay CDH connection until descriptor validation. Use one container-create
+transaction to roll back all newly acquired resources on every failure and
+retain ownership when cleanup must be retried. Delegate CopyFile confinement
+to the pinned Kata agent shared-root implementation.
+
 Generated-by: OpenAI Codex
 ---
  .../cmd/agent-protocol-forwarder/main.go      |  14 +-
  .../cmd/process-user-data/main.go             |  13 +
  .../pkg/forwarder/interceptor/cdh_client.go   |  14 +-
- .../pkg/forwarder/interceptor/cloud_volume.go |   3 +
+ .../pkg/forwarder/interceptor/cloud_volume.go |  15 +-
  .../interceptor/cloud_volume_test.go          |   9 +
- .../pkg/forwarder/interceptor/interceptor.go  |  72 +++++
- .../forwarder/interceptor/sealed_volume.go    | 281 ++++++++++++++++++
- .../interceptor/sealed_volume_test.go         | 169 +++++++++++
+ .../pkg/forwarder/interceptor/interceptor.go  | 100 ++++++-
+ .../forwarder/interceptor/sealed_volume.go    | 262 ++++++++++++++++++
+ .../interceptor/sealed_volume_test.go         | 177 ++++++++++++
+ .../interceptor/volume_transaction_test.go    |  62 +++++
  src/cloud-api-adaptor/pkg/userdata/measure.go | 166 +++++++++++
- .../pkg/userdata/measure_test.go              | 164 ++++++++++
- 10 files changed, 902 insertions(+), 3 deletions(-)
+ .../pkg/userdata/measure_test.go              | 164 +++++++++++
+ 11 files changed, 976 insertions(+), 20 deletions(-)
  create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/sealed_volume.go
  create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/sealed_volume_test.go
+ create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/volume_transaction_test.go
  create mode 100644 src/cloud-api-adaptor/pkg/userdata/measure.go
  create mode 100644 src/cloud-api-adaptor/pkg/userdata/measure_test.go
 
 diff --git a/src/cloud-api-adaptor/cmd/agent-protocol-forwarder/main.go b/src/cloud-api-adaptor/cmd/agent-protocol-forwarder/main.go
-index e36fccec497aae4204e0258abfe3768f2ae87462..edcae7839f31058255666b5e57482565b5cce11d 100644
+index e36fccec..edcae783 100644
 --- a/src/cloud-api-adaptor/cmd/agent-protocol-forwarder/main.go
 +++ b/src/cloud-api-adaptor/cmd/agent-protocol-forwarder/main.go
 @@ -91,11 +91,21 @@ func (cfg *Config) Setup() (cmd.Starter, error) {
@@ -60,7 +67,7 @@ index e36fccec497aae4204e0258abfe3768f2ae87462..edcae7839f31058255666b5e57482565
  	return cmd.NewStarter(services...), nil
  }
 diff --git a/src/cloud-api-adaptor/cmd/process-user-data/main.go b/src/cloud-api-adaptor/cmd/process-user-data/main.go
-index 05fab1ee1e1aa633b26a20b921e7ccb19ddbcff5..eee09ab76596f01993cb25c753bdabc2b784ecec 100644
+index 05fab1ee..eee09ab7 100644
 --- a/src/cloud-api-adaptor/cmd/process-user-data/main.go
 +++ b/src/cloud-api-adaptor/cmd/process-user-data/main.go
 @@ -45,6 +45,19 @@ func init() {
@@ -84,7 +91,7 @@ index 05fab1ee1e1aa633b26a20b921e7ccb19ddbcff5..eee09ab76596f01993cb25c753bdabc2
  
  func main() {
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/cdh_client.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/cdh_client.go
-index 008dd7eff58ce9d81b73d7b84d2975fddcf9580a..05186fb60ec2cdb2995b0e574726597c91040278 100644
+index 008dd7ef..05186fb6 100644
 --- a/src/cloud-api-adaptor/pkg/forwarder/interceptor/cdh_client.go
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/cdh_client.go
 @@ -14,7 +14,10 @@ import (
@@ -113,10 +120,10 @@ index 008dd7eff58ce9d81b73d7b84d2975fddcf9580a..05186fb60ec2cdb2995b0e574726597c
 +	return resp.GetPlaintext(), nil
 +}
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume.go
-index 18a5f0ebb9d5d40b3570b33ee70e82cc8276e26e..accab0940263537008c904386e3b8cdeb08b75ff 100644
+index f0c391af..7255b37e 100644
 --- a/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume.go
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume.go
-@@ -139,6 +139,9 @@ func (i *interceptor) prepareCloudVolumes(ctx context.Context, req *pb.CreateCon
+@@ -136,6 +136,9 @@ func (i *interceptor) prepareCloudVolumes(ctx context.Context, req *pb.CreateCon
  	if err != nil {
  		return nil, fmt.Errorf("corrupt cloud_volumes annotation (pod would start without volumes): %w", err)
  	}
@@ -126,11 +133,51 @@ index 18a5f0ebb9d5d40b3570b33ee70e82cc8276e26e..accab0940263537008c904386e3b8cde
  	var workspace *workspacePolicy
  	if i.requireEncryptedVolumes && len(volumes) != 0 {
  		if i.workspace == nil {
+@@ -160,10 +163,10 @@ func (i *interceptor) prepareCloudVolumes(ctx context.Context, req *pb.CreateCon
+ 			prepared = append(prepared, volume)
+ 		}
+ 		if err != nil {
+-			return prepared, preserveOriginalError(err, cleanupPreparedCloudVolumes(ctx, prepared))
++			return prepared, err
+ 		}
+ 		if err := rewriteCloudMount(req, name, volumes[name], volume.sourcePath); err != nil {
+-			return prepared, preserveOriginalError(err, cleanupPreparedCloudVolumes(ctx, prepared))
++			return prepared, err
+ 		}
+ 	}
+ 	return prepared, nil
+@@ -205,14 +208,14 @@ func prepareCloudVolume(ctx context.Context, name string, volume util.CloudVolum
+ 			if err := ensureWorkspaceInitialized(ctx, device, volume, *workspace, func(ctx context.Context, device, diskID, fsType, uri string) error {
+ 				return initializeWorkspaceVolume(ctx, device, diskID, fsType, uri, prepared)
+ 			}); err != nil {
+-				return prepared, preserveOriginalError(err, cleanupPreparedCloudVolumes(ctx, prepared))
++				return prepared, err
+ 			}
+ 		}
+ 		if err := prepareCDHCloudVolume(ctx, prepared, name, device, volume, workspace != nil); err != nil {
+-			return prepared, preserveOriginalError(err, cleanupPreparedCloudVolumes(ctx, prepared))
++			return prepared, err
+ 		}
+ 		if err := applyCloudVolumeFSGroup(prepared.sourcePath, name, volume); err != nil {
+-			return prepared, preserveOriginalError(err, cleanupPreparedCloudVolumes(ctx, prepared))
++			return prepared, err
+ 		}
+ 		return prepared, nil
+ 	}
+@@ -221,7 +224,7 @@ func prepareCloudVolume(ctx context.Context, name string, volume util.CloudVolum
+ 		return prepared, fmt.Errorf("mount cloud volume %s: %w", name, err)
+ 	}
+ 	if err := applyCloudVolumeFSGroup(prepared.sourcePath, name, volume); err != nil {
+-		return prepared, preserveOriginalError(err, cleanupPreparedCloudVolumes(ctx, prepared))
++		return prepared, err
+ 	}
+ 	return prepared, nil
+ }
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume_test.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume_test.go
-index a97fcb6472fe936f7f8e5c1e506a2f6eb58fbc2a..836f79e4f1f9758965340bbfa415b5c452a0462f 100644
+index ab645558..cf710006 100644
 --- a/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume_test.go
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume_test.go
-@@ -188,6 +188,15 @@ func TestValidateReusableCloudMountRequiresSecurityOptions(t *testing.T) {
+@@ -180,6 +180,15 @@ func TestValidateReusableCloudMountRequiresSecurityOptions(t *testing.T) {
  	require.ErrorContains(t, err, "option noexec=false, expected true")
  }
  
@@ -147,7 +194,7 @@ index a97fcb6472fe936f7f8e5c1e506a2f6eb58fbc2a..836f79e4f1f9758965340bbfa415b5c4
  	valid := "/dev/mapper/caa-vol-0 is active.\n  type: LUKS2\n  cipher: aes-xts-plain64\n  keysize: 512 [bits]\n  sector size: 4096 [bytes]\n"
  	require.NoError(t, validateWorkspaceMapperStatus(valid))
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
-index cec0fdd51bcc01db3be492b72fde05d44732e14c..05c99966802b0a81ee5eeb66bb4df88c085c9c74 100644
+index 91d6096a..87fe80d3 100644
 --- a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
 @@ -52,6 +52,7 @@ type interceptor struct {
@@ -158,7 +205,7 @@ index cec0fdd51bcc01db3be492b72fde05d44732e14c..05c99966802b0a81ee5eeb66bb4df88c
  }
  
  func dial(ctx context.Context, agentSocket string) (net.Conn, error) {
-@@ -100,7 +101,20 @@ func NewInterceptorWithEncryptedVolumes(agentSocket, nsPath string, required boo
+@@ -100,7 +101,26 @@ func NewInterceptorWithEncryptedVolumes(agentSocket, nsPath string, required boo
  	}
  }
  
@@ -173,21 +220,46 @@ index cec0fdd51bcc01db3be492b72fde05d44732e14c..05c99966802b0a81ee5eeb66bb4df88c
 +}
 +
  func (i *interceptor) CreateContainer(ctx context.Context, req *pb.CreateContainerRequest) (*emptypb.Empty, error) {
++	return i.createContainer(ctx, req, i.prepareCloudVolumes)
++}
++
++func (i *interceptor) createContainer(ctx context.Context, req *pb.CreateContainerRequest,
++	prepare func(context.Context, *pb.CreateContainerRequest, string) ([]*preparedCloudVolume, error),
++) (res *emptypb.Empty, err error) {
 +	if req == nil || req.OCI == nil || req.OCI.Linux == nil {
 +		return nil, errors.New("CreateContainer lacks OCI Linux specification")
 +	}
  
  	logger.Printf("CreateContainer: containerID:%s", req.ContainerId)
  
-@@ -115,6 +129,7 @@ func (i *interceptor) CreateContainer(ctx context.Context, req *pb.CreateContain
+@@ -115,17 +135,65 @@ func (i *interceptor) CreateContainer(ctx context.Context, req *pb.CreateContain
  	}
  
  	var preparedVolumes []*preparedCloudVolume
 +	var verifiedSecrets string
++	defer func() {
++		if err != nil && verifiedSecrets != "" {
++			_ = os.RemoveAll(verifiedSecrets)
++		}
++	}()
  	if cvJSON, ok := req.OCI.Annotations[util.CloudVolumesAnnotationKey]; ok && cvJSON != "" {
  		// Serialize acquisition with sandbox cleanup and other container retries.
  		i.cloudVolumeMu.Lock()
-@@ -126,6 +141,29 @@ func (i *interceptor) CreateContainer(ctx context.Context, req *pb.CreateContain
+ 		defer i.cloudVolumeMu.Unlock()
+-		var err error
+-		preparedVolumes, err = i.prepareCloudVolumes(ctx, req, cvJSON)
+-		if err != nil {
++		// One transaction boundary covers every later return, including sealed
++		// descriptor rejection and a canceled/failed agent RPC. Keep ownership of
++		// anything rollback could not release so DestroySandbox can retry it.
++		defer func() {
++			if err != nil {
++				err = preserveOriginalError(err, cleanupPreparedCloudVolumes(ctx, preparedVolumes))
++			}
+ 			i.trackOwnedCloudVolumes(preparedVolumes)
++		}()
++		preparedVolumes, err = prepare(ctx, req, cvJSON)
++		if err != nil {
  			return nil, err
  		}
  	}
@@ -197,12 +269,24 @@ index cec0fdd51bcc01db3be492b72fde05d44732e14c..05c99966802b0a81ee5eeb66bb4df88c
 +		defer gate.mu.Unlock()
 +		name := req.OCI.Annotations["io.kubernetes.cri.container-name"]
 +		if name == gate.manifest.Container {
-+			client, err := newCDHClient(ctx, cdhSocketPath)
-+			if err != nil {
-+				return nil, err
-+			}
-+			defer client.close()
-+			verifiedSecrets, err = gate.verifyAndUnseal(ctx, req, client.unsealSecret)
++			var client *cdhClient
++			var err error
++			defer func() {
++				if client != nil {
++					client.close()
++				}
++			}()
++			verifiedSecrets, err = gate.verifyAndUnseal(ctx, req,
++				func(ctx context.Context, sealed []byte) ([]byte, error) {
++					if client == nil {
++						var dialErr error
++						client, dialErr = newCDHClient(ctx, cdhSocketPath)
++						if dialErr != nil {
++							return nil, dialErr
++						}
++					}
++					return client.unsealSecret(ctx, sealed)
++				})
 +			if err != nil {
 +				return nil, err
 +			}
@@ -217,38 +301,26 @@ index cec0fdd51bcc01db3be492b72fde05d44732e14c..05c99966802b0a81ee5eeb66bb4df88c
  
  	if len(req.OCI.Mounts) > 0 {
  		for _, m := range req.OCI.Mounts {
-@@ -142,6 +180,9 @@ func (i *interceptor) CreateContainer(ctx context.Context, req *pb.CreateContain
+@@ -138,17 +206,10 @@ func (i *interceptor) CreateContainer(ctx context.Context, req *pb.CreateContain
+ 		}
+ 	}
  
+-	res, err := i.Redirector.CreateContainer(ctx, req)
+-
++	res, err = i.Redirector.CreateContainer(ctx, req)
  	if err != nil {
  		logger.Printf("CreateContainer failed with error: %v", err)
-+		if verifiedSecrets != "" {
-+			_ = os.RemoveAll(verifiedSecrets)
-+		}
- 		cleanupErr := cleanupPreparedCloudVolumes(ctx, preparedVolumes)
- 		i.trackOwnedCloudVolumes(preparedVolumes)
- 		err = preserveOriginalError(err, cleanupErr)
-@@ -152,6 +193,20 @@ func (i *interceptor) CreateContainer(ctx context.Context, req *pb.CreateContain
+-		cleanupErr := cleanupPreparedCloudVolumes(ctx, preparedVolumes)
+-		i.trackOwnedCloudVolumes(preparedVolumes)
+-		err = preserveOriginalError(err, cleanupErr)
+-	} else {
+-		i.trackOwnedCloudVolumes(preparedVolumes)
+ 	}
+-
  	return res, err
  }
  
-+func (i *interceptor) CopyFile(ctx context.Context, req *pb.CopyFileRequest) (*emptypb.Empty, error) {
-+	if i.sealedGate != nil {
-+		i.sealedGate.mu.Lock()
-+		defer i.sealedGate.mu.Unlock()
-+		if req == nil {
-+			return nil, errors.New("CopyFile request is nil")
-+		}
-+		if err := i.sealedGate.checkCopyFilePath(req.Path); err != nil {
-+			return nil, err
-+		}
-+	}
-+	return i.Redirector.CopyFile(ctx, req)
-+}
-+
- func normalizeBindMountOptions(options []string, readOnly bool) []string {
- 	result := make([]string, 0, len(options)+1)
- 	seen := make(map[string]struct{}, len(options)+1)
-@@ -189,6 +244,13 @@ func (i *interceptor) StartContainer(ctx context.Context, req *pb.StartContainer
+@@ -189,6 +250,13 @@ func (i *interceptor) StartContainer(ctx context.Context, req *pb.StartContainer
  }
  
  func (i *interceptor) RemoveContainer(ctx context.Context, req *pb.RemoveContainerRequest) (*emptypb.Empty, error) {
@@ -262,7 +334,7 @@ index cec0fdd51bcc01db3be492b72fde05d44732e14c..05c99966802b0a81ee5eeb66bb4df88c
  
  	logger.Printf("RemoveContainer: containerID:%s", req.ContainerId)
  
-@@ -196,6 +258,10 @@ func (i *interceptor) RemoveContainer(ctx context.Context, req *pb.RemoveContain
+@@ -196,6 +264,10 @@ func (i *interceptor) RemoveContainer(ctx context.Context, req *pb.RemoveContain
  
  	if err != nil {
  		logger.Printf("RemoveContainer failed with error: %v", err)
@@ -273,7 +345,7 @@ index cec0fdd51bcc01db3be492b72fde05d44732e14c..05c99966802b0a81ee5eeb66bb4df88c
  	}
  	return res, err
  }
-@@ -241,6 +307,12 @@ func (i *interceptor) DestroySandbox(ctx context.Context, req *pb.DestroySandbox
+@@ -241,6 +313,12 @@ func (i *interceptor) DestroySandbox(ctx context.Context, req *pb.DestroySandbox
  
  	if err != nil {
  		logger.Printf("DestroySandbox failed with error: %v", err)
@@ -288,10 +360,10 @@ index cec0fdd51bcc01db3be492b72fde05d44732e14c..05c99966802b0a81ee5eeb66bb4df88c
  	return res, err
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/sealed_volume.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/sealed_volume.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..a0e8be7cc9457ee2d59b0ce095babdb687f14ceb
+index 00000000..b5a7d236
 --- /dev/null
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/sealed_volume.go
-@@ -0,0 +1,281 @@
+@@ -0,0 +1,262 @@
 +// Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -394,25 +466,6 @@ index 0000000000000000000000000000000000000000..a0e8be7cc9457ee2d59b0ce095babdb6
 +
 +func isWithin(path, root string) bool {
 +	return path == root || strings.HasPrefix(path, root+string(os.PathSeparator))
-+}
-+
-+func (g *sealedVolumeGate) checkCopyFilePath(path string) error {
-+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
-+		return errors.New("CopyFile path is not absolute and canonical")
-+	}
-+	if isWithin(path, "/run/peerpod") {
-+		return errors.New("CopyFile cannot modify measured guest files")
-+	}
-+	// A host-created relative symlink elsewhere under the allowed CopyFile
-+	// prefix must not alias the private tree. Check the target as well as its
-+	// parent because a new file may not yet exist.
-+	for _, candidate := range []string{path, filepath.Dir(path)} {
-+		resolved, err := filepath.EvalSymlinks(candidate)
-+		if err == nil && isWithin(resolved, "/run/peerpod") {
-+			return errors.New("CopyFile path aliases measured guest files")
-+		}
-+	}
-+	return nil
 +}
 +
 +func (g *sealedVolumeGate) privateDirectory(containerID string) (string, error) {
@@ -575,10 +628,10 @@ index 0000000000000000000000000000000000000000..a0e8be7cc9457ee2d59b0ce095babdb6
 +}
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/sealed_volume_test.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/sealed_volume_test.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..4e0af6e823e2c9769506f5c5beca8deec904093b
+index 00000000..47e4b047
 --- /dev/null
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/sealed_volume_test.go
-@@ -0,0 +1,169 @@
+@@ -0,0 +1,177 @@
 +package interceptor
 +
 +import (
@@ -708,6 +761,33 @@ index 0000000000000000000000000000000000000000..4e0af6e823e2c9769506f5c5beca8dee
 +	}
 +}
 +
++func TestCreateContainerSealedGatePrecedesAgent(t *testing.T) {
++	gate, req, source := sealedFixture(t)
++	req.OCI.Linux = &pb.Linux{}
++	req.OCI.Annotations = map[string]string{"io.kubernetes.cri.container-name": "bootstrap"}
++	if err := os.WriteFile(filepath.Join(source, "tls.key"), []byte("plaintext"), 0600); err != nil {
++		t.Fatal(err)
++	}
++	mock := &mockRedirector{}
++	i := &interceptor{Redirector: mock, sealedGate: gate}
++	if _, err := i.CreateContainer(context.Background(), req); err == nil {
++		t.Fatal("plaintext reached Kata agent")
++	}
++	if mock.createContainerCalled {
++		t.Fatal("Kata agent was called before sealed-volume verification")
++	}
++
++	req.OCI.Annotations["io.kubernetes.cri.container-name"] = "other"
++	req.OCI.Mounts[0].Destination = "/different"
++	req.OCI.Mounts[0].Source = filepath.Join(gate.privateRoot, req.ContainerId)
++	if _, err := i.CreateContainer(context.Background(), req); err == nil {
++		t.Fatal("non-target container mounted private Secret tree")
++	}
++	if mock.createContainerCalled {
++		t.Fatal("Kata agent received non-target private mount")
++	}
++}
++
 +func TestSealedVolumeRejectsSymlinkEscape(t *testing.T) {
 +	gate, req, source := sealedFixture(t)
 +	outside := filepath.Join(t.TempDir(), "outside")
@@ -729,28 +809,77 @@ index 0000000000000000000000000000000000000000..4e0af6e823e2c9769506f5c5beca8dee
 +		t.Fatal("symlink escape was accepted")
 +	}
 +}
+diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/volume_transaction_test.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/volume_transaction_test.go
+new file mode 100644
+index 00000000..021ee0c1
+--- /dev/null
++++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/volume_transaction_test.go
+@@ -0,0 +1,62 @@
++// (C) Copyright Confidential Containers Contributors
++// SPDX-License-Identifier: Apache-2.0
 +
-+func TestCopyFileCannotOverwriteMeasuredOrPrivatePaths(t *testing.T) {
-+	gate := &sealedVolumeGate{privateRoot: sealedVolumePrivateRoot}
-+	for _, path := range []string{
-+		"/run/peerpod/openshell-bootstrap.json",
-+		"/run/peerpod/verified-secrets/abc123/tls.key",
-+		"/run/peerpod/../peerpod/aa.toml",
++package interceptor
++
++import (
++	"context"
++	"errors"
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/confidential-containers/cloud-api-adaptor/src/cloud-api-adaptor/pkg/util"
++	pb "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/agent/protocols/grpc"
++	"github.com/stretchr/testify/require"
++)
++
++func TestCreateContainerRollsBackBeforeAndAfterSealedGate(t *testing.T) {
++	for _, tc := range []struct {
++		name                               string
++		preparationFailure, cleanupFailure bool
++	}{
++		{name: "sealed rejection"}, {name: "preparation failure", preparationFailure: true}, {name: "failed rollback retained for destroy", cleanupFailure: true},
 +	} {
-+		if err := gate.checkCopyFilePath(path); err == nil {
-+			t.Fatalf("CopyFile accepted %s", path)
-+		}
-+	}
-+	if err := gate.checkCopyFilePath("/run/kata-containers/shared/containers/abc123-file"); err != nil {
-+		t.Fatal(err)
-+	}
-+	if !strings.HasPrefix(gate.privateRoot, "/run/peerpod/") {
-+		t.Fatal("verified root escaped measured guest tmpfs")
++		t.Run(tc.name, func(t *testing.T) {
++			owned := filepath.Join(t.TempDir(), "owned")
++			require.NoError(t, os.Mkdir(owned, 0700))
++			borrowed := filepath.Join(t.TempDir(), "borrowed")
++			require.NoError(t, os.Mkdir(borrowed, 0700))
++			unmountErr := errors.New("device busy")
++			cleaned := false
++			v := &preparedCloudVolume{sourcePath: owned, createdDirHere: true, mountedHere: true, unmount: func(string, int) error {
++				cleaned = true
++				if tc.cleanupFailure {
++					return unmountErr
++				}
++				return nil
++			}}
++			i := &interceptor{sealedGate: &sealedVolumeGate{manifest: sealedVolumeManifest{Container: "bootstrap", Destination: "/secrets"}}}
++			req := &pb.CreateContainerRequest{OCI: &pb.Spec{Linux: &pb.Linux{}, Annotations: map[string]string{util.CloudVolumesAnnotationKey: "{}", "io.kubernetes.cri.container-name": "unmeasured"}, Mounts: []*pb.Mount{{Destination: "/secrets"}}}}
++			_, err := i.createContainer(context.Background(), req, func(context.Context, *pb.CreateContainerRequest, string) ([]*preparedCloudVolume, error) {
++				volumes := []*preparedCloudVolume{v, {sourcePath: borrowed}}
++				if tc.preparationFailure {
++					return volumes, errors.New("preparation failed")
++				}
++				return volumes, nil
++			})
++			require.Error(t, err)
++			require.True(t, cleaned, "early error skipped resource rollback")
++			require.DirExists(t, borrowed, "rollback removed a borrowed resource")
++			if tc.cleanupFailure {
++				require.ErrorIs(t, err, unmountErr)
++				require.Len(t, i.cloudVolumes, 1, "failed cleanup lost ownership")
++				tc.cleanupFailure = false
++				require.NoError(t, cleanupPreparedCloudVolumes(context.Background(), i.cloudVolumes))
++			} else {
++				require.Empty(t, i.cloudVolumes)
++			}
++			require.NoDirExists(t, owned)
++		})
 +	}
 +}
 diff --git a/src/cloud-api-adaptor/pkg/userdata/measure.go b/src/cloud-api-adaptor/pkg/userdata/measure.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..22253f08a73ae97aa379519b5b5e773dc7f92306
+index 00000000..22253f08
 --- /dev/null
 +++ b/src/cloud-api-adaptor/pkg/userdata/measure.go
 @@ -0,0 +1,166 @@
@@ -922,7 +1051,7 @@ index 0000000000000000000000000000000000000000..22253f08a73ae97aa379519b5b5e773d
 +}
 diff --git a/src/cloud-api-adaptor/pkg/userdata/measure_test.go b/src/cloud-api-adaptor/pkg/userdata/measure_test.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..dd52b71c1eccb085999ae33e042f82ad7e887748
+index 00000000..dd52b71c
 --- /dev/null
 +++ b/src/cloud-api-adaptor/pkg/userdata/measure_test.go
 @@ -0,0 +1,164 @@
@@ -1090,3 +1219,6 @@ index 0000000000000000000000000000000000000000..dd52b71c1eccb085999ae33e042f82ad
 +	go server.Serve(context.Background(), listener)
 +	require.ErrorContains(t, MeasureInitdata(context.Background(), path, digestPath, socket, eventlog), "requires a TDX attester")
 +}
+-- 
+2.43.7
+

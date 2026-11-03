@@ -1,1 +1,1 @@
-ba8769a124c96d736f1fbd47005764cbada70d2c4fa9f3e099e5dd336a05e564  0001-fix-alibabacloud-confirm-absence-after-failed-delete.patch
+ffec1f022c784f3f746ff86547338f2e1f1ba4b1e066100ed91ed14ba1398828  ../shared/alibabacloud-retained-instance-deletion.patch

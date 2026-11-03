@@ -1,7 +1,7 @@
-From 203157d34d2685dbb157ca1d805830c3fd65842c Mon Sep 17 00:00:00 2001
+From 0799c5944403565e734eb45cf1690e71acad8361 Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
-Date: Tue, 3 Nov 2026 01:05:58 +0800
-Subject: [PATCH 4/5] test: share the CSI conformance runner with CI
+Date: Tue, 3 Nov 2026 11:58:13 +0800
+Subject: [PATCH] test: share the CSI conformance runner with CI
 
 The local and CI conformance invocations should exercise the same
 supported RPC scope. Move the shared command and skip list into the
@@ -15,7 +15,7 @@ Generated-by: OpenAI Codex
  2 files changed, 40 insertions(+), 114 deletions(-)
 
 diff --git a/.github/workflows/csi-sanity.yaml b/.github/workflows/csi-sanity.yaml
-index b8e673ad18d310b47a498788f37b76ac30a672e0..2beaa88c9e0af45a99bddbe0bad4d38f64167327 100644
+index b8e673ad..2beaa88c 100644
 --- a/.github/workflows/csi-sanity.yaml
 +++ b/.github/workflows/csi-sanity.yaml
 @@ -17,106 +17,14 @@ jobs:
@@ -134,7 +134,7 @@ index b8e673ad18d310b47a498788f37b76ac30a672e0..2beaa88c9e0af45a99bddbe0bad4d38f
 +      - name: Build driver and run csi-sanity tests
 +        run: make test-verbose
 diff --git a/hack/run-csi-sanity.sh b/hack/run-csi-sanity.sh
-index 142129c9d65baa6f3f4de1851592f1ef70301169..05deb63670261ddb5edfd503686a8f6090b4e4a2 100755
+index 142129c9..05deb636 100755
 --- a/hack/run-csi-sanity.sh
 +++ b/hack/run-csi-sanity.sh
 @@ -5,13 +5,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -231,3 +231,6 @@ index 142129c9d65baa6f3f4de1851592f1ef70301169..05deb63670261ddb5edfd503686a8f60
  SKIP+="|GroupController|volume from an existing source"
  
  "$CSI_SANITY" \
+-- 
+2.43.7
+

@@ -1,0 +1,154 @@
+From 9a6f1eb82d89d330023d9b1142dcc343f24e5657 Mon Sep 17 00:00:00 2001
+From: Weidong Sun <sunweidong@linux.alibaba.com>
+Date: Tue, 3 Nov 2026 11:58:13 +0800
+Subject: [PATCH] controller: validate actual capacity on recovered volumes
+
+Use the requested capacity range for cached and cloud-recovered volumes.
+Reject incompatible existing disks before saving a record and report the
+actual provider capacity after rounding instead of the requested size.
+
+Generated-by: OpenAI Codex
+---
+ pkg/driver/capacity_test.go    | 83 ++++++++++++++++++++++++++++++++++
+ pkg/driver/controllerserver.go | 24 ++++++++--
+ 2 files changed, 102 insertions(+), 5 deletions(-)
+ create mode 100644 pkg/driver/capacity_test.go
+
+diff --git a/pkg/driver/capacity_test.go b/pkg/driver/capacity_test.go
+new file mode 100644
+index 00000000..12d88064
+--- /dev/null
++++ b/pkg/driver/capacity_test.go
+@@ -0,0 +1,83 @@
++// (C) Copyright Confidential Containers Contributors
++// SPDX-License-Identifier: Apache-2.0
++
++package driver
++
++import (
++	"context"
++	"os"
++	"testing"
++
++	provider "github.com/confidential-devhub/caa-csi-block-driver/pkg/provider"
++	"github.com/container-storage-interface/spec/lib/go/csi"
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/status"
++)
++
++type recoveredCapacityProvider struct {
++	provider.BlockVolumeProvider
++	size  int64
++	calls int
++}
++
++func (p *recoveredCapacityProvider) CreateVolume(_ context.Context, name string, _ int64) (*provider.VolumeInfo, error) {
++	p.calls++
++	return &provider.VolumeInfo{VolumeID: name, Path: "d-retained", Provider: "capacity-fixture", SizeBytes: p.size}, nil
++}
++
++func TestCreateVolumeValidatesActualRecoveredCapacity(t *testing.T) {
++	const gib = int64(1 << 30)
++	for _, tc := range []struct {
++		name                    string
++		actual, required, limit int64
++		want                    codes.Code
++	}{
++		{"undersized recovered disk", gib, 20 * gib, 0, codes.AlreadyExists},
++		{"oversized recovered disk", 30 * gib, 20 * gib, 25 * gib, codes.AlreadyExists},
++		{"rounded disk within range", 21 * gib, 20*gib + 1, 22 * gib, codes.OK},
++		{"larger disk without upper bound", 30 * gib, 20 * gib, 0, codes.OK},
++		{"zero reported capacity", 0, 20 * gib, 0, codes.AlreadyExists},
++		{"negative required", gib, -1, 0, codes.InvalidArgument},
++		{"reversed capacity range", 20 * gib, 20 * gib, 10 * gib, codes.InvalidArgument},
++	} {
++		for _, cached := range []bool{false, true} {
++			t.Run(tc.name+map[bool]string{false: "/cloud", true: "/store"}[cached], func(t *testing.T) {
++				t.Setenv("CSI_VOLUME_STORE_DIR", t.TempDir())
++				p := &recoveredCapacityProvider{size: tc.actual}
++				provider.RegisterProvider("capacity-fixture", func(map[string]string) (provider.BlockVolumeProvider, error) { return p, nil })
++				store := newVolumeStore()
++				if cached {
++					if err := store.Save(&volumeRecord{VolumeID: "pvc-capacity", Provider: "capacity-fixture", Path: "d-retained", CapacityBytes: tc.actual}); err != nil {
++						t.Fatal(err)
++					}
++				}
++				server := &controllerServer{store: store}
++				req := &csi.CreateVolumeRequest{Name: "pvc-capacity", CapacityRange: &csi.CapacityRange{RequiredBytes: tc.required, LimitBytes: tc.limit}, Parameters: map[string]string{"cloudProvider": "capacity-fixture"}, VolumeCapabilities: []*csi.VolumeCapability{{AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{}}, AccessMode: &csi.VolumeCapability_AccessMode{Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER}}}}
++				resp, err := server.CreateVolume(t.Context(), req)
++				if status.Code(err) != tc.want {
++					t.Fatalf("error=%v, want %v", err, tc.want)
++				}
++				if tc.want == codes.OK {
++					if resp.Volume.CapacityBytes != tc.actual {
++						t.Fatalf("advertised %d, actual %d", resp.Volume.CapacityBytes, tc.actual)
++					}
++					rec, err := store.Load(req.Name)
++					if err != nil || rec.CapacityBytes != tc.actual {
++						t.Fatalf("record=%+v, error=%v", rec, err)
++					}
++					// Replay must use the same capacity-range semantics.
++					if _, err := server.CreateVolume(t.Context(), req); err != nil {
++						t.Fatalf("replay: %v", err)
++					}
++				} else if !cached {
++					if _, err := store.Load(req.Name); !os.IsNotExist(err) {
++						t.Fatalf("incompatible result was persisted: %v", err)
++					}
++				}
++				if (cached || tc.want == codes.InvalidArgument) && p.calls != 0 {
++					t.Fatal("unexpected cloud call")
++				}
++			})
++		}
++	}
++}
+diff --git a/pkg/driver/controllerserver.go b/pkg/driver/controllerserver.go
+index c0bf177a..b2bb250a 100644
+--- a/pkg/driver/controllerserver.go
++++ b/pkg/driver/controllerserver.go
+@@ -105,15 +105,22 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
+ 		}
+ 	}
+ 
+-	capacity := req.GetCapacityRange().GetRequiredBytes()
++	required, limit := req.GetCapacityRange().GetRequiredBytes(), req.GetCapacityRange().GetLimitBytes()
++	if required < 0 || limit < 0 || (limit > 0 && required > limit) {
++		return nil, status.Error(codes.InvalidArgument, "invalid capacity range")
++	}
++	capacity := required
+ 	if capacity == 0 {
+-		capacity = 1073741824 // default 1 GiB
++		capacity = 1073741824 // default 1 GiB, bounded by the caller's limit
++		if limit > 0 && limit < capacity {
++			capacity = limit
++		}
+ 	}
++	compatible := func(size int64) bool { return size > 0 && size >= required && (limit == 0 || size <= limit) }
+ 
+ 	if rec, err := cs.store.Load(req.GetName()); err == nil {
+-		if rec.CapacityBytes != 0 && rec.CapacityBytes != capacity {
+-			return nil, status.Errorf(codes.AlreadyExists,
+-				"volume %s already exists with different capacity (%d != %d)", req.GetName(), rec.CapacityBytes, capacity)
++		if !compatible(rec.CapacityBytes) {
++			return nil, status.Errorf(codes.AlreadyExists, "volume %s capacity %d is outside the requested range", req.GetName(), rec.CapacityBytes)
+ 		}
+ 		csLogger.Printf("CreateVolume: %s already exists, returning existing", req.GetName())
+ 		volumeCtx := map[string]string{"cloudProvider": rec.Provider}
+@@ -182,6 +189,13 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
+ 		return nil, status.Errorf(codes.Internal, "provider.CreateVolume failed: %v", err)
+ 	}
+ 
++	// Providers also recover existing cloud volumes when local records are
++	// missing. Validate the returned size before saving or advertising capacity.
++	if volInfo == nil || !compatible(volInfo.SizeBytes) {
++		return nil, status.Errorf(codes.AlreadyExists, "provider volume %s is incompatible with the requested capacity range", req.GetName())
++	}
++	capacity = volInfo.SizeBytes
++
+ 	if err := cs.store.Save(&volumeRecord{
+ 		VolumeID:      req.GetName(),
+ 		Provider:      volInfo.Provider,
+-- 
+2.43.7
+

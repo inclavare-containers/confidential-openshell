@@ -7,6 +7,7 @@ if (( $# )); then
   [[ $# == 2 && $1 == --region ]] || die "$usage"
   region=$2
 fi
+bash deployment/build/check-region.sh "$region"
 bash deployment/guest/build-image.sh
 receipt=$(cat .local/guest-build/latest-receipt)
 bash deployment/build/select-guest.sh built "$region" "$receipt"

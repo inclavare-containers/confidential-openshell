@@ -11,13 +11,17 @@ build_tags
 selection=.local/guest-selection.json
 PODVM_MODE=$(jq -er .mode "$selection")
 PODVM_REGION=$(jq -er .region "$selection")
+bash deployment/build/check-region.sh "$PODVM_REGION"
 PODVM_IMAGE_ID=$(jq -r .image_id "$selection")
 PODVM_QCOW2=$(jq -r .qcow "$selection")
 PODVM_REFERENCE_VALUES=$(jq -er .references "$selection")
 GUEST_BUILD_RECEIPT=$(jq -r .receipt "$selection")
 cd "$BUILD_ROOT"
-HANDOFF="$BUILD_ROOT/artifacts/handoff"
-test ! -e "$HANDOFF" # A fresh handoff cannot include stale or private files.
+destination="$BUILD_ROOT/artifacts/handoff"
+[[ ! -e "$destination" ]] || die "Completed handoff already exists: $destination. Retain it before packaging another release."
+mkdir -p "$BUILD_ROOT/artifacts"
+HANDOFF=$(mktemp -d "$BUILD_ROOT/artifacts/.handoff.XXXXXX")
+trap 'rm -rf -- "$HANDOFF"' EXIT
 mkdir -p "$HANDOFF/source" "$HANDOFF/outputs" "$HANDOFF/charts" artifacts/images
 docker save -o artifacts/images/caa.tar "openshell/cloud-api-adaptor:$CAA_TAG"
 docker save -o artifacts/images/csi.tar "openshell/caa-csi-block-driver:$CSI_TAG"
@@ -61,6 +65,10 @@ jq -n --arg caa "$CAA_TAG" --arg csi "$CSI_TAG" --arg peerpod_ctrl "$PEERPOD_CTR
     guest:(if $mode == "import" then $guest else null end),references:$refs}' > "$HANDOFF/selection.json"
 (cd "$HANDOFF" && sha256sum source/*.tar outputs/* charts/* \
   *.json > SHA256SUMS)
+(cd "$HANDOFF" && sha256sum -c SHA256SUMS --quiet)
+mv -T "$HANDOFF" "$destination"
+trap - EXIT
+HANDOFF="$destination"
 sha256sum "$HANDOFF/SHA256SUMS" # Retain through the authenticated administrative channel.
 sha256sum "$HANDOFF/SHA256SUMS" | cut -d ' ' -f1 > "$BUILD_ROOT/artifacts/handoff.sha256"
 printf 'Handoff ready: %s\n' "$HANDOFF"

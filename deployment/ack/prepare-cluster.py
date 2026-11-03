@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+from pathlib import Path
 import subprocess
 
 from cloud import Cloud, OPERATOR, require, run, write
@@ -63,6 +64,9 @@ def nodepool_request(config, security_group, key):
     }
 
 
+SUPPORTED_CONTAINERD = json.loads(Path(__file__).with_name('ack.example.json').read_text())['containerd_version']
+
+
 def validate_nodes(nodes):
     require(nodes['items'], 'ACK has no workers. Wait for node-pool creation, then repeat this step.')
     require(len({n['metadata']['labels']['topology.kubernetes.io/zone'] for n in nodes['items']}) == 1,
@@ -72,9 +76,9 @@ def validate_nodes(nodes):
         require(status.get('features', {}).get('supplementalGroupsPolicy') is True and
                 status['nodeInfo']['operatingSystem'] == 'linux' and status['nodeInfo']['architecture'] == 'amd64' and
                 'Ubuntu 24.04' in status['nodeInfo'].get('osImage', '') and
-                status['nodeInfo']['containerRuntimeVersion'].startswith('containerd://') and
+                status['nodeInfo']['containerRuntimeVersion'] == 'containerd://' + SUPPORTED_CONTAINERD and
                 any(c['type'] == 'Ready' and c['status'] == 'True' for c in status['conditions']),
-                f"Worker {node['metadata']['name']} must be Ready Ubuntu 24.04/amd64 and support containerd/supplementalGroupsPolicy.")
+                f"Worker {node['metadata']['name']} must be Ready Ubuntu 24.04/amd64 and use containerd {SUPPORTED_CONTAINERD} with supplementalGroupsPolicy (OCI 1.3.0 profile).")
 
 
 def main():
@@ -84,6 +88,8 @@ def main():
     args = parser.parse_args()
     cloud = Cloud()
     config = cloud.config
+    require(config['containerd_version'] == SUPPORTED_CONTAINERD,
+            f'This OCI 1.3.0 deployment profile requires containerd {SUPPORTED_CONTAINERD}.')
     if config.get('zone_id'):
         require_tdx_zone(cloud.region, config['podvm_instance_type'], config['zone_id'])
     cluster = cloud.state.get('cluster_id') or config.get('cluster_id')

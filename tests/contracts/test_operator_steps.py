@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import shutil
 import sys
 import tarfile
 import tempfile
@@ -28,6 +29,7 @@ def load(name, relative):
 cli = load('operator_cli', 'deployment/cli.py')
 selection = load('operator_workers', 'deployment/peerpods/select-workers.py')
 profile = load('worker_profile', 'deployment/peerpods/worker-profile.py')
+release = load('release_install', 'deployment/build/install-release.py')
 
 
 class PublicSteps(unittest.TestCase):
@@ -217,6 +219,48 @@ class ReleaseInstallation(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual((destination / 'keep').read_text(), 'existing deployment')
             self.assertFalse((root / 'operator').exists())
+
+
+class HandoffCopy(unittest.TestCase):
+    def test_interrupted_copy_can_retry_without_publishing_partial_release(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, checksum = ReleaseInstallation().make_handoff(root)
+            target = root / 'installed-handoff'
+
+            def interrupted(source, target):
+                target.mkdir()
+                (target / 'partial').write_text('interrupted')
+                raise OSError('injected full filesystem')
+
+            with patch.object(release.shutil, 'copytree', side_effect=interrupted):
+                with self.assertRaisesRegex(OSError, 'injected'):
+                    release.copy_handoff(source, target, checksum)
+            self.assertFalse(target.exists())
+            self.assertEqual(list(root.glob('.installed-handoff.*')), [])
+            release.copy_handoff(source, target, checksum)
+            self.assertEqual((target / 'SHA256SUMS').read_bytes(), (source / 'SHA256SUMS').read_bytes())
+            # Completed releases are verified and preserved on retry.
+            with patch.object(release.shutil, 'copytree', side_effect=AssertionError('copied completed release')):
+                release.copy_handoff(source, target, checksum)
+
+    def test_changed_copy_is_rejected_before_publication(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, checksum = ReleaseInstallation().make_handoff(root)
+            target = root / 'installed-handoff'
+            real_copy = shutil.copytree
+
+            def changed(source, staged, *args, **kwargs):
+                real_copy(source, staged, *args, **kwargs)
+                if Path(source) == root / 'handoff':
+                    (Path(staged) / 'outputs/containerd-shim-kata-v2').write_text('changed')
+
+            with patch.object(release.shutil, 'copytree', side_effect=changed):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    release.copy_handoff(source, target, checksum)
+            self.assertFalse(target.exists())
+            self.assertEqual(list(root.glob('.installed-handoff.*')), [])
 
 
 if __name__ == '__main__':

@@ -1,0 +1,564 @@
+From ae32da4eb6adc477eda8685cc692d1f1be612fe5 Mon Sep 17 00:00:00 2001
+From: Weidong Sun <sunweidong@linux.alibaba.com>
+Date: Tue, 3 Nov 2026 11:58:12 +0800
+Subject: [PATCH] alibabacloud: protect retained disks in every instance
+ deletion path
+
+Read the complete attached-disk inventory before each deletion attempt and
+reject unsafe retention settings or security operation locks. Share this
+narrow guard between the adaptor and independent PeerPod controller builds.
+Confirm exact instance absence after a failed deletion, preserving all
+other errors and the PeerPod finalizer until a successful retry.
+
+Generated-by: OpenAI Codex
+---
+ src/cloud-providers/alibabacloud/provider.go  |  28 +--
+ .../alibabacloud/provider_delete_test.go      |  86 ++++++++
+ .../alibabacloud/retained_delete.go           | 197 ++++++++++++++++++
+ .../alibabacloud/retained_delete_test.go      | 111 ++++++++++
+ .../controllers/finalizer_test.go             |  64 ++++++
+ 5 files changed, 468 insertions(+), 18 deletions(-)
+ create mode 100644 src/cloud-providers/alibabacloud/provider_delete_test.go
+ create mode 100644 src/cloud-providers/alibabacloud/retained_delete.go
+ create mode 100644 src/cloud-providers/alibabacloud/retained_delete_test.go
+ create mode 100644 src/peerpod-ctrl/controllers/finalizer_test.go
+
+diff --git a/src/cloud-providers/alibabacloud/provider.go b/src/cloud-providers/alibabacloud/provider.go
+index 389f2d11..0ca9cb1d 100644
+--- a/src/cloud-providers/alibabacloud/provider.go
++++ b/src/cloud-providers/alibabacloud/provider.go
+@@ -38,6 +38,7 @@ const (
+ 
+ // Make ecsClient a mockable interface
+ type ecsClient interface {
++	DescribeDisks(request *ecs.DescribeDisksRequest) (*ecs.DescribeDisksResponse, error)
+ 	RunInstances(
+ 		params *ecs.RunInstancesRequest) (*ecs.RunInstancesResponse, error)
+ 	DeleteInstance(
+@@ -368,32 +369,23 @@ func (p *alibabaCloudProvider) CreateInstance(ctx context.Context, podName, sand
+ }
+ 
+ func (p *alibabaCloudProvider) DeleteInstance(ctx context.Context, instanceID string) error {
++	if instanceID == "" {
++		return errors.New("refusing to delete an Alibaba Cloud instance without an ID")
++	}
+ 	logger.Printf("Deleting instance (%s)", instanceID)
+ 	err := p.waitUntilTimeout(time.Duration(time.Second*30), func() (bool, error) {
+-		req := ecs.DeleteInstanceRequest{
+-			InstanceId: tea.String(instanceID),
+-			Force:      tea.Bool(true),
+-		}
+-		resp, err := p.ecsClient.DeleteInstance(&req)
++		absent, err := p.deleteInstanceWithRetentionGuard(ctx, instanceID)
+ 		if err != nil {
+-			if *err.(*tea.SDKError).Code == "IncorrectInstanceStatus" {
+-				logger.Printf("instance %s is not in the correct state to be deleted, retrying", instanceID)
++			var sdkError *tea.SDKError
++			if errors.As(err, &sdkError) && sdkError != nil && tea.StringValue(sdkError.Code) == "IncorrectInstanceStatus" {
+ 				return false, nil
+ 			}
+-
+-			if *err.(*tea.SDKError).Code == "InvalidInstanceId.NotFound" {
+-				logger.Printf("instance %s is not found", instanceID)
+-				return true, nil
+-			}
+-
+-			logger.Printf("failed to delete an instance: %v and the response is %v", err, resp)
+-			return false, fmt.Errorf("failed to delete an instance %s: %+v", instanceID, err)
++			return false, err
+ 		}
+-
+-		return true, nil
++		return absent || err == nil, nil
+ 	})
+ 	if err != nil {
+-		return fmt.Errorf("failed to delete an instance %s", instanceID)
++		return fmt.Errorf("failed to delete an instance %s: %w", instanceID, err)
+ 	}
+ 
+ 	logger.Printf("Deleted an instance %s", instanceID)
+diff --git a/src/cloud-providers/alibabacloud/provider_delete_test.go b/src/cloud-providers/alibabacloud/provider_delete_test.go
+new file mode 100644
+index 00000000..934c065e
+--- /dev/null
++++ b/src/cloud-providers/alibabacloud/provider_delete_test.go
+@@ -0,0 +1,86 @@
++// (C) Copyright Confidential Containers Contributors
++// SPDX-License-Identifier: Apache-2.0
++
++package alibabacloud
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"testing"
++
++	ecs "github.com/alibabacloud-go/ecs-20140526/v4/client"
++	"github.com/alibabacloud-go/tea/tea"
++)
++
++type fakeDeleteECSClient struct {
++	*ecs.Client
++	deleteError       error
++	attributeError    error
++	attributeResponse *ecs.DescribeInstanceAttributeResponse
++	deleteRequests    []*ecs.DeleteInstanceRequest
++	attributeRequests []*ecs.DescribeInstanceAttributeRequest
++}
++
++func (f *fakeDeleteECSClient) DescribeDisks(request *ecs.DescribeDisksRequest) (*ecs.DescribeDisksResponse, error) {
++	return &ecs.DescribeDisksResponse{Body: &ecs.DescribeDisksResponseBody{Disks: &ecs.DescribeDisksResponseBodyDisks{}}}, nil
++}
++
++func (f *fakeDeleteECSClient) DeleteInstance(request *ecs.DeleteInstanceRequest) (*ecs.DeleteInstanceResponse, error) {
++	f.deleteRequests = append(f.deleteRequests, request)
++	return &ecs.DeleteInstanceResponse{Body: &ecs.DeleteInstanceResponseBody{}}, f.deleteError
++}
++
++func (f *fakeDeleteECSClient) DescribeInstanceAttribute(request *ecs.DescribeInstanceAttributeRequest) (*ecs.DescribeInstanceAttributeResponse, error) {
++	f.attributeRequests = append(f.attributeRequests, request)
++	return f.attributeResponse, f.attributeError
++}
++
++func TestDeleteInstanceConfirmsAbsenceAfterError(t *testing.T) {
++	denied := &tea.SDKError{Code: tea.String("Forbidden.RAM"), Message: tea.String("tag-conditioned deletion denied")}
++	notFound := &tea.SDKError{Code: tea.String("InvalidInstanceId.NotFound"), Message: tea.String("instance is absent")}
++	readDenied := &tea.SDKError{Code: tea.String("Forbidden.RAM"), Message: tea.String("read denied")}
++	transportError := errors.New("delete response lost")
++	for _, test := range []struct {
++		name          string
++		deleteError   error
++		readError     error
++		readResponse  *ecs.DescribeInstanceAttributeResponse
++		wantSuccess   bool
++		wantReadCalls int
++	}{
++		{name: "successful deletion needs no read", wantSuccess: true},
++		{name: "documented deletion not-found needs no read", deleteError: notFound, wantSuccess: true},
++		{name: "denied delete confirmed absent", deleteError: denied, readError: notFound, wantSuccess: true, wantReadCalls: 1},
++		{name: "lost delete response confirmed absent", deleteError: transportError, readError: notFound, wantSuccess: true, wantReadCalls: 1},
++		{name: "wrapped read not-found confirms absence", deleteError: denied, readError: fmt.Errorf("read: %w", notFound), wantSuccess: true, wantReadCalls: 1},
++		{name: "existing instance preserves deletion denial", deleteError: denied, readResponse: &ecs.DescribeInstanceAttributeResponse{Body: &ecs.DescribeInstanceAttributeResponseBody{InstanceId: tea.String("i-target")}}, wantReadCalls: 1},
++		{name: "empty successful response cannot prove absence", deleteError: denied, wantReadCalls: 1},
++		{name: "read denial preserves deletion denial", deleteError: denied, readError: readDenied, wantReadCalls: 1},
++		{name: "read transport failure preserves deletion denial", deleteError: denied, readError: errors.New("read response lost"), wantReadCalls: 1},
++		{name: "other read not-found code cannot prove absence", deleteError: denied, readError: &tea.SDKError{Code: tea.String("InvalidRegionId.NotFound")}, wantReadCalls: 1},
++		{name: "read error without code cannot prove absence", deleteError: denied, readError: &tea.SDKError{Message: tea.String("incomplete SDK error")}, wantReadCalls: 1},
++		{name: "non-SDK deletion error preserved if instance exists", deleteError: transportError, wantReadCalls: 1},
++	} {
++		t.Run(test.name, func(t *testing.T) {
++			client := &fakeDeleteECSClient{deleteError: test.deleteError, attributeError: test.readError, attributeResponse: test.readResponse}
++			p := &alibabaCloudProvider{ecsClient: client, serviceConfig: &Config{Region: "cn-beijing"}}
++			err := p.DeleteInstance(context.Background(), "i-target")
++			if test.wantSuccess && err != nil {
++				t.Fatalf("DeleteInstance() = %v, want confirmed success", err)
++			}
++			if !test.wantSuccess && !errors.Is(err, test.deleteError) {
++				t.Fatalf("DeleteInstance() = %v, want original deletion error %v", err, test.deleteError)
++			}
++			if len(client.deleteRequests) != 1 || tea.StringValue(client.deleteRequests[0].InstanceId) != "i-target" || !tea.BoolValue(client.deleteRequests[0].Force) {
++				t.Fatal("deletion must retain the exact target and existing Force behavior")
++			}
++			if len(client.attributeRequests) != test.wantReadCalls {
++				t.Fatalf("read calls = %d, want %d", len(client.attributeRequests), test.wantReadCalls)
++			}
++			if test.wantReadCalls == 1 && tea.StringValue(client.attributeRequests[0].InstanceId) != "i-target" {
++				t.Fatal("absence read must target the same exact instance on the same client")
++			}
++		})
++	}
++}
+diff --git a/src/cloud-providers/alibabacloud/retained_delete.go b/src/cloud-providers/alibabacloud/retained_delete.go
+new file mode 100644
+index 00000000..fed5906f
+--- /dev/null
++++ b/src/cloud-providers/alibabacloud/retained_delete.go
+@@ -0,0 +1,197 @@
++// (C) Copyright Confidential Containers Contributors
++// SPDX-License-Identifier: Apache-2.0
++
++package alibabacloud
++
++import (
++	"context"
++	"errors"
++	"fmt"
++
++	ecs "github.com/alibabacloud-go/ecs-20140526/v4/client"
++	"github.com/alibabacloud-go/tea/tea"
++)
++
++// This deletion guard is shared by the adaptor and independent PeerPod
++// controller builds. Keep it independent of disk attachment and guest code.
++type alibabaDataDisk struct {
++	id                    string
++	zone                  string
++	status                string
++	instanceID            string
++	diskType              string
++	multiAttach           string
++	portable              bool
++	deleteWithInstance    bool
++	hasDeleteWithInstance bool
++}
++
++func describeAlibabaAttachedDataDisks(ctx context.Context, client ecsClient, region, instanceID string) ([]alibabaDataDisk, error) {
++	if err := ctx.Err(); err != nil {
++		return nil, err
++	}
++	response, err := client.DescribeDisks(&ecs.DescribeDisksRequest{
++		RegionId: tea.String(region), InstanceId: tea.String(instanceID),
++		DiskType: tea.String("data"), PageSize: tea.Int32(100),
++	})
++	if err != nil {
++		return nil, fmt.Errorf("describe data disks attached to instance %s: %w", instanceID, err)
++	}
++	return parseAlibabaDataDisksResponse(response)
++}
++
++func parseAlibabaDataDisksResponse(response *ecs.DescribeDisksResponse) ([]alibabaDataDisk, error) {
++	if response == nil || response.Body == nil || response.Body.Disks == nil {
++		return nil, errors.New("DescribeDisks returned an incomplete response")
++	}
++	if tea.StringValue(response.Body.NextToken) != "" {
++		return nil, errors.New("DescribeDisks returned a truncated response")
++	}
++	items := response.Body.Disks.Disk
++	if response.Body.TotalCount != nil && int(tea.Int32Value(response.Body.TotalCount)) != len(items) {
++		return nil, fmt.Errorf("DescribeDisks reported %d disks but returned %d", tea.Int32Value(response.Body.TotalCount), len(items))
++	}
++	disks := make([]alibabaDataDisk, 0, len(response.Body.Disks.Disk))
++	seen := make(map[string]struct{}, len(items))
++	for _, item := range items {
++		if item == nil {
++			return nil, errors.New("DescribeDisks returned an empty disk entry")
++		}
++		diskID := tea.StringValue(item.DiskId)
++		if diskID == "" {
++			return nil, errors.New("DescribeDisks returned a disk without an ID")
++		}
++		if _, found := seen[diskID]; found {
++			return nil, fmt.Errorf("DescribeDisks returned duplicate disk %s", diskID)
++		}
++		seen[diskID] = struct{}{}
++		disks = append(disks, alibabaDataDisk{
++			id: diskID, zone: tea.StringValue(item.ZoneId),
++			status: tea.StringValue(item.Status), instanceID: tea.StringValue(item.InstanceId),
++			diskType: tea.StringValue(item.Type), multiAttach: tea.StringValue(item.MultiAttach),
++			portable: tea.BoolValue(item.Portable), deleteWithInstance: tea.BoolValue(item.DeleteWithInstance),
++			hasDeleteWithInstance: item.DeleteWithInstance != nil,
++		})
++	}
++	return disks, nil
++}
++
++// Query ECS instead of maintaining a second in-memory attachment journal.
++func (p *alibabaCloudProvider) retainedDataDisksForInstanceDelete(ctx context.Context, instanceID string) ([]string, error) {
++	disks, err := describeAlibabaAttachedDataDisks(ctx, p.ecsClient, p.serviceConfig.Region, instanceID)
++	if err != nil {
++		return nil, err
++	}
++	ids := make([]string, 0, len(disks))
++	for _, disk := range disks {
++		_, relevant, err := classifyRetainedAlibabaDataDisk(instanceID, disk)
++		if err != nil {
++			return nil, err
++		}
++		if !relevant || disk.instanceID != instanceID {
++			return nil, fmt.Errorf("disk %s is not attached to instance %s", disk.id, instanceID)
++		}
++		ids = append(ids, disk.id)
++	}
++	return ids, nil
++}
++
++func classifyRetainedAlibabaDataDisk(instanceID string, disk alibabaDataDisk) (available, relevant bool, err error) {
++	if disk.diskType != "data" || !disk.portable {
++		return false, false, fmt.Errorf("disk %s is not a detachable data disk", disk.id)
++	}
++	if disk.multiAttach != "Disabled" {
++		return false, false, fmt.Errorf("disk %s has unsupported multi-attach mode %q", disk.id, disk.multiAttach)
++	}
++	if !disk.hasDeleteWithInstance || disk.deleteWithInstance {
++		return false, false, fmt.Errorf("disk %s does not explicitly set DeleteWithInstance=false", disk.id)
++	}
++	switch disk.status {
++	case "Available":
++		if disk.instanceID != "" {
++			return false, false, fmt.Errorf("available disk %s is unexpectedly bound to instance %s", disk.id, disk.instanceID)
++		}
++		return true, true, nil
++	case "In_use":
++		if disk.instanceID == "" {
++			return false, false, fmt.Errorf("in-use disk %s has no instance identity", disk.id)
++		}
++		return false, disk.instanceID == instanceID, nil
++	case "Attaching", "Detaching":
++		if disk.instanceID == "" || disk.instanceID == instanceID {
++			return false, true, nil
++		}
++		return false, false, nil
++	default:
++		return false, false, fmt.Errorf("disk %s is in unsupported cleanup state %q", disk.id, disk.status)
++	}
++}
++
++func (p *alibabaCloudProvider) validateInstanceRetainedDiskSafety(ctx context.Context, instanceID string) (bool, error) {
++	if err := ctx.Err(); err != nil {
++		return false, err
++	}
++	response, err := p.ecsClient.DescribeInstanceAttribute(&ecs.DescribeInstanceAttributeRequest{
++		InstanceId: tea.String(instanceID),
++	})
++	if isAlibabaInstanceNotFoundError(err) {
++		return true, nil
++	}
++	if err != nil {
++		return false, fmt.Errorf("describe Alibaba Cloud instance %s before retained-disk deletion: %w", instanceID, err)
++	}
++	if response == nil || response.Body == nil {
++		return false, fmt.Errorf("describe Alibaba Cloud instance %s before retained-disk deletion returned an incomplete response", instanceID)
++	}
++	if response.Body.OperationLocks == nil {
++		return false, nil
++	}
++	for _, lock := range response.Body.OperationLocks.LockReason {
++		if lock == nil {
++			return false, fmt.Errorf("instance %s returned an unrecognized operation lock", instanceID)
++		}
++		switch reason := tea.StringValue(lock.LockReason); reason {
++		case "security":
++			return false, fmt.Errorf("refusing to delete security-locked instance %s because Alibaba Cloud would ignore DeleteWithInstance=false", instanceID)
++		case "financial", "Recycling", "dedicatedhostfinancial", "refunded":
++		default:
++			return false, fmt.Errorf("instance %s returned unrecognized operation lock %q", instanceID, reason)
++		}
++	}
++	return false, nil
++}
++
++func isAlibabaInstanceNotFoundError(err error) bool {
++	var sdkErr *tea.SDKError
++	return errors.As(err, &sdkErr) && tea.StringValue(sdkErr.Code) == "InvalidInstanceId.NotFound"
++}
++
++// deleteInstanceWithRetentionGuard is the only mutation boundary used by
++// both deletion loops. Recheck current disk/lock state on every retry.
++// The bool result confirms exact absence; nil error alone means accepted.
++func (p *alibabaCloudProvider) deleteInstanceWithRetentionGuard(ctx context.Context, instanceID string) (bool, error) {
++	disks, err := p.retainedDataDisksForInstanceDelete(ctx, instanceID)
++	if err != nil {
++		return false, fmt.Errorf("validate retained disks: %w", err)
++	}
++	if len(disks) != 0 {
++		absent, err := p.validateInstanceRetainedDiskSafety(ctx, instanceID)
++		if err != nil || absent {
++			return absent, err
++		}
++	}
++	_, err = p.ecsClient.DeleteInstance(&ecs.DeleteInstanceRequest{InstanceId: tea.String(instanceID), Force: tea.Bool(true)})
++	if err == nil {
++		return false, nil
++	}
++	if isAlibabaInstanceNotFoundError(err) {
++		return true, nil
++	}
++	// A tag-conditioned denial can race another caller's successful deletion.
++	// Only a typed not-found for this exact ID confirms that outcome.
++	_, readErr := p.ecsClient.DescribeInstanceAttribute(&ecs.DescribeInstanceAttributeRequest{InstanceId: tea.String(instanceID)})
++	if isAlibabaInstanceNotFoundError(readErr) {
++		return true, nil
++	}
++	return false, fmt.Errorf("delete instance %s: %w", instanceID, err)
++}
+diff --git a/src/cloud-providers/alibabacloud/retained_delete_test.go b/src/cloud-providers/alibabacloud/retained_delete_test.go
+new file mode 100644
+index 00000000..2588ff7a
+--- /dev/null
++++ b/src/cloud-providers/alibabacloud/retained_delete_test.go
+@@ -0,0 +1,111 @@
++// (C) Copyright Confidential Containers Contributors
++// SPDX-License-Identifier: Apache-2.0
++
++package alibabacloud
++
++import (
++	"context"
++	"errors"
++	"strings"
++	"testing"
++
++	ecs "github.com/alibabacloud-go/ecs-20140526/v4/client"
++	"github.com/alibabacloud-go/tea/tea"
++)
++
++type retentionClient struct {
++	*ecs.Client
++	disks                  *ecs.DescribeDisksResponse
++	diskErr                error
++	lock                   string
++	deleted                bool
++	lockAfterFailure       bool
++	deleteCalls, lockReads int
++}
++
++func (c *retentionClient) DescribeDisks(req *ecs.DescribeDisksRequest) (*ecs.DescribeDisksResponse, error) {
++	if c.deleted && tea.StringValue(req.InstanceId) != "" {
++		return &ecs.DescribeDisksResponse{Body: &ecs.DescribeDisksResponseBody{Disks: &ecs.DescribeDisksResponseBodyDisks{}}}, nil
++	}
++	return c.disks, c.diskErr
++}
++func (c *retentionClient) DescribeInstanceAttribute(req *ecs.DescribeInstanceAttributeRequest) (*ecs.DescribeInstanceAttributeResponse, error) {
++	if c.deleted {
++		return nil, &tea.SDKError{Code: tea.String("InvalidInstanceId.NotFound")}
++	}
++	c.lockReads++
++	body := &ecs.DescribeInstanceAttributeResponseBody{InstanceId: req.InstanceId}
++	if c.lock != "" {
++		body.OperationLocks = &ecs.DescribeInstanceAttributeResponseBodyOperationLocks{LockReason: []*ecs.DescribeInstanceAttributeResponseBodyOperationLocksLockReason{{LockReason: tea.String(c.lock)}}}
++	}
++	return &ecs.DescribeInstanceAttributeResponse{Body: body}, nil
++}
++func (c *retentionClient) DeleteInstance(req *ecs.DeleteInstanceRequest) (*ecs.DeleteInstanceResponse, error) {
++	c.deleteCalls++
++	if c.lockAfterFailure && c.deleteCalls == 1 {
++		c.lock = "security"
++		return nil, &tea.SDKError{Code: tea.String("IncorrectInstanceStatus")}
++	}
++	if tea.StringValue(req.InstanceId) != "i-retained" || !tea.BoolValue(req.Force) {
++		return nil, errors.New("wrong deletion request")
++	}
++	c.deleted = true
++	for _, disk := range c.disks.Body.Disks.Disk {
++		disk.Status = tea.String("Available")
++		disk.InstanceId = tea.String("")
++	}
++	return &ecs.DeleteInstanceResponse{Body: &ecs.DeleteInstanceResponseBody{}}, nil
++}
++
++// Run the same cases against both independent binaries' provider queues.
++func TestDeleteInstanceRetentionGuard(t *testing.T) {
++	for _, tc := range []struct {
++		name, lock, wantError string
++		mutate                func(*retentionClient)
++	}{
++		{name: "retained disk is released safely"},
++		{name: "security lock blocks delete", lock: "security", wantError: "security-locked"},
++		{name: "unknown lock fails closed with retained disk", lock: "new-lock", wantError: "unrecognized operation lock"},
++		{name: "known financial lock does not imply data loss", lock: "financial"},
++		{name: "ephemeral security lock is not blocked", lock: "security", mutate: func(c *retentionClient) { c.disks.Body.Disks.Disk = nil }},
++		{name: "delete with instance rejected", wantError: "DeleteWithInstance=false", mutate: func(c *retentionClient) { c.disks.Body.Disks.Disk[0].DeleteWithInstance = tea.Bool(true) }},
++		{name: "missing retention attribute rejected", wantError: "DeleteWithInstance=false", mutate: func(c *retentionClient) { c.disks.Body.Disks.Disk[0].DeleteWithInstance = nil }},
++		{name: "wrong instance rejected", wantError: "not attached", mutate: func(c *retentionClient) { c.disks.Body.Disks.Disk[0].InstanceId = tea.String("i-other") }},
++		{name: "inventory permission error prevents delete", wantError: "inventory denied", mutate: func(c *retentionClient) { c.diskErr = errors.New("inventory denied") }},
++		{name: "truncated inventory prevents delete", wantError: "truncated", mutate: func(c *retentionClient) { c.disks.Body.NextToken = tea.String("more") }},
++		{name: "incomplete inventory prevents delete", wantError: "incomplete", mutate: func(c *retentionClient) { c.disks = nil }},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			c := &retentionClient{lock: tc.lock, disks: &ecs.DescribeDisksResponse{Body: &ecs.DescribeDisksResponseBody{Disks: &ecs.DescribeDisksResponseBodyDisks{Disk: []*ecs.DescribeDisksResponseBodyDisksDisk{{DiskId: tea.String("d-retained"), Type: tea.String("data"), Portable: tea.Bool(true), MultiAttach: tea.String("Disabled"), DeleteWithInstance: tea.Bool(false), Status: tea.String("In_use"), InstanceId: tea.String("i-retained")}}}}}}
++			if tc.mutate != nil {
++				tc.mutate(c)
++			}
++			p := &alibabaCloudProvider{ecsClient: c, serviceConfig: &Config{Region: "cn-beijing"}}
++			err := p.DeleteInstance(context.Background(), "i-retained")
++			if tc.wantError != "" {
++				if err == nil || !strings.Contains(err.Error(), tc.wantError) {
++					t.Fatalf("error=%v, want %q", err, tc.wantError)
++				}
++				if c.deleteCalls != 0 {
++					t.Fatalf("unsafe delete called %d times", c.deleteCalls)
++				}
++			} else {
++				if err != nil || c.deleteCalls != 1 {
++					t.Fatalf("error=%v, delete calls=%d", err, c.deleteCalls)
++				}
++				if tc.name == "ephemeral security lock is not blocked" && c.lockReads != 0 {
++					t.Fatal("applied retained-disk lock checks to an ephemeral instance")
++				}
++			}
++		})
++	}
++}
++
++func TestDeleteInstanceRechecksRetentionOnRetry(t *testing.T) {
++	c := &retentionClient{lockAfterFailure: true, disks: &ecs.DescribeDisksResponse{Body: &ecs.DescribeDisksResponseBody{Disks: &ecs.DescribeDisksResponseBodyDisks{Disk: []*ecs.DescribeDisksResponseBodyDisksDisk{{DiskId: tea.String("d-retained"), Type: tea.String("data"), Portable: tea.Bool(true), MultiAttach: tea.String("Disabled"), DeleteWithInstance: tea.Bool(false), Status: tea.String("In_use"), InstanceId: tea.String("i-retained")}}}}}}
++	p := &alibabaCloudProvider{ecsClient: c, serviceConfig: &Config{Region: "cn-beijing"}}
++	err := p.DeleteInstance(context.Background(), "i-retained")
++	if err == nil || !strings.Contains(err.Error(), "security-locked") || c.deleteCalls != 1 {
++		t.Fatalf("error=%v delete calls=%d; second mutation must be blocked", err, c.deleteCalls)
++	}
++}
+diff --git a/src/peerpod-ctrl/controllers/finalizer_test.go b/src/peerpod-ctrl/controllers/finalizer_test.go
+new file mode 100644
+index 00000000..d0f5940e
+--- /dev/null
++++ b/src/peerpod-ctrl/controllers/finalizer_test.go
+@@ -0,0 +1,64 @@
++// (C) Copyright Confidential Containers Contributors
++// SPDX-License-Identifier: Apache-2.0
++
++package controllers
++
++import (
++	"context"
++	"errors"
++	"testing"
++
++	provider "github.com/confidential-containers/cloud-api-adaptor/src/cloud-providers"
++	api "github.com/confidential-containers/cloud-api-adaptor/src/peerpod-ctrl/api/v1alpha1"
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/apimachinery/pkg/types"
++	ctrl "sigs.k8s.io/controller-runtime"
++	"sigs.k8s.io/controller-runtime/pkg/client/fake"
++)
++
++type refusingRetentionProvider struct {
++	provider.Provider
++	err      error
++	instance string
++}
++
++func (p *refusingRetentionProvider) DeleteInstance(_ context.Context, id string) error {
++	p.instance = id
++	return p.err
++}
++
++func TestFinalizerRetainsPeerPodUntilProviderAllowsDeletion(t *testing.T) {
++	scheme := runtime.NewScheme()
++	if err := api.AddToScheme(scheme); err != nil {
++		t.Fatal(err)
++	}
++	now := metav1.Now()
++	pp := &api.PeerPod{ObjectMeta: metav1.ObjectMeta{Name: "retained", Namespace: "default", DeletionTimestamp: &now, Finalizers: []string{ppFinalizer}}, Spec: api.PeerPodSpec{CloudProvider: "alibabacloud", InstanceID: "i-retained"}}
++	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pp).Build()
++	guardErr := errors.New("security lock prevents retained disk deletion")
++	p := &refusingRetentionProvider{err: guardErr}
++	r := &PeerPodReconciler{Client: client, Scheme: scheme, Providers: map[string]provider.Provider{"alibabacloud": p}}
++	key := types.NamespacedName{Name: pp.Name, Namespace: pp.Namespace}
++	if _, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: key}); !errors.Is(err, guardErr) {
++		t.Fatalf("lost guard error: %v", err)
++	}
++	if p.instance != "i-retained" {
++		t.Fatalf("wrong instance %q", p.instance)
++	}
++	current := &api.PeerPod{}
++	if err := client.Get(t.Context(), key, current); err != nil {
++		t.Fatal(err)
++	}
++	if len(current.Finalizers) != 1 || current.Finalizers[0] != ppFinalizer {
++		t.Fatal("released finalizer despite retained-disk guard failure")
++	}
++	p.err = nil
++	if _, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: key}); err != nil {
++		t.Fatal(err)
++	}
++	if err := client.Get(t.Context(), key, current); !apierrors.IsNotFound(err) {
++		t.Fatalf("successful retry did not finish deletion: %v", err)
++	}
++}
+-- 
+2.43.7
+

@@ -71,6 +71,6 @@ script may share a CA; independently managed deployments can separate AS signing
 KBS TLS and registry TLS material.
 
 Follow the [deployment runbook](../../docs/deployment.md) for installation and
-recovery. Policy-denial tests must identify the actual `PolicyDeny` error;
+recovery; see the [backup set and recovery limits](../../docs/operations.md#recovery-limits). Policy-denial tests must identify the actual `PolicyDeny` error;
 an unrelated HTTP 500 is a failed test. Runtime credentials and state belong
 outside this checkout.

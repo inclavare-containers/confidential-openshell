@@ -209,7 +209,7 @@ def main():
     for series in sorted((ROOT / 'patches').glob('*/series')):
         for name in ['series', 'SHA256SUMS', *series.read_text().splitlines()]:
             if name and not name.startswith('#'):
-                path = series.parent / name
+                path = (series.parent / name).resolve()
                 report['input_sha256'][str(path.relative_to(ROOT))] = digest(path)
     for name, path in artifacts.items():
         report['artifacts'][name] = {'path': str(path.relative_to(ROOT)), 'sha256': digest(path), 'bytes': path.stat().st_size}

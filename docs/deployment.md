@@ -82,8 +82,11 @@ Skip step 3. This command lists existing clusters and asks which to use:
 ```
 
 Obtains an administrator kubeconfig and checks the region, API access, RRSA,
-Ready Linux/amd64 containerd workers, `supplementalGroupsPolicy` and Terway
+Ready Ubuntu 24.04/amd64 workers with **containerd 2.3.4**,
+`supplementalGroupsPolicy` and Terway
 NetworkPolicy. It retains the existing cluster, VPC, node pools and worker OS.
+The measured policy requires the tested OCI 1.3.0 contract and containerd config
+schema 3. Other runtime versions require a separately validated profile.
 Missing prerequisites fail with an explanation; it does not upgrade the cluster
 or silently enable its features.
 
@@ -337,7 +340,8 @@ OpenCode, Codex and Claude Code use the default Community image.
 ## 10. Verify both confidential roles
 
 Installation/readiness checks do not prove real attestation or all security
-boundaries. Before accepting a new image or deployment, check:
+boundaries. Before accepting a new image or deployment, run the
+[live acceptance procedure](live-acceptance.md), then check:
 
 | Check | Required result |
 | --- | --- |
@@ -353,3 +357,6 @@ Keep private evidence outside source/releases. The development policy accepts TC
 `UpToDate` and `OutOfDate`; record the actual status and choose production
 requirements separately. See [tests](../tests/README.md) and
 [architecture](architecture.md).
+
+For stopped release updates, rollback, backups and deployment retirement, follow
+[operations](operations.md). Preserve the release and resource identity checks.

@@ -1,7 +1,7 @@
-From 4df64eb2e1ad6c59b9982555640fffe09efc85af Mon Sep 17 00:00:00 2001
+From 05d18b455cfcde9ef0d93325c0cbe287f8728685 Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
-Date: Tue, 3 Nov 2026 01:07:30 +0800
-Subject: [PATCH 07/10] alibabacloud: bound compressed instance user data
+Date: Tue, 3 Nov 2026 11:58:13 +0800
+Subject: [PATCH] alibabacloud: bound compressed instance user data
 
 Encode compressed cloud-config within the ECS user-data limit and bound
 decompression when the guest retrieves it. Reject malformed or oversized
@@ -24,7 +24,7 @@ Generated-by: OpenAI Codex
 
 diff --git a/src/cloud-api-adaptor/pkg/adaptor/cloud/cloudconfig_transport_test.go b/src/cloud-api-adaptor/pkg/adaptor/cloud/cloudconfig_transport_test.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..3d9137e89408fdd830b0d2182dfa6efefd472780
+index 00000000..3d9137e8
 --- /dev/null
 +++ b/src/cloud-api-adaptor/pkg/adaptor/cloud/cloudconfig_transport_test.go
 @@ -0,0 +1,57 @@
@@ -87,7 +87,7 @@ index 0000000000000000000000000000000000000000..3d9137e89408fdd830b0d2182dfa6efe
 +}
 diff --git a/src/cloud-api-adaptor/pkg/userdata/alibabacloud_test.go b/src/cloud-api-adaptor/pkg/userdata/alibabacloud_test.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..c1ea9d673b04e05924c4966a282aae30cd359f03
+index 00000000..c1ea9d67
 --- /dev/null
 +++ b/src/cloud-api-adaptor/pkg/userdata/alibabacloud_test.go
 @@ -0,0 +1,67 @@
@@ -159,7 +159,7 @@ index 0000000000000000000000000000000000000000..c1ea9d673b04e05924c4966a282aae30
 +	}
 +}
 diff --git a/src/cloud-api-adaptor/pkg/userdata/provision.go b/src/cloud-api-adaptor/pkg/userdata/provision.go
-index 2807a3cd02f488ee9f463d65afaddc36c057bc90..49dc5c8a0a4a16848886ed537e6b50b237261938 100644
+index 2807a3cd..49dc5c8a 100644
 --- a/src/cloud-api-adaptor/pkg/userdata/provision.go
 +++ b/src/cloud-api-adaptor/pkg/userdata/provision.go
 @@ -1,9 +1,12 @@
@@ -223,7 +223,7 @@ index 2807a3cd02f488ee9f463d65afaddc36c057bc90..49dc5c8a0a4a16848886ed537e6b50b2
  
  func newProvider(ctx context.Context) (UserDataProvider, error) {
 diff --git a/src/cloud-providers/alibabacloud/provider.go b/src/cloud-providers/alibabacloud/provider.go
-index ee602f66c0cb88c2f24950b353803e334911e238..164a8202efbcb312c80d817982ee91d98c448b22 100644
+index f06dd0ba..ce6db87d 100644
 --- a/src/cloud-providers/alibabacloud/provider.go
 +++ b/src/cloud-providers/alibabacloud/provider.go
 @@ -4,6 +4,8 @@
@@ -293,7 +293,7 @@ index ee602f66c0cb88c2f24950b353803e334911e238..164a8202efbcb312c80d817982ee91d9
  	if err != nil {
 diff --git a/src/cloud-providers/alibabacloud/userdata_test.go b/src/cloud-providers/alibabacloud/userdata_test.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..5b0f1f194d3c60ef6bb0b9883824e3c9c813410e
+index 00000000..5b0f1f19
 --- /dev/null
 +++ b/src/cloud-providers/alibabacloud/userdata_test.go
 @@ -0,0 +1,87 @@
@@ -384,3 +384,6 @@ index 0000000000000000000000000000000000000000..5b0f1f194d3c60ef6bb0b9883824e3c9
 +		t.Fatalf("expected compressed-size error, got %v", err)
 +	}
 +}
+-- 
+2.43.7
+

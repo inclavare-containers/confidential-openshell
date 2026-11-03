@@ -1,7 +1,7 @@
-From 621dbc9b1a446098351217081984560e19ad3ea1 Mon Sep 17 00:00:00 2001
+From cb2a8c2717018325e85da437c1ba3e9a73b90922 Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
-Date: Tue, 3 Nov 2026 01:07:30 +0800
-Subject: [PATCH 10/10] podnetwork: preserve on-link routes during guest setup
+Date: Tue, 3 Nov 2026 11:58:13 +0800
+Subject: [PATCH] podnetwork: preserve on-link routes during guest setup
 
 A Pod with a /32 address may use a gateway outside its prefix. Losing
 the on-link route flag while transferring worker network configuration
@@ -20,7 +20,7 @@ Generated-by: OpenAI Codex
  4 files changed, 74 insertions(+)
 
 diff --git a/src/cloud-api-adaptor/pkg/podnetwork/podnetwork_test.go b/src/cloud-api-adaptor/pkg/podnetwork/podnetwork_test.go
-index 580edbb8a8e3a4de79d1508e3292fdef8734729c..655d0a08d0919ffe44d327d1da8ac56d3e4b7978 100644
+index 580edbb8..655d0a08 100644
 --- a/src/cloud-api-adaptor/pkg/podnetwork/podnetwork_test.go
 +++ b/src/cloud-api-adaptor/pkg/podnetwork/podnetwork_test.go
 @@ -4,6 +4,7 @@
@@ -109,7 +109,7 @@ index 580edbb8a8e3a4de79d1508e3292fdef8734729c..655d0a08d0919ffe44d327d1da8ac56d
  	testutils.SkipTestIfNotRoot(t)
  
 diff --git a/src/cloud-api-adaptor/pkg/podnetwork/podnode.go b/src/cloud-api-adaptor/pkg/podnetwork/podnode.go
-index 50c4d8986774a4897283a04bfc46d62460027e8b..3a5a8a097df36636b326ee139f91949fc5aa5e7d 100644
+index 50c4d898..3a5a8a09 100644
 --- a/src/cloud-api-adaptor/pkg/podnetwork/podnode.go
 +++ b/src/cloud-api-adaptor/pkg/podnetwork/podnode.go
 @@ -132,6 +132,7 @@ func (n *podNode) Setup() error {
@@ -121,7 +121,7 @@ index 50c4d8986774a4897283a04bfc46d62460027e8b..3a5a8a097df36636b326ee139f91949f
  		if err := podNS.RouteAdd(&nRoute); err != nil {
  			return fmt.Errorf("failed to add a route to %s via %s on pod network namespace %s: %w", route.Dst, route.GW, podNS.Path(), err)
 diff --git a/src/cloud-api-adaptor/pkg/podnetwork/tunneler/tunneler.go b/src/cloud-api-adaptor/pkg/podnetwork/tunneler/tunneler.go
-index 0a6ce5b447ab2cd60d64cac1dad43eb2acda4478..7d41d04e6cad483017ffe55fa17c4a8994e50b25 100644
+index 0a6ce5b4..7d41d04e 100644
 --- a/src/cloud-api-adaptor/pkg/podnetwork/tunneler/tunneler.go
 +++ b/src/cloud-api-adaptor/pkg/podnetwork/tunneler/tunneler.go
 @@ -37,6 +37,7 @@ type Route struct {
@@ -133,7 +133,7 @@ index 0a6ce5b447ab2cd60d64cac1dad43eb2acda4478..7d41d04e6cad483017ffe55fa17c4a89
  
  type Neighbor struct {
 diff --git a/src/cloud-api-adaptor/pkg/podnetwork/workernode.go b/src/cloud-api-adaptor/pkg/podnetwork/workernode.go
-index fedebe840c8394bb3f3940d0a06852cc3c7b3e3a..198e3c775e37047a17f5310e46e9e9d27303fa51 100644
+index fedebe84..198e3c77 100644
 --- a/src/cloud-api-adaptor/pkg/podnetwork/workernode.go
 +++ b/src/cloud-api-adaptor/pkg/podnetwork/workernode.go
 @@ -286,6 +286,7 @@ func (n *workerNode) Inspect(nsPath string) (*tunneler.Config, error) {
@@ -144,3 +144,6 @@ index fedebe840c8394bb3f3940d0a06852cc3c7b3e3a..198e3c775e37047a17f5310e46e9e9d2
  		}
  		config.Routes = append(config.Routes, r)
  	}
+-- 
+2.43.7
+

@@ -1,7 +1,7 @@
-From 90261ba7793d791b5a456f3faef78e40af2fd3a7 Mon Sep 17 00:00:00 2001
+From 9fd711a41069bf8f93a4aa4e8e77a8af348e5b8e Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
-Date: Tue, 3 Nov 2026 01:07:30 +0800
-Subject: [PATCH 05/10] guest: mount retained encrypted volumes through CDH
+Date: Tue, 3 Nov 2026 11:58:12 +0800
+Subject: [PATCH] guest: mount retained encrypted volumes through CDH
 
 Reuse the CDH SecureMount API for retained devices with embedded LUKS
 headers. Bind disk identities and key references to measured workspace
@@ -13,27 +13,32 @@ Check the active LUKS2 mapping for AES-XTS with a 512-bit key and
 readonly behavior and roll back only mounts and mappings acquired by the
 current call.
 
+Apply fsGroup recursively to retained content without changing owners or
+following paths outside the volume. Preserve readonly mounts and set the
+directory setgid bit so newly created files inherit the requested group.
+
 Generated-by: OpenAI Codex
 ---
  .../cmd/agent-protocol-forwarder/main.go      |  26 +-
  .../cmd/agent-protocol-forwarder/main_test.go |  19 +
  .../pkg/forwarder/interceptor/cdh_client.go   |   8 +
- .../pkg/forwarder/interceptor/cloud_volume.go | 495 ++++++++++++++++++
- .../interceptor/cloud_volume_test.go          | 200 +++++++
- .../pkg/forwarder/interceptor/interceptor.go  | 297 ++---------
- .../forwarder/interceptor/interceptor_test.go | 269 +---------
- .../pkg/forwarder/interceptor/workspace.go    | 267 ++++++++++
+ .../pkg/forwarder/interceptor/cloud_volume.go | 529 ++++++++++++++++++
+ .../interceptor/cloud_volume_test.go          | 192 +++++++
+ .../pkg/forwarder/interceptor/fsgroup_test.go |  79 +++
+ .../pkg/forwarder/interceptor/interceptor.go  | 299 ++--------
+ .../forwarder/interceptor/interceptor_test.go | 269 +--------
+ .../pkg/forwarder/interceptor/workspace.go    | 267 +++++++++
  .../forwarder/interceptor/workspace_test.go   | 127 +++++
  .../pkg/util/cloud_csi_test.go                |   1 +
- .../pkg/util/direct_volume.go                 |  13 +
- 11 files changed, 1207 insertions(+), 515 deletions(-)
+ 11 files changed, 1300 insertions(+), 516 deletions(-)
  create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume.go
  create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume_test.go
+ create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/fsgroup_test.go
  create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace.go
  create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace_test.go
 
 diff --git a/src/cloud-api-adaptor/cmd/agent-protocol-forwarder/main.go b/src/cloud-api-adaptor/cmd/agent-protocol-forwarder/main.go
-index 189a35950701aafc6797387e19261546f1fa0fc5..e36fccec497aae4204e0258abfe3768f2ae87462 100644
+index 189a3595..e36fccec 100644
 --- a/src/cloud-api-adaptor/cmd/agent-protocol-forwarder/main.go
 +++ b/src/cloud-api-adaptor/cmd/agent-protocol-forwarder/main.go
 @@ -9,6 +9,7 @@ import (
@@ -98,7 +103,7 @@ index 189a35950701aafc6797387e19261546f1fa0fc5..e36fccec497aae4204e0258abfe3768f
  	podNode := podnetwork.NewPodNode(cfg.podNamespace, cfg.HostInterface, cfg.daemonConfig.PodNetwork)
  
 diff --git a/src/cloud-api-adaptor/cmd/agent-protocol-forwarder/main_test.go b/src/cloud-api-adaptor/cmd/agent-protocol-forwarder/main_test.go
-index 829589f2611d0bf2cf9ecd35d969c79a6f623f8a..4c4940765420a75c53e8fd133325e15cb75f8d8f 100644
+index 829589f2..4c494076 100644
 --- a/src/cloud-api-adaptor/cmd/agent-protocol-forwarder/main_test.go
 +++ b/src/cloud-api-adaptor/cmd/agent-protocol-forwarder/main_test.go
 @@ -129,6 +129,25 @@ func TestConfigSetup(t *testing.T) {
@@ -128,7 +133,7 @@ index 829589f2611d0bf2cf9ecd35d969c79a6f623f8a..4c4940765420a75c53e8fd133325e15c
  		_, cleanup := setupTestConfig(t, `{"pod-namespace": "test-ns"}`,
  			"-tls-skip-verify",
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/cdh_client.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/cdh_client.go
-index 4affce22215e9e57d83985c3b27b7bd60e366d6a..008dd7eff58ce9d81b73d7b84d2975fddcf9580a 100644
+index 4affce22..008dd7ef 100644
 --- a/src/cloud-api-adaptor/pkg/forwarder/interceptor/cdh_client.go
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/cdh_client.go
 @@ -59,6 +59,14 @@ func (c *cdhClient) close() {
@@ -148,10 +153,10 @@ index 4affce22215e9e57d83985c3b27b7bd60e366d6a..008dd7eff58ce9d81b73d7b84d2975fd
  		VolumeType: volumeType,
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..18a5f0ebb9d5d40b3570b33ee70e82cc8276e26e
+index 00000000..f0c391af
 --- /dev/null
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume.go
-@@ -0,0 +1,495 @@
+@@ -0,0 +1,529 @@
 +// (C) Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -161,13 +166,13 @@ index 0000000000000000000000000000000000000000..18a5f0ebb9d5d40b3570b33ee70e82cc
 +	"context"
 +	"errors"
 +	"fmt"
++	"io/fs"
 +	"os"
 +	"os/exec"
 +	"path/filepath"
 +	"sort"
 +	"strconv"
 +	"strings"
-+	"sync"
 +	"syscall"
 +	"time"
 +
@@ -180,7 +185,6 @@ index 0000000000000000000000000000000000000000..18a5f0ebb9d5d40b3570b33ee70e82cc
 +// preparedCloudVolume tracks only resources acquired by one CreateContainer
 +// call. Reused mounts and mappers are intentionally not owned by that call.
 +type preparedCloudVolume struct {
-+	mu                      sync.Mutex
 +	initializerProcessGroup int
 +	sourcePath              string
 +	mountedHere             bool
@@ -206,8 +210,6 @@ index 0000000000000000000000000000000000000000..18a5f0ebb9d5d40b3570b33ee70e82cc
 +	if v == nil {
 +		return nil
 +	}
-+	v.mu.Lock()
-+	defer v.mu.Unlock()
 +	if v.initializerProcessGroup != 0 {
 +		if err := waitInitializerProcessGroup(ctx, v.initializerProcessGroup); err != nil {
 +			return err
@@ -362,14 +364,14 @@ index 0000000000000000000000000000000000000000..18a5f0ebb9d5d40b3570b33ee70e82cc
 +			if err := ensureWorkspaceInitialized(ctx, device, volume, *workspace, func(ctx context.Context, device, diskID, fsType, uri string) error {
 +				return initializeWorkspaceVolume(ctx, device, diskID, fsType, uri, prepared)
 +			}); err != nil {
-+				return prepared, err
++				return prepared, preserveOriginalError(err, cleanupPreparedCloudVolumes(ctx, prepared))
 +			}
 +		}
 +		if err := prepareCDHCloudVolume(ctx, prepared, name, device, volume, workspace != nil); err != nil {
-+			return prepared, err
++			return prepared, preserveOriginalError(err, cleanupPreparedCloudVolumes(ctx, prepared))
 +		}
 +		if err := applyCloudVolumeFSGroup(prepared.sourcePath, name, volume); err != nil {
-+			return prepared, err
++			return prepared, preserveOriginalError(err, cleanupPreparedCloudVolumes(ctx, prepared))
 +		}
 +		return prepared, nil
 +	}
@@ -378,21 +380,58 @@ index 0000000000000000000000000000000000000000..18a5f0ebb9d5d40b3570b33ee70e82cc
 +		return prepared, fmt.Errorf("mount cloud volume %s: %w", name, err)
 +	}
 +	if err := applyCloudVolumeFSGroup(prepared.sourcePath, name, volume); err != nil {
-+		return prepared, err
++		return prepared, preserveOriginalError(err, cleanupPreparedCloudVolumes(ctx, prepared))
 +	}
 +	return prepared, nil
 +}
 +
++// Delegate fsGroup permission semantics without following symlinks outside
++// the mounted volume. Apply the root last, after all existing content succeeds.
 +func applyCloudVolumeFSGroup(path, name string, volume util.CloudVolumeAnnotation) error {
 +	if volume.FSGroup == "" || volume.ReadOnly {
 +		return nil
 +	}
-+	gid, _ := strconv.ParseUint(volume.FSGroup, 10, 32) // validated by DecodeCloudVolumeAnnotations
-+	if err := os.Chown(path, -1, int(gid)); err != nil {
-+		return fmt.Errorf("apply fsGroup to %s: %w", name, err)
++	root, err := os.OpenRoot(path)
++	if err != nil {
++		return fmt.Errorf("open fsGroup volume %s: %w", name, err)
 +	}
-+	if err := os.Chmod(path, 0o2775); err != nil {
-+		return fmt.Errorf("apply fsGroup mode to %s: %w", name, err)
++	defer root.Close()
++	gid, _ := strconv.ParseUint(volume.FSGroup, 10, 32) // decoded and validated
++	apply := func(path string, info os.FileInfo) error {
++		if info.Mode()&os.ModeSymlink != 0 {
++			return nil
++		}
++		mode := info.Mode() | 0o660
++		if info.IsDir() {
++			mode |= 0o110 | os.ModeSetgid
++		}
++		if err := root.Chown(path, -1, int(gid)); err != nil {
++			return err
++		}
++		return root.Chmod(path, mode)
++	}
++	err = fs.WalkDir(root.FS(), ".", func(current string, entry os.DirEntry, walkErr error) error {
++		if walkErr != nil {
++			return walkErr
++		}
++		if current == "." {
++			return nil
++		}
++		info, err := entry.Info()
++		if err != nil {
++			return err
++		}
++		return apply(current, info)
++	})
++	if err == nil {
++		var info os.FileInfo
++		info, err = root.Lstat(".")
++		if err == nil {
++			err = apply(".", info)
++		}
++	}
++	if err != nil {
++		return fmt.Errorf("apply fsGroup to %s: %w", name, err)
 +	}
 +	return nil
 +}
@@ -450,7 +489,7 @@ index 0000000000000000000000000000000000000000..18a5f0ebb9d5d40b3570b33ee70e82cc
 +		// Mark acquisition before RPC so an applied-but-unreported open is
 +		// reclaimed, while mappings borrowed from an earlier call stay open.
 +		prepared.openedCDHMapperHere = true
-+		secureErr := secureMount(ctx, device, prepared.cdhDevicePath, volume.FSType, volume.EncryptType, volume.KeyID, prepared.cdhMapperName, volume.ReadOnly, volume.Options)
++		secureErr := secureMount(ctx, device, prepared.cdhDevicePath, volume.EncryptType, volume.KeyID, prepared.cdhMapperName)
 +		exists, statErr := blockDeviceExists(prepared.cdhMapperPath)
 +		if !exists && statErr == nil {
 +			prepared.openedCDHMapperHere = false
@@ -649,10 +688,10 @@ index 0000000000000000000000000000000000000000..18a5f0ebb9d5d40b3570b33ee70e82cc
 +}
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume_test.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume_test.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..a97fcb6472fe936f7f8e5c1e506a2f6eb58fbc2a
+index 00000000..ab645558
 --- /dev/null
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume_test.go
-@@ -0,0 +1,200 @@
+@@ -0,0 +1,192 @@
 +// (C) Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -745,14 +784,6 @@ index 0000000000000000000000000000000000000000..a97fcb6472fe936f7f8e5c1e506a2f6e
 +	require.NoError(t, volume.cleanup(context.Background()))
 +	assert.Equal(t, []string{"unmount", "close"}, events)
 +
-+	reused := &preparedCloudVolume{
-+		cdhMapperName: "reused", cdhMapperPath: "/dev/mapper/reused",
-+		closeCDHMapper: func(context.Context, string, string) error {
-+			t.Fatal("cleanup closed a mapper that this call did not open")
-+			return nil
-+		},
-+	}
-+	require.NoError(t, reused.cleanup(context.Background()))
 +}
 +
 +func TestPreparedCloudVolumeCleanupRetriesInDependencyOrder(t *testing.T) {
@@ -853,8 +884,93 @@ index 0000000000000000000000000000000000000000..a97fcb6472fe936f7f8e5c1e506a2f6e
 +	}
 +	require.Error(t, validateWorkspaceMapperStatus("inactive"))
 +}
+diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/fsgroup_test.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/fsgroup_test.go
+new file mode 100644
+index 00000000..21fcc08b
+--- /dev/null
++++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/fsgroup_test.go
+@@ -0,0 +1,79 @@
++// (C) Copyright Confidential Containers Contributors
++// SPDX-License-Identifier: Apache-2.0
++
++package interceptor
++
++import (
++	"os"
++	"os/exec"
++	"path/filepath"
++	"syscall"
++	"testing"
++
++	"github.com/confidential-containers/cloud-api-adaptor/src/cloud-api-adaptor/pkg/util"
++	"github.com/stretchr/testify/require"
++)
++
++func TestFSGroupRetainedContentAndInheritance(t *testing.T) {
++	if os.Geteuid() != 0 {
++		t.Skip("requires chown and process credentials")
++	}
++	root, err := os.MkdirTemp("/var/tmp", "caa-fsgroup-")
++	require.NoError(t, err)
++	t.Cleanup(func() { _ = os.RemoveAll(root) })
++	require.NoError(t, os.Chmod(root, 0755))
++	volume := filepath.Join(root, "workspace")
++	nested := filepath.Join(volume, "nested")
++	require.NoError(t, os.MkdirAll(nested, 0700))
++	file := filepath.Join(nested, "retained")
++	require.NoError(t, os.WriteFile(file, []byte("retained data"), 0600))
++	for _, p := range []string{volume, nested, file} {
++		require.NoError(t, os.Chown(p, 1002, 1002))
++	}
++	outside := filepath.Join(root, "outside")
++	require.NoError(t, os.Mkdir(outside, 0700))
++	require.NoError(t, os.WriteFile(filepath.Join(outside, "untouched"), []byte("outside"), 0600))
++	require.NoError(t, os.Symlink(outside, filepath.Join(nested, "link")))
++	require.NoError(t, applyCloudVolumeFSGroup(volume, "vol-0", util.CloudVolumeAnnotation{FSGroup: "2000"}))
++	for _, p := range []string{volume, nested, file} {
++		info, err := os.Stat(p)
++		require.NoError(t, err)
++		st := info.Sys().(*syscall.Stat_t)
++		require.EqualValues(t, 1002, st.Uid)
++		require.EqualValues(t, 2000, st.Gid)
++		if info.IsDir() {
++			require.NotZero(t, info.Mode()&os.ModeSetgid)
++		} else {
++			require.Zero(t, info.Mode().Perm()&0111, "made a data file executable")
++		}
++	}
++	outsideInfo, err := os.Stat(filepath.Join(outside, "untouched"))
++	require.NoError(t, err)
++	require.EqualValues(t, 0, outsideInfo.Sys().(*syscall.Stat_t).Gid)
++	require.Equal(t, os.FileMode(0600), outsideInfo.Mode().Perm())
++	// A process whose primary GID differs from fsGroup must read/write retained
++	// content and create files inheriting the volume's group.
++	cmd := exec.Command("sh", "-c", `cat "$1/nested/retained" >/dev/null && echo appended >> "$1/nested/retained" && touch "$1/nested/new"`, "sh", volume)
++	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: 1001, Gid: 1001, Groups: []uint32{2000}}}
++	out, err := cmd.CombinedOutput()
++	require.NoError(t, err, string(out))
++	info, err := os.Stat(filepath.Join(nested, "new"))
++	require.NoError(t, err)
++	require.EqualValues(t, 2000, info.Sys().(*syscall.Stat_t).Gid)
++	// Retained files can be reassigned for a later workload group.
++	require.NoError(t, applyCloudVolumeFSGroup(volume, "vol-0", util.CloudVolumeAnnotation{FSGroup: "3000"}))
++	info, err = os.Stat(file)
++	require.NoError(t, err)
++	require.EqualValues(t, 3000, info.Sys().(*syscall.Stat_t).Gid)
++}
++
++func TestFSGroupReadOnlyDoesNotMutate(t *testing.T) {
++	root := t.TempDir()
++	before, err := os.Stat(root)
++	require.NoError(t, err)
++	require.NoError(t, applyCloudVolumeFSGroup(root, "vol-0", util.CloudVolumeAnnotation{FSGroup: "2000", ReadOnly: true}))
++	after, err := os.Stat(root)
++	require.NoError(t, err)
++	require.Equal(t, before.Mode(), after.Mode())
++	require.Equal(t, before.Sys().(*syscall.Stat_t).Gid, after.Sys().(*syscall.Stat_t).Gid)
++}
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
-index 7d89ed183fcada3871c681a219990b2e4c4ae1e7..cec0fdd51bcc01db3be492b72fde05d44732e14c 100644
+index 7d89ed18..91d6096a 100644
 --- a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
 @@ -13,15 +13,13 @@ import (
@@ -1275,6 +1391,15 @@ index 7d89ed183fcada3871c681a219990b2e4c4ae1e7..cec0fdd51bcc01db3be492b72fde05d4
  }
  
  // luksMagic is the 6-byte signature at the start of every LUKS1/LUKS2 volume.
+@@ -909,7 +720,7 @@ func validateEncryptParams(encryptType, keyID string) (string, error) {
+ 	}
+ }
+ 
+-func secureMount(ctx context.Context, device, mountPoint, fsType, encryptType, keyID, mapperName string, readOnly bool, mountOptions []string) error {
++func secureMount(ctx context.Context, device, mountPoint, encryptType, keyID, mapperName string) error {
+ 	normalized, err := validateEncryptParams(encryptType, keyID)
+ 	if err != nil {
+ 		return err
 @@ -919,14 +730,10 @@ func secureMount(ctx context.Context, device, mountPoint, fsType, encryptType, k
  	if err != nil {
  		return fmt.Errorf("cannot determine LUKS state of %s (refusing to proceed to avoid data loss): %w", device, err)
@@ -1318,7 +1443,7 @@ index 7d89ed183fcada3871c681a219990b2e4c4ae1e7..cec0fdd51bcc01db3be492b72fde05d4
  	}
  
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor_test.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor_test.go
-index 6dd222641e3b35bc54c8641376de2ad8ff8783d5..74ffc1e17be8dbc53fd55aa46dadaf52524a3343 100644
+index 6dd22264..1b796161 100644
 --- a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor_test.go
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor_test.go
 @@ -102,38 +102,6 @@ func TestNewInterceptor(t *testing.T) {
@@ -1628,17 +1753,17 @@ index 6dd222641e3b35bc54c8641376de2ad8ff8783d5..74ffc1e17be8dbc53fd55aa46dadaf52
  	})
  }
 +
-+func TestSecureMountReadOnlyRefusesUninitializedDevice(t *testing.T) {
++func TestSecureMountRefusesUninitializedDevice(t *testing.T) {
 +	device := filepath.Join(t.TempDir(), "plain-device")
 +	require.NoError(t, os.WriteFile(device, make([]byte, 512), 0o600))
 +
-+	err := secureMount(context.Background(), device, "/run/cloud-volumes/vol-0", "ext4",
-+		"luks2", "default/key/volume", "caa-vol-0", true, []string{"ro"})
++	err := secureMount(context.Background(), device, "/run/cloud-volumes/vol-0",
++		"luks2", "default/key/volume", "caa-vol-0")
 +	require.ErrorContains(t, err, "not initialized")
 +}
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..09d75a6dae2c33da360c151118916a18fd2e4227
+index 00000000..09d75a6d
 --- /dev/null
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace.go
 @@ -0,0 +1,267 @@
@@ -1911,7 +2036,7 @@ index 0000000000000000000000000000000000000000..09d75a6dae2c33da360c151118916a18
 +}
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace_test.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace_test.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..a1cdce29c0b5fd93497c04715b5727c7d57eb361
+index 00000000..a1cdce29
 --- /dev/null
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace_test.go
 @@ -0,0 +1,127 @@
@@ -2043,7 +2168,7 @@ index 0000000000000000000000000000000000000000..a1cdce29c0b5fd93497c04715b5727c7
 +	require.False(t, prepared.owned())
 +}
 diff --git a/src/cloud-api-adaptor/pkg/util/cloud_csi_test.go b/src/cloud-api-adaptor/pkg/util/cloud_csi_test.go
-index 31cc45b1ce38819fdea67f792180c0768b259980..90b144ad08f39e8ec3d52dd18dff9caa344af993 100644
+index 31cc45b1..90b144ad 100644
 --- a/src/cloud-api-adaptor/pkg/util/cloud_csi_test.go
 +++ b/src/cloud-api-adaptor/pkg/util/cloud_csi_test.go
 @@ -221,6 +221,7 @@ func TestDecodeCloudVolumeAnnotations(t *testing.T) {
@@ -2054,27 +2179,6 @@ index 31cc45b1ce38819fdea67f792180c0768b259980..90b144ad08f39e8ec3d52dd18dff9caa
  	} {
  		t.Run(name, func(t *testing.T) {
  			_, err := DecodeCloudVolumeAnnotations(annotation)
-diff --git a/src/cloud-api-adaptor/pkg/util/direct_volume.go b/src/cloud-api-adaptor/pkg/util/direct_volume.go
-index 4e4ec362e766d12dca49236e2a9cb03e6bd16ba6..825e17733ff77f9f32eab5175963ed50908e7ce4 100644
---- a/src/cloud-api-adaptor/pkg/util/direct_volume.go
-+++ b/src/cloud-api-adaptor/pkg/util/direct_volume.go
-@@ -154,6 +154,19 @@ func DecodeCloudVolumeAnnotations(data string) (map[string]CloudVolumeAnnotation
- 		if err := validateFSGroup(volume.FSGroup); err != nil {
- 			return nil, fmt.Errorf("cloud volume %s has invalid fs_group: %w", name, err)
- 		}
-+		if (volume.EncryptType == "") != (volume.KeyID == "") {
-+			return nil, fmt.Errorf("cloud volume %s must set encrypt_type and key_id together", name)
-+		}
-+		if volume.EncryptType != "" {
-+			switch strings.ToLower(volume.EncryptType) {
-+			case "luks", "luks2":
-+			default:
-+				return nil, fmt.Errorf("cloud volume %s has unsupported encrypt_type %q", name, volume.EncryptType)
-+			}
-+			if strings.TrimSpace(volume.KeyID) != volume.KeyID || strings.ContainsAny(volume.KeyID, "\t\r\n") {
-+				return nil, fmt.Errorf("cloud volume %s has invalid key_id", name)
-+			}
-+		}
- 		if _, exists := seenDisks[volume.DiskID]; exists {
- 			return nil, fmt.Errorf("cloud volume %s duplicates disk_id %q", name, volume.DiskID)
- 		}
+-- 
+2.43.7
+

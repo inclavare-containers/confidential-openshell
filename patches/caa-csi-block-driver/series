@@ -1,5 +1,6 @@
-0001-feat-alibabacloud-provision-ESSD-with-existing-provi.patch
-0002-feat-node-publish-the-paired-CAA-volume-contract-ato.patch
-0003-feat-deploy-separate-controller-credentials-and-node.patch
-0004-test-share-the-CSI-conformance-runner-between-local-.patch
-0005-build-pin-supported-build-and-runtime-base-indexes.patch
+0001-controller-validate-actual-capacity-on-recovered-volumes.patch
+0002-alibabacloud-add-ESSD-support-through-the-provider-interface.patch
+0003-node-publish-versioned-direct-volume-metadata-atomically.patch
+0004-deploy-separate-CSI-controller-and-node-responsibilities.patch
+0005-test-share-the-CSI-conformance-runner-with-CI.patch
+0006-build-pin-supported-build-and-runtime-base-images.patch

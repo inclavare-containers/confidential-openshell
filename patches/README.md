@@ -8,14 +8,16 @@ components. Exact bases and result trees are authoritative in the
 | Component | Ordered series | Required behavior |
 | --- | --- | --- |
 | CAA | [10 patches](cloud-api-adaptor/series) | Immutable direct-volume metadata; Alibaba VPC and retained ESSD attachment/deletion; bounded userdata and host credential exclusion; guest disk discovery, stock CDH encrypted-device unlock, a measured embedded-LUKS initializer, sealed mounts and on-link Pod routes |
-| CSI | [5 patches](caa-csi-block-driver/series) | Alibaba ESSD through existing provider interfaces; atomic v1 metadata and delegated fsGroup for the paired CAA; separate controller/node deployment; shared conformance runner and pinned build/runtime bases |
-| PeerPod controller | [1 independent backport](peerpod-ctrl/README.md) | Confirm exact instance absence after an otherwise unhandled Alibaba deletion failure, preserving other errors and existing IAM scope |
+| CSI | [6 patches](caa-csi-block-driver/series) | Capacity validation for recovered disks; Alibaba ESSD through existing provider interfaces; atomic v1 metadata and delegated fsGroup for the paired CAA; separate controller/node deployment; shared conformance runner and pinned build/runtime bases |
+| PeerPod controller | [1 shared deletion patch](peerpod-ctrl/README.md) | Check retained disks and operation locks before deletion; confirm exact instance absence after a failed delete while preserving other errors |
 | Kata host Go shim | [1 patch](kata-containers/README.md) | Preserve `NoNewPrivileges` in exec requests; use the released guest agent and genpolicy unchanged |
 
 Build copies are prepared by `deployment/build/prepare-sources.sh` from local
 pinned upstream objects and the explicit `series` order. The helper verifies
 SHA256SUMS and the resulting Git tree. It refuses to overwrite an existing build
-copy. `repos/` stays at the clean upstream base. No upstream versions change.
+copy. The two Alibaba queues reference the same narrow patch in `shared/`;
+the controller does not inherit attachment or guest code. `repos/` stays at
+the clean upstream base. No upstream versions change.
 
 The [build guide](../docs/build.md) is the single source-preparation, binary/container
 and Kata-packaging route. Follow the [deployment runbook](../docs/deployment.md) for
@@ -29,6 +31,17 @@ only its own queue, rather than the CAA adapter queue.
 Generic fixes can be removed after the selected upstream version supplies their
 behavior and the corresponding acceptance checks pass. When guest inputs change,
 rebuild the image and extract its references together.
+
+The measured workspace and sealed-volume/TDX patches are product overlays, not
+claims of generic upstream behavior. Their per-request disk, key and descriptor
+authorization remains in the measured guest. Moving constants into deployment
+configuration would not replace these checks. A future Kata Storage migration
+must cover filesystem flags, recursive fsGroup, readonly replay and shared mount
+cleanup before removing the current layer. Likewise, PodInfoOnMount alone does
+not supply identity to NodeUnpublishVolume; the existing ownership checks remain.
+Helm is the source for CSI raw manifests, which are retained for the upstream
+installation interface and regenerated together. The node requires privileged
+mode for its current bidirectional mount propagation.
 
 The local CSI build uses one paired v1 metadata contract. It does not carry the
 legacy writer, format-migration switches, a pending-create journal, additional

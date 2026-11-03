@@ -405,6 +405,15 @@ class Setup(CloudFixture, unittest.TestCase):
         self.prepare('--enable-rrsa')
         self.assertEqual([a['body'] for op, a in self.calls if op == 'ModifyCluster'], [{'enable_rrsa': True}])
 
+    def test_existing_worker_runtime_must_match_measured_profile(self):
+        for version in ('containerd://1.7.35', 'containerd://2.2.0', 'containerd://2.4.0'):
+            with self.subTest(version=version):
+                self.nodes['items'][0]['status']['nodeInfo']['containerRuntimeVersion'] = version
+                with self.assertRaisesRegex(SystemExit, 'containerd 2.3.4'):
+                    cluster.validate_nodes(self.nodes)
+        self.nodes['items'][0]['status']['nodeInfo']['containerRuntimeVersion'] = 'containerd://2.3.4'
+        cluster.validate_nodes(self.nodes)
+
     def test_unsupported_worker_and_disabled_network_policy_fail(self):
         self.nodes['items'][0]['status']['features']['supplementalGroupsPolicy'] = False
         with self.assertRaisesRegex(SystemExit, 'supplementalGroupsPolicy'):
