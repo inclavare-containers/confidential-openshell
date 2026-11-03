@@ -1,4 +1,4 @@
-From 8d6578b8b6d5c4c32a58a36438389425aa1c159a Mon Sep 17 00:00:00 2001
+From 3e1ca954e9800a38c62879956974cc746c4b7bbe Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
 Date: Tue, 3 Nov 2026 11:58:13 +0800
 Subject: [PATCH] node: publish versioned direct-volume metadata atomically
@@ -15,14 +15,14 @@ Generated-by: OpenAI Codex
 ---
  pkg/driver/controllerserver.go            |   5 +-
  pkg/driver/directvolume.go                | 260 +++++++++++++
- pkg/driver/directvolume_test.go           | 435 ++++++++++++++++++++++
+ pkg/driver/directvolume_test.go           | 448 ++++++++++++++++++++++
  pkg/driver/identity_contract_test.go      |  69 ++++
  pkg/driver/metadata_atomic.go             |  48 +++
- pkg/driver/metadata_atomic_test.go        |  73 ++++
- pkg/driver/nodeserver.go                  | 246 +++++++-----
+ pkg/driver/metadata_atomic_test.go        |  49 +++
+ pkg/driver/nodeserver.go                  | 246 ++++++++----
  pkg/driver/nodeserver_test.go             |  32 +-
  pkg/driver/testdata/direct-volume-v1.json |   1 +
- 9 files changed, 1080 insertions(+), 89 deletions(-)
+ 9 files changed, 1069 insertions(+), 89 deletions(-)
  create mode 100644 pkg/driver/directvolume.go
  create mode 100644 pkg/driver/directvolume_test.go
  create mode 100644 pkg/driver/identity_contract_test.go
@@ -321,10 +321,10 @@ index 00000000..c30c7bcb
 +}
 diff --git a/pkg/driver/directvolume_test.go b/pkg/driver/directvolume_test.go
 new file mode 100644
-index 00000000..f15c59b4
+index 00000000..a9fc2f64
 --- /dev/null
 +++ b/pkg/driver/directvolume_test.go
-@@ -0,0 +1,435 @@
+@@ -0,0 +1,448 @@
 +// (C) Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -632,9 +632,15 @@ index 00000000..f15c59b4
 +
 +func TestNodePublishVolumeRecoversAfterPluginRestart(t *testing.T) {
 +	node, target, metadataPath := setupPublishedNode(t)
-+	delete(node.devices, "pvc-workspace")
++	request := publishRequest(target, csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER, false)
++	contextSize := len(request.VolumeContext)
++	if _, err := node.NodePublishVolume(t.Context(), request); err != nil {
++		t.Fatal(err)
++	}
 +
-+	if _, err := node.NodePublishVolume(t.Context(), publishRequest(target, csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER, false)); err != nil {
++	// Recreate the plugin without NodeStage, then replay the same publish.
++	node = newNodeServer("node-1")
++	if _, err := node.NodePublishVolume(t.Context(), request); err != nil {
 +		t.Fatal(err)
 +	}
 +	metadata, err := readDirectVolumeMetadata(metadataPath)
@@ -643,6 +649,13 @@ index 00000000..f15c59b4
 +	}
 +	if metadata.Device != "cloud-disk-123" || node.devices["pvc-workspace"] != "cloud-disk-123" {
 +		t.Fatalf("plugin state was not recovered: metadata=%+v devices=%v", metadata, node.devices)
++	}
++	if len(request.VolumeContext) != contextSize || request.VolumeContext["cloud-provider"] != "" {
++		t.Fatal("publish mutated caller volume context")
++	}
++	request.VolumeContext["cloud-volume-path"] = "other-disk"
++	if _, err := newNodeServer("node-1").NodePublishVolume(t.Context(), request); status.Code(err) != codes.AlreadyExists {
++		t.Fatalf("expected conflicting disk replay to fail, got %v", err)
 +	}
 +}
 +
@@ -891,10 +904,10 @@ index 00000000..7fe9801d
 +}
 diff --git a/pkg/driver/metadata_atomic_test.go b/pkg/driver/metadata_atomic_test.go
 new file mode 100644
-index 00000000..480e0a60
+index 00000000..0849defb
 --- /dev/null
 +++ b/pkg/driver/metadata_atomic_test.go
-@@ -0,0 +1,73 @@
+@@ -0,0 +1,49 @@
 +// (C) Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -930,30 +943,6 @@ index 00000000..480e0a60
 +	leftovers, err := filepath.Glob(filepath.Join(filepath.Dir(path), ".mountInfo.json.*"))
 +	if err != nil || len(leftovers) != 0 {
 +		t.Fatalf("temporary files left: %v, %v", leftovers, err)
-+	}
-+}
-+
-+func TestAtomicMetadataPublishReplaysAfterNodeRestart(t *testing.T) {
-+	t.Setenv("KATA_DIRECT_VOLUME_ROOT_PATH", t.TempDir())
-+	kubelet := t.TempDir()
-+	t.Setenv("KUBELET_ROOT_PATH", kubelet)
-+	target := filepath.Join(kubelet, "pods", "pod-uid", "volumes", "kubernetes.io~csi", "volume-1", "mount")
-+	request := &csi.NodePublishVolumeRequest{
-+		VolumeId: "volume-1", TargetPath: target,
-+		VolumeContext:    map[string]string{"cloud-volume-path": "disk-1"},
-+		VolumeCapability: &csi.VolumeCapability{AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{}}},
-+	}
-+	for i := 0; i < 2; i++ {
-+		if _, err := newNodeServer("node").NodePublishVolume(t.Context(), request); err != nil {
-+			t.Fatal(err)
-+		}
-+	}
-+	if len(request.VolumeContext) != 1 {
-+		t.Fatal("publish mutated caller volume context")
-+	}
-+	request.VolumeContext["cloud-volume-path"] = "other-disk"
-+	if _, err := newNodeServer("node").NodePublishVolume(t.Context(), request); status.Code(err) != codes.AlreadyExists {
-+		t.Fatalf("expected conflict, got %v", err)
 +	}
 +}
 +

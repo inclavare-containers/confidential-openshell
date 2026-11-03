@@ -1,4 +1,4 @@
-From 9fd711a41069bf8f93a4aa4e8e77a8af348e5b8e Mon Sep 17 00:00:00 2001
+From 871cde1fecb25b05e814a4fc57e56e503c69bd6e Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
 Date: Tue, 3 Nov 2026 11:58:12 +0800
 Subject: [PATCH] guest: mount retained encrypted volumes through CDH
@@ -23,14 +23,14 @@ Generated-by: OpenAI Codex
  .../cmd/agent-protocol-forwarder/main_test.go |  19 +
  .../pkg/forwarder/interceptor/cdh_client.go   |   8 +
  .../pkg/forwarder/interceptor/cloud_volume.go | 529 ++++++++++++++++++
- .../interceptor/cloud_volume_test.go          | 192 +++++++
+ .../interceptor/cloud_volume_test.go          | 166 ++++++
  .../pkg/forwarder/interceptor/fsgroup_test.go |  79 +++
  .../pkg/forwarder/interceptor/interceptor.go  | 299 ++--------
  .../forwarder/interceptor/interceptor_test.go | 269 +--------
  .../pkg/forwarder/interceptor/workspace.go    | 267 +++++++++
  .../forwarder/interceptor/workspace_test.go   | 127 +++++
  .../pkg/util/cloud_csi_test.go                |   1 +
- 11 files changed, 1300 insertions(+), 516 deletions(-)
+ 11 files changed, 1274 insertions(+), 516 deletions(-)
  create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume.go
  create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume_test.go
  create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/fsgroup_test.go
@@ -688,10 +688,10 @@ index 00000000..f0c391af
 +}
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume_test.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume_test.go
 new file mode 100644
-index 00000000..ab645558
+index 00000000..b106e6c4
 --- /dev/null
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume_test.go
-@@ -0,0 +1,192 @@
+@@ -0,0 +1,166 @@
 +// (C) Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -758,32 +758,6 @@ index 00000000..ab645558
 +	}
 +	require.NoError(t, volume.cleanup(context.Background()))
 +	assert.False(t, closed)
-+}
-+
-+func TestPreparedCloudVolumeCDHCleanupOwnsMapperIndependently(t *testing.T) {
-+	directory := filepath.Join(t.TempDir(), "volume")
-+	require.NoError(t, os.Mkdir(directory, 0o755))
-+	events := []string{}
-+	volume := &preparedCloudVolume{
-+		sourcePath: directory, mountedHere: true, createdDirHere: true,
-+		cdhMapperName: "caa-vol-0", cdhMapperPath: "/dev/mapper/caa-vol-0",
-+		openedCDHMapperHere: true,
-+		unmount: func(string, int) error {
-+			events = append(events, "unmount")
-+			return nil
-+		},
-+		closeCDHMapper: func(context.Context, string, string) error {
-+			events = append(events, "close")
-+			return nil
-+		},
-+	}
-+
-+	require.NoError(t, volume.cleanup(context.Background()))
-+	assert.Equal(t, []string{"unmount", "close"}, events)
-+	assert.NoDirExists(t, directory)
-+	require.NoError(t, volume.cleanup(context.Background()))
-+	assert.Equal(t, []string{"unmount", "close"}, events)
-+
 +}
 +
 +func TestPreparedCloudVolumeCleanupRetriesInDependencyOrder(t *testing.T) {

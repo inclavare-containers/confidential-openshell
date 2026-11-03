@@ -1,6 +1,6 @@
 50d53848d9849901a44e8697784327e556d3ab702c4b912d9e42d0b1f7eadbdf  0001-controller-validate-actual-capacity-on-recovered-volumes.patch
 1e0bda641256e616a77fae26258e0668e8022bcafc08ec82ca59b66bfe605bdc  0002-alibabacloud-add-ESSD-support-through-the-provider-interface.patch
-4131ef081973963ac6d04850997b264790bc3a63851a60afd031581da097189a  0003-node-publish-versioned-direct-volume-metadata-atomically.patch
+6b3dbbe62e59d2586362d5c56c85b4ff493a2a6863a183f30b5f311d15ddf6ee  0003-node-publish-versioned-direct-volume-metadata-atomically.patch
 aeeaf1092c2e8a08dbd3499fbce87858801c6c73298dce2dc46f5c7a7fc8e402  0004-deploy-separate-CSI-controller-and-node-responsibilities.patch
 732e745b0f514e9984c36c9501ec2bc097aff372e53df9b5d153f384ab4f4264  0005-test-share-the-CSI-conformance-runner-with-CI.patch
 a0ecd6ebade853f9946fd16ea3e70fa9c7241baafa9bc026c6bf0822d7b92494  0006-build-pin-supported-build-and-runtime-base-images.patch

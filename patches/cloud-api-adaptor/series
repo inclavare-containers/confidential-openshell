@@ -1,6 +1,7 @@
-../shared/alibabacloud-retained-instance-deletion.patch
+0001a-alibabacloud-confirm-instance-absence-after-delete-errors.patch
+0001b-alibabacloud-protect-retained-disks-before-instance-deletion.patch
 0002-volumes-preserve-immutable-direct-volume-mount-plans.patch
-0003-alibabacloud-accept-an-explicit-VPC-ID.patch
+0003-alibabacloud-keep-image-overrides-local-to-each-instance.patch
 0004-alibabacloud-attach-and-retain-ESSD-data-disks.patch
 0005-guest-resolve-Alibaba-disks-by-their-measured-identities.patch
 0006-guest-mount-retained-encrypted-volumes-through-CDH.patch

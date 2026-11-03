@@ -44,7 +44,7 @@ def main():
         ALIBABA_CLOUD_ROLE_ARN=state['ram_roles']['caa'], ALIBABA_CLOUD_OIDC_PROVIDER_ARN=state['rrsa']['oidc_arn'],
         IMAGEID=state['podvm_image_id'],
         INITDATA=base64.b64encode(gzip.compress(INITDATA.read_bytes(), mtime=0)).decode(),
-        PAUSE_IMAGE=image('pause'), REGION=cloud.region, VPC_ID=state['vpc_id'],
+        PAUSE_IMAGE=image('pause'), REGION=cloud.region,
         VSWITCH_ID=state['podvm_vswitch_id'], SECURITY_GROUP_IDS=state['podvm_security_group_id'],
         PODVM_INSTANCE_TYPE=cloud.config['podvm_instance_type'],
         TAGS=f'ClusterId={state["cluster_id"]},caa-csi-driver=caa-csi-block-driver',

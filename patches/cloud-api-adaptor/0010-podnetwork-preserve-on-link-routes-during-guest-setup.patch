@@ -1,26 +1,28 @@
-From cb2a8c2717018325e85da437c1ba3e9a73b90922 Mon Sep 17 00:00:00 2001
+From e32c515ef83987587241170514f337c6f847958c Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
-Date: Tue, 3 Nov 2026 11:58:13 +0800
+Date: Tue, 3 Nov 2026 17:39:18 +0800
 Subject: [PATCH] podnetwork: preserve on-link routes during guest setup
 
-A Pod with a /32 address may use a gateway outside its prefix. Losing
-the on-link route flag while transferring worker network configuration
-makes that route impossible to install in the guest.
+A Pod route may use a gateway outside the interface's connected prefix.
+Dropping RTNH_F_ONLINK while transferring the worker's network
+configuration makes such a route impossible to install in the guest.
 
-Carry the flag through inspection, serialization and route replay. Cover
-the worker-to-guest path with a network-namespace regression test.
+Carry the flag through route inspection, JSON serialization and guest
+setup. Extend the existing worker and guest network tests to verify
+flag preservation and installation of a route with an off-subnet gateway.
 
-Signed-off-by: Weidong Sun <sunweidong@linux.alibaba.com>
+Fixes: #3434
 Generated-by: OpenAI Codex
+Signed-off-by: Weidong Sun <sunweidong@linux.alibaba.com>
 ---
- .../pkg/podnetwork/podnetwork_test.go         | 71 +++++++++++++++++++
+ .../pkg/podnetwork/podnetwork_test.go         | 29 ++++++++++++++++++-
  .../pkg/podnetwork/podnode.go                 |  1 +
  .../pkg/podnetwork/tunneler/tunneler.go       |  1 +
  .../pkg/podnetwork/workernode.go              |  1 +
- 4 files changed, 74 insertions(+)
+ 4 files changed, 31 insertions(+), 1 deletion(-)
 
 diff --git a/src/cloud-api-adaptor/pkg/podnetwork/podnetwork_test.go b/src/cloud-api-adaptor/pkg/podnetwork/podnetwork_test.go
-index 580edbb8..655d0a08 100644
+index 580edbb8..a5fcceb4 100644
 --- a/src/cloud-api-adaptor/pkg/podnetwork/podnetwork_test.go
 +++ b/src/cloud-api-adaptor/pkg/podnetwork/podnetwork_test.go
 @@ -4,6 +4,7 @@
@@ -31,82 +33,71 @@ index 580edbb8..655d0a08 100644
  	"fmt"
  	"net/netip"
  	"os"
-@@ -203,6 +204,76 @@ func TestPodNode(t *testing.T) {
- 	}
- }
+@@ -73,7 +74,12 @@ func TestWorkerNode(t *testing.T) {
  
-+func TestOnlinkRouteReplay(t *testing.T) {
-+	testutils.SkipTestIfNotRoot(t)
-+
-+	const mockTunnelType = "mock-onlink"
-+	tunneler.Register(mockTunnelType, newMockWorkerNodeTunneler, newMockPodNodeTunneler)
-+
-+	workerNS, _ := tuntest.NewNamedNS(t, "test-onlink-worker")
-+	defer tuntest.DeleteNamedNS(t, workerNS)
-+	tuntest.BridgeAdd(t, workerNS, "ens0")
-+	tuntest.AddrAdd(t, workerNS, "ens0", "192.168.0.2/24")
-+	tuntest.RouteAdd(t, workerNS, "", "192.168.0.1", "ens0")
-+
-+	workerPodNS, _ := tuntest.NewNamedNS(t, "test-onlink-source")
-+	defer tuntest.DeleteNamedNS(t, workerPodNS)
-+	tuntest.BridgeAdd(t, workerPodNS, "eth0")
-+	tuntest.AddrAdd(t, workerPodNS, "eth0", "10.0.0.2/32")
-+	defaultRoute := &netops.Route{
+ 	tuntest.BridgeAdd(t, workerPodNS, "eth0")
+ 	tuntest.AddrAdd(t, workerPodNS, "eth0", "172.16.0.2/24")
+-	tuntest.RouteAdd(t, workerPodNS, "", "172.16.0.1", "eth0")
++	require.NoError(t, workerPodNS.RouteAdd(&netops.Route{
 +		Destination: netip.MustParsePrefix("0.0.0.0/0"),
-+		Gateway:     netip.MustParseAddr("169.254.1.1"),
++		Gateway:     netip.MustParseAddr("172.16.0.1"),
 +		Device:      "eth0",
 +		Onlink:      true,
-+	}
-+	require.NoError(t, workerPodNS.RouteAdd(defaultRoute))
-+
-+	guestPodNS, _ := tuntest.NewNamedNS(t, "test-onlink-target")
-+	defer tuntest.DeleteNamedNS(t, guestPodNS)
-+	tuntest.BridgeAdd(t, guestPodNS, "eth0")
-+	tuntest.AddrAdd(t, guestPodNS, "eth0", "10.0.0.2/32")
-+
-+	require.NoError(t, workerNS.Run(func() error {
-+		workerNode, err := NewWorkerNode(&tunneler.NetworkConfig{TunnelType: mockTunnelType})
-+		if err != nil {
-+			return err
-+		}
-+		config, err := workerNode.Inspect(workerPodNS.Path())
-+		if err != nil {
-+			return err
-+		}
-+		require.Len(t, config.Routes, 1)
-+		require.True(t, config.Routes[0].Onlink)
-+
-+		// Inspect's JSON is the actual worker-to-guest transport for PodNode.Setup.
-+		encoded, err := json.Marshal(config)
-+		if err != nil {
-+			return err
-+		}
-+		var guestConfig tunneler.Config
-+		if err := json.Unmarshal(encoded, &guestConfig); err != nil {
-+			return err
-+		}
-+		require.True(t, guestConfig.Routes[0].Onlink)
-+
-+		// A /32 Pod IP cannot reach this link-local gateway without RTNH_F_ONLINK.
-+		withoutOnlink := guestConfig
-+		withoutOnlink.Routes = []*tunneler.Route{{
-+			Dst: guestConfig.Routes[0].Dst, GW: guestConfig.Routes[0].GW,
-+			Dev: guestConfig.Routes[0].Dev,
-+		}}
-+		require.Error(t, NewPodNode(guestPodNS.Path(), "", &withoutOnlink).Setup())
-+		require.NoError(t, NewPodNode(guestPodNS.Path(), "", &guestConfig).Setup())
-+		routes, err := guestPodNS.RouteList()
-+		if err != nil {
-+			return err
-+		}
-+		require.Len(t, routes, 1)
-+		require.True(t, routes[0].Onlink)
-+		return nil
 +	}))
-+}
+ 
+ 	for hostInterface, expected := range map[string]struct {
+ 		podNodeIP    string
+@@ -98,6 +104,13 @@ func TestWorkerNode(t *testing.T) {
+ 			config, err := workerNode.Inspect(workerPodNS.Path())
+ 			require.Nil(t, err, "hostInterface=%q", hostInterface)
+ 
++			// Route flags must survive the worker-to-guest JSON transport.
++			data, err := json.Marshal(config)
++			require.NoError(t, err)
++			var received tunneler.Config
++			require.NoError(t, json.Unmarshal(data, &received))
++			config = &received
 +
- func TestPluginDetectHostInterface(t *testing.T) {
- 	testutils.SkipTestIfNotRoot(t)
+ 			err = workerNode.Setup(workerPodNS.Path(), []netip.Addr{netip.MustParseAddr("192.168.0.3"), netip.MustParseAddr("192.168.0.3")}, config)
+ 			require.Nil(t, err, "hostInterface=%q", hostInterface)
+ 
+@@ -113,9 +126,11 @@ func TestWorkerNode(t *testing.T) {
+ 			require.Equal(t, dstRoute, "0.0.0.0/0", "hostInterface=%q", hostInterface)
+ 			require.Equal(t, config.Routes[0].GW.String(), "172.16.0.1", "hostInterface=%q", hostInterface)
+ 			require.Equal(t, config.Routes[0].Dev, "eth0", "hostInterface=%q", hostInterface)
++			require.True(t, config.Routes[0].Onlink, "hostInterface=%q", hostInterface)
+ 			require.Equal(t, config.Routes[1].Dst.String(), "172.16.0.0/24", "hostInterface=%q", hostInterface)
+ 			require.Equal(t, config.Routes[1].GW.IsValid(), false, "hostInterface=%q", hostInterface)
+ 			require.Equal(t, config.Routes[1].Dev, "eth0", "hostInterface=%q", hostInterface)
++			require.False(t, config.Routes[1].Onlink, "hostInterface=%q", hostInterface)
+ 
+ 			err = workerNode.Teardown(workerPodNS.Path(), config)
+ 			require.Nil(t, err, "hostInterface=%q", hostInterface)
+@@ -179,6 +194,13 @@ func TestPodNode(t *testing.T) {
+ 							Dst: netip.MustParsePrefix("172.16.0.0/24"),
+ 							Dev: "eth0",
+ 						},
++						{
++							// This gateway is outside the interface's connected subnet.
++							Dst:    netip.MustParsePrefix("10.0.0.0/24"),
++							GW:     netip.MustParseAddr("169.254.1.1"),
++							Dev:    "eth0",
++							Onlink: true,
++						},
+ 					},
+ 					InterfaceName: "eth0",
+ 					MTU:           1500,
+@@ -193,6 +215,11 @@ func TestPodNode(t *testing.T) {
+ 				err := podNode.Setup()
+ 				require.Nil(t, err, "hostInterface=%q", hostInterface)
+ 
++				routes, err := podNS.RouteList(&netops.Route{Destination: netip.MustParsePrefix("10.0.0.0/24")})
++				require.NoError(t, err)
++				require.Len(t, routes, 1)
++				require.True(t, routes[0].Onlink)
++
+ 				err = podNode.Teardown()
+ 				require.Nil(t, err, "hostInterface=%q", hostInterface)
  
 diff --git a/src/cloud-api-adaptor/pkg/podnetwork/podnode.go b/src/cloud-api-adaptor/pkg/podnetwork/podnode.go
 index 50c4d898..3a5a8a09 100644

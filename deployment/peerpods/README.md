@@ -12,10 +12,12 @@ is the base image; `build.peerpod_ctrl` supplies the local repository and tag. S
 `resourceCtrl.image` to the digest published in your trusted registry. Fresh
 builds must record their own binary/archive/image hashes.
 
-The controller's [independent backport](../../patches/peerpod-ctrl/README.md) confirms
+The controller's [CAA patch selection](../../patches/peerpod-ctrl/README.md) confirms
 absence after an otherwise unhandled DeleteInstance failure. Only a same-client,
 exact-ID read returning typed `InvalidInstanceId.NotFound` converts that failure
-to success; other results preserve the delete error. It reuses existing read
-permission. Provider initialization also requires `vpc:DescribeVSwitchAttributes`
+to success; other results preserve the delete error. This generic fix reuses
+existing read permission. A separate retained-volume patch checks attached disks
+and security locks before deletion, requiring `ecs:DescribeDisks` as well.
+Provider initialization also requires `vpc:DescribeVSwitchAttributes`
 scoped to the configured vSwitch. The controller queue is separate from the CAA
 adapter queue.

@@ -1,4 +1,4 @@
-From 05d18b455cfcde9ef0d93325c0cbe287f8728685 Mon Sep 17 00:00:00 2001
+From 1541c2823f3c123a969cd1b2f534c8591dd04129 Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
 Date: Tue, 3 Nov 2026 11:58:13 +0800
 Subject: [PATCH] alibabacloud: bound compressed instance user data
@@ -12,22 +12,22 @@ preserves the decoded initdata bytes and their SHA-384 digest.
 
 Generated-by: OpenAI Codex
 ---
- .../cloud/cloudconfig_transport_test.go       | 57 ++++++++++++
+ .../cloud/cloudconfig_transport_test.go       | 56 ++++++++++++
  .../pkg/userdata/alibabacloud_test.go         | 67 ++++++++++++++
  .../pkg/userdata/provision.go                 | 36 +++++++-
  src/cloud-providers/alibabacloud/provider.go  | 38 +++++++-
  .../alibabacloud/userdata_test.go             | 87 +++++++++++++++++++
- 5 files changed, 280 insertions(+), 5 deletions(-)
+ 5 files changed, 279 insertions(+), 5 deletions(-)
  create mode 100644 src/cloud-api-adaptor/pkg/adaptor/cloud/cloudconfig_transport_test.go
  create mode 100644 src/cloud-api-adaptor/pkg/userdata/alibabacloud_test.go
  create mode 100644 src/cloud-providers/alibabacloud/userdata_test.go
 
 diff --git a/src/cloud-api-adaptor/pkg/adaptor/cloud/cloudconfig_transport_test.go b/src/cloud-api-adaptor/pkg/adaptor/cloud/cloudconfig_transport_test.go
 new file mode 100644
-index 00000000..3d9137e8
+index 00000000..387c18eb
 --- /dev/null
 +++ b/src/cloud-api-adaptor/pkg/adaptor/cloud/cloudconfig_transport_test.go
-@@ -0,0 +1,57 @@
+@@ -0,0 +1,56 @@
 +// (C) Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -36,7 +36,6 @@ index 00000000..3d9137e8
 +import (
 +	"bytes"
 +	"compress/gzip"
-+	"crypto/sha512"
 +	"encoding/base64"
 +	"io"
 +	"testing"
@@ -81,7 +80,7 @@ index 00000000..3d9137e8
 +	if err != nil {
 +		t.Fatal(err)
 +	}
-+	if !bytes.Equal(decoded, raw) || sha512.Sum384(decoded) != sha512.Sum384(raw) {
++	if !bytes.Equal(decoded, raw) {
 +		t.Fatal("native cloud-config changed measured initdata bytes")
 +	}
 +}
@@ -223,7 +222,7 @@ index 2807a3cd..49dc5c8a 100644
  
  func newProvider(ctx context.Context) (UserDataProvider, error) {
 diff --git a/src/cloud-providers/alibabacloud/provider.go b/src/cloud-providers/alibabacloud/provider.go
-index f06dd0ba..ce6db87d 100644
+index 96179d5b..1809f7e5 100644
 --- a/src/cloud-providers/alibabacloud/provider.go
 +++ b/src/cloud-providers/alibabacloud/provider.go
 @@ -4,6 +4,8 @@

@@ -34,8 +34,8 @@ git -C "$prepared" checkout --detach "$base"
 while IFS= read -r patch; do
   [[ -n "$patch" && "$patch" != \#* ]] || continue
   case "$patch" in
-    ../shared/*.patch)
-      [[ "${patch#../shared/}" != */* ]] || exit 1 ;;
+    ../cloud-api-adaptor/*.patch)
+      [[ "$component" == peerpod-ctrl && "${patch#../cloud-api-adaptor/}" != */* ]] || exit 1 ;;
     *.patch) [[ "$patch" != */* ]] || exit 1 ;;
     *) exit 1 ;;
   esac

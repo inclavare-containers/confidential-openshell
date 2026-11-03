@@ -1,0 +1,201 @@
+From 19fca4bf6077833217935a46d6018d6965a493d6 Mon Sep 17 00:00:00 2001
+From: Weidong Sun <sunweidong@linux.alibaba.com>
+Date: Tue, 3 Nov 2026 19:30:00 +0800
+Subject: [PATCH] alibabacloud: confirm instance absence after deletion errors
+
+A concurrent cleanup can remove an instance before another caller receives
+its deletion error. Read that exact instance after a failed deletion and
+accept only InvalidInstanceId.NotFound as proof of absence. Preserve all
+other errors and handle non-SDK errors without a type-assertion panic.
+
+This change applies to the existing instance deletion path and requires
+no data-disk support or additional DescribeDisks permission.
+
+Generated-by: OpenAI Codex
+---
+ .../alibabacloud/instance_delete.go           | 35 ++++++++
+ src/cloud-providers/alibabacloud/provider.go  | 25 ++----
+ .../alibabacloud/provider_delete_test.go      | 84 +++++++++++++++++++
+ 3 files changed, 127 insertions(+), 17 deletions(-)
+ create mode 100644 src/cloud-providers/alibabacloud/instance_delete.go
+ create mode 100644 src/cloud-providers/alibabacloud/provider_delete_test.go
+
+diff --git a/src/cloud-providers/alibabacloud/instance_delete.go b/src/cloud-providers/alibabacloud/instance_delete.go
+new file mode 100644
+index 00000000..7c1e2de8
+--- /dev/null
++++ b/src/cloud-providers/alibabacloud/instance_delete.go
+@@ -0,0 +1,35 @@
++// (C) Copyright Confidential Containers Contributors
++// SPDX-License-Identifier: Apache-2.0
++
++package alibabacloud
++
++import (
++	"errors"
++	"fmt"
++	ecs "github.com/alibabacloud-go/ecs-20140526/v4/client"
++	"github.com/alibabacloud-go/tea/tea"
++)
++
++func isAlibabaInstanceNotFoundError(err error) bool {
++	var sdkErr *tea.SDKError
++	return errors.As(err, &sdkErr) && tea.StringValue(sdkErr.Code) == "InvalidInstanceId.NotFound"
++}
++
++// deleteInstanceAndConfirmAbsence preserves deletion errors unless an exact
++// instance read confirms absence. A nil error alone means deletion was accepted.
++func (p *alibabaCloudProvider) deleteInstanceAndConfirmAbsence(instanceID string) (bool, error) {
++	_, err := p.ecsClient.DeleteInstance(&ecs.DeleteInstanceRequest{InstanceId: tea.String(instanceID), Force: tea.Bool(true)})
++	if err == nil {
++		return false, nil
++	}
++	if isAlibabaInstanceNotFoundError(err) {
++		return true, nil
++	}
++	// A tag-conditioned denial can race another caller's successful deletion.
++	// Only a typed not-found for this exact ID confirms that outcome.
++	_, readErr := p.ecsClient.DescribeInstanceAttribute(&ecs.DescribeInstanceAttributeRequest{InstanceId: tea.String(instanceID)})
++	if isAlibabaInstanceNotFoundError(readErr) {
++		return true, nil
++	}
++	return false, fmt.Errorf("delete instance %s: %w", instanceID, err)
++}
+diff --git a/src/cloud-providers/alibabacloud/provider.go b/src/cloud-providers/alibabacloud/provider.go
+index 389f2d11..02425ac0 100644
+--- a/src/cloud-providers/alibabacloud/provider.go
++++ b/src/cloud-providers/alibabacloud/provider.go
+@@ -368,32 +368,23 @@ func (p *alibabaCloudProvider) CreateInstance(ctx context.Context, podName, sand
+ }
+ 
+ func (p *alibabaCloudProvider) DeleteInstance(ctx context.Context, instanceID string) error {
++	if instanceID == "" {
++		return errors.New("refusing to delete an Alibaba Cloud instance without an ID")
++	}
+ 	logger.Printf("Deleting instance (%s)", instanceID)
+ 	err := p.waitUntilTimeout(time.Duration(time.Second*30), func() (bool, error) {
+-		req := ecs.DeleteInstanceRequest{
+-			InstanceId: tea.String(instanceID),
+-			Force:      tea.Bool(true),
+-		}
+-		resp, err := p.ecsClient.DeleteInstance(&req)
++		_, err := p.deleteInstanceAndConfirmAbsence(instanceID)
+ 		if err != nil {
+-			if *err.(*tea.SDKError).Code == "IncorrectInstanceStatus" {
+-				logger.Printf("instance %s is not in the correct state to be deleted, retrying", instanceID)
++			var sdkError *tea.SDKError
++			if errors.As(err, &sdkError) && sdkError != nil && tea.StringValue(sdkError.Code) == "IncorrectInstanceStatus" {
+ 				return false, nil
+ 			}
+-
+-			if *err.(*tea.SDKError).Code == "InvalidInstanceId.NotFound" {
+-				logger.Printf("instance %s is not found", instanceID)
+-				return true, nil
+-			}
+-
+-			logger.Printf("failed to delete an instance: %v and the response is %v", err, resp)
+-			return false, fmt.Errorf("failed to delete an instance %s: %+v", instanceID, err)
++			return false, err
+ 		}
+-
+ 		return true, nil
+ 	})
+ 	if err != nil {
+-		return fmt.Errorf("failed to delete an instance %s", instanceID)
++		return fmt.Errorf("failed to delete an instance %s: %w", instanceID, err)
+ 	}
+ 
+ 	logger.Printf("Deleted an instance %s", instanceID)
+diff --git a/src/cloud-providers/alibabacloud/provider_delete_test.go b/src/cloud-providers/alibabacloud/provider_delete_test.go
+new file mode 100644
+index 00000000..bd767198
+--- /dev/null
++++ b/src/cloud-providers/alibabacloud/provider_delete_test.go
+@@ -0,0 +1,84 @@
++// (C) Copyright Confidential Containers Contributors
++// SPDX-License-Identifier: Apache-2.0
++
++package alibabacloud
++
++import (
++	"errors"
++	"fmt"
++	"testing"
++
++	ecs "github.com/alibabacloud-go/ecs-20140526/v4/client"
++	"github.com/alibabacloud-go/tea/tea"
++)
++
++type fakeDeleteECSClient struct {
++	*ecs.Client
++	deleteError       error
++	attributeError    error
++	attributeResponse *ecs.DescribeInstanceAttributeResponse
++	deleteRequests    []*ecs.DeleteInstanceRequest
++	attributeRequests []*ecs.DescribeInstanceAttributeRequest
++}
++
++func (f *fakeDeleteECSClient) DeleteInstance(request *ecs.DeleteInstanceRequest) (*ecs.DeleteInstanceResponse, error) {
++	f.deleteRequests = append(f.deleteRequests, request)
++	return &ecs.DeleteInstanceResponse{Body: &ecs.DeleteInstanceResponseBody{}}, f.deleteError
++}
++
++func (f *fakeDeleteECSClient) DescribeInstanceAttribute(request *ecs.DescribeInstanceAttributeRequest) (*ecs.DescribeInstanceAttributeResponse, error) {
++	f.attributeRequests = append(f.attributeRequests, request)
++	return f.attributeResponse, f.attributeError
++}
++
++func TestDeleteInstanceConfirmsAbsenceAfterError(t *testing.T) {
++	denied := &tea.SDKError{Code: tea.String("Forbidden.RAM"), Message: tea.String("tag-conditioned deletion denied")}
++	notFound := &tea.SDKError{Code: tea.String("InvalidInstanceId.NotFound"), Message: tea.String("instance is absent")}
++	readDenied := &tea.SDKError{Code: tea.String("Forbidden.RAM"), Message: tea.String("read denied")}
++	transportError := errors.New("delete response lost")
++	for _, test := range []struct {
++		name          string
++		deleteError   error
++		readError     error
++		readResponse  *ecs.DescribeInstanceAttributeResponse
++		wantSuccess   bool
++		wantReadCalls int
++	}{
++		{name: "successful deletion needs no read", wantSuccess: true},
++		{name: "documented deletion not-found needs no read", deleteError: notFound, wantSuccess: true},
++		{name: "denied delete confirmed absent", deleteError: denied, readError: notFound, wantSuccess: true, wantReadCalls: 1},
++		{name: "lost delete response confirmed absent", deleteError: transportError, readError: notFound, wantSuccess: true, wantReadCalls: 1},
++		{name: "wrapped read not-found confirms absence", deleteError: denied, readError: fmt.Errorf("read: %w", notFound), wantSuccess: true, wantReadCalls: 1},
++		{name: "existing instance preserves deletion denial", deleteError: denied, readResponse: &ecs.DescribeInstanceAttributeResponse{Body: &ecs.DescribeInstanceAttributeResponseBody{InstanceId: tea.String("i-target")}}, wantReadCalls: 1},
++		{name: "empty successful response cannot prove absence", deleteError: denied, wantReadCalls: 1},
++		{name: "read denial preserves deletion denial", deleteError: denied, readError: readDenied, wantReadCalls: 1},
++		{name: "read transport failure preserves deletion denial", deleteError: denied, readError: errors.New("read response lost"), wantReadCalls: 1},
++		{name: "other read not-found code cannot prove absence", deleteError: denied, readError: &tea.SDKError{Code: tea.String("InvalidRegionId.NotFound")}, wantReadCalls: 1},
++		{name: "read error without code cannot prove absence", deleteError: denied, readError: &tea.SDKError{Message: tea.String("incomplete SDK error")}, wantReadCalls: 1},
++		{name: "non-SDK deletion error preserved if instance exists", deleteError: transportError, wantReadCalls: 1},
++	} {
++		t.Run(test.name, func(t *testing.T) {
++			client := &fakeDeleteECSClient{deleteError: test.deleteError, attributeError: test.readError, attributeResponse: test.readResponse}
++			p := &alibabaCloudProvider{ecsClient: client, serviceConfig: &Config{Region: "cn-beijing"}}
++			absent, err := p.deleteInstanceAndConfirmAbsence("i-target")
++			if absent != (test.wantSuccess && test.deleteError != nil) {
++				t.Fatalf("confirmed absence = %t for delete error %v", absent, test.deleteError)
++			}
++			if test.wantSuccess && err != nil {
++				t.Fatalf("DeleteInstance() = %v, want confirmed success", err)
++			}
++			if !test.wantSuccess && !errors.Is(err, test.deleteError) {
++				t.Fatalf("DeleteInstance() = %v, want original deletion error %v", err, test.deleteError)
++			}
++			if len(client.deleteRequests) != 1 || tea.StringValue(client.deleteRequests[0].InstanceId) != "i-target" || !tea.BoolValue(client.deleteRequests[0].Force) {
++				t.Fatal("deletion must retain the exact target and existing Force behavior")
++			}
++			if len(client.attributeRequests) != test.wantReadCalls {
++				t.Fatalf("read calls = %d, want %d", len(client.attributeRequests), test.wantReadCalls)
++			}
++			if test.wantReadCalls == 1 && tea.StringValue(client.attributeRequests[0].InstanceId) != "i-target" {
++				t.Fatal("absence read must target the same exact instance on the same client")
++			}
++		})
++	}
++}
+-- 
+2.43.7
+

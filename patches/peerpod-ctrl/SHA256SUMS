@@ -1,1 +1,2 @@
-ffec1f022c784f3f746ff86547338f2e1f1ba4b1e066100ed91ed14ba1398828  ../shared/alibabacloud-retained-instance-deletion.patch
+73c8a36b2b868d5397ae067e6208d22c5038f9cf6274dfc0d67fb38d06d6b20e  ../cloud-api-adaptor/0001a-alibabacloud-confirm-instance-absence-after-delete-errors.patch
+bb66f6184adc8ee6a30f3cd83a3dce96128b5caf6ba24edfcffdcb36b613c0c7  ../cloud-api-adaptor/0001b-alibabacloud-protect-retained-disks-before-instance-deletion.patch
