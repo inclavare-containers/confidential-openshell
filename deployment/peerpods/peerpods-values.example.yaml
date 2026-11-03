@@ -43,7 +43,7 @@ resourceCtrl:
       pod-identity.alibabacloud.com/role-name: CAA_RAM_ROLE_NAME
   image:
     repository: PRIVATE_REGISTRY/openshell/peerpod-ctrl
-    tag: "upstream-v0.23-alibabacloud-delete-idempotent-20261012@sha256:f3a9c12970b775b2c511f65b33867dad49cd71740db08b9e6397b03c4de23f6c"
+    tag: "v0.23.0-alibabacloud@sha256:PATCHED_PEERPOD_CONTROLLER_IMAGE_SHA256"
 webhook:
   enabled: true
   replicas: 1
