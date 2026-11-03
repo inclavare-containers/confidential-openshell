@@ -104,6 +104,13 @@ def require_containerd_version(output, expected):
         raise SystemExit(f'Worker requires containerd {expected} for the measured OCI 1.3.0 profile; found {output.strip()}.')
 
 
+def require_containerd_config(effective):
+    # The pinned ACK runtime migrates schema 3 input to schema 4 when dumping it.
+    if effective.get('version') not in (3, 4) or not all(key in effective.get('plugins', {}) for key in
+            ('io.containerd.cri.v1.runtime', 'io.containerd.cri.v1.images')):
+        raise SystemExit('Worker requires containerd config schema 3 or 4 with CRI runtime and images plugins; no files changed.')
+
+
 def main():
     pause, shim_sha, containerd_version = sys.argv[1:]
     observed = hashlib.sha256(Path('/opt/kata/bin/containerd-shim-kata-v2').read_bytes()).hexdigest()
@@ -128,9 +135,7 @@ def main():
     path = Path(config)
     command = [args[0], '--config', config, 'config', 'dump']
     effective = tomllib.loads(subprocess.check_output(command, text=True))
-    if effective.get('version') != 3 or not all(key in effective.get('plugins', {}) for key in
-            ('io.containerd.cri.v1.runtime', 'io.containerd.cri.v1.images')):
-        raise SystemExit('Worker requires containerd config version 3 with CRI runtime and images plugins; no files changed.')
+    require_containerd_config(effective)
     runtime = effective['plugins']['io.containerd.cri.v1.runtime']['containerd']['runtimes']['kata-remote']
     kata_path = Path(runtime['options']['ConfigPath'])
     if not str(kata_path).startswith('/opt/kata/') or '..' in kata_path.parts:

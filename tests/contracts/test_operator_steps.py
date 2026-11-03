@@ -93,6 +93,16 @@ class WorkerSelection(unittest.TestCase):
 
 
 class WorkerProfile(unittest.TestCase):
+    def test_containerd_config_accepts_native_migration_and_requires_cri_plugins(self):
+        plugins = {'io.containerd.cri.v1.runtime': {}, 'io.containerd.cri.v1.images': {}}
+        for version in (3, 4):
+            profile.require_containerd_config({'version': version, 'plugins': plugins})
+        for config in ({'version': 2, 'plugins': plugins}, {'version': 5, 'plugins': plugins},
+                       {'version': 4, 'plugins': {'io.containerd.cri.v1.runtime': {}}},
+                       {'version': 4}):
+            with self.subTest(config=config), self.assertRaisesRegex(SystemExit, 'CRI runtime and images plugins'):
+                profile.require_containerd_config(config)
+
     def test_containerd_release_version_accepts_ack_and_upstream_output(self):
         for version in ('2.3.4', 'v2.3.4'):
             profile.require_containerd_version(

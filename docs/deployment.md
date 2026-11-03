@@ -85,8 +85,10 @@ Obtains an administrator kubeconfig and checks the region, API access, RRSA,
 Ready Ubuntu 24.04/amd64 workers with **containerd 2.3.4**,
 `supplementalGroupsPolicy` and Terway
 NetworkPolicy. It retains the existing cluster, VPC, node pools and worker OS.
-The measured policy requires the tested OCI 1.3.0 contract and containerd config
-schema 3. Other runtime versions require a separately validated profile.
+The measured policy requires the tested OCI 1.3.0 contract and containerd's CRI
+runtime/images plugins. Schema 3 input is supported; this runtime may migrate its
+effective configuration to schema 4. Other runtime versions require a separately
+validated profile.
 Missing prerequisites fail with an explanation; it does not upgrade the cluster
 or silently enable its features.
 
