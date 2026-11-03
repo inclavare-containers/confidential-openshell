@@ -44,8 +44,9 @@ servers. Standard command-scoped proxy variables are supported. Docker image
 downloads also need working daemon connectivity; configure it using Docker's
 [daemon proxy instructions](https://docs.docker.com/engine/daemon/proxy/) when needed.
 Guest builds pass the command's proxy variables to the tools build and mkosi
-container. Both use host networking, so a proxy listening on the build host's
-loopback address is reachable. Proxy settings are not saved in the guest image.
+container. Guest and CSI builds use host networking, so a proxy listening on the
+build host's loopback address is reachable. Proxy settings are not saved in the
+guest image.
 
 ## Obtain complete fixed sources
 

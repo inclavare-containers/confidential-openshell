@@ -9,7 +9,7 @@ CSI_UPSTREAM_COMMIT=$(git -C .local/build-sources/caa-csi-block-driver rev-parse
 CSI_TAG="csi-${CSI_TREE:0:8}"
 make -C .local/build-sources/caa-csi-block-driver GOOS=linux GOARCH=amd64 \
   VERSION="tree-$CSI_TREE" build
-docker build --platform linux/amd64 --output type=docker \
+docker build --network host --platform linux/amd64 --output type=docker \
   --build-arg VERSION="tree-$CSI_TREE" \
   --build-arg HTTP_PROXY --build-arg HTTPS_PROXY --build-arg NO_PROXY \
   --label "org.opencontainers.image.revision=$CSI_UPSTREAM_COMMIT" \

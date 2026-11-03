@@ -3,6 +3,7 @@
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
+export PATH="/usr/local/go/bin:/usr/local/bin:$PATH"
 export GOPROXY=off GOSUMDB=off GOTOOLCHAIN=local
 test_tmp="$(mktemp -d "${TMPDIR:-/tmp}/co-tests.XXXXXX")"
 export TMPDIR="$test_tmp"
