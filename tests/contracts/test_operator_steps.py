@@ -93,6 +93,18 @@ class WorkerSelection(unittest.TestCase):
 
 
 class WorkerProfile(unittest.TestCase):
+    def test_containerd_release_version_accepts_ack_and_upstream_output(self):
+        for version in ('2.3.4', 'v2.3.4'):
+            profile.require_containerd_version(
+                f'containerd github.com/containerd/containerd/v2 {version} 4eddfe81d0f9\n', '2.3.4')
+        for output in ('containerd github.com/containerd/containerd/v2 2.3.40 abc',
+                       'containerd github.com/containerd/containerd/v2 v2.3.4-rc.1 abc',
+                       'containerd github.com/containerd/containerd/v2 2.2.4 v2.3.4',
+                       'unknown github.com/containerd/containerd/v2 2.3.4 abc',
+                       'containerd 2.3.4'):
+            with self.subTest(output=output), self.assertRaisesRegex(SystemExit, 'requires containerd 2.3.4'):
+                profile.require_containerd_version(output, '2.3.4')
+
     def test_kubelet_deadline_preserves_other_arguments_and_environment(self):
         for value in ('"--max-pods=110 --runtime-request-timeout=2m --v=3"',
                       '--max-pods=110 --runtime-request-timeout 2m --v=3'):

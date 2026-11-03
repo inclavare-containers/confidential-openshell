@@ -97,6 +97,13 @@ def kubelet_timeout(text):
     return text + ('' if not text or text.endswith('\n') else '\n') + assignment + '\n'
 
 
+def require_containerd_version(output, expected):
+    fields = output.split()
+    # Upstream releases use v2.3.4; ACK packages report 2.3.4 in the same field.
+    if len(fields) < 3 or fields[0] != 'containerd' or fields[2].removeprefix('v') != expected:
+        raise SystemExit(f'Worker requires containerd {expected} for the measured OCI 1.3.0 profile; found {output.strip()}.')
+
+
 def main():
     pause, shim_sha, containerd_version = sys.argv[1:]
     observed = hashlib.sha256(Path('/opt/kata/bin/containerd-shim-kata-v2').read_bytes()).hexdigest()
@@ -117,8 +124,7 @@ def main():
         elif arg.startswith('--config='):
             config = arg.split('=', 1)[1]
     version = subprocess.check_output([args[0], '--version'], text=True)
-    if 'v' + containerd_version not in version.split():
-        raise SystemExit(f'Worker requires containerd {containerd_version} for the measured OCI 1.3.0 profile; found {version.strip()}.')
+    require_containerd_version(version, containerd_version)
     path = Path(config)
     command = [args[0], '--config', config, 'config', 'dump']
     effective = tomllib.loads(subprocess.check_output(command, text=True))
