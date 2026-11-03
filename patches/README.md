@@ -7,7 +7,7 @@ components. Exact bases and result trees are authoritative in the
 
 | Component | Ordered series | Required behavior |
 | --- | --- | --- |
-| CAA | [11 patches](cloud-api-adaptor/series) | Separate generic instance-deletion handling and retained-disk protection; immutable direct-volume metadata; Alibaba per-instance image selection and retained ESSD attachment/deletion; bounded userdata, optional image-pull credential forwarding and reduced diagnostic output; guest disk discovery, stock CDH encrypted-device unlock, a measured embedded-LUKS initializer, sealed mounts and on-link Pod routes |
+| CAA | [13 patches](cloud-api-adaptor/series) | Separate generic instance-deletion handling and retained-disk protection; immutable direct-volume metadata; Alibaba per-instance image selection and retained ESSD attachment/deletion; bounded userdata, optional image-pull credential forwarding and reduced diagnostic output; guest disk discovery, stock CDH encrypted-device unlock, a measured embedded-LUKS initializer, sealed mounts and on-link Pod routes |
 | CSI | [6 patches](caa-csi-block-driver/series) | Capacity validation for recovered disks; Alibaba ESSD through existing provider interfaces; atomic v1 metadata and delegated fsGroup for the paired CAA; separate controller/node deployment; shared conformance runner and pinned build/runtime bases |
 | PeerPod controller | [2 CAA patches](peerpod-ctrl/README.md) | Apply the same generic deletion fix and retained-volume protection used by CAA |
 | Kata host Go shim | [1 patch](kata-containers/README.md) | Preserve `NoNewPrivileges` in exec requests; use the released guest agent and genpolicy unchanged |
@@ -33,13 +33,12 @@ Generic fixes can be removed after the selected upstream version supplies their
 behavior and the corresponding acceptance checks pass. When guest inputs change,
 rebuild the image and extract its references together.
 
-The [classification and review ledger](storage-review.md) distinguishes two
-storage workstreams: confidential-volume additions awaiting design discussion,
-and fixes/enhancements to storage behavior already present upstream. Mixed patches
-identify both parts explicitly; their generic portions need separate extraction
-before submission. Other generic changes are listed separately. A dependency on
-an existing CDH or CSI API does not make the whole confidential-volume profile a
-generic bug fix.
+The [classification and review ledger](storage-review.md) separates generic fixes,
+ordinary provider support, and the confidential-volume contract. The latter waits
+for upstream storage design discussion; it is not bundled into independent
+provider fixes. The [migration record](../docs/coco-migration.md) pins the selected
+post-release CoCo sources and records validation separately from the saved main
+branch.
 
 The CAA queue carries the submitted patches for
 [on-link routes (#3435)](https://github.com/confidential-containers/cloud-api-adaptor/pull/3435)
@@ -88,12 +87,11 @@ workstream. OpenShell's v0.1.6 source imports
 and existing confidential wrappers remain pinned; no upstream release is rolled
 back by this simplification.
 
-The initdata transport uses upstream cloud-config generation. The guest strips only outer
-base64 transport CR/LF before strict decoding; decoded TOML and its SHA-384 measurement
-remain byte-for-byte unchanged. The native AA adapter retains the published ttrpc subset:
-it uses the existing protobuf/ttrpc dependencies without vendoring a generated protocol
-library. AA performs the actual
-measurement; canonical eventlog checks prevent duplicate extension.
+The initdata transport uses upstream cloud-config generation. The guest checks
+that decoded TOML, its SHA-384 digest and the materialized files agree. AA receives
+that exact TOML via `--initdata-toml` and owns the standard `InitData` event and
+restart handling. AS/KBS policies authorize current bindings using that verified
+event. There is no local runtime-extension RPC or AAEL encoder in CAA.
 
 Local patch commits use `Weidong Sun <sunweidong@linux.alibaba.com>` as their author,
 with scoped subjects and a rationale for the complete change. Existing sign-offs

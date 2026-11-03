@@ -29,15 +29,16 @@ measured_initdata(appraisal) := digest if {
 		some event in logs
 		event.type_name == "EV_EVENT_TAG"
 		event.details.unicode_name == "AAEL"
-		event.details.data.operation == "initdata"
+		event.details.data.operation == "InitData"
 	]
 	count(matches) == 1
 	only := matches[0]
 	only.index == 4
 	only.digest_matches_event == true
-	only.details.data.domain == "confidentialcontainers.org"
-	digest := only.details.data.content
-	regex.match("^[0-9a-f]{96}$", digest)
+	only.details.data.domain == "github.com/confidential-containers"
+	encoded_digest := only.details.data.content.digest
+	regex.match("^sha384:[0-9a-f]{96}$", encoded_digest)
+	digest := trim_prefix(encoded_digest, "sha384:")
 	count(only.digests) == 1
 	only.digests[0].alg == "SHA-384"
 	only.digests[0].digest == approved_initdata_events[digest]

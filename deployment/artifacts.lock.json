@@ -3,7 +3,7 @@
   "platform": "linux/amd64",
   "podvm": {
     "source": "cloud-api-adaptor",
-    "commit": "e3e0f00480b41c08e3e4dbc6b64aba7722fb65f9",
+    "commit": "9ca88115b6daa43f023a8a3b61ee48190707b6e1",
     "distribution": "ubuntu",
     "release": "resolute",
     "profile": "production",
@@ -17,23 +17,23 @@
     "tools_base_image": "ubuntu@sha256:0d39fcc8335d6d74d5502f6df2d30119ff4790ebbb60b364818d5112d9e3e932"
   },
   "guest_components": {
-    "version": "0.22.0",
+    "version": "post-v0.22.0-de1142e1",
     "repository": "confidential-containers/guest-components",
-    "commit": "eae0bf63a3a9db7721f86e0a2b0b9941a7fcba3a",
+    "commit": "de1142e1dfb9d56ece0bd758c6efda7fb52c56bd",
     "binaries": {
       "attestation-agent": {
-        "ref": "ghcr.io/confidential-containers/guest-components/attestation-agent@sha256:e5261dad39359af6915de5650d0bcd3657d3a8e18ff568fa3b1126acf0076d03",
-        "binary_sha256": "4efa6e8b7451c0834cd830a1e017cfdee0f4298a2ff5942f3553fe319f7012be",
+        "ref": "ghcr.io/confidential-containers/guest-components/attestation-agent@sha256:a3aff6e2fd814e2a6a2dabf287cfdeeecc0e769ba67d14abb950e30cc1fc5159",
+        "binary_sha256": "792b177099c5be2fc7f9fdbd6d988f4cce7a0030129baf64562eda7093bcc854",
         "archive": "attestation-agent.tar.xz"
       },
       "confidential-data-hub": {
-        "ref": "ghcr.io/confidential-containers/guest-components/confidential-data-hub@sha256:b86a3d344a6a6a222e92a9b4a5834d75b6a835857c490693262cabfb48ff2292",
-        "binary_sha256": "6bd5ea332da7bb5e5511eb883a878702a85e19348f1d93a18f5f849c5597a177",
+        "ref": "ghcr.io/confidential-containers/guest-components/confidential-data-hub@sha256:4a61cede4e71d5b93843b2d01771f06390c6d232841ffd49acd1b88a1ffb9e85",
+        "binary_sha256": "5ad4855d94a34adb2d3f57f159c4049122c9821d916ddb36af6c100738461e39",
         "archive": "confidential-data-hub.tar.xz"
       },
       "api-server-rest": {
-        "ref": "ghcr.io/confidential-containers/guest-components/api-server-rest@sha256:33bda7748968de9da58535ebcb2cd48dc32bb8575d7fcc323989581fdc3bec62",
-        "binary_sha256": "070a291153a83af73ec2e5272173b069e98e963cbaa1ec0f754c9489bbedecdb",
+        "ref": "ghcr.io/confidential-containers/guest-components/api-server-rest@sha256:404f12058f735eba37c054909368c8260d9e56a8e68ea0add4ca20ee83837f12",
+        "binary_sha256": "4a3cd264681387270f52cf12382c92b024afe4172cc7fff6ab5a4a1345f2e294",
         "archive": "api-server-rest.tar.xz"
       }
     }

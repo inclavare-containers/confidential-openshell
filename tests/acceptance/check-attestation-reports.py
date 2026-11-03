@@ -30,7 +30,7 @@ def signed(key, digest):
         'ear.trustworthiness-vector': {'hardware': 2, 'configuration': 2, 'executables': 3, 'file-system': 2},
         'ear.veraison.annotated-evidence': {'tdx': {'tcb_status': 'UpToDate', 'quote': {'body': {'mr_td': 'b' * 96}},
             'uefi_event_logs': [{'type_name': 'EV_EVENT_TAG', 'details': {'unicode_name': 'AAEL',
-                'data': {'domain': 'confidentialcontainers.org', 'operation': 'initdata', 'content': digest}}}]}}
+                'data': {'domain': 'github.com/confidential-containers', 'operation': 'InitData', 'content': {'digest': 'sha384:' + digest}}}}]}}
     }}}
     message = '.'.join(h.h.b64url(json.dumps(v).encode()) for v in [{'alg': 'ES256'}, claims])
     r, s = utils.decode_dss_signature(key.sign(message.encode(), ec.ECDSA(hashes.SHA256())))

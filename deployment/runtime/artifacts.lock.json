@@ -34,8 +34,8 @@
   },
   "charts": {
     "kata-deploy-4.2.0.tgz": "52a3e9139e810d58867a7676fb38957870dd09e8b2033e54cebdda7c97598e8c",
-    "peerpodctrl-0.5.0.tgz": "c5596b121a36b37068cd13d37f6baed808b7f371e68580af79fd1316a375c2a8",
-    "peerpods-webhook-0.5.0.tgz": "328235dc4f913fa64bad41ca1710e43edc7c118671b231a3f6640b8b7a9c3a5e"
+    "peerpodctrl-0.5.0.tgz": "19b4854a1534a9fd2c7ae19463b336ce13b40a1d0c11abc602f29c7adf75799b",
+    "peerpods-webhook-0.5.0.tgz": "f2d1a278835b95c26361ef6f23f494ccbf4787c4aa1ddbe240f96f62a540b685"
   },
   "downloads": {
     "gateway": {
@@ -64,8 +64,8 @@
     "workload": "ghcr.io/nvidia/openshell-community/sandboxes/base@sha256:c2a43bb0d765774e2790b3babfb20997bb2eac7b4bf4c6d7d8661e99817bf904",
     "pause": "registry.k8s.io/pause@sha256:8d4106c88ec0bd28001e34c975d65175d994072d65341f62a8ab0754b0fafe10",
     "supervisor": "ghcr.io/nvidia/openshell/supervisor@sha256:ce859a7d77ee515d3fe0b3c7dc61286516f402eb1d25c761d806d9ae5ed96c0b",
-    "trustee_as": "ghcr.io/confidential-containers/attestation-service@sha256:5b3908adfc47568ec24ab4a88a0e0bf3c8fe0a47d4c44ebfa08c16c86eebc890",
-    "trustee_kbs": "ghcr.io/confidential-containers/key-broker-service@sha256:69551b909005a28fd4f02c31ed774ff030551bac73bfe30df9360d222b674822",
+    "trustee_as": "ghcr.io/confidential-containers/staged-images/coco-as-grpc@sha256:64f5df731a39ab6a4d72d77cd2596d8f2d994b18d41b30a43861bbc4933ebb1a",
+    "trustee_kbs": "ghcr.io/confidential-containers/staged-images/kbs-grpc-as@sha256:ac3b61254c672a9c715fe813022962fc7cbf8b9c199cc9950700bb68719ce8b6",
     "caa": "quay.io/confidential-containers/cloud-api-adaptor@sha256:0d6fff9437a1bd663f9740bc58f76f135cd33308593238f00b4f26347d800d8e",
     "peerpod_ctrl_runtime": "quay.io/confidential-containers/peerpod-ctrl@sha256:64d463b70a708eee9912ef289f38dd4a76612561094dcc822fbfa10dd63015d4",
     "peerpod_webhook": "quay.io/confidential-containers/peer-pods-webhook@sha256:b1b2e7bb2b880728fba68fe490914d803e810c947f1e5a2af40f8b9d7cf9b07e",
@@ -84,19 +84,18 @@
   "sources": {
     "trustee": {
       "repository": "https://github.com/confidential-containers/trustee",
-      "tag": "v0.22.0",
-      "commit": "512fed65642015b849f38fb13bfdec7806639987"
+      "commit": "ade2f25782d69d16efa9aeaf6d58c5a48bd5bc56"
     }
   },
   "build": {
     "peerpod_ctrl": {
       "repository": "openshell/peerpod-ctrl",
-      "tag": "v0.23.0-alibabacloud"
+      "tag": "9ca88115-alibabacloud"
     },
     "caa": {
-      "go_version": "1.26.7",
+      "go_version": "1.26.10",
       "build_args": {
-        "VERSION": "v0.23.0-dev"
+        "VERSION": "post-v0.23.0-9ca88115"
       }
     }
   }

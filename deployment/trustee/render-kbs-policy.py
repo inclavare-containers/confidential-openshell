@@ -30,7 +30,8 @@ def initdata_event_sha384(digest: str) -> str:
     """Hash the AA's complete TCG2 tagged event, including its LE header."""
     if not HEX96.fullmatch(digest):
         raise ValueError("invalid measured initdata digest")
-    text = f"confidentialcontainers.org initdata {digest}".encode("ascii")
+    text = ('github.com/confidential-containers InitData '
+            f'{{"digest":"sha384:{digest}"}}').encode("ascii")
     event = struct.pack("<II", 0x4141454C, len(text)) + text
     return hashlib.sha384(event).hexdigest()
 

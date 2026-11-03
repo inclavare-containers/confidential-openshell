@@ -4,8 +4,8 @@ Confidential OpenShell runs the unmodified OpenShell v0.1.6 Gateway, CLI and
 supervisor with an external confidential Kubernetes ComputeDriver. The coding
 workload uses the unmodified, digest-pinned OpenShell Community base image,
 which includes OpenCode, Codex, Claude Code and their developer tools.
-The guest uses the official Ubuntu mkosi/UKI flow and released CoCo 0.22 AA/CDH;
-Trustee 0.22 provides appraisal and key release. Integration hooks add measured
+The guest uses the official Ubuntu mkosi/UKI flow and commit-pinned upstream AA/CDH;
+Trustee provides appraisal and key release at the matching migration pin. Integration hooks add measured
 OpenShell bootstrap and encrypted persistent workspaces. Native OpenShell owns
 TLS, sandbox JWTs, RPC authorization and the supervisor/workload protocol.
 

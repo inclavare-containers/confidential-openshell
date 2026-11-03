@@ -1,6 +1,6 @@
-From f094f22d1394c0633fea1eeb7f7b2bd87baba6c1 Mon Sep 17 00:00:00 2001
+From a0f4f57865c2bb8f84ebd1a693ddad938a51887e Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
-Date: Tue, 3 Nov 2026 11:58:12 +0800
+Date: Tue, 3 Nov 2026 20:11:26 +0800
 Subject: [PATCH] volumes: preserve immutable direct-volume mount plans
 
 Container creation must use the same disk-to-mount plan that was
@@ -19,27 +19,27 @@ Generated-by: OpenAI Codex
  .../pkg/adaptor/cloud/cloud.go                |  15 +-
  .../pkg/adaptor/cloud/cloud_test.go           |   8 +-
  .../pkg/adaptor/k8sops/peerpod.go             |  18 +
- .../pkg/adaptor/proxy/cloud_volumes_test.go   | 240 +++++++--
+ .../pkg/adaptor/proxy/cloud_volumes_test.go   | 363 ++++++++++----
  .../pkg/adaptor/proxy/factory.go              |   7 +-
  .../pkg/adaptor/proxy/proxy.go                |  43 +-
  .../pkg/adaptor/proxy/proxy_test.go           |  44 +-
- .../pkg/adaptor/proxy/service.go              | 178 ++-----
+ .../pkg/adaptor/proxy/service.go              | 168 ++-----
  .../pkg/adaptor/proxy/service_test.go         | 105 +---
- .../pkg/forwarder/interceptor/interceptor.go  |  62 ++-
+ .../pkg/forwarder/interceptor/interceptor.go  |  53 +-
  .../forwarder/interceptor/interceptor_test.go |  21 +-
- src/cloud-api-adaptor/pkg/util/cloud.go       | 100 ----
- .../pkg/util/cloud_csi_test.go                | 370 ++++++++------
+ src/cloud-api-adaptor/pkg/util/cloud.go       |  98 ----
+ .../pkg/util/cloud_csi_test.go                | 382 ++++++++-------
  .../pkg/util/direct_volume.go                 | 455 ++++++++++++++++++
  .../pkg/util/testdata/direct-volume-v1.json   |   1 +
- 15 files changed, 1072 insertions(+), 595 deletions(-)
+ 15 files changed, 1155 insertions(+), 626 deletions(-)
  create mode 100644 src/cloud-api-adaptor/pkg/util/direct_volume.go
  create mode 100644 src/cloud-api-adaptor/pkg/util/testdata/direct-volume-v1.json
 
 diff --git a/src/cloud-api-adaptor/pkg/adaptor/cloud/cloud.go b/src/cloud-api-adaptor/pkg/adaptor/cloud/cloud.go
-index 5a9b154c..f22b2f9d 100644
+index 66c6f0fd..ce44b000 100644
 --- a/src/cloud-api-adaptor/pkg/adaptor/cloud/cloud.go
 +++ b/src/cloud-api-adaptor/pkg/adaptor/cloud/cloud.go
-@@ -195,8 +195,17 @@ func (s *cloudService) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (r
+@@ -196,8 +196,17 @@ func (s *cloudService) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (r
  	// Get Pod VM image from annotations
  	image := util.GetImageFromAnnotation(req.Annotations)
  
@@ -49,7 +49,7 @@ index 5a9b154c..f22b2f9d 100644
 +	// use the same immutable disk order and mount contract. Kata's remote
 +	// hypervisor request does not forward the CRI sandbox UID, so resolve it
 +	// lazily from the API server only when direct-volume metadata is present.
-+	directVolumes, err := util.ResolveCSIVolumesForPod("", func() (string, error) {
++	directVolumes, err := util.ResolveCSIVolumesForPod(util.GetPodUID(req.Annotations), func() (string, error) {
 +		return s.ppService.GetPodUID(ctx, pod, namespace)
 +	})
 +	if err != nil {
@@ -59,7 +59,7 @@ index 5a9b154c..f22b2f9d 100644
  	if len(csiVolumes) > 0 {
  		logger.Printf("Found %d CSI volumes to attach to PodVM", len(csiVolumes))
  	}
-@@ -232,7 +241,7 @@ func (s *cloudService) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (r
+@@ -233,7 +242,7 @@ func (s *cloudService) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (r
  	}
  	socketPath := filepath.Join(podDir, proxy.SocketName)
  
@@ -69,18 +69,18 @@ index 5a9b154c..f22b2f9d 100644
  	daemonConfig := forwarder.Config{
  		PodNamespace: namespace,
 diff --git a/src/cloud-api-adaptor/pkg/adaptor/cloud/cloud_test.go b/src/cloud-api-adaptor/pkg/adaptor/cloud/cloud_test.go
-index 76d388e9..9eb40356 100644
+index a39f4569..1b1225c8 100644
 --- a/src/cloud-api-adaptor/pkg/adaptor/cloud/cloud_test.go
 +++ b/src/cloud-api-adaptor/pkg/adaptor/cloud/cloud_test.go
-@@ -22,6 +22,7 @@ import (
- 	"github.com/confidential-containers/cloud-api-adaptor/src/cloud-api-adaptor/pkg/forwarder"
+@@ -23,6 +23,7 @@ import (
+ 	"github.com/confidential-containers/cloud-api-adaptor/src/cloud-api-adaptor/pkg/paths"
  	"github.com/confidential-containers/cloud-api-adaptor/src/cloud-api-adaptor/pkg/podnetwork"
  	"github.com/confidential-containers/cloud-api-adaptor/src/cloud-api-adaptor/pkg/podnetwork/tunneler"
 +	"github.com/confidential-containers/cloud-api-adaptor/src/cloud-api-adaptor/pkg/util"
  	"github.com/confidential-containers/cloud-api-adaptor/src/cloud-api-adaptor/pkg/util/tlsutil"
  	provider "github.com/confidential-containers/cloud-api-adaptor/src/cloud-providers"
  	"github.com/confidential-containers/cloud-api-adaptor/src/cloud-providers/util/cloudinit"
-@@ -85,10 +86,12 @@ func (p *mockProxy) CAService() tlsutil.CAService {
+@@ -86,10 +87,12 @@ func (p *mockProxy) CAService() tlsutil.CAService {
  }
  
  type mockProxyFactory struct {
@@ -95,7 +95,7 @@ index 76d388e9..9eb40356 100644
  	return &mockProxy{
  		socketPath: socketPath,
  		readyCh:    make(chan struct{}),
-@@ -150,6 +153,7 @@ func TestCloudService(t *testing.T) {
+@@ -151,6 +154,7 @@ func TestCloudService(t *testing.T) {
  	assert.NoError(t, err)
  	assert.NotNil(t, res1)
  	assert.Contains(t, res1.AgentSocketPath, dir)
@@ -133,7 +133,7 @@ index 918908da..54e5fb33 100644
  func (s *PeerPodService) OwnPeerPod(podname string, podns string, instanceID string) error {
  	pod, err := s.getPod(podname, podns)
 diff --git a/src/cloud-api-adaptor/pkg/adaptor/proxy/cloud_volumes_test.go b/src/cloud-api-adaptor/pkg/adaptor/proxy/cloud_volumes_test.go
-index ca8b0b92..975727ca 100644
+index d06b3120..975727ca 100644
 --- a/src/cloud-api-adaptor/pkg/adaptor/proxy/cloud_volumes_test.go
 +++ b/src/cloud-api-adaptor/pkg/adaptor/proxy/cloud_volumes_test.go
 @@ -19,11 +19,32 @@ import (
@@ -319,15 +319,86 @@ index ca8b0b92..975727ca 100644
  		withMounts(&pb.Mount{
  			Destination: "/mnt/regular",
  			Source:      "/some/regular/path",
-@@ -220,6 +295,7 @@ func TestCloudVolumes_SkipsVolumesFromOtherPods(t *testing.T) {
- 	writeTestMountInfo(t, dir,
- 		"/var/lib/kubelet/pods/other-pod-uid/volumes/kubernetes.io~csi/pvc-other/mount",
- 		map[string]interface{}{"device": "other-disk", "fstype": "ext4"})
+@@ -211,61 +286,28 @@ func TestCloudVolumes_NoAnnotationWhenNoCSIVolumes(t *testing.T) {
+ }
+ 
+ func TestCloudVolumes_SkipsVolumesFromOtherPods(t *testing.T) {
+-	const (
+-		podUID    = "pod-uid-BBB"
+-		volPath   = "/var/lib/kubelet/pods/" + podUID + "/volumes/kubernetes.io~csi/pvc-mine/mount"
+-		otherPath = "/var/lib/kubelet/pods/pod-uid-AAA/volumes/kubernetes.io~csi/pvc-other/mount"
+-	)
+-
+-	// counting the other pod's entry, which sorts first, would move this pod's volume to LUN 1
+-	require.Less(t, b64.URLEncoding.EncodeToString([]byte(otherPath)), b64.URLEncoding.EncodeToString([]byte(volPath)))
+-
+-	tests := []struct {
+-		name        string
+-		annotations map[string]string
+-	}{
+-		{
+-			name:        "containerd sandbox uid",
+-			annotations: map[string]string{"io.kubernetes.cri.sandbox-uid": podUID},
+-		},
+-		{
+-			name: "cri-o sandbox name",
+-			annotations: map[string]string{
+-				"io.kubernetes.cri-o.SandboxName": "k8s_test-pod_default_" + podUID + "_0",
+-			},
+-		},
+-	}
+-	for _, tt := range tests {
+-		t.Run(tt.name, func(t *testing.T) {
+-			dir := t.TempDir()
+-			overrideKataDirectVolumesDir(t, dir)
+-
+-			service, cleanup := setupMockAgentAndService(t)
+-			defer cleanup()
+-
+-			writeTestMountInfo(t, dir, otherPath, map[string]interface{}{"device": "other-disk", "fstype": "ext4"})
+-			writeTestMountInfo(t, dir, volPath, map[string]interface{}{"device": "my-disk", "fstype": "ext4"})
++	dir := t.TempDir()
++	overrideKataDirectVolumesDir(t, dir)
+ 
+-			req := newCreateContainerRequest("test-other-pod").
+-				withAnnotations(tt.annotations).
+-				withMounts(&pb.Mount{Destination: "/data", Source: volPath, Type: "bind"}).
+-				build()
++	service, cleanup := setupMockAgentAndService(t)
++	defer cleanup()
+ 
+-			_, err := service.CreateContainer(context.Background(), req)
+-			require.NoError(t, err)
++	writeTestMountInfo(t, dir,
++		"/var/lib/kubelet/pods/other-pod-uid/volumes/kubernetes.io~csi/pvc-other/mount",
++		map[string]interface{}{"device": "other-disk", "fstype": "ext4"})
 +	setTestDirectVolumeResolution(t, service, "my-pod-uid")
  
- 	req := newCreateContainerRequest("test-other-pod").
- 		withAnnotations(map[string]string{
-@@ -260,6 +336,7 @@ func TestCloudVolumes_LUNIndexSkippedVolumeConsistency(t *testing.T) {
+-			cvJSON := req.OCI.Annotations["io.confidentialcontainers.org.cloud_volumes"]
+-			require.NotEmpty(t, cvJSON)
++	req := newCreateContainerRequest("test-other-pod").
++		withAnnotations(map[string]string{
++			"io.kubernetes.cri.sandbox-uid": "my-pod-uid",
++		}).
++		build()
+ 
+-			var cloudVolumes map[string]map[string]string
+-			require.NoError(t, json.Unmarshal([]byte(cvJSON), &cloudVolumes))
++	_, err := service.CreateContainer(context.Background(), req)
++	require.NoError(t, err)
+ 
+-			require.Len(t, cloudVolumes, 1)
+-			require.Contains(t, cloudVolumes, "vol-0")
+-			assert.Equal(t, "my-disk", cloudVolumes["vol-0"]["disk_id"])
+-			assert.Equal(t, "0", cloudVolumes["vol-0"]["lun"])
+-		})
+-	}
++	_, ok := req.OCI.Annotations["io.confidentialcontainers.org.cloud_volumes"]
++	assert.False(t, ok, "should not include volumes from other pods")
+ }
+ 
+ func TestCloudVolumes_LUNIndexSkippedVolumeConsistency(t *testing.T) {
+@@ -294,6 +336,7 @@ func TestCloudVolumes_LUNIndexSkippedVolumeConsistency(t *testing.T) {
  	writeTestMountInfo(t, dir, volPathC, map[string]interface{}{
  		"device": "disk-charlie", "fstype": "ext4",
  	})
@@ -335,7 +406,7 @@ index ca8b0b92..975727ca 100644
  
  	req := newCreateContainerRequest("test-lun-skip").
  		withAnnotations(map[string]string{
-@@ -278,7 +355,7 @@ func TestCloudVolumes_LUNIndexSkippedVolumeConsistency(t *testing.T) {
+@@ -312,7 +355,7 @@ func TestCloudVolumes_LUNIndexSkippedVolumeConsistency(t *testing.T) {
  	cvJSON := req.OCI.Annotations["io.confidentialcontainers.org.cloud_volumes"]
  	require.NotEmpty(t, cvJSON)
  
@@ -344,7 +415,7 @@ index ca8b0b92..975727ca 100644
  	require.NoError(t, json.Unmarshal([]byte(cvJSON), &cloudVolumes))
  
  	// Should only have 2 entries (vol-b is skipped because no OCI mount)
-@@ -287,7 +364,7 @@ func TestCloudVolumes_LUNIndexSkippedVolumeConsistency(t *testing.T) {
+@@ -321,7 +364,7 @@ func TestCloudVolumes_LUNIndexSkippedVolumeConsistency(t *testing.T) {
  	// Collect LUN values
  	luns := make(map[string]string)
  	for _, vol := range cloudVolumes {
@@ -353,76 +424,45 @@ index ca8b0b92..975727ca 100644
  	}
  
  	// vol-a should get LUN 0 (canonical index 0)
-@@ -301,13 +378,10 @@ func TestCloudVolumes_LUNIndexSkippedVolumeConsistency(t *testing.T) {
+@@ -335,26 +378,163 @@ func TestCloudVolumes_LUNIndexSkippedVolumeConsistency(t *testing.T) {
  	assert.Equal(t, "disk-charlie", luns["2"])
  }
  
 -func TestCloudVolumes_SkipsVolumeWithNoDiskID(t *testing.T) {
 +func TestCloudVolumes_RejectsVolumeWithNoDiskIDDuringResolution(t *testing.T) {
- 	dir := t.TempDir()
- 	overrideKataDirectVolumesDir(t, dir)
- 
--	service, cleanup := setupMockAgentAndService(t)
--	defer cleanup()
--
- 	podUID := "pod-uid-666"
- 	volPath := "/var/lib/kubelet/pods/" + podUID + "/volumes/kubernetes.io~csi/pvc-nodisk/mount"
- 
-@@ -315,31 +389,14 @@ func TestCloudVolumes_SkipsVolumeWithNoDiskID(t *testing.T) {
- 		"fstype": "ext4",
- 	})
- 
--	req := newCreateContainerRequest("test-no-disk").
--		withAnnotations(map[string]string{
--			"io.kubernetes.cri.sandbox-uid": podUID,
--		}).
--		withMounts(&pb.Mount{
--			Destination: "/mnt/nodisk",
--			Source:      volPath,
--			Type:        "bind",
--		}).
--		build()
--
--	_, err := service.CreateContainer(context.Background(), req)
--	require.NoError(t, err)
--
--	_, ok := req.OCI.Annotations["io.confidentialcontainers.org.cloud_volumes"]
--	assert.False(t, ok, "annotation should not be set when volume has no disk ID")
++	dir := t.TempDir()
++	overrideKataDirectVolumesDir(t, dir)
++
++	podUID := "pod-uid-666"
++	volPath := "/var/lib/kubelet/pods/" + podUID + "/volumes/kubernetes.io~csi/pvc-nodisk/mount"
++
++	writeTestMountInfo(t, dir, volPath, map[string]interface{}{
++		"fstype": "ext4",
++	})
++
 +	_, err := util.ResolveCSIVolumesForPod(podUID, nil)
 +	require.ErrorContains(t, err, "invalid device")
- }
- 
--func TestCloudVolumes_SkipsInvalidMountInfoJSON(t *testing.T) {
++}
++
 +func TestCloudVolumes_RejectsInvalidMountInfoDuringResolution(t *testing.T) {
- 	dir := t.TempDir()
- 	overrideKataDirectVolumesDir(t, dir)
- 
--	service, cleanup := setupMockAgentAndService(t)
--	defer cleanup()
--
- 	podUID := "pod-uid-777"
- 	volPath := "/var/lib/kubelet/pods/" + podUID + "/volumes/kubernetes.io~csi/pvc-badjson/mount"
- 
-@@ -348,22 +405,107 @@ func TestCloudVolumes_SkipsInvalidMountInfoJSON(t *testing.T) {
- 	require.NoError(t, os.MkdirAll(volDir, 0o755))
- 	require.NoError(t, os.WriteFile(filepath.Join(volDir, "mountInfo.json"), []byte("not json"), 0o644))
- 
--	req := newCreateContainerRequest("test-bad-json").
--		withAnnotations(map[string]string{
--			"io.kubernetes.cri.sandbox-uid": podUID,
--		}).
--		withMounts(&pb.Mount{
--			Destination: "/mnt/badjson",
--			Source:      volPath,
--			Type:        "bind",
--		}).
++	dir := t.TempDir()
++	overrideKataDirectVolumesDir(t, dir)
++
++	podUID := "pod-uid-777"
++	volPath := "/var/lib/kubelet/pods/" + podUID + "/volumes/kubernetes.io~csi/pvc-badjson/mount"
++
++	encoded := b64.URLEncoding.EncodeToString([]byte(volPath))
++	volDir := filepath.Join(dir, encoded)
++	require.NoError(t, os.MkdirAll(volDir, 0o755))
++	require.NoError(t, os.WriteFile(filepath.Join(volDir, "mountInfo.json"), []byte("not json"), 0o644))
++
 +	_, err := util.ResolveCSIVolumesForPod(podUID, nil)
 +	require.ErrorContains(t, err, "parse CSI mount info")
 +}
 +
 +func TestCloudVolumes_MetadataMutationDoesNotChangeResolution(t *testing.T) {
-+	dir := t.TempDir()
-+	overrideKataDirectVolumesDir(t, dir)
+ 	dir := t.TempDir()
+ 	overrideKataDirectVolumesDir(t, dir)
 +	service, cleanup := setupMockAgentAndService(t)
 +	defer cleanup()
 +
@@ -442,25 +482,25 @@ index ca8b0b92..975727ca 100644
 +	req := newCreateContainerRequest("test-immutable").
 +		withAnnotations(map[string]string{"io.kubernetes.cri.sandbox-uid": podUID}).
 +		withMounts(&pb.Mount{Destination: "/workspace", Source: volumePath, Type: "bind"}).
- 		build()
++		build()
  
- 	_, err := service.CreateContainer(context.Background(), req)
- 	require.NoError(t, err)
++	_, err := service.CreateContainer(context.Background(), req)
++	require.NoError(t, err)
 +	var volumes map[string]util.CloudVolumeAnnotation
 +	require.NoError(t, json.Unmarshal([]byte(req.OCI.Annotations[util.CloudVolumesAnnotationKey]), &volumes))
 +	assert.Equal(t, "disk-original", volumes["vol-0"].DiskID)
 +	assert.True(t, volumes["vol-0"].ReadOnly)
 +	assert.Equal(t, []string{"nodev", "ro"}, volumes["vol-0"].Options)
 +}
- 
--	_, ok := req.OCI.Annotations["io.confidentialcontainers.org.cloud_volumes"]
--	assert.False(t, ok, "annotation should not be set with invalid JSON")
++
 +func TestCloudVolumes_UnknownCanonicalSourceFailsClosed(t *testing.T) {
 +	dir := t.TempDir()
 +	overrideKataDirectVolumesDir(t, dir)
-+	service, cleanup := setupMockAgentAndService(t)
-+	defer cleanup()
-+
+ 	service, cleanup := setupMockAgentAndService(t)
+ 	defer cleanup()
+ 
+-	podUID := "pod-uid-666"
+-	volPath := "/var/lib/kubelet/pods/" + podUID + "/volumes/kubernetes.io~csi/pvc-nodisk/mount"
 +	podUID := "pod-uid-unknown"
 +	known := "/var/lib/kubelet/pods/" + podUID + "/volumes/kubernetes.io~csi/pvc-known/mount"
 +	unknown := "/var/lib/kubelet/pods/" + podUID + "/volumes/kubernetes.io~csi/pvc-unknown/mount"
@@ -519,25 +559,113 @@ index ca8b0b92..975727ca 100644
 +	assert.Equal(t, expectedB.LUN, second[nameB].LUN)
 +	assert.Equal(t, expectedB.MountPoint, second[nameB].MountPoint)
 +	assert.True(t, second[nameB].ReadOnly)
++}
++
++func TestCloudVolumes_EncryptionAnnotation(t *testing.T) {
++	dir := t.TempDir()
++	overrideKataDirectVolumesDir(t, dir)
++
++	service, cleanup := setupMockAgentAndService(t)
++	defer cleanup()
++
++	podUID := "pod-uid-enc-333"
++	volPath := "/var/lib/kubelet/pods/" + podUID + "/volumes/kubernetes.io~csi/pvc-encrypted/mount"
+ 
+ 	writeTestMountInfo(t, dir, volPath, map[string]interface{}{
++		"device": "/subscriptions/sub/disks/csi-vol-pvc-encrypted",
+ 		"fstype": "ext4",
++		"metadata": map[string]interface{}{
++			"cloud-volume-path": "/subscriptions/sub/disks/csi-vol-pvc-encrypted",
++			"encrypt-type":      "LUKS",
++			"kbs-key-id":        "default/key/volume-enc-key",
++		},
+ 	})
++	setTestDirectVolumeResolution(t, service, podUID)
+ 
+-	req := newCreateContainerRequest("test-no-disk").
++	req := newCreateContainerRequest("test-encrypted-vol").
+ 		withAnnotations(map[string]string{
+ 			"io.kubernetes.cri.sandbox-uid": podUID,
+ 		}).
+ 		withMounts(&pb.Mount{
+-			Destination: "/mnt/nodisk",
++			Destination: "/mnt/secret",
+ 			Source:      volPath,
+ 			Type:        "bind",
+ 		}).
+@@ -363,31 +543,44 @@ func TestCloudVolumes_SkipsVolumeWithNoDiskID(t *testing.T) {
+ 	_, err := service.CreateContainer(context.Background(), req)
+ 	require.NoError(t, err)
+ 
+-	_, ok := req.OCI.Annotations["io.confidentialcontainers.org.cloud_volumes"]
+-	assert.False(t, ok, "annotation should not be set when volume has no disk ID")
++	cvJSON, ok := req.OCI.Annotations[util.CloudVolumesAnnotationKey]
++	require.True(t, ok, "cloud_volumes annotation should be set")
++
++	var cloudVolumes map[string]util.CloudVolumeAnnotation
++	require.NoError(t, json.Unmarshal([]byte(cvJSON), &cloudVolumes))
++
++	require.Contains(t, cloudVolumes, "vol-0")
++	vol := cloudVolumes["vol-0"]
++	assert.Equal(t, "/mnt/secret", vol.MountPoint)
++	assert.Equal(t, "ext4", vol.FSType)
++	assert.Equal(t, "0", vol.LUN)
++	assert.Equal(t, "/subscriptions/sub/disks/csi-vol-pvc-encrypted", vol.DiskID)
++	assert.Equal(t, "LUKS", vol.EncryptType)
++	assert.Equal(t, "default/key/volume-enc-key", vol.KeyID)
  }
  
- func TestCloudVolumes_EncryptionAnnotation(t *testing.T) {
-@@ -385,6 +527,7 @@ func TestCloudVolumes_EncryptionAnnotation(t *testing.T) {
- 			"kbs-key-id":        "default/key/volume-enc-key",
- 		},
- 	})
+-func TestCloudVolumes_SkipsInvalidMountInfoJSON(t *testing.T) {
++func TestCloudVolumes_NoEncryptionParamsWhenAbsent(t *testing.T) {
+ 	dir := t.TempDir()
+ 	overrideKataDirectVolumesDir(t, dir)
+ 
+ 	service, cleanup := setupMockAgentAndService(t)
+ 	defer cleanup()
+ 
+-	podUID := "pod-uid-777"
+-	volPath := "/var/lib/kubelet/pods/" + podUID + "/volumes/kubernetes.io~csi/pvc-badjson/mount"
++	podUID := "pod-uid-plain-444"
++	volPath := "/var/lib/kubelet/pods/" + podUID + "/volumes/kubernetes.io~csi/pvc-plain/mount"
+ 
+-	encoded := b64.URLEncoding.EncodeToString([]byte(volPath))
+-	volDir := filepath.Join(dir, encoded)
+-	require.NoError(t, os.MkdirAll(volDir, 0o755))
+-	require.NoError(t, os.WriteFile(filepath.Join(volDir, "mountInfo.json"), []byte("not json"), 0o644))
++	writeTestMountInfo(t, dir, volPath, map[string]interface{}{
++		"device": "vol-abc123def",
++		"fstype": "xfs",
++	})
 +	setTestDirectVolumeResolution(t, service, podUID)
  
- 	req := newCreateContainerRequest("test-encrypted-vol").
+-	req := newCreateContainerRequest("test-bad-json").
++	req := newCreateContainerRequest("test-plain-vol").
  		withAnnotations(map[string]string{
-@@ -430,6 +573,7 @@ func TestCloudVolumes_NoEncryptionParamsWhenAbsent(t *testing.T) {
- 		"device": "vol-abc123def",
- 		"fstype": "xfs",
- 	})
-+	setTestDirectVolumeResolution(t, service, podUID)
+ 			"io.kubernetes.cri.sandbox-uid": podUID,
+ 		}).
+ 		withMounts(&pb.Mount{
+-			Destination: "/mnt/badjson",
++			Destination: "/mnt/data",
+ 			Source:      volPath,
+ 			Type:        "bind",
+ 		}).
+@@ -396,6 +589,14 @@ func TestCloudVolumes_SkipsInvalidMountInfoJSON(t *testing.T) {
+ 	_, err := service.CreateContainer(context.Background(), req)
+ 	require.NoError(t, err)
  
- 	req := newCreateContainerRequest("test-plain-vol").
- 		withAnnotations(map[string]string{
+-	_, ok := req.OCI.Annotations["io.confidentialcontainers.org.cloud_volumes"]
+-	assert.False(t, ok, "annotation should not be set with invalid JSON")
++	cvJSON, ok := req.OCI.Annotations[util.CloudVolumesAnnotationKey]
++	require.True(t, ok, "cloud_volumes annotation should be set")
++
++	var cloudVolumes map[string]util.CloudVolumeAnnotation
++	require.NoError(t, json.Unmarshal([]byte(cvJSON), &cloudVolumes))
++
++	require.Contains(t, cloudVolumes, "vol-0")
++	vol := cloudVolumes["vol-0"]
++	assert.Equal(t, "", vol.EncryptType)
++	assert.Equal(t, "", vol.KeyID)
+ }
 diff --git a/src/cloud-api-adaptor/pkg/adaptor/proxy/factory.go b/src/cloud-api-adaptor/pkg/adaptor/proxy/factory.go
 index 779e2fcc..d4e7e981 100644
 --- a/src/cloud-api-adaptor/pkg/adaptor/proxy/factory.go
@@ -730,7 +858,7 @@ index b9bbb97c..96431e94 100644
  }
  
 diff --git a/src/cloud-api-adaptor/pkg/adaptor/proxy/service.go b/src/cloud-api-adaptor/pkg/adaptor/proxy/service.go
-index abe00e7e..3f17eb61 100644
+index a668d4f8..abe569bf 100644
 --- a/src/cloud-api-adaptor/pkg/adaptor/proxy/service.go
 +++ b/src/cloud-api-adaptor/pkg/adaptor/proxy/service.go
 @@ -5,13 +5,9 @@ package proxy
@@ -830,7 +958,7 @@ index abe00e7e..3f17eb61 100644
  	if req.OCI.Annotations != nil && req.OCI.Annotations[defaultGPUsAnnotation] != "" {
  		req.OCI.Annotations[cdiAnnotationKey] = defaultCDIType
  		logger.Printf("adding CDI annotation %s: %s", cdiAnnotationKey, defaultCDIType)
-@@ -103,109 +77,36 @@ func (s *proxyService) CreateContainer(ctx context.Context, req *pb.CreateContai
+@@ -103,99 +77,36 @@ func (s *proxyService) CreateContainer(ctx context.Context, req *pb.CreateContai
  		logger.Printf("Pulling image separately not support on main. It is required to use the nydus-snapshotter, which isn't configured properly here.")
  	}
  
@@ -842,7 +970,7 @@ index abe00e7e..3f17eb61 100644
 +	// captured before the PodVM attachment request. A container may use any
 +	// subset, but it cannot introduce an unresolvable CSI source.
  	cloudVolumes := make(map[string]util.CloudVolumeAnnotation)
--	podUID := req.OCI.Annotations["io.kubernetes.cri.sandbox-uid"]
+-	podUID := util.GetPodUID(req.OCI.Annotations)
 -
 -	dirEntries, dirErr := os.ReadDir(util.KataDirectVolumesDir)
 -	if dirErr == nil {
@@ -877,17 +1005,9 @@ index abe00e7e..3f17eb61 100644
 -			}
 -
 -			diskID := ""
--			encryptType := ""
--			keyID := ""
 -			if md, ok := mountInfo["metadata"].(map[string]interface{}); ok {
 -				if cp, ok := md["cloud-volume-path"].(string); ok && cp != "" {
 -					diskID = cp
--				}
--				if et, ok := md["encrypt-type"].(string); ok {
--					encryptType = et
--				}
--				if kid, ok := md["kbs-key-id"].(string); ok {
--					keyID = kid
 -				}
 -			}
 -			if diskID == "" {
@@ -920,14 +1040,12 @@ index abe00e7e..3f17eb61 100644
 -
 -			volKey := fmt.Sprintf("vol-%d", canonicalIdx)
 -			cloudVolumes[volKey] = util.CloudVolumeAnnotation{
--				MountPoint:  mountDest,
--				FSType:      fsType,
--				LUN:         fmt.Sprintf("%d", canonicalIdx),
--				DiskID:      diskID,
--				EncryptType: encryptType,
--				KeyID:       keyID,
+-				MountPoint: mountDest,
+-				FSType:     fsType,
+-				LUN:        fmt.Sprintf("%d", canonicalIdx),
+-				DiskID:     diskID,
 -			}
--			logger.Printf("Detected cloud volume %s -> %s (lun=%d, disk=%s, fs=%s, encrypt=%s)", volKey, mountDest, canonicalIdx, diskID, fsType, encryptType)
+-			logger.Printf("Detected cloud volume %s -> %s (lun=%d, disk=%s, fs=%s)", volKey, mountDest, canonicalIdx, diskID, fsType)
 -			canonicalIdx++
 +	for _, mount := range req.OCI.Mounts {
 +		_, canonical := util.CSINodePublishVolumePodUID(mount.Source)
@@ -962,7 +1080,7 @@ index abe00e7e..3f17eb61 100644
  	}
  
  	res, err := s.Redirector.CreateContainer(ctx, req)
-@@ -217,20 +118,9 @@ func (s *proxyService) CreateContainer(ctx context.Context, req *pb.CreateContai
+@@ -207,20 +118,9 @@ func (s *proxyService) CreateContainer(ctx context.Context, req *pb.CreateContai
  	return res, err
  }
  
@@ -1167,7 +1285,7 @@ index d5196523..a712b222 100644
  	require.NoError(t, err)
  
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
-index d9bb7679..0273c78f 100644
+index b32afaf7..ce16854f 100644
 --- a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
 @@ -5,7 +5,6 @@ package interceptor
@@ -1176,11 +1294,11 @@ index d9bb7679..0273c78f 100644
  	"context"
 -	"encoding/json"
  	"fmt"
- 	"io"
  	"log"
-@@ -160,8 +159,8 @@ func (i *interceptor) CreateContainer(ctx context.Context, req *pb.CreateContain
- 	}
- 
+ 	"net"
+@@ -127,8 +126,8 @@ func (i *interceptor) CreateContainer(ctx context.Context, req *pb.CreateContain
+ 	// Handle cloud volumes: detect device, format if needed, mount, and
+ 	// bind-mount into the container's mount namespace.
  	if cvJSON, ok := req.OCI.Annotations[util.CloudVolumesAnnotationKey]; ok && cvJSON != "" {
 -		var cloudVolumes map[string]util.CloudVolumeAnnotation
 -		if err := json.Unmarshal([]byte(cvJSON), &cloudVolumes); err != nil {
@@ -1189,7 +1307,7 @@ index d9bb7679..0273c78f 100644
  			return nil, fmt.Errorf("corrupt cloud_volumes annotation (pod would start without volumes): %w", err)
  		}
  
-@@ -175,6 +174,8 @@ func (i *interceptor) CreateContainer(ctx context.Context, req *pb.CreateContain
+@@ -142,6 +141,8 @@ func (i *interceptor) CreateContainer(ctx context.Context, req *pb.CreateContain
  			volInfo := cloudVolumes[volName]
  			mountPoint := volInfo.MountPoint
  			fsType := volInfo.FSType
@@ -1198,29 +1316,22 @@ index d9bb7679..0273c78f 100644
  			lunStr := volInfo.LUN
  			if mountPoint == "" || lunStr == "" {
  				return nil, fmt.Errorf("cloud volume %s missing required mount_point or lun field", volName)
-@@ -215,18 +216,18 @@ func (i *interceptor) CreateContainer(ctx context.Context, req *pb.CreateContain
- 
- 			if volInfo.EncryptType != "" {
- 				mapperName := "caa-" + safeName
--				if err := secureMount(ctx, device, hostMountPoint, fsType, volInfo.EncryptType, volInfo.KeyID, mapperName); err != nil {
-+				if err := secureMount(ctx, device, hostMountPoint, fsType, volInfo.EncryptType, volInfo.KeyID, mapperName, readOnly, options); err != nil {
- 					return nil, fmt.Errorf("failed to secure-mount cloud volume %s at %s: %w", volName, hostMountPoint, err)
- 				}
- 				i.cloudMounts = append(i.cloudMounts, cloudMount{path: hostMountPoint, encrypted: true, mapperName: mapperName})
- 			} else {
--				if err := formatAndMount(device, hostMountPoint, fsType); err != nil {
-+				if err := formatAndMount(device, hostMountPoint, fsType, readOnly, options); err != nil {
- 					return nil, fmt.Errorf("failed to mount cloud volume %s at %s: %w", volName, hostMountPoint, err)
- 				}
- 				i.cloudMounts = append(i.cloudMounts, cloudMount{path: hostMountPoint, encrypted: false})
+@@ -180,12 +181,12 @@ func (i *interceptor) CreateContainer(ctx context.Context, req *pb.CreateContain
+ 				return nil, fmt.Errorf("cloud volume %s device %s not available: %w", volName, device, err)
  			}
  
--			if fsGroupStr := volInfo.FSGroup; fsGroupStr != "" {
-+			if fsGroupStr := volInfo.FSGroup; fsGroupStr != "" && !readOnly {
- 				if gid, err := strconv.Atoi(fsGroupStr); err == nil {
- 					logger.Printf("cloud volume %s: applying fsGroup %d to %s", volName, gid, hostMountPoint)
- 					if err := os.Chown(hostMountPoint, -1, gid); err != nil {
-@@ -243,13 +244,14 @@ func (i *interceptor) CreateContainer(ctx context.Context, req *pb.CreateContain
+-			if err := formatAndMount(device, hostMountPoint, fsType); err != nil {
++			if err := formatAndMount(device, hostMountPoint, fsType, readOnly, options); err != nil {
+ 				return nil, fmt.Errorf("failed to mount cloud volume %s at %s: %w", volName, hostMountPoint, err)
+ 			}
+ 			i.cloudMountPaths = append(i.cloudMountPaths, hostMountPoint)
+ 
+-			if err := applyCloudVolumeFSGroup(hostMountPoint, volInfo.FSGroup, false); err != nil {
++			if err := applyCloudVolumeFSGroup(hostMountPoint, volInfo.FSGroup, readOnly); err != nil {
+ 				return nil, err
+ 			}
+ 
+@@ -194,13 +195,14 @@ func (i *interceptor) CreateContainer(ctx context.Context, req *pb.CreateContain
  				if m.Destination == mountPoint {
  					req.OCI.Mounts[idx].Source = hostMountPoint
  					req.OCI.Mounts[idx].Type = "bind"
@@ -1236,7 +1347,7 @@ index d9bb7679..0273c78f 100644
  			}
  		}
  	}
-@@ -289,6 +291,29 @@ func isTargetPath(path, targetPath string) bool {
+@@ -240,6 +242,29 @@ func isTargetPath(path, targetPath string) bool {
  	return targetPath != "" && targetPath == path
  }
  
@@ -1266,7 +1377,7 @@ index d9bb7679..0273c78f 100644
  func waitForDeviceMounted(ctx context.Context, path string) error {
  
  	ctx, cancel := context.WithTimeout(ctx, volumeCheckTimeout)
-@@ -749,7 +774,7 @@ func waitForDevice(device string) error {
+@@ -700,7 +725,7 @@ func waitForDevice(device string) error {
  	return fmt.Errorf("device %s not available after 60s", device)
  }
  
@@ -1275,7 +1386,7 @@ index d9bb7679..0273c78f 100644
  	if fsType == "" {
  		fsType = "ext4"
  	}
-@@ -764,7 +789,12 @@ func formatAndMount(device, mountPoint, fsType string) error {
+@@ -715,7 +740,12 @@ func formatAndMount(device, mountPoint, fsType string) error {
  
  	// Try mounting first — if the disk already has a valid filesystem, this
  	// avoids any risk of accidentally reformatting it.
@@ -1289,7 +1400,7 @@ index d9bb7679..0273c78f 100644
  	if mountOut, mountErr := mountCmd.CombinedOutput(); mountErr == nil {
  		logger.Printf("Mounted existing filesystem on %s at %s (type=%s)", device, mountPoint, fsType)
  		return nil
-@@ -778,7 +808,7 @@ func formatAndMount(device, mountPoint, fsType string) error {
+@@ -729,7 +759,7 @@ func formatAndMount(device, mountPoint, fsType string) error {
  		out, err := exec.Command("blkid", "-p", device).CombinedOutput()
  		outStr := strings.TrimSpace(string(out))
  		if err == nil && len(outStr) > 0 {
@@ -1298,7 +1409,7 @@ index d9bb7679..0273c78f 100644
  			if autoOut, autoErr := autoMount.CombinedOutput(); autoErr == nil {
  				logger.Printf("Mounted %s at %s (auto-detected type from: %s)", device, mountPoint, outStr)
  				return nil
-@@ -805,6 +835,9 @@ func formatAndMount(device, mountPoint, fsType string) error {
+@@ -756,6 +786,9 @@ func formatAndMount(device, mountPoint, fsType string) error {
  	if !needsFormat {
  		return fmt.Errorf("cannot determine filesystem state of %s after retries; refusing to format to protect data", device)
  	}
@@ -1308,7 +1419,7 @@ index d9bb7679..0273c78f 100644
  
  	logger.Printf("No filesystem on %s, formatting as %s", device, fsType)
  	mkfsCmd := exec.Command("mkfs."+fsType, device)
-@@ -813,7 +846,7 @@ func formatAndMount(device, mountPoint, fsType string) error {
+@@ -764,7 +797,7 @@ func formatAndMount(device, mountPoint, fsType string) error {
  	}
  	logger.Printf("Formatted %s as %s", device, fsType)
  
@@ -1317,34 +1428,11 @@ index d9bb7679..0273c78f 100644
  	if mountOut, mountErr := mountCmd2.CombinedOutput(); mountErr != nil {
  		return fmt.Errorf("mount after format %s -> %s failed: %s: %w", device, mountPoint, strings.TrimSpace(string(mountOut)), mountErr)
  	}
-@@ -857,7 +890,7 @@ func validateEncryptParams(encryptType, keyID string) (string, error) {
- 	}
- }
- 
--func secureMount(ctx context.Context, device, mountPoint, fsType, encryptType, keyID, mapperName string) error {
-+func secureMount(ctx context.Context, device, mountPoint, fsType, encryptType, keyID, mapperName string, readOnly bool, mountOptions []string) error {
- 	normalized, err := validateEncryptParams(encryptType, keyID)
- 	if err != nil {
- 		return err
-@@ -892,9 +925,12 @@ func secureMount(ctx context.Context, device, mountPoint, fsType, encryptType, k
- 	if mapperName != "" {
- 		options["mapperName"] = mapperName
- 	}
-+	if readOnly {
-+		options["readOnly"] = "true"
-+	}
- 
- 	// Upstream SecureMountResponse is empty; mount point is the path we requested.
--	if err := client.secureMount(ctx, "block-device", options, []string{}, mountPoint); err != nil {
-+	if err := client.secureMount(ctx, "block-device", options, mountOptions, mountPoint); err != nil {
- 		return fmt.Errorf("CDH secure_mount failed for %s: %w", device, err)
- 	}
- 
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor_test.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor_test.go
-index ece31ca4..6dd22264 100644
+index 789c896e..5240f068 100644
 --- a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor_test.go
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor_test.go
-@@ -1001,7 +1001,7 @@ func TestCloudVolumesJSONParseError(t *testing.T) {
+@@ -949,7 +949,7 @@ func TestCloudVolumesJSONParseError(t *testing.T) {
  					Namespaces: []*pb.LinuxNamespace{},
  				},
  				Annotations: map[string]string{
@@ -1353,7 +1441,7 @@ index ece31ca4..6dd22264 100644
  				},
  			},
  		}
-@@ -1009,7 +1009,7 @@ func TestCloudVolumesJSONParseError(t *testing.T) {
+@@ -957,7 +957,7 @@ func TestCloudVolumesJSONParseError(t *testing.T) {
  		ctx := context.Background()
  		_, err := i.CreateContainer(ctx, req)
  		assert.Error(t, err)
@@ -1362,7 +1450,7 @@ index ece31ca4..6dd22264 100644
  	})
  
  	t.Run("unsupported filesystem type returns error", func(t *testing.T) {
-@@ -1026,7 +1026,7 @@ func TestCloudVolumesJSONParseError(t *testing.T) {
+@@ -974,7 +974,7 @@ func TestCloudVolumesJSONParseError(t *testing.T) {
  					Namespaces: []*pb.LinuxNamespace{},
  				},
  				Annotations: map[string]string{
@@ -1371,7 +1459,7 @@ index ece31ca4..6dd22264 100644
  				},
  			},
  		}
-@@ -1059,7 +1059,7 @@ func TestCloudVolumesJSONParseError(t *testing.T) {
+@@ -1007,7 +1007,7 @@ func TestCloudVolumesJSONParseError(t *testing.T) {
  		ctx := context.Background()
  		_, err := i.CreateContainer(ctx, req)
  		assert.Error(t, err)
@@ -1380,7 +1468,7 @@ index ece31ca4..6dd22264 100644
  	})
  
  	t.Run("invalid lun value returns error", func(t *testing.T) {
-@@ -1076,7 +1076,7 @@ func TestCloudVolumesJSONParseError(t *testing.T) {
+@@ -1024,7 +1024,7 @@ func TestCloudVolumesJSONParseError(t *testing.T) {
  					Namespaces: []*pb.LinuxNamespace{},
  				},
  				Annotations: map[string]string{
@@ -1389,7 +1477,7 @@ index ece31ca4..6dd22264 100644
  				},
  			},
  		}
-@@ -1087,7 +1087,7 @@ func TestCloudVolumesJSONParseError(t *testing.T) {
+@@ -1035,7 +1035,7 @@ func TestCloudVolumesJSONParseError(t *testing.T) {
  		assert.Contains(t, err.Error(), "invalid lun")
  	})
  
@@ -1398,7 +1486,7 @@ index ece31ca4..6dd22264 100644
  		mock := &mockRedirector{}
  		i := &interceptor{
  			Redirector: mock,
-@@ -1101,14 +1101,14 @@ func TestCloudVolumesJSONParseError(t *testing.T) {
+@@ -1049,14 +1049,14 @@ func TestCloudVolumesJSONParseError(t *testing.T) {
  					Namespaces: []*pb.LinuxNamespace{},
  				},
  				Annotations: map[string]string{
@@ -1415,7 +1503,7 @@ index ece31ca4..6dd22264 100644
  		assert.Error(t, err)
  		assert.Contains(t, err.Error(), "cloud volume vol-0")
  	})
-@@ -1139,6 +1139,11 @@ func TestCloudVolumesJSONParseError(t *testing.T) {
+@@ -1087,6 +1087,11 @@ func TestCloudVolumesJSONParseError(t *testing.T) {
  	})
  }
  
@@ -1428,7 +1516,7 @@ index ece31ca4..6dd22264 100644
  	t.Run("returns false for nonexistent device", func(t *testing.T) {
  		assert.False(t, hasPartitions("nonexistent_device_xyz"))
 diff --git a/src/cloud-api-adaptor/pkg/util/cloud.go b/src/cloud-api-adaptor/pkg/util/cloud.go
-index 8e555f91..1e14dbec 100644
+index 39f3f462..be4f7411 100644
 --- a/src/cloud-api-adaptor/pkg/util/cloud.go
 +++ b/src/cloud-api-adaptor/pkg/util/cloud.go
 @@ -1,17 +1,11 @@
@@ -1449,7 +1537,7 @@ index 8e555f91..1e14dbec 100644
  	cri "github.com/containerd/containerd/pkg/cri/annotations"
  	hypannotations "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/annotations"
  )
-@@ -120,97 +114,3 @@ func Contains(slice []string, s string) bool {
+@@ -149,95 +143,3 @@ func Contains(slice []string, s string) bool {
  	}
  	return false
  }
@@ -1473,13 +1561,11 @@ index 8e555f91..1e14dbec 100644
 -// CloudVolumeAnnotation is the schema for each entry in the cloud_volumes
 -// annotation. It is serialized by the proxy and deserialized by the interceptor.
 -type CloudVolumeAnnotation struct {
--	MountPoint  string `json:"mount_point"`
--	FSType      string `json:"fs_type"`
--	LUN         string `json:"lun"`
--	DiskID      string `json:"disk_id"`
--	FSGroup     string `json:"fs_group,omitempty"`
--	EncryptType string `json:"encrypt_type,omitempty"`
--	KeyID       string `json:"key_id,omitempty"`
+-	MountPoint string `json:"mount_point"`
+-	FSType     string `json:"fs_type"`
+-	LUN        string `json:"lun"`
+-	DiskID     string `json:"disk_id"`
+-	FSGroup    string `json:"fs_group,omitempty"`
 -}
 -
 -// GetCSIVolumesForPod scans the shared direct-volumes directory for
@@ -1490,7 +1576,7 @@ index 8e555f91..1e14dbec 100644
 -func GetCSIVolumesForPod(annotations map[string]string) []provider.CloudVolume {
 -	var volumes []provider.CloudVolume
 -
--	podUID := annotations[cri.SandboxUID]
+-	podUID := GetPodUID(annotations)
 -
 -	entries, err := os.ReadDir(KataDirectVolumesDir)
 -	if err != nil {
@@ -1548,7 +1634,7 @@ index 8e555f91..1e14dbec 100644
 -	return volumes
 -}
 diff --git a/src/cloud-api-adaptor/pkg/util/cloud_csi_test.go b/src/cloud-api-adaptor/pkg/util/cloud_csi_test.go
-index 8eeaffdb..31cc45b1 100644
+index b7e0617a..31cc45b1 100644
 --- a/src/cloud-api-adaptor/pkg/util/cloud_csi_test.go
 +++ b/src/cloud-api-adaptor/pkg/util/cloud_csi_test.go
 @@ -8,10 +8,9 @@ import (
@@ -1597,7 +1683,7 @@ index 8eeaffdb..31cc45b1 100644
  	t.Helper()
  	encoded := b64.URLEncoding.EncodeToString([]byte(volumePath))
  	volDir := filepath.Join(dir, encoded)
-@@ -37,191 +63,237 @@ func writeMountInfo(t *testing.T, dir, volumePath string, info map[string]interf
+@@ -37,205 +63,237 @@ func writeMountInfo(t *testing.T, dir, volumePath string, info map[string]interf
  	require.NoError(t, os.WriteFile(filepath.Join(volDir, "mountInfo.json"), data, 0o644))
  }
  
@@ -1605,21 +1691,8 @@ index 8eeaffdb..31cc45b1 100644
 -	setupDirectVolumesDir(t)
 -	volumes := GetCSIVolumesForPod(map[string]string{})
 -	assert.Nil(t, volumes)
--}
--
--func TestGetCSIVolumesForPod_NonExistentDirectory(t *testing.T) {
--	origDir := KataDirectVolumesDir
--	KataDirectVolumesDir = "/nonexistent/path"
--	defer func() { KataDirectVolumesDir = origDir }()
--
--	volumes := GetCSIVolumesForPod(map[string]string{})
--	assert.Nil(t, volumes)
--}
--
--func TestGetCSIVolumesForPod_SingleVolume(t *testing.T) {
 +func TestDirectVolumeMetadataV1GoldenContract(t *testing.T) {
- 	dir := setupDirectVolumesDir(t)
--	volPath := "/var/lib/kubelet/pods/pod-uid-123/volumes/kubernetes.io~csi/pvc-abc/mount"
++	dir := setupDirectVolumesDir(t)
 +	volumePath := "/var/lib/kubelet/pods/pod-uid-123/volumes/kubernetes.io~csi/pvc-workspace/mount"
 +	encoded := b64.URLEncoding.EncodeToString([]byte(volumePath))
 +	volumeDir := filepath.Join(dir, encoded)
@@ -1627,47 +1700,35 @@ index 8eeaffdb..31cc45b1 100644
 +	golden, err := os.ReadFile(filepath.Join("testdata", "direct-volume-v1.json"))
 +	require.NoError(t, err)
 +	require.NoError(t, os.WriteFile(filepath.Join(volumeDir, "mountInfo.json"), golden, 0o600))
- 
--	writeMountInfo(t, dir, volPath, map[string]interface{}{
--		"device": "/subscriptions/sub1/resourceGroups/rg1/providers/Microsoft.Compute/disks/csi-vol-pvc-abc",
--		"fstype": "ext4",
--	})
++
 +	info, err := ReadDirectVolumeMountInfo(filepath.Join(volumeDir, "mountInfo.json"))
 +	require.NoError(t, err)
 +	assert.Equal(t, "d-workspace123", info.Device)
 +	assert.True(t, info.ReadOnly)
 +	assert.Equal(t, []string{"noatime", "ro"}, info.Options)
 +	assert.Equal(t, "2000", info.FSGroup)
- 
--	volumes := GetCSIVolumesForPod(map[string]string{})
++
 +	resolution, err := ResolveCSIVolumesForPod("pod-uid-123", nil)
 +	require.NoError(t, err)
 +	volumes := resolution.ProviderVolumes()
- 	require.Len(t, volumes, 1)
--	assert.Equal(t, "/subscriptions/sub1/resourceGroups/rg1/providers/Microsoft.Compute/disks/csi-vol-pvc-abc", volumes[0].DiskID)
++	require.Len(t, volumes, 1)
 +	assert.Equal(t, "d-workspace123", volumes[0].DiskID)
  }
  
--func TestGetCSIVolumesForPod_CloudVolumePathTakesPrecedence(t *testing.T) {
+-func TestGetCSIVolumesForPod_NonExistentDirectory(t *testing.T) {
+-	origDir := KataDirectVolumesDir
+-	KataDirectVolumesDir = "/nonexistent/path"
+-	defer func() { KataDirectVolumesDir = origDir }()
 +func TestDirectVolumeResolutionMapsAttachmentsAndMounts(t *testing.T) {
- 	dir := setupDirectVolumesDir(t)
--	volPath := "/var/lib/kubelet/pods/pod-uid-123/volumes/kubernetes.io~csi/pvc-abc/mount"
--
--	writeMountInfo(t, dir, volPath, map[string]interface{}{
--		"device": "fallback-device",
--		"fstype": "ext4",
--		"metadata": map[string]interface{}{
--			"cloud-volume-path": "/subscriptions/sub1/disks/preferred-disk",
--		},
++	dir := setupDirectVolumesDir(t)
 +	podUID := "pod-uid-copy"
 +	volumePath := "/var/lib/kubelet/pods/" + podUID + "/volumes/kubernetes.io~csi/pvc-copy/mount"
 +	writeMountInfo(t, dir, volumePath, map[string]interface{}{
 +		"device": "disk-original", "readonly": true, "options": []string{"nodev", "ro"},
- 	})
++	})
  
 -	volumes := GetCSIVolumesForPod(map[string]string{})
--	require.Len(t, volumes, 1)
--	assert.Equal(t, "/subscriptions/sub1/disks/preferred-disk", volumes[0].DiskID)
+-	assert.Nil(t, volumes)
 +	resolution, err := ResolveCSIVolumesForPod(podUID, nil)
 +	require.NoError(t, err)
 +	attachments := resolution.ProviderVolumes()
@@ -1680,24 +1741,10 @@ index 8eeaffdb..31cc45b1 100644
 +	assert.Equal(t, []string{"nodev", "ro"}, volume.Options)
  }
  
--func TestGetCSIVolumesForPod_PodUIDFiltering(t *testing.T) {
+-func TestGetCSIVolumesForPod_SingleVolume(t *testing.T) {
 +func TestDirectVolumeResolutionLooksUpPodUIDOnce(t *testing.T) {
  	dir := setupDirectVolumesDir(t)
--
--	writeMountInfo(t, dir,
--		"/var/lib/kubelet/pods/pod-uid-AAA/volumes/kubernetes.io~csi/pvc-1/mount",
--		map[string]interface{}{"device": "disk-A", "fstype": "ext4"})
--
--	writeMountInfo(t, dir,
--		"/var/lib/kubelet/pods/pod-uid-BBB/volumes/kubernetes.io~csi/pvc-2/mount",
--		map[string]interface{}{"device": "disk-B", "fstype": "ext4"})
--
--	writeMountInfo(t, dir,
--		"/var/lib/kubelet/pods/pod-uid-AAA/volumes/kubernetes.io~csi/pvc-3/mount",
--		map[string]interface{}{"device": "disk-C", "fstype": "ext4"})
--
--	annotations := map[string]string{
--		cri.SandboxUID: "pod-uid-AAA",
+-	volPath := "/var/lib/kubelet/pods/pod-uid-123/volumes/kubernetes.io~csi/pvc-abc/mount"
 +	podUID := "pod-uid-lookup"
 +	for _, handle := range []string{"pvc-a", "pvc-b"} {
 +		volumePath := "/var/lib/kubelet/pods/" + podUID +
@@ -1705,72 +1752,50 @@ index 8eeaffdb..31cc45b1 100644
 +		writeMountInfo(t, dir, volumePath, map[string]interface{}{
 +			"device": "disk-" + handle,
 +		})
- 	}
--	volumes := GetCSIVolumesForPod(annotations)
--	require.Len(t, volumes, 2)
--
--	diskIDs := []string{volumes[0].DiskID, volumes[1].DiskID}
--	assert.Contains(t, diskIDs, "disk-A")
--	assert.Contains(t, diskIDs, "disk-C")
--	assert.NotContains(t, diskIDs, "disk-B")
--}
--
--func TestGetCSIVolumesForPod_EmptyPodUIDReturnsAll(t *testing.T) {
--	dir := setupDirectVolumesDir(t)
--
--	writeMountInfo(t, dir,
--		"/var/lib/kubelet/pods/pod-uid-AAA/volumes/kubernetes.io~csi/pvc-1/mount",
--		map[string]interface{}{"device": "disk-A", "fstype": "ext4"})
++	}
  
--	writeMountInfo(t, dir,
--		"/var/lib/kubelet/pods/pod-uid-BBB/volumes/kubernetes.io~csi/pvc-2/mount",
--		map[string]interface{}{"device": "disk-B", "fstype": "ext4"})
--
--	volumes := GetCSIVolumesForPod(map[string]string{})
--	assert.Len(t, volumes, 2)
+-	writeMountInfo(t, dir, volPath, map[string]interface{}{
+-		"device": "/subscriptions/sub1/resourceGroups/rg1/providers/Microsoft.Compute/disks/csi-vol-pvc-abc",
+-		"fstype": "ext4",
 +	lookups := 0
 +	resolution, err := ResolveCSIVolumesForPod("", func() (string, error) {
 +		lookups++
 +		return podUID, nil
-+	})
+ 	})
+-
+-	volumes := GetCSIVolumesForPod(map[string]string{})
+-	require.Len(t, volumes, 1)
+-	assert.Equal(t, "/subscriptions/sub1/resourceGroups/rg1/providers/Microsoft.Compute/disks/csi-vol-pvc-abc", volumes[0].DiskID)
 +	require.NoError(t, err)
 +	assert.Equal(t, 1, lookups)
 +	assert.Len(t, resolution.ProviderVolumes(), 2)
  }
  
--func TestGetCSIVolumesForPod_SkipsNonCSIVolumes(t *testing.T) {
+-func TestGetCSIVolumesForPod_CloudVolumePathTakesPrecedence(t *testing.T) {
 +func TestDirectVolumeResolutionRequiresPodUIDLookup(t *testing.T) {
  	dir := setupDirectVolumesDir(t)
+-	volPath := "/var/lib/kubelet/pods/pod-uid-123/volumes/kubernetes.io~csi/pvc-abc/mount"
+-
+-	writeMountInfo(t, dir, volPath, map[string]interface{}{
+-		"device": "fallback-device",
+-		"fstype": "ext4",
+-		"metadata": map[string]interface{}{
+-			"cloud-volume-path": "/subscriptions/sub1/disks/preferred-disk",
+-		},
 +	volumePath := "/var/lib/kubelet/pods/pod-uid-missing/volumes/" +
 +		"kubernetes.io~csi/pvc-missing/mount"
 +	writeMountInfo(t, dir, volumePath, map[string]interface{}{
 +		"device": "disk-missing",
-+	})
+ 	})
  
--	writeMountInfo(t, dir,
--		"/var/lib/kubelet/pods/pod-uid-123/volumes/kubernetes.io~csi/pvc-1/mount",
--		map[string]interface{}{"device": "csi-disk", "fstype": "ext4"})
--
--	writeMountInfo(t, dir,
--		"/var/lib/kubelet/pods/pod-uid-123/volumes/kubernetes.io~configmap/config/mount",
--		map[string]interface{}{"device": "configmap-device", "fstype": "ext4"})
--
 -	volumes := GetCSIVolumesForPod(map[string]string{})
 -	require.Len(t, volumes, 1)
--	assert.Equal(t, "csi-disk", volumes[0].DiskID)
+-	assert.Equal(t, "/subscriptions/sub1/disks/preferred-disk", volumes[0].DiskID)
 +	_, err := ResolveCSIVolumesForPod("", nil)
 +	require.ErrorContains(t, err, "pod UID lookup is required")
  }
  
--func TestGetCSIVolumesForPod_SkipsMissingDiskID(t *testing.T) {
--	dir := setupDirectVolumesDir(t)
--
--	writeMountInfo(t, dir,
--		"/var/lib/kubelet/pods/pod-uid-123/volumes/kubernetes.io~csi/pvc-no-disk/mount",
--		map[string]interface{}{"fstype": "ext4"})
--
--	volumes := GetCSIVolumesForPod(map[string]string{})
--	assert.Empty(t, volumes)
+-func TestGetCSIVolumesForPod_PodUIDFiltering(t *testing.T) {
 +func TestDirectVolumeMetadataV1FailsClosed(t *testing.T) {
 +	valid := func() map[string]interface{} {
 +		return map[string]interface{}{
@@ -1780,10 +1805,20 @@ index 8eeaffdb..31cc45b1 100644
 +			"volume-handle": "pvc-workspace",
 +		}
 +	}
-+	tests := []struct {
+ 	tests := []struct {
+-		name        string
+-		annotations map[string]string
 +		name   string
 +		mutate func(map[string]interface{})
-+	}{
+ 	}{
+-		{
+-			name:        "containerd sandbox uid",
+-			annotations: map[string]string{cri.SandboxUID: "pod-uid-AAA"},
+-		},
+-		{
+-			name:        "cri-o sandbox name",
+-			annotations: map[string]string{cri.SandboxName: "k8s_my-pod_default_pod-uid-AAA_0"},
+-		},
 +		{name: "missing readonly", mutate: func(info map[string]interface{}) { delete(info, "readonly") }},
 +		{name: "wrong version", mutate: func(info map[string]interface{}) { info["version"] = 0 }},
 +		{name: "unsupported filesystem", mutate: func(info map[string]interface{}) { info["fstype"] = "btrfs" }},
@@ -1792,7 +1827,30 @@ index 8eeaffdb..31cc45b1 100644
 +			info["options"] = []string{"atime", "noatime"}
 +		}},
 +		{name: "non-canonical fs-group", mutate: func(info map[string]interface{}) { info["fs-group"] = "02000" }},
-+	}
+ 	}
+-	for _, tt := range tests {
+-		t.Run(tt.name, func(t *testing.T) {
+-			dir := setupDirectVolumesDir(t)
+-
+-			writeMountInfo(t, dir,
+-				"/var/lib/kubelet/pods/pod-uid-AAA/volumes/kubernetes.io~csi/pvc-1/mount",
+-				map[string]interface{}{"device": "disk-A", "fstype": "ext4"})
+-
+-			writeMountInfo(t, dir,
+-				"/var/lib/kubelet/pods/pod-uid-BBB/volumes/kubernetes.io~csi/pvc-2/mount",
+-				map[string]interface{}{"device": "disk-B", "fstype": "ext4"})
+-
+-			writeMountInfo(t, dir,
+-				"/var/lib/kubelet/pods/pod-uid-AAA/volumes/kubernetes.io~csi/pvc-3/mount",
+-				map[string]interface{}{"device": "disk-C", "fstype": "ext4"})
+-
+-			volumes := GetCSIVolumesForPod(tt.annotations)
+-			require.Len(t, volumes, 2)
+-
+-			diskIDs := []string{volumes[0].DiskID, volumes[1].DiskID}
+-			assert.Contains(t, diskIDs, "disk-A")
+-			assert.Contains(t, diskIDs, "disk-C")
+-			assert.NotContains(t, diskIDs, "disk-B")
 +	for _, test := range tests {
 +		t.Run(test.name, func(t *testing.T) {
 +			dir := t.TempDir()
@@ -1804,17 +1862,35 @@ index 8eeaffdb..31cc45b1 100644
 +			require.NoError(t, os.WriteFile(path, data, 0o600))
 +			_, err = ReadDirectVolumeMountInfo(path)
 +			require.Error(t, err)
-+		})
-+	}
+ 		})
+ 	}
  }
  
--func TestGetCSIVolumesForPod_SkipsInvalidJSON(t *testing.T) {
+-func TestGetCSIVolumesForPod_EmptyPodUIDReturnsAll(t *testing.T) {
 -	dir := setupDirectVolumesDir(t)
--	volPath := "/var/lib/kubelet/pods/pod-uid-123/volumes/kubernetes.io~csi/pvc-bad/mount"
--	encoded := b64.URLEncoding.EncodeToString([]byte(volPath))
--	volDir := filepath.Join(dir, encoded)
--	require.NoError(t, os.MkdirAll(volDir, 0o755))
--	require.NoError(t, os.WriteFile(filepath.Join(volDir, "mountInfo.json"), []byte("{invalid json"), 0o644))
+-
+-	writeMountInfo(t, dir,
+-		"/var/lib/kubelet/pods/pod-uid-AAA/volumes/kubernetes.io~csi/pvc-1/mount",
+-		map[string]interface{}{"device": "disk-A", "fstype": "ext4"})
+-
+-	writeMountInfo(t, dir,
+-		"/var/lib/kubelet/pods/pod-uid-BBB/volumes/kubernetes.io~csi/pvc-2/mount",
+-		map[string]interface{}{"device": "disk-B", "fstype": "ext4"})
+-
+-	volumes := GetCSIVolumesForPod(map[string]string{})
+-	assert.Len(t, volumes, 2)
+-}
+-
+-func TestGetCSIVolumesForPod_SkipsNonCSIVolumes(t *testing.T) {
+-	dir := setupDirectVolumesDir(t)
+-
+-	writeMountInfo(t, dir,
+-		"/var/lib/kubelet/pods/pod-uid-123/volumes/kubernetes.io~csi/pvc-1/mount",
+-		map[string]interface{}{"device": "csi-disk", "fstype": "ext4"})
+-
+-	writeMountInfo(t, dir,
+-		"/var/lib/kubelet/pods/pod-uid-123/volumes/kubernetes.io~configmap/config/mount",
+-		map[string]interface{}{"device": "configmap-device", "fstype": "ext4"})
 +func TestReadDirectVolumeMountInfoRejectsUnsafeFiles(t *testing.T) {
 +	t.Run("symlink", func(t *testing.T) {
 +		dir := t.TempDir()
@@ -1824,26 +1900,37 @@ index 8eeaffdb..31cc45b1 100644
 +		require.NoError(t, os.Symlink(target, path))
  
 -	volumes := GetCSIVolumesForPod(map[string]string{})
--	assert.Empty(t, volumes)
+-	require.Len(t, volumes, 1)
+-	assert.Equal(t, "csi-disk", volumes[0].DiskID)
 -}
+-
+-func TestGetCSIVolumesForPod_SkipsMissingDiskID(t *testing.T) {
+-	dir := setupDirectVolumesDir(t)
 +		_, err := ReadDirectVolumeMountInfo(path)
 +		require.ErrorIs(t, err, unix.ELOOP)
 +	})
  
--func TestGetCSIVolumesForPod_SkipsNonBase64Directories(t *testing.T) {
--	dir := setupDirectVolumesDir(t)
+-	writeMountInfo(t, dir,
+-		"/var/lib/kubelet/pods/pod-uid-123/volumes/kubernetes.io~csi/pvc-no-disk/mount",
+-		map[string]interface{}{"fstype": "ext4"})
 +	t.Run("fifo", func(t *testing.T) {
 +		path := filepath.Join(t.TempDir(), "mountInfo.json")
 +		require.NoError(t, unix.Mkfifo(path, 0o600))
  
--	require.NoError(t, os.MkdirAll(filepath.Join(dir, "not-base64-encoded"), 0o755))
+-	volumes := GetCSIVolumesForPod(map[string]string{})
+-	assert.Empty(t, volumes)
+-}
 +		_, err := ReadDirectVolumeMountInfo(path)
 +		require.ErrorContains(t, err, "not a regular file")
 +	})
  
--	writeMountInfo(t, dir,
--		"/var/lib/kubelet/pods/pod-uid-123/volumes/kubernetes.io~csi/pvc-ok/mount",
--		map[string]interface{}{"device": "good-disk", "fstype": "ext4"})
+-func TestGetCSIVolumesForPod_SkipsInvalidJSON(t *testing.T) {
+-	dir := setupDirectVolumesDir(t)
+-	volPath := "/var/lib/kubelet/pods/pod-uid-123/volumes/kubernetes.io~csi/pvc-bad/mount"
+-	encoded := b64.URLEncoding.EncodeToString([]byte(volPath))
+-	volDir := filepath.Join(dir, encoded)
+-	require.NoError(t, os.MkdirAll(volDir, 0o755))
+-	require.NoError(t, os.WriteFile(filepath.Join(volDir, "mountInfo.json"), []byte("{invalid json"), 0o644))
 +	t.Run("oversize", func(t *testing.T) {
 +		path := filepath.Join(t.TempDir(), "mountInfo.json")
 +		file, err := os.Create(path)
@@ -1852,20 +1939,32 @@ index 8eeaffdb..31cc45b1 100644
 +		require.NoError(t, file.Close())
  
 -	volumes := GetCSIVolumesForPod(map[string]string{})
--	require.Len(t, volumes, 1)
--	assert.Equal(t, "good-disk", volumes[0].DiskID)
+-	assert.Empty(t, volumes)
 +		_, err = ReadDirectVolumeMountInfo(path)
 +		require.ErrorContains(t, err, "exceeds")
 +	})
  }
  
--func TestGetCSIVolumesForPod_SkipsRegularFiles(t *testing.T) {
+-func TestGetCSIVolumesForPod_SkipsNonBase64Directories(t *testing.T) {
 -	dir := setupDirectVolumesDir(t)
+-
+-	require.NoError(t, os.MkdirAll(filepath.Join(dir, "not-base64-encoded"), 0o755))
+-
+-	writeMountInfo(t, dir,
+-		"/var/lib/kubelet/pods/pod-uid-123/volumes/kubernetes.io~csi/pvc-ok/mount",
+-		map[string]interface{}{"device": "good-disk", "fstype": "ext4"})
+-
+-	volumes := GetCSIVolumesForPod(map[string]string{})
 +func TestDecodeCloudVolumeAnnotations(t *testing.T) {
 +	valid := `{"vol-0":{"mount_point":"/workspace","fs_type":"ext4","lun":"0","disk_id":"d-workspace123","readonly":true,"options":["noatime","ro"],"fs_group":"2000"}}`
 +	volumes, err := DecodeCloudVolumeAnnotations(valid)
 +	require.NoError(t, err)
-+	require.Len(t, volumes, 1)
+ 	require.Len(t, volumes, 1)
+-	assert.Equal(t, "good-disk", volumes[0].DiskID)
+-}
+-
+-func TestGetCSIVolumesForPod_SkipsRegularFiles(t *testing.T) {
+-	dir := setupDirectVolumesDir(t)
 +	assert.True(t, volumes["vol-0"].ReadOnly)
 +	assert.Equal(t, []string{"noatime", "ro"}, volumes["vol-0"].Options)
 +

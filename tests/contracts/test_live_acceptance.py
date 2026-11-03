@@ -30,7 +30,7 @@ class LiveEvidence(unittest.TestCase):
             'ear.trustworthiness-vector': {'hardware': 2, 'configuration': 2, 'executables': 3, 'file-system': 2},
             'ear.veraison.annotated-evidence': {'runtime_data_claims': {'tee-pubkey': {}}, 'tdx': {
                 'uefi_event_logs': [{'type_name': 'EV_EVENT_TAG', 'details': {'unicode_name': 'AAEL',
-                    'data': {'domain': 'confidentialcontainers.org', 'operation': 'initdata', 'content': digest}}}]}}}}}
+                    'data': {'domain': 'github.com/confidential-containers', 'operation': 'InitData', 'content': {'digest': 'sha384:' + digest}}}}]}}}}}
 
         def signed():
             content = b64(b'{"alg":"ES256"}') + '.' + b64(json.dumps(claims).encode())

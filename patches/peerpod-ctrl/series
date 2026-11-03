@@ -1,2 +1,2 @@
-../cloud-api-adaptor/0001a-alibabacloud-confirm-instance-absence-after-delete-errors.patch
-../cloud-api-adaptor/0001b-alibabacloud-protect-retained-disks-before-instance-deletion.patch
+../cloud-api-adaptor/generic/0003-alibabacloud-confirm-delete-absence.patch
+../cloud-api-adaptor/provider/0002-alibabacloud-retained-delete-guard.patch

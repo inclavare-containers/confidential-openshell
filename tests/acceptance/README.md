@@ -5,7 +5,7 @@ TDX sessions and current/cross-role KBS release on a deployed trusted host.
 Follow the [live procedure](../../docs/live-acceptance.md) for its prerequisites,
 private evidence, native Stop/Start and cleanup.
 
-The remaining optional helpers run official Trustee 0.22 on disposable loopback endpoints
+The remaining optional helpers run the pinned official Trustee builds on disposable loopback endpoints
 with synthetic signed claims and resources. They check policy loading and resource
 decisions; they do not contact deployed KBS or establish hardware attestation.
 

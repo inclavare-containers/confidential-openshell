@@ -37,6 +37,7 @@ def validate(data, materialized_mutation=None):
         parent = Path(tmp)
         raw = ('version="0.1.0"\nalgorithm="sha384"\n[data]\n' + '\n'.join(json.dumps(k) + '=' + json.dumps(v) for k, v in data.items())).encode()
         (parent / 'initdata').write_bytes(base64.b64encode(gzip.compress(raw, mtime=0)))
+        (parent / 'initdata.toml').write_bytes(raw)
         (parent / 'initdata.digest').write_text(hashlib.sha384(raw).hexdigest())
         for k, v in data.items():
             (parent / k).write_text(v)
@@ -91,6 +92,8 @@ class GuestContract(unittest.TestCase):
             validate(fixture('workload'), lambda p: (p / 'policy.rego').write_text('allow all'))
         with self.assertRaisesRegex(ValueError, 'digest'):
             validate(fixture('workload'), lambda p: (p / 'initdata.digest').write_text('0' * 96))
+        with self.assertRaisesRegex(ValueError, 'initdata.toml'):
+            validate(fixture('workload'), lambda p: (p / 'initdata.toml').write_text('different input'))
 
     def test_workspace_binding_remains_required(self):
         data = fixture('workload'); body = json.loads(data['openshell-bootstrap.json'])
@@ -135,12 +138,10 @@ class GuestContract(unittest.TestCase):
         cdh = (units / 'confidential-data-hub.service.d/20-confidential.conf').read_text()
         kata = (units / 'kata-agent.service.d/20-confidential.conf').read_text()
         self.assertIn('After=process-user-data.service systemd-time-wait-sync.service', aa)
-        self.assertIn('ExecStartPost=/usr/local/libexec/openshell-guest/extend-initdata', aa)
+        self.assertIn('--initdata-toml /run/peerpod/initdata.toml', aa)
         self.assertIn('Requires=attestation-agent.service', cdh)
         self.assertIn('After=attestation-agent.service', cdh)
         self.assertIn('After=confidential-data-hub.service', kata)
-        extension = (HELPERS / 'extend-initdata').read_text()
-        self.assertIn('process-user-data measure-initdata', extension)
 
     def test_reference_namespace_ingress_default_deny_is_retained(self):
         policy = (ROOT / 'deployment/openshell/network-fence.example.yaml').read_text()

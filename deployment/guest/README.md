@@ -2,13 +2,13 @@
 
 The main profile uses CAA v0.23.0's official Ubuntu mkosi image definitions,
 production profile, UKI boot and SquashFS dm-verity root. Released CoCo guest
-components v0.22.0 provide the TDX AA and CDH. Kata agent 4.2.0 and pause remain
+components at the locked upstream commit provide the TDX AA and CDH. Kata agent 4.2.0 and pause remain
 unmodified released binaries. `deployment/artifacts.lock.json` pins source,
 OCI artifacts and binary hashes.
 
 The only compiled guest integrations are CAA's APF and process-user-data from
 the verified patch tree. The image reuses upstream systemd units; small drop-ins
-validate measured initdata, extend its exact SHA-384 through AA's native ttRPC,
+validate measured initdata, pass its exact TOML to native AA startup binding,
 and gate CDH/Kata/APF startup. Ubuntu `python3` supports the validator and
 workspace initializer; `systemd-timesyncd` with Alibaba NTP corrects the ECS RTC
 before KBS authentication. AA/CDH daemon sources are unchanged. The upstream

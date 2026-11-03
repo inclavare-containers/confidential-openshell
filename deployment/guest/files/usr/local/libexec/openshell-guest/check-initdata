@@ -55,6 +55,8 @@ def main():
     measured_digest = hashlib.sha384(raw).hexdigest().encode("ascii")
     if regular(PARENT / "initdata.digest").strip() != measured_digest:
         raise ValueError("CAA initdata digest differs from exact TOML bytes")
+    if regular(PARENT / "initdata.toml") != raw:
+        raise ValueError("AA initdata.toml differs from exact TOML bytes")
     for name in REQUIRED:
         path = PARENT / name
         if name == "openshell-bootstrap.json" and not path.exists():

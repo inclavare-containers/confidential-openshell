@@ -13,8 +13,8 @@ func TestInitdataEventDigestBinding(t *testing.T) {
 	second := writeBinding(t, dir, "supervisor", "generation-2", "sandbox-2", "KEY", digest("7"))
 	kbs, as := renderSealedPolicies(t, dir)
 	claims, refs := approvedEvidence()
-	refs["AA.eventlog.confidentialcontainers.org.initdata"] = []any{digest("6"), digest("7")}
-	refs["AA.eventlog.confidentialcontainers.org.initdata.sha384"] = map[string]any{
+	refs["AA.eventlog.InitData"] = []any{digest("6"), digest("7")}
+	refs["AA.eventlog.InitData.sha384"] = map[string]any{
 		digest("6"): initdataEventDigest(digest("6")), digest("7"): initdataEventDigest(digest("7")),
 	}
 	for _, tc := range []struct {
@@ -25,11 +25,11 @@ func TestInitdataEventDigestBinding(t *testing.T) {
 	}{
 		{"original canonical event", func(map[string]any) {}, first, true},
 		{"second canonical event", func(event map[string]any) {
-			event["details"].(map[string]any)["data"].(map[string]any)["content"] = digest("7")
+			event["details"].(map[string]any)["data"].(map[string]any)["content"] = map[string]any{"digest": "sha384:" + digest("7")}
 			event["digests"].([]any)[0].(map[string]any)["digest"] = initdataEventDigest(digest("7"))
 		}, second, true},
 		{"approved text replaced but original digest retained", func(event map[string]any) {
-			event["details"].(map[string]any)["data"].(map[string]any)["content"] = digest("7")
+			event["details"].(map[string]any)["data"].(map[string]any)["content"] = map[string]any{"digest": "sha384:" + digest("7")}
 		}, second, false},
 		{"wrong measurement register", func(event map[string]any) { event["index"] = 3 }, first, false},
 		{"missing register", func(event map[string]any) { delete(event, "index") }, first, false},

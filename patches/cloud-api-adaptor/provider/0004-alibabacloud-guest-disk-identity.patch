@@ -1,6 +1,6 @@
-From b277440ae8450c224c5a85c56d77635eb928c05f Mon Sep 17 00:00:00 2001
+From 617565cb392a8308186d7141adb9ce7a0601ebe4 Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
-Date: Tue, 3 Nov 2026 11:58:12 +0800
+Date: Tue, 3 Nov 2026 20:11:27 +0800
 Subject: [PATCH] guest: resolve Alibaba disks by their measured identities
 
 A guest device name is not a stable cloud-disk identity. Resolve Alibaba
@@ -406,7 +406,7 @@ index 00000000..a76665dd
 +	}
 +}
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
-index 0273c78f..7d89ed18 100644
+index ce16854f..029520b3 100644
 --- a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
 @@ -5,6 +5,7 @@ package interceptor
@@ -415,9 +415,9 @@ index 0273c78f..7d89ed18 100644
  	"context"
 +	"errors"
  	"fmt"
- 	"io"
  	"log"
-@@ -449,6 +450,9 @@ func detectCloudProvider() string {
+ 	"net"
+@@ -400,6 +401,9 @@ func detectCloudProvider() string {
  // (SCSI rescan, udev rules), so the entire detection is retried.
  func findDataDiskDevice(lunIdx int, diskID string) (string, error) {
  	provider := detectCloudProvider()
@@ -427,7 +427,7 @@ index 0273c78f..7d89ed18 100644
  	logger.Printf("Cloud provider detected: %s (LUN %d, diskID %s)", provider, lunIdx, diskID)
  
  	maxAttempts := 15
-@@ -464,10 +468,11 @@ func findDataDiskDevice(lunIdx int, diskID string) (string, error) {
+@@ -415,10 +419,11 @@ func findDataDiskDevice(lunIdx int, diskID string) (string, error) {
  		}
  	}
  
@@ -440,7 +440,7 @@ index 0273c78f..7d89ed18 100644
  	for attempt := 1; attempt <= maxAttempts; attempt++ {
  		if attempt > 1 {
  			logger.Printf("Retry %d/%d for LUN %d...", attempt, maxAttempts, lunIdx)
-@@ -475,6 +480,15 @@ func findDataDiskDevice(lunIdx int, diskID string) (string, error) {
+@@ -426,6 +431,15 @@ func findDataDiskDevice(lunIdx int, diskID string) (string, error) {
  		}
  
  		switch provider {
@@ -456,7 +456,7 @@ index 0273c78f..7d89ed18 100644
  		case "azure":
  			if dev, err := findAzureDataDisk(lunIdx); err == nil {
  				return dev, nil
-@@ -489,12 +503,17 @@ func findDataDiskDevice(lunIdx int, diskID string) (string, error) {
+@@ -440,12 +454,17 @@ func findDataDiskDevice(lunIdx int, diskID string) (string, error) {
  			}
  		}
  

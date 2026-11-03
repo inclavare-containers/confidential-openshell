@@ -1,0 +1,196 @@
+From 2bdbe638a97258d1cb6abedcc84f51828526121a Mon Sep 17 00:00:00 2001
+From: Weidong Sun <sunweidong@linux.alibaba.com>
+Date: Tue, 3 Nov 2026 20:11:26 +0800
+Subject: [PATCH] volumes: apply fsGroup to retained contents
+
+Apply group ownership and access recursively while preserving file owners and existing execute bits. Set directory setgid for new files, avoid following symlinks, and report failures to the caller.
+
+Generated-by: OpenAI Codex
+---
+ .../pkg/forwarder/interceptor/fsgroup.go      | 64 +++++++++++++++
+ .../pkg/forwarder/interceptor/fsgroup_test.go | 78 +++++++++++++++++++
+ .../pkg/forwarder/interceptor/interceptor.go  | 12 +--
+ 3 files changed, 144 insertions(+), 10 deletions(-)
+ create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/fsgroup.go
+ create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/fsgroup_test.go
+
+diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/fsgroup.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/fsgroup.go
+new file mode 100644
+index 00000000..805d7edb
+--- /dev/null
++++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/fsgroup.go
+@@ -0,0 +1,64 @@
++// (C) Copyright Confidential Containers Contributors
++// SPDX-License-Identifier: Apache-2.0
++
++package interceptor
++
++import (
++	"fmt"
++	"io/fs"
++	"os"
++	"strconv"
++)
++
++// Apply group access recursively without changing owners or following symlinks.
++func applyCloudVolumeFSGroup(path, group string, readOnly bool) error {
++	if group == "" || readOnly {
++		return nil
++	}
++	root, err := os.OpenRoot(path)
++	if err != nil {
++		return fmt.Errorf("open fsGroup volume %s: %w", path, err)
++	}
++	defer root.Close()
++	gid, err := strconv.ParseUint(group, 10, 32)
++	if err != nil {
++		return fmt.Errorf("invalid fsGroup %q: %w", group, err)
++	}
++	apply := func(path string, info os.FileInfo) error {
++		if info.Mode()&os.ModeSymlink != 0 {
++			return nil
++		}
++		mode := info.Mode() | 0o660
++		if info.IsDir() {
++			mode |= 0o110 | os.ModeSetgid
++		}
++		if err := root.Chown(path, -1, int(gid)); err != nil {
++			return err
++		}
++		return root.Chmod(path, mode)
++	}
++	err = fs.WalkDir(root.FS(), ".", func(current string, entry os.DirEntry, walkErr error) error {
++		if walkErr != nil {
++			return walkErr
++		}
++		if current == "." {
++			return nil
++		}
++		info, err := entry.Info()
++		if err != nil {
++			return err
++		}
++		return apply(current, info)
++	})
++	if err == nil {
++		var info os.FileInfo
++		info, err = root.Lstat(".")
++		if err == nil {
++			err = apply(".", info)
++		}
++	}
++	if err != nil {
++		return fmt.Errorf("apply fsGroup to %s: %w", path, err)
++	}
++	return nil
++}
+diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/fsgroup_test.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/fsgroup_test.go
+new file mode 100644
+index 00000000..e5bbc00d
+--- /dev/null
++++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/fsgroup_test.go
+@@ -0,0 +1,78 @@
++// (C) Copyright Confidential Containers Contributors
++// SPDX-License-Identifier: Apache-2.0
++
++package interceptor
++
++import (
++	"os"
++	"os/exec"
++	"path/filepath"
++	"syscall"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++)
++
++func TestFSGroupRetainedContentAndInheritance(t *testing.T) {
++	if os.Geteuid() != 0 {
++		t.Skip("requires chown and process credentials")
++	}
++	root, err := os.MkdirTemp("/var/tmp", "caa-fsgroup-")
++	require.NoError(t, err)
++	t.Cleanup(func() { _ = os.RemoveAll(root) })
++	require.NoError(t, os.Chmod(root, 0755))
++	volume := filepath.Join(root, "workspace")
++	nested := filepath.Join(volume, "nested")
++	require.NoError(t, os.MkdirAll(nested, 0700))
++	file := filepath.Join(nested, "retained")
++	require.NoError(t, os.WriteFile(file, []byte("retained data"), 0600))
++	for _, p := range []string{volume, nested, file} {
++		require.NoError(t, os.Chown(p, 1002, 1002))
++	}
++	outside := filepath.Join(root, "outside")
++	require.NoError(t, os.Mkdir(outside, 0700))
++	require.NoError(t, os.WriteFile(filepath.Join(outside, "untouched"), []byte("outside"), 0600))
++	require.NoError(t, os.Symlink(outside, filepath.Join(nested, "link")))
++	require.NoError(t, applyCloudVolumeFSGroup(volume, "2000", false))
++	for _, p := range []string{volume, nested, file} {
++		info, err := os.Stat(p)
++		require.NoError(t, err)
++		st := info.Sys().(*syscall.Stat_t)
++		require.EqualValues(t, 1002, st.Uid)
++		require.EqualValues(t, 2000, st.Gid)
++		if info.IsDir() {
++			require.NotZero(t, info.Mode()&os.ModeSetgid)
++		} else {
++			require.Zero(t, info.Mode().Perm()&0111, "made a data file executable")
++		}
++	}
++	outsideInfo, err := os.Stat(filepath.Join(outside, "untouched"))
++	require.NoError(t, err)
++	require.EqualValues(t, 0, outsideInfo.Sys().(*syscall.Stat_t).Gid)
++	require.Equal(t, os.FileMode(0600), outsideInfo.Mode().Perm())
++	// A process whose primary GID differs from fsGroup must read/write retained
++	// content and create files inheriting the volume's group.
++	cmd := exec.Command("sh", "-c", `cat "$1/nested/retained" >/dev/null && echo appended >> "$1/nested/retained" && touch "$1/nested/new"`, "sh", volume)
++	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: 1001, Gid: 1001, Groups: []uint32{2000}}}
++	out, err := cmd.CombinedOutput()
++	require.NoError(t, err, string(out))
++	info, err := os.Stat(filepath.Join(nested, "new"))
++	require.NoError(t, err)
++	require.EqualValues(t, 2000, info.Sys().(*syscall.Stat_t).Gid)
++	// Retained files can be reassigned for a later workload group.
++	require.NoError(t, applyCloudVolumeFSGroup(volume, "3000", false))
++	info, err = os.Stat(file)
++	require.NoError(t, err)
++	require.EqualValues(t, 3000, info.Sys().(*syscall.Stat_t).Gid)
++}
++
++func TestFSGroupReadOnlyDoesNotMutate(t *testing.T) {
++	root := t.TempDir()
++	before, err := os.Stat(root)
++	require.NoError(t, err)
++	require.NoError(t, applyCloudVolumeFSGroup(root, "2000", true))
++	after, err := os.Stat(root)
++	require.NoError(t, err)
++	require.Equal(t, before.Mode(), after.Mode())
++	require.Equal(t, before.Sys().(*syscall.Stat_t).Gid, after.Sys().(*syscall.Stat_t).Gid)
++}
+diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
+index a5b3cfbe..b32afaf7 100644
+--- a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
++++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
+@@ -185,16 +185,8 @@ func (i *interceptor) CreateContainer(ctx context.Context, req *pb.CreateContain
+ 			}
+ 			i.cloudMountPaths = append(i.cloudMountPaths, hostMountPoint)
+ 
+-			if fsGroupStr := volInfo.FSGroup; fsGroupStr != "" {
+-				if gid, err := strconv.Atoi(fsGroupStr); err == nil {
+-					logger.Printf("cloud volume %s: applying fsGroup %d to %s", volName, gid, hostMountPoint)
+-					if err := os.Chown(hostMountPoint, -1, gid); err != nil {
+-						logger.Printf("WARNING: failed to chown %s to gid %d: %v", hostMountPoint, gid, err)
+-					}
+-					if err := os.Chmod(hostMountPoint, 0o2775); err != nil {
+-						logger.Printf("WARNING: failed to chmod %s: %v", hostMountPoint, err)
+-					}
+-				}
++			if err := applyCloudVolumeFSGroup(hostMountPoint, volInfo.FSGroup, false); err != nil {
++				return nil, err
+ 			}
+ 
+ 			rewrote := false
+-- 
+2.43.7
+

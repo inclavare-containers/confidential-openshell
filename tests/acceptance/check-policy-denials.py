@@ -48,12 +48,13 @@ def sha256_file(path):
 def signed_token(issuer, issuer_jwk, tee_pubkey, digest, tcb="OutOfDate", attributes="0000001000000000",
                  event_digest_override=None, index=4, digest_matches_event=True):
     header = {"alg": "ES256", "jwk": issuer_jwk}
-    text = f"confidentialcontainers.org initdata {digest}".encode("ascii")
+    text = ('github.com/confidential-containers InitData '
+            f'{{"digest":"sha384:{digest}"}}').encode("ascii")
     event_digest = hashlib.sha384(struct.pack("<II", 0x4141454c, len(text)) + text).hexdigest()
     event = {"index": index, "type_name": "EV_EVENT_TAG", "digest_matches_event": digest_matches_event,
              "digests": [{"alg": "SHA-384", "digest": event_digest_override or event_digest}],
              "details": {"unicode_name": "AAEL", "data": {
-        "domain": "confidentialcontainers.org", "operation": "initdata", "content": digest,
+        "domain": "github.com/confidential-containers", "operation": "InitData", "content": {"digest": "sha384:" + digest},
     }}}
     claims = {
         "exp": int(time.time()) + 120, "nbf": int(time.time()) - 10,
@@ -88,7 +89,9 @@ def request(url, token=None):
 def release_command(binary, rootfs=None):
     if rootfs is None:
         return [str(binary)]
-    libraries = [rootfs / "usr/lib/x86_64-linux-gnu", rootfs / "lib/x86_64-linux-gnu"]
+    libraries = [rootfs / path for path in (
+        "usr/lib/x86_64-linux-gnu", "lib/x86_64-linux-gnu",
+        "usr/local/lib/x86_64-linux-gnu", "usr/local/lib")]
     loader = next((path / "ld-linux-x86-64.so.2" for path in libraries
                    if (path / "ld-linux-x86-64.so.2").is_file()), None)
     if loader is None:

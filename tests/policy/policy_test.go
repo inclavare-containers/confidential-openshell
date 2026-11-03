@@ -241,9 +241,9 @@ func approvedEvidence() (map[string]any, map[string]any) {
 		events = append(events, event(1, "EV_PLATFORM_CONFIG_FLAGS", name, digest("a")))
 	}
 	body["rtmr_0"] = digest("9") // Native verifier owns full CCEL replay, including dynamic ACPI.
-	events = append(events, map[string]any{"index": 4, "type_name": "EV_EVENT_TAG", "digest_matches_event": true, "details": map[string]any{"unicode_name": "AAEL", "data": map[string]any{"domain": "confidentialcontainers.org", "operation": "initdata", "content": digest("6")}}, "digests": []any{map[string]any{"alg": "SHA-384", "digest": initdataEventDigest(digest("6"))}}})
-	refs["AA.eventlog.confidentialcontainers.org.initdata"] = []any{digest("6")}
-	refs["AA.eventlog.confidentialcontainers.org.initdata.sha384"] = map[string]any{digest("6"): initdataEventDigest(digest("6"))}
+	events = append(events, map[string]any{"index": 4, "type_name": "EV_EVENT_TAG", "digest_matches_event": true, "details": map[string]any{"unicode_name": "AAEL", "data": map[string]any{"domain": "github.com/confidential-containers", "operation": "InitData", "content": map[string]any{"digest": "sha384:" + digest("6")}}}, "digests": []any{map[string]any{"alg": "SHA-384", "digest": initdataEventDigest(digest("6"))}}})
+	refs["AA.eventlog.InitData"] = []any{digest("6")}
+	refs["AA.eventlog.InitData.sha384"] = map[string]any{digest("6"): initdataEventDigest(digest("6"))}
 	return map[string]any{"tdx": map[string]any{"tcb_status": "UpToDate", "quote": map[string]any{"header": map[string]any{"tee_type": "81000000", "vendor_id": "939a7233f79c4ca9940a0db3957f0607"}, "body": body}, "uefi_event_logs": events}}, refs
 }
 func evidenceEvents(claims map[string]any) []any {
@@ -278,7 +278,7 @@ func cloneJSON(t *testing.T, value map[string]any) map[string]any {
 }
 func digest(value string) string { return strings.Repeat(value, 96) }
 func initdataEventDigest(value string) string {
-	text := []byte("confidentialcontainers.org initdata " + value)
+	text := []byte(`github.com/confidential-containers InitData {"digest":"sha384:` + value + `"}`)
 	event := make([]byte, 8+len(text))
 	binary.LittleEndian.PutUint32(event, 0x4141454c)
 	binary.LittleEndian.PutUint32(event[4:], uint32(len(text)))
@@ -314,8 +314,8 @@ func evaluate(t *testing.T, module, query string, input, data map[string]any) an
 	// checked-in template is separately evaluated unchanged and remains closed.
 	if module == "tdx-podvm.rego" {
 		refs := data["reference"].(map[string]any)
-		allowed, _ := json.Marshal(refs["AA.eventlog.confidentialcontainers.org.initdata"])
-		events, _ := json.Marshal(refs["AA.eventlog.confidentialcontainers.org.initdata.sha384"])
+		allowed, _ := json.Marshal(refs["AA.eventlog.InitData"])
+		events, _ := json.Marshal(refs["AA.eventlog.InitData.sha384"])
 		content = []byte(strings.ReplaceAll(strings.ReplaceAll(string(content), "approved_initdata := []", "approved_initdata := "+string(allowed)), "approved_initdata_events := {}", "approved_initdata_events := "+string(events)))
 	}
 	return evaluateContent(t, module, string(content), query, input, data)

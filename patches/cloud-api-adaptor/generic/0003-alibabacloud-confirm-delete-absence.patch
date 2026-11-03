@@ -1,4 +1,4 @@
-From 19fca4bf6077833217935a46d6018d6965a493d6 Mon Sep 17 00:00:00 2001
+From cbb75737ec0210339be84250e6720a5cd747f4b4 Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
 Date: Tue, 3 Nov 2026 19:30:00 +0800
 Subject: [PATCH] alibabacloud: confirm instance absence after deletion errors
@@ -62,10 +62,10 @@ index 00000000..7c1e2de8
 +	return false, fmt.Errorf("delete instance %s: %w", instanceID, err)
 +}
 diff --git a/src/cloud-providers/alibabacloud/provider.go b/src/cloud-providers/alibabacloud/provider.go
-index 389f2d11..02425ac0 100644
+index 26312855..411a9d41 100644
 --- a/src/cloud-providers/alibabacloud/provider.go
 +++ b/src/cloud-providers/alibabacloud/provider.go
-@@ -368,32 +368,23 @@ func (p *alibabaCloudProvider) CreateInstance(ctx context.Context, podName, sand
+@@ -369,32 +369,23 @@ func (p *alibabaCloudProvider) CreateInstance(ctx context.Context, podName, sand
  }
  
  func (p *alibabaCloudProvider) DeleteInstance(ctx context.Context, instanceID string) error {

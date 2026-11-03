@@ -49,13 +49,13 @@ def verify_ear(token, public_key):
         raise ValueError('missing guest recipient key')
     events = [e.get('details', {}).get('data', {}) for e in evidence['tdx']['uefi_event_logs']
               if e.get('type_name') == 'EV_EVENT_TAG' and e.get('details', {}).get('unicode_name') == 'AAEL'
-              and e.get('details', {}).get('data', {}).get('operation') == 'initdata']
-    if len(events) != 1 or events[0].get('domain') != 'confidentialcontainers.org':
+              and e.get('details', {}).get('data', {}).get('operation') == 'InitData']
+    if len(events) != 1 or events[0].get('domain') != 'github.com/confidential-containers':
         raise ValueError('unexpected initdata event')
-    digest = events[0].get('content', '')
-    if not re.fullmatch('[0-9a-f]{96}', digest):
+    encoded_digest = events[0].get('content', {}).get('digest', '')
+    if not re.fullmatch('sha384:[0-9a-f]{96}', encoded_digest):
         raise ValueError('invalid initdata digest')
-    return digest
+    return encoded_digest.removeprefix('sha384:')
 
 
 def current_bindings(state, uid):

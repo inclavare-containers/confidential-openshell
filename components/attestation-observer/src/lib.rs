@@ -176,16 +176,17 @@ pub fn summarize(token: &str, key: &DecodingKey, observed_at: u64) -> Result<Rep
         .filter(|e| {
             e["type_name"] == "EV_EVENT_TAG"
                 && e["details"]["unicode_name"] == "AAEL"
-                && e["details"]["data"]["operation"] == "initdata"
+                && e["details"]["data"]["operation"] == "InitData"
         })
         .collect::<Vec<_>>();
     if initdata.len() != 1
-        || initdata[0]["details"]["data"]["domain"] != "confidentialcontainers.org"
+        || initdata[0]["details"]["data"]["domain"] != "github.com/confidential-containers"
     {
         return Err("ambiguous initdata");
     }
-    let digest = initdata[0]["details"]["data"]["content"]
+    let digest = initdata[0]["details"]["data"]["content"]["digest"]
         .as_str()
+        .and_then(|s| s.strip_prefix("sha384:"))
         .filter(|s| is_digest(s))
         .ok_or("invalid initdata digest")?
         .to_owned();

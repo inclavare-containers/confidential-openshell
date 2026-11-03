@@ -87,18 +87,20 @@ initdata_measurement_matches(events) if {
 		some event in events
 		event.type_name == "EV_EVENT_TAG"
 		event.details.unicode_name == "AAEL"
-		event.details.data.operation == "initdata"
+		event.details.data.operation == "InitData"
 	]
 	count(matches) == 1
 	only := matches[0]
 	only.index == 4
 	only.digest_matches_event == true
-	only.details.data.domain == "confidentialcontainers.org"
-	regex.match("^[0-9a-f]{96}$", only.details.data.content)
-	only.details.data.content in approved_initdata
+	only.details.data.domain == "github.com/confidential-containers"
+	encoded_digest := only.details.data.content.digest
+	regex.match("^sha384:[0-9a-f]{96}$", encoded_digest)
+	digest := trim_prefix(encoded_digest, "sha384:")
+	digest in approved_initdata
 	count(only.digests) == 1
 	only.digests[0].alg == "SHA-384"
-	only.digests[0].digest == approved_initdata_events[only.details.data.content]
+	only.digests[0].digest == approved_initdata_events[digest]
 }
 
 td_is_non_debug if {

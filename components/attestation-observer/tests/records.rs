@@ -14,7 +14,7 @@ fn claims() -> Value {
         "ear.trustworthiness-vector": {"hardware": 2},
         "ear.veraison.annotated-evidence": {"tdx": {"tcb_status": "UpToDate", "quote": {"body": {"mr_td": "b".repeat(96)}},
             "uefi_event_logs": [{"type_name":"EV_EVENT_TAG", "details": {"unicode_name": "AAEL",
-                "data": {"operation": "initdata", "domain": "confidentialcontainers.org", "content": "a".repeat(96)}}}]}}
+                "data": {"operation": "InitData", "domain": "github.com/confidential-containers", "content": {"digest": format!("sha384:{}", "a".repeat(96))}}}}]}}
     }}})
 }
 fn signed(key: &KeyPair, value: &Value) -> String {

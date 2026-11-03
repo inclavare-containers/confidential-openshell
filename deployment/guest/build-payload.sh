@@ -43,7 +43,7 @@ find "${tree}" -type d -name __pycache__ -prune -exec rm -rf -- {} +
 find "${tree}" -type f -name '*.pyc' -delete
 
 # The APF/PUD adapters are the only local executable builds. AA/CDH, Kata and
-# pause are unmodified checksum-pinned upstream releases.
+# pause are unmodified checksum-pinned upstream artifacts.
 make -C "${source_dir}" RELEASE_BUILD=true BUILTIN_CLOUD_PROVIDERS=alibabacloud \
     agent-protocol-forwarder process-user-data
 for binary in agent-protocol-forwarder process-user-data; do
@@ -52,7 +52,7 @@ done
 
 for binary in attestation-agent confidential-data-hub api-server-rest; do
     expected="$(jq -r --arg name "${binary}" '.guest_components.binaries[$name].binary_sha256' "${lock}")"
-    cached="${artifacts}/cache/${binary}-0.22.0"
+    cached="${artifacts}/cache/${binary}-$(jq -r '.guest_components.commit' "${lock}")"
     if ! [[ -f "${cached}" && ! -L "${cached}" ]] ||
         ! printf '%s  %s\n' "${expected}" "${cached}" | sha256sum -c - >/dev/null 2>&1; then
         command -v oras >/dev/null

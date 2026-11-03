@@ -26,7 +26,7 @@ protoc-bin-vendored = { workspace = true }
 tonic-prost-build = { workspace = true }
 
 [dev-dependencies]
-rcgen = { workspace = true }
+rcgen = { workspace = true, features = ["aws_lc_rs"] }
 
 [lints]
 workspace = true

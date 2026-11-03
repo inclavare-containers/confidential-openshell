@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stress the renderer with official Trustee 0.22 AS/KBS policy engines.
+"""Stress the renderer with the pinned official Trustee AS/KBS policy engines.
 
 This runs loopback AS/KBS with synthetic sample evidence/tokens and a fixture
 resource. It does not contact production or prove hardware attestation.
@@ -121,13 +121,13 @@ def protobuf_string(number, value):
     return bytes(result) + raw
 
 
-def grpc_call(address, method, payload, area):
+def grpc_call(address, method, payload, area, service="attestation.AttestationService"):
     frame = b"\x00" + struct.pack(">I", len(payload)) + payload
     headers, response = area / "grpc.private.headers", area / "grpc.private.response"
     subprocess.run(["curl", "--silent", "--show-error", "--fail", "--http2-prior-knowledge",
                     "--max-time", "30", "--dump-header", str(headers), "--output", str(response),
                     "--header", "Content-Type: application/grpc", "--header", "TE: trailers",
-                    "--data-binary", "@-", address + "/attestation.AttestationService/" + method],
+                    "--data-binary", "@-", address + "/" + service + "/" + method],
                    input=frame, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     if re.findall(r"^grpc-status:\s*(\d+)\s*$", headers.read_text(), re.I | re.M) != ["0"]:
         raise RuntimeError("isolated released AS returned non-success gRPC status")
@@ -163,11 +163,17 @@ def check_released_as(binary, rootfs, policy, area):
                 time.sleep(0.1)
         else:
             raise RuntimeError("isolated released AS did not bind loopback")
-        public_reference = area / "fixture.references.json"
-        public_reference.write_text(json.dumps({"measurement.fixture.sha384": ["a" * 96]}))
-        subprocess.run(["python3", str(HERE.parents[1] / "deployment/trustee/register-references.py"),
-                        "--address", address, "--references", str(public_reference)],
-                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        # This isolated AS exposes only loopback gRPC. Deployed registration
+        # continues to use the authenticated KBS management API.
+        reference_id = "measurement.fixture.sha384"
+        reference_values = ["a" * 96]
+        message = json.dumps({"version": "0.1.0", "type": "sample", "payload":
+            base64.b64encode(json.dumps({reference_id: reference_values}).encode()).decode()})
+        reference_service = "reference.ReferenceValueProviderService"
+        grpc_call(address, "RegisterReferenceValue", protobuf_string(1, message), area, reference_service)
+        response = grpc_call(address, "QueryReferenceValue", protobuf_string(1, reference_id), area, reference_service)
+        if response != protobuf_string(1, json.dumps(reference_values, separators=(",", ":"))):
+            raise RuntimeError("released AS reference readback differs from registered values")
         raw_policy = policy.read_bytes()
         encoded_policy = base64.urlsafe_b64encode(raw_policy).rstrip(b"=")
         grpc_call(address, "SetAttestationPolicy", protobuf_string(1, "fixture_cpu") + protobuf_string(2, encoded_policy), area)

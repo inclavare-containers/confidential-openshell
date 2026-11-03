@@ -27,7 +27,7 @@ then starts Docker. Success prints Python and Docker server versions.
 ./cos host toolchains
 ```
 
-Installs the pinned Rust 1.95.0 and Go 1.26.7 toolchains. These sources need
+Installs the pinned Rust 1.95.0 and Go 1.26.10 toolchains. These sources need
 newer compiler versions than Ubuntu 24.04 supplies. Matching versions are reused.
 
 ### Release tools

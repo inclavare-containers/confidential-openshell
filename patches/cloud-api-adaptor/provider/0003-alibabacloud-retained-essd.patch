@@ -1,25 +1,17 @@
-From b43c00a361f34d4cd8fbeaf82e4a407a6eb26d69 Mon Sep 17 00:00:00 2001
+From a54501110f9cf521ddfa8d19ad4dd284e17cc34f Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
-Date: Tue, 3 Nov 2026 11:58:12 +0800
+Date: Tue, 3 Nov 2026 20:11:27 +0800
 Subject: [PATCH] alibabacloud: attach and retain ESSD data disks
 
-Attach the requested data disks to the new instance and preserve them
-when deleting the PodVM. Use the CRI sandbox ID as the native
-RunInstances ClientToken and reconcile attachment state through ECS
-queries.
-
-Discover current attachments during deletion, require safe retention
-settings for attached data disks, and wait for their release. Keep
-cancellation and cloud errors visible; apply retained-disk lock checks
-only when data disks exist.
+Attach requested data disks and reconcile their release after instance deletion. Keep the retained-volume guard on every mutation attempt and preserve timeout, cancellation, and cloud failures.
 
 Generated-by: OpenAI Codex
 ---
  .../alibabacloud/delete_instance_test.go      | 410 ++++++++++++++++++
- src/cloud-providers/alibabacloud/provider.go  | 156 ++++++-
+ src/cloud-providers/alibabacloud/provider.go  | 121 +++++-
  src/cloud-providers/alibabacloud/volumes.go   | 267 ++++++++++++
  .../alibabacloud/volumes_test.go              | 253 +++++++++++
- 4 files changed, 1063 insertions(+), 23 deletions(-)
+ 4 files changed, 1036 insertions(+), 15 deletions(-)
  create mode 100644 src/cloud-providers/alibabacloud/delete_instance_test.go
  create mode 100644 src/cloud-providers/alibabacloud/volumes.go
  create mode 100644 src/cloud-providers/alibabacloud/volumes_test.go
@@ -441,34 +433,23 @@ index 00000000..fcef69a3
 +
 +}
 diff --git a/src/cloud-providers/alibabacloud/provider.go b/src/cloud-providers/alibabacloud/provider.go
-index 403f1fd4..96179d5b 100644
+index c24d0a49..e2ce3758 100644
 --- a/src/cloud-providers/alibabacloud/provider.go
 +++ b/src/cloud-providers/alibabacloud/provider.go
-@@ -5,11 +5,13 @@ package alibabacloud
- 
- import (
- 	"context"
-+	"crypto/sha256"
- 	"encoding/base64"
- 	"errors"
- 	"fmt"
- 	"log"
- 	"net/netip"
-+	"sort"
- 	"strconv"
- 	"strings"
- 	"sync"
-@@ -29,6 +31,7 @@ import (
+@@ -33,9 +33,9 @@ import (
  var logger = log.New(log.Writer(), "[adaptor/cloud/alibabacloud] ", log.LstdFlags|log.Lmsgprefix)
  
  const (
-+	sandboxIDTagKey    = "SandboxId"
- 	maxInstanceNameLen = 63
+-	sandboxIDTagKey         = "SandboxId"
+ 	maxInstanceNameLen      = 63
+ 	maxUserDataPayloadBytes = 16 * 1024
++	sandboxIDTagKey         = "SandboxId"
  
  	EnvRoleArn         = "ALIBABA_CLOUD_ROLE_ARN"
-@@ -36,9 +39,13 @@ const (
- 	EnvOidcTokenFile   = "ALIBABA_CLOUD_OIDC_TOKEN_FILE"
- )
+ 	EnvOidcProviderArn = "ALIBABA_CLOUD_OIDC_PROVIDER_ARN"
+@@ -67,9 +67,13 @@ func encodeUserData(data string) (string, error) {
+ 	return base64.StdEncoding.EncodeToString(payload), nil
+ }
  
 +var (
 +	instanceCleanupTimeout      = 10 * time.Minute
@@ -481,7 +462,7 @@ index 403f1fd4..96179d5b 100644
  	RunInstances(
  		params *ecs.RunInstancesRequest) (*ecs.RunInstancesResponse, error)
  	DeleteInstance(
-@@ -49,6 +56,10 @@ type ecsClient interface {
+@@ -80,6 +84,10 @@ type ecsClient interface {
  	// Describe InstanceAttribute
  	DescribeInstanceAttribute(
  		params *ecs.DescribeInstanceAttributeRequest) (*ecs.DescribeInstanceAttributeResponse, error)
@@ -492,17 +473,7 @@ index 403f1fd4..96179d5b 100644
  	// Create NIC
  	CreateNetworkInterface(
  		params *ecs.CreateNetworkInterfaceRequest) (*ecs.CreateNetworkInterfaceResponse, error)
-@@ -199,6 +210,9 @@ func (p *alibabaCloudProvider) getIPs(instanceID string, ecsClient ecsClient) ([
- }
- 
- func (p *alibabaCloudProvider) CreateInstance(ctx context.Context, podName, sandboxID string, cloudConfig cloudinit.CloudConfigGenerator, spec provider.InstanceTypeSpec) (instance *provider.Instance, err error) {
-+	if sandboxID == "" {
-+		return nil, errors.New("sandbox ID is required")
-+	}
- 	// Public IP address
- 	var publicIPAddr *netip.Addr
- 
-@@ -216,14 +230,27 @@ func (p *alibabaCloudProvider) CreateInstance(ctx context.Context, podName, sand
+@@ -252,6 +260,9 @@ func (p *alibabaCloudProvider) CreateInstance(ctx context.Context, podName, sand
  	if err != nil {
  		return nil, err
  	}
@@ -510,72 +481,20 @@ index 403f1fd4..96179d5b 100644
 +		return nil, err
 +	}
  
--	tags := make([]*ecs.RunInstancesRequestTag, 0)
--	for k, v := range p.serviceConfig.Tags {
-+	tagKeys := make([]string, 0, len(p.serviceConfig.Tags))
-+	for key := range p.serviceConfig.Tags {
-+		if key != sandboxIDTagKey {
-+			tagKeys = append(tagKeys, key)
-+		}
-+	}
-+	sort.Strings(tagKeys)
-+	tags := make([]*ecs.RunInstancesRequestTag, 0, len(tagKeys)+2)
-+	for _, k := range tagKeys {
- 		tags = append(tags, &ecs.RunInstancesRequestTag{
- 			Key:   tea.String(k),
--			Value: tea.String(v),
-+			Value: tea.String(p.serviceConfig.Tags[k]),
- 		})
- 	}
-+	tags = append(tags, &ecs.RunInstancesRequestTag{
-+		Key: tea.String(sandboxIDTagKey), Value: tea.String(sandboxID),
-+	})
- 
- 	var req *ecs.RunInstancesRequest
- 
-@@ -239,6 +266,8 @@ func (p *alibabaCloudProvider) CreateInstance(ctx context.Context, podName, sand
- 	}
- 
- 	req = &ecs.RunInstancesRequest{
-+		// ECS owns idempotency; retrying the same CRI sandbox uses the same token.
-+		ClientToken:        tea.String(fmt.Sprintf("%x", sha256.Sum256([]byte(sandboxID)))),
- 		RegionId:           tea.String(p.serviceConfig.Region),
- 		MinAmount:          tea.Int32(1),
- 		Amount:             tea.Int32(1),
-@@ -280,13 +309,14 @@ func (p *alibabaCloudProvider) CreateInstance(ctx context.Context, podName, sand
- 	}
- 
- 	logger.Printf("CreateInstance: name: %q", instanceName)
--
--	result, err := p.ecsClient.RunInstances(req)
-+	response, err := p.ecsClient.RunInstances(req)
- 	if err != nil {
--		return nil, fmt.Errorf("creating instance (%v) returned error: %s", result, err)
-+		return nil, fmt.Errorf("create Alibaba Cloud instance: %w", err)
- 	}
--
--	instanceID := *result.Body.InstanceIdSets.InstanceIdSet[0]
-+	if response == nil || response.Body == nil || response.Body.InstanceIdSets == nil || len(response.Body.InstanceIdSets.InstanceIdSet) != 1 || tea.StringValue(response.Body.InstanceIdSets.InstanceIdSet[0]) == "" {
-+		return nil, errors.New("RunInstances returned no unique instance ID")
-+	}
-+	instanceID := tea.StringValue(response.Body.InstanceIdSets.InstanceIdSet[0])
- 	logger.Printf("created an instance %s for sandbox %s", instanceID, sandboxID)
- 
- 	// Create partial instance to return on error (allows caller to cleanup)
-@@ -320,7 +350,11 @@ func (p *alibabaCloudProvider) CreateInstance(ctx context.Context, podName, sand
+ 	tagKeys := make([]string, 0, len(p.serviceConfig.Tags))
+ 	for key := range p.serviceConfig.Tags {
+@@ -369,6 +380,10 @@ func (p *alibabaCloudProvider) CreateInstance(ctx context.Context, podName, sand
  	}
  	logger.Printf("Instance %s is ready.", instanceID)
  
--	ips, err := p.getIPs(*result.Body.InstanceIdSets.InstanceIdSet[0], p.ecsClient)
 +	if err := p.attachDataDisks(ctx, instanceID, spec.Volumes); err != nil {
 +		return instance, fmt.Errorf("attaching Alibaba Cloud data disks: %w", err)
 +	}
 +
-+	ips, err := p.getIPs(instanceID, p.ecsClient)
+ 	ips, err := p.getIPs(instanceID, p.ecsClient)
  	if err != nil {
  		logger.Printf("failed to get IPs for the instance : %v ", err)
- 		return instance, err
-@@ -374,22 +408,22 @@ func (p *alibabaCloudProvider) DeleteInstance(ctx context.Context, instanceID st
+@@ -423,22 +438,22 @@ func (p *alibabaCloudProvider) DeleteInstance(ctx context.Context, instanceID st
  		return errors.New("refusing to delete an Alibaba Cloud instance without an ID")
  	}
  	logger.Printf("Deleting instance (%s)", instanceID)
@@ -611,7 +530,7 @@ index 403f1fd4..96179d5b 100644
  
  	p.eipsMu.Lock()
  	eipID := p.eips[instanceID]
-@@ -406,6 +440,82 @@ func (p *alibabaCloudProvider) DeleteInstance(ctx context.Context, instanceID st
+@@ -455,6 +470,82 @@ func (p *alibabaCloudProvider) DeleteInstance(ctx context.Context, instanceID st
  	return nil
  }
  

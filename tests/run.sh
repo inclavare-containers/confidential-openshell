@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # Offline checks only: no cloud, quote, KBS resource, model API or deployment.
 set -euo pipefail
-export PATH="/usr/local/go/bin:$PATH"
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
 export GOPROXY=off GOSUMDB=off GOTOOLCHAIN=local

@@ -1,6 +1,6 @@
-From 871cde1fecb25b05e814a4fc57e56e503c69bd6e Mon Sep 17 00:00:00 2001
+From 9a24e4702c05baea7dac47b8d8d86ae59eaae598 Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
-Date: Tue, 3 Nov 2026 11:58:12 +0800
+Date: Tue, 3 Nov 2026 20:11:27 +0800
 Subject: [PATCH] guest: mount retained encrypted volumes through CDH
 
 Reuse the CDH SecureMount API for retained devices with embedded LUKS
@@ -21,19 +21,18 @@ Generated-by: OpenAI Codex
 ---
  .../cmd/agent-protocol-forwarder/main.go      |  26 +-
  .../cmd/agent-protocol-forwarder/main_test.go |  19 +
- .../pkg/forwarder/interceptor/cdh_client.go   |   8 +
- .../pkg/forwarder/interceptor/cloud_volume.go | 529 ++++++++++++++++++
- .../interceptor/cloud_volume_test.go          | 166 ++++++
- .../pkg/forwarder/interceptor/fsgroup_test.go |  79 +++
- .../pkg/forwarder/interceptor/interceptor.go  | 299 ++--------
- .../forwarder/interceptor/interceptor_test.go | 269 +--------
- .../pkg/forwarder/interceptor/workspace.go    | 267 +++++++++
+ .../pkg/forwarder/interceptor/cdh_client.go   |  82 +++
+ .../pkg/forwarder/interceptor/cloud_volume.go | 483 ++++++++++++++++++
+ .../interceptor/cloud_volume_test.go          | 170 ++++++
+ .../pkg/forwarder/interceptor/interceptor.go  | 305 +++++------
+ .../forwarder/interceptor/interceptor_test.go | 225 +-------
+ .../pkg/forwarder/interceptor/workspace.go    | 267 ++++++++++
  .../forwarder/interceptor/workspace_test.go   | 127 +++++
  .../pkg/util/cloud_csi_test.go                |   1 +
- 11 files changed, 1274 insertions(+), 516 deletions(-)
+ 10 files changed, 1295 insertions(+), 410 deletions(-)
+ create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/cdh_client.go
  create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume.go
  create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume_test.go
- create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/fsgroup_test.go
  create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace.go
  create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace_test.go
 
@@ -133,13 +132,70 @@ index 829589f2..4c494076 100644
  		_, cleanup := setupTestConfig(t, `{"pod-namespace": "test-ns"}`,
  			"-tls-skip-verify",
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/cdh_client.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/cdh_client.go
-index 4affce22..008dd7ef 100644
---- a/src/cloud-api-adaptor/pkg/forwarder/interceptor/cdh_client.go
+new file mode 100644
+index 00000000..bb486508
+--- /dev/null
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/cdh_client.go
-@@ -59,6 +59,14 @@ func (c *cdhClient) close() {
- 	}
- }
- 
+@@ -0,0 +1,82 @@
++// (C) Copyright Confidential Containers Contributors
++// SPDX-License-Identifier: Apache-2.0
++
++package interceptor
++
++import (
++	"context"
++	"fmt"
++	"net"
++	"time"
++
++	"github.com/containerd/ttrpc"
++
++	"github.com/confidential-containers/cloud-api-adaptor/src/cloud-api-adaptor/pkg/forwarder/interceptor/cdhpb"
++)
++
++const cdhServiceName = "api.SecureMountService"
++
++type cdhClient struct {
++	client *ttrpc.Client
++}
++
++func newCDHClient(ctx context.Context, socketPath string) (*cdhClient, error) {
++	const maxAttempts = 10
++	const retryDelay = 2 * time.Second
++
++	dialer := &net.Dialer{Timeout: 5 * time.Second}
++
++	var conn net.Conn
++	var err error
++	for attempt := 1; attempt <= maxAttempts; attempt++ {
++		conn, err = dialer.DialContext(ctx, "unix", socketPath)
++		if err == nil {
++			break
++		}
++		if attempt == maxAttempts {
++			break
++		}
++		logger.Printf("CDH socket %s not ready (attempt %d/%d): %v", socketPath, attempt, maxAttempts, err)
++		select {
++		case <-ctx.Done():
++			return nil, fmt.Errorf("dialing CDH socket %s: %w", socketPath, ctx.Err())
++		case <-time.After(retryDelay):
++		}
++	}
++	if err != nil {
++		return nil, fmt.Errorf("dialing CDH socket %s after %d attempts: %w", socketPath, maxAttempts, err)
++	}
++
++	client := ttrpc.NewClient(conn)
++	return &cdhClient{client: client}, nil
++}
++
++func (c *cdhClient) close() {
++	if err := c.client.Close(); err != nil {
++		logger.Printf("WARNING: closing CDH ttrpc client: %v", err)
++	}
++}
++
 +func (c *cdhClient) getResource(ctx context.Context, uri string) ([]byte, error) {
 +	resp := &cdhpb.GetResourceResponse{}
 +	if err := c.client.Call(ctx, "api.GetResourceService", "GetResource", &cdhpb.GetResourceRequest{ResourcePath: uri}, resp); err != nil {
@@ -148,15 +204,27 @@ index 4affce22..008dd7ef 100644
 +	return resp.GetResource(), nil
 +}
 +
- func (c *cdhClient) secureMount(ctx context.Context, volumeType string, options map[string]string, flags []string, mountPoint string) error {
- 	req := &cdhpb.SecureMountRequest{
- 		VolumeType: volumeType,
++func (c *cdhClient) secureMount(ctx context.Context, volumeType string, options map[string]string, flags []string, mountPoint string) error {
++	req := &cdhpb.SecureMountRequest{
++		VolumeType: volumeType,
++		Options:    options,
++		Flags:      flags,
++		MountPoint: mountPoint,
++	}
++	resp := &cdhpb.SecureMountResponse{}
++
++	if err := c.client.Call(ctx, cdhServiceName, "SecureMount", req, resp); err != nil {
++		return fmt.Errorf("CDH SecureMount RPC failed: %w", err)
++	}
++
++	return nil
++}
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume.go
 new file mode 100644
-index 00000000..f0c391af
+index 00000000..b7dd0c3c
 --- /dev/null
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume.go
-@@ -0,0 +1,529 @@
+@@ -0,0 +1,483 @@
 +// (C) Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -166,7 +234,6 @@ index 00000000..f0c391af
 +	"context"
 +	"errors"
 +	"fmt"
-+	"io/fs"
 +	"os"
 +	"os/exec"
 +	"path/filepath"
@@ -330,6 +397,9 @@ index 00000000..f0c391af
 +
 +func prepareCloudVolume(ctx context.Context, name string, volume util.CloudVolumeAnnotation, workspace *workspacePolicy) (*preparedCloudVolume, error) {
 +	lun, _ := strconv.Atoi(volume.LUN) // validated by DecodeCloudVolumeAnnotations
++	if workspace == nil && (volume.EncryptType != "" || volume.KeyID != "") {
++		return nil, errors.New("encrypted cloud volumes require measured workspace policy")
++	}
 +	if workspace != nil {
 +		if err := workspace.authorize(volume); err != nil {
 +			return nil, fmt.Errorf("cloud volume %s: %w", name, err)
@@ -370,7 +440,7 @@ index 00000000..f0c391af
 +		if err := prepareCDHCloudVolume(ctx, prepared, name, device, volume, workspace != nil); err != nil {
 +			return prepared, preserveOriginalError(err, cleanupPreparedCloudVolumes(ctx, prepared))
 +		}
-+		if err := applyCloudVolumeFSGroup(prepared.sourcePath, name, volume); err != nil {
++		if err := applyCloudVolumeFSGroup(prepared.sourcePath, volume.FSGroup, volume.ReadOnly); err != nil {
 +			return prepared, preserveOriginalError(err, cleanupPreparedCloudVolumes(ctx, prepared))
 +		}
 +		return prepared, nil
@@ -379,7 +449,7 @@ index 00000000..f0c391af
 +	if err != nil {
 +		return prepared, fmt.Errorf("mount cloud volume %s: %w", name, err)
 +	}
-+	if err := applyCloudVolumeFSGroup(prepared.sourcePath, name, volume); err != nil {
++	if err := applyCloudVolumeFSGroup(prepared.sourcePath, volume.FSGroup, volume.ReadOnly); err != nil {
 +		return prepared, preserveOriginalError(err, cleanupPreparedCloudVolumes(ctx, prepared))
 +	}
 +	return prepared, nil
@@ -387,56 +457,8 @@ index 00000000..f0c391af
 +
 +// Delegate fsGroup permission semantics without following symlinks outside
 +// the mounted volume. Apply the root last, after all existing content succeeds.
-+func applyCloudVolumeFSGroup(path, name string, volume util.CloudVolumeAnnotation) error {
-+	if volume.FSGroup == "" || volume.ReadOnly {
-+		return nil
-+	}
-+	root, err := os.OpenRoot(path)
-+	if err != nil {
-+		return fmt.Errorf("open fsGroup volume %s: %w", name, err)
-+	}
-+	defer root.Close()
-+	gid, _ := strconv.ParseUint(volume.FSGroup, 10, 32) // decoded and validated
-+	apply := func(path string, info os.FileInfo) error {
-+		if info.Mode()&os.ModeSymlink != 0 {
-+			return nil
-+		}
-+		mode := info.Mode() | 0o660
-+		if info.IsDir() {
-+			mode |= 0o110 | os.ModeSetgid
-+		}
-+		if err := root.Chown(path, -1, int(gid)); err != nil {
-+			return err
-+		}
-+		return root.Chmod(path, mode)
-+	}
-+	err = fs.WalkDir(root.FS(), ".", func(current string, entry os.DirEntry, walkErr error) error {
-+		if walkErr != nil {
-+			return walkErr
-+		}
-+		if current == "." {
-+			return nil
-+		}
-+		info, err := entry.Info()
-+		if err != nil {
-+			return err
-+		}
-+		return apply(current, info)
-+	})
-+	if err == nil {
-+		var info os.FileInfo
-+		info, err = root.Lstat(".")
-+		if err == nil {
-+			err = apply(".", info)
-+		}
-+	}
-+	if err != nil {
-+		return fmt.Errorf("apply fsGroup to %s: %w", name, err)
-+	}
-+	return nil
-+}
 +
-+// CDH 0.22's filesystem mount ignores readonly/flags. Ask it only to open
++// CDH's filesystem mount ignores readonly/flags. Ask it only to open
 +// the encrypted device, then enforce underlay, mapper and filesystem modes here.
 +func prepareCDHCloudVolume(ctx context.Context, prepared *preparedCloudVolume, name, device string, volume util.CloudVolumeAnnotation, measuredWorkspace bool) error {
 +	prepared.cdhMapperName = "caa-" + name
@@ -688,10 +710,10 @@ index 00000000..f0c391af
 +}
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume_test.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume_test.go
 new file mode 100644
-index 00000000..b106e6c4
+index 00000000..0efb07b7
 --- /dev/null
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume_test.go
-@@ -0,0 +1,166 @@
+@@ -0,0 +1,170 @@
 +// (C) Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -788,6 +810,10 @@ index 00000000..b106e6c4
 +}
 +
 +func TestEncryptedVolumeRequiredNeverFallsBackToRawDisk(t *testing.T) {
++	_, untrustedErr := prepareCloudVolume(context.Background(), "vol-0",
++		util.CloudVolumeAnnotation{EncryptType: "luks2", KeyID: "default/key/untrusted"}, nil)
++	assert.ErrorContains(t, untrustedErr, "require measured workspace policy")
++
 +	policy := testWorkspacePolicy()
 +	i := &interceptor{requireEncryptedVolumes: true, workspace: &policy}
 +	req := &pb.CreateContainerRequest{OCI: &pb.Spec{Mounts: []*pb.Mount{{Destination: "/data"}}}}
@@ -858,96 +884,17 @@ index 00000000..b106e6c4
 +	}
 +	require.Error(t, validateWorkspaceMapperStatus("inactive"))
 +}
-diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/fsgroup_test.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/fsgroup_test.go
-new file mode 100644
-index 00000000..21fcc08b
---- /dev/null
-+++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/fsgroup_test.go
-@@ -0,0 +1,79 @@
-+// (C) Copyright Confidential Containers Contributors
-+// SPDX-License-Identifier: Apache-2.0
-+
-+package interceptor
-+
-+import (
-+	"os"
-+	"os/exec"
-+	"path/filepath"
-+	"syscall"
-+	"testing"
-+
-+	"github.com/confidential-containers/cloud-api-adaptor/src/cloud-api-adaptor/pkg/util"
-+	"github.com/stretchr/testify/require"
-+)
-+
-+func TestFSGroupRetainedContentAndInheritance(t *testing.T) {
-+	if os.Geteuid() != 0 {
-+		t.Skip("requires chown and process credentials")
-+	}
-+	root, err := os.MkdirTemp("/var/tmp", "caa-fsgroup-")
-+	require.NoError(t, err)
-+	t.Cleanup(func() { _ = os.RemoveAll(root) })
-+	require.NoError(t, os.Chmod(root, 0755))
-+	volume := filepath.Join(root, "workspace")
-+	nested := filepath.Join(volume, "nested")
-+	require.NoError(t, os.MkdirAll(nested, 0700))
-+	file := filepath.Join(nested, "retained")
-+	require.NoError(t, os.WriteFile(file, []byte("retained data"), 0600))
-+	for _, p := range []string{volume, nested, file} {
-+		require.NoError(t, os.Chown(p, 1002, 1002))
-+	}
-+	outside := filepath.Join(root, "outside")
-+	require.NoError(t, os.Mkdir(outside, 0700))
-+	require.NoError(t, os.WriteFile(filepath.Join(outside, "untouched"), []byte("outside"), 0600))
-+	require.NoError(t, os.Symlink(outside, filepath.Join(nested, "link")))
-+	require.NoError(t, applyCloudVolumeFSGroup(volume, "vol-0", util.CloudVolumeAnnotation{FSGroup: "2000"}))
-+	for _, p := range []string{volume, nested, file} {
-+		info, err := os.Stat(p)
-+		require.NoError(t, err)
-+		st := info.Sys().(*syscall.Stat_t)
-+		require.EqualValues(t, 1002, st.Uid)
-+		require.EqualValues(t, 2000, st.Gid)
-+		if info.IsDir() {
-+			require.NotZero(t, info.Mode()&os.ModeSetgid)
-+		} else {
-+			require.Zero(t, info.Mode().Perm()&0111, "made a data file executable")
-+		}
-+	}
-+	outsideInfo, err := os.Stat(filepath.Join(outside, "untouched"))
-+	require.NoError(t, err)
-+	require.EqualValues(t, 0, outsideInfo.Sys().(*syscall.Stat_t).Gid)
-+	require.Equal(t, os.FileMode(0600), outsideInfo.Mode().Perm())
-+	// A process whose primary GID differs from fsGroup must read/write retained
-+	// content and create files inheriting the volume's group.
-+	cmd := exec.Command("sh", "-c", `cat "$1/nested/retained" >/dev/null && echo appended >> "$1/nested/retained" && touch "$1/nested/new"`, "sh", volume)
-+	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: 1001, Gid: 1001, Groups: []uint32{2000}}}
-+	out, err := cmd.CombinedOutput()
-+	require.NoError(t, err, string(out))
-+	info, err := os.Stat(filepath.Join(nested, "new"))
-+	require.NoError(t, err)
-+	require.EqualValues(t, 2000, info.Sys().(*syscall.Stat_t).Gid)
-+	// Retained files can be reassigned for a later workload group.
-+	require.NoError(t, applyCloudVolumeFSGroup(volume, "vol-0", util.CloudVolumeAnnotation{FSGroup: "3000"}))
-+	info, err = os.Stat(file)
-+	require.NoError(t, err)
-+	require.EqualValues(t, 3000, info.Sys().(*syscall.Stat_t).Gid)
-+}
-+
-+func TestFSGroupReadOnlyDoesNotMutate(t *testing.T) {
-+	root := t.TempDir()
-+	before, err := os.Stat(root)
-+	require.NoError(t, err)
-+	require.NoError(t, applyCloudVolumeFSGroup(root, "vol-0", util.CloudVolumeAnnotation{FSGroup: "2000", ReadOnly: true}))
-+	after, err := os.Stat(root)
-+	require.NoError(t, err)
-+	require.Equal(t, before.Mode(), after.Mode())
-+	require.Equal(t, before.Sys().(*syscall.Stat_t).Gid, after.Sys().(*syscall.Stat_t).Gid)
-+}
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
-index 7d89ed18..91d6096a 100644
+index 029520b3..2740e6c0 100644
 --- a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
-@@ -13,15 +13,13 @@ import (
+@@ -7,20 +7,19 @@ import (
+ 	"context"
+ 	"errors"
+ 	"fmt"
++	"io"
+ 	"log"
+ 	"net"
  	"os"
  	"os/exec"
  	"path/filepath"
@@ -964,74 +911,38 @@ index 7d89ed18..91d6096a 100644
  	specs "github.com/opencontainers/runtime-spec/specs-go"
  	"google.golang.org/protobuf/types/known/emptypb"
  
-@@ -30,10 +28,7 @@ import (
+@@ -29,10 +28,10 @@ import (
  )
  
  const (
 -	volumeTargetPathKey  = "io.confidentialcontainers.org.peerpodvolumes.target_path"
  	cloudVolumeMountBase = "/run/cloud-volumes"
--	volumeCheckInterval  = 5 * time.Second
--	volumeCheckTimeout   = 3 * time.Minute
- 	cdhSocketPath        = "/run/confidential-containers/cdh.sock"
+ 	volumeCheckInterval  = 5 * time.Second
+ 	volumeCheckTimeout   = 3 * time.Minute
++	cdhSocketPath        = "/run/confidential-containers/cdh.sock"
  )
  
-@@ -49,59 +44,14 @@ type Interceptor interface {
- 	agentproto.Redirector
- }
- 
--type cloudMount struct {
--	path       string
--	encrypted  bool
--	mapperName string
--}
--
+ var allowedFSTypes = map[string]bool{
+@@ -50,22 +49,11 @@ type Interceptor interface {
  type interceptor struct {
  	agentproto.Redirector
  
--	nsPath      string
--	cloudMounts []cloudMount
+-	nsPath          string
+-	cloudMountPaths []string
 -}
 -
+-// unmountCloudVolumes unmounts all cloud volume mount points in reverse order.
+-// Called during DestroySandbox to clean up before the PodVM is terminated.
 -func (i *interceptor) unmountCloudVolumes() {
--	for idx := len(i.cloudMounts) - 1; idx >= 0; idx-- {
--		cm := i.cloudMounts[idx]
--		mapperName := cm.mapperName
--		if cm.encrypted && mapperName == "" {
--			mapperName = findMapperForMountPoint(cm.path)
--		}
--		if err := syscall.Unmount(cm.path, 0); err != nil {
--			logger.Printf("WARNING: failed to unmount cloud volume %s: %v", cm.path, err)
--			continue
--		}
--		logger.Printf("Unmounted cloud volume %s", cm.path)
--		if !cm.encrypted {
--			continue
--		}
--		if mapperName == "" {
--			logger.Printf("WARNING: cannot determine LUKS mapper name for %s, skipping cryptsetup close", cm.path)
--			continue
--		}
--		if out, err := exec.Command("cryptsetup", "close", mapperName).CombinedOutput(); err != nil {
--			logger.Printf("WARNING: cryptsetup close %s failed: %v (%s)", mapperName, err, string(out))
+-	for idx := len(i.cloudMountPaths) - 1; idx >= 0; idx-- {
+-		mp := i.cloudMountPaths[idx]
+-		if err := syscall.Unmount(mp, 0); err != nil {
+-			logger.Printf("WARNING: failed to unmount cloud volume %s: %v", mp, err)
 -		} else {
--			logger.Printf("Closed LUKS mapping %s", mapperName)
+-			logger.Printf("Unmounted cloud volume %s", mp)
 -		}
 -	}
--	i.cloudMounts = nil
--}
--
--func findMapperForMountPoint(mountPoint string) string {
--	data, err := os.ReadFile("/proc/mounts")
--	if err != nil {
--		return ""
--	}
--	for _, line := range strings.Split(string(data), "\n") {
--		fields := strings.Fields(line)
--		if len(fields) >= 2 && fields[1] == mountPoint && strings.HasPrefix(fields[0], "/dev/mapper/") {
--			return strings.TrimPrefix(fields[0], "/dev/mapper/")
--		}
--	}
--	return ""
+-	i.cloudMountPaths = nil
 +	nsPath                  string
 +	requireEncryptedVolumes bool
 +	workspace               *workspacePolicy
@@ -1040,7 +951,7 @@ index 7d89ed18..91d6096a 100644
  }
  
  func dial(ctx context.Context, agentSocket string) (net.Conn, error) {
-@@ -132,6 +82,10 @@ func dial(ctx context.Context, agentSocket string) (net.Conn, error) {
+@@ -96,6 +84,10 @@ func dial(ctx context.Context, agentSocket string) (net.Conn, error) {
  }
  
  func NewInterceptor(agentSocket, nsPath string) Interceptor {
@@ -1051,7 +962,7 @@ index 7d89ed18..91d6096a 100644
  
  	agentDialer := func(ctx context.Context) (net.Conn, error) {
  		return dial(ctx, agentSocket)
-@@ -140,8 +94,9 @@ func NewInterceptor(agentSocket, nsPath string) Interceptor {
+@@ -104,8 +96,9 @@ func NewInterceptor(agentSocket, nsPath string) Interceptor {
  	redirector := agentproto.NewRedirector(agentDialer)
  
  	return &interceptor{
@@ -1063,10 +974,12 @@ index 7d89ed18..91d6096a 100644
  	}
  }
  
-@@ -159,106 +114,19 @@ func (i *interceptor) CreateContainer(ctx context.Context, req *pb.CreateContain
+@@ -124,92 +117,19 @@ func (i *interceptor) CreateContainer(ctx context.Context, req *pb.CreateContain
  		logger.Printf("    %s: %q", ns.Type, ns.Path)
  	}
  
+-	// Handle cloud volumes: detect device, format if needed, mount, and
+-	// bind-mount into the container's mount namespace.
 +	var preparedVolumes []*preparedCloudVolume
  	if cvJSON, ok := req.OCI.Annotations[util.CloudVolumesAnnotationKey]; ok && cvJSON != "" {
 -		cloudVolumes, err := util.DecodeCloudVolumeAnnotations(cvJSON)
@@ -1129,29 +1042,13 @@ index 7d89ed18..91d6096a 100644
 -				return nil, fmt.Errorf("cloud volume %s device %s not available: %w", volName, device, err)
 -			}
 -
--			if volInfo.EncryptType != "" {
--				mapperName := "caa-" + safeName
--				if err := secureMount(ctx, device, hostMountPoint, fsType, volInfo.EncryptType, volInfo.KeyID, mapperName, readOnly, options); err != nil {
--					return nil, fmt.Errorf("failed to secure-mount cloud volume %s at %s: %w", volName, hostMountPoint, err)
--				}
--				i.cloudMounts = append(i.cloudMounts, cloudMount{path: hostMountPoint, encrypted: true, mapperName: mapperName})
--			} else {
--				if err := formatAndMount(device, hostMountPoint, fsType, readOnly, options); err != nil {
--					return nil, fmt.Errorf("failed to mount cloud volume %s at %s: %w", volName, hostMountPoint, err)
--				}
--				i.cloudMounts = append(i.cloudMounts, cloudMount{path: hostMountPoint, encrypted: false})
+-			if err := formatAndMount(device, hostMountPoint, fsType, readOnly, options); err != nil {
+-				return nil, fmt.Errorf("failed to mount cloud volume %s at %s: %w", volName, hostMountPoint, err)
 -			}
+-			i.cloudMountPaths = append(i.cloudMountPaths, hostMountPoint)
 -
--			if fsGroupStr := volInfo.FSGroup; fsGroupStr != "" && !readOnly {
--				if gid, err := strconv.Atoi(fsGroupStr); err == nil {
--					logger.Printf("cloud volume %s: applying fsGroup %d to %s", volName, gid, hostMountPoint)
--					if err := os.Chown(hostMountPoint, -1, gid); err != nil {
--						logger.Printf("WARNING: failed to chown %s to gid %d: %v", hostMountPoint, gid, err)
--					}
--					if err := os.Chmod(hostMountPoint, 0o2775); err != nil {
--						logger.Printf("WARNING: failed to chmod %s: %v", hostMountPoint, err)
--					}
--				}
+-			if err := applyCloudVolumeFSGroup(hostMountPoint, volInfo.FSGroup, readOnly); err != nil {
+-				return nil, err
 -			}
 -
 -			rewrote := false
@@ -1178,7 +1075,7 @@ index 7d89ed18..91d6096a 100644
  	if len(req.OCI.Mounts) > 0 {
  		for _, m := range req.OCI.Mounts {
  			if _, err := os.Stat(m.Source); os.IsNotExist(err) && m.Type == "bind" {
-@@ -267,15 +135,6 @@ func (i *interceptor) CreateContainer(ctx context.Context, req *pb.CreateContain
+@@ -218,15 +138,6 @@ func (i *interceptor) CreateContainer(ctx context.Context, req *pb.CreateContain
  					logger.Printf("Failed to create dir: %v", err)
  				}
  			}
@@ -1194,7 +1091,7 @@ index 7d89ed18..91d6096a 100644
  		}
  	}
  
-@@ -283,15 +142,16 @@ func (i *interceptor) CreateContainer(ctx context.Context, req *pb.CreateContain
+@@ -234,15 +145,16 @@ func (i *interceptor) CreateContainer(ctx context.Context, req *pb.CreateContain
  
  	if err != nil {
  		logger.Printf("CreateContainer failed with error: %v", err)
@@ -1215,7 +1112,7 @@ index 7d89ed18..91d6096a 100644
  func normalizeBindMountOptions(options []string, readOnly bool) []string {
  	result := make([]string, 0, len(options)+1)
  	seen := make(map[string]struct{}, len(options)+1)
-@@ -315,43 +175,6 @@ func normalizeBindMountOptions(options []string, readOnly bool) []string {
+@@ -266,43 +178,6 @@ func normalizeBindMountOptions(options []string, readOnly bool) []string {
  	return result
  }
  
@@ -1259,7 +1156,7 @@ index 7d89ed18..91d6096a 100644
  func (i *interceptor) StartContainer(ctx context.Context, req *pb.StartContainerRequest) (*emptypb.Empty, error) {
  
  	logger.Printf("StartContainer: containerID:%s", req.ContainerId)
-@@ -406,7 +229,13 @@ func (i *interceptor) DestroySandbox(ctx context.Context, req *pb.DestroySandbox
+@@ -357,7 +232,13 @@ func (i *interceptor) DestroySandbox(ctx context.Context, req *pb.DestroySandbox
  
  	logger.Printf("DestroySandbox")
  
@@ -1274,7 +1171,7 @@ index 7d89ed18..91d6096a 100644
  
  	res, err := i.Redirector.DestroySandbox(ctx, req)
  
-@@ -776,34 +605,16 @@ func dumpBlockDeviceDiagnostics() {
+@@ -727,34 +608,16 @@ func dumpBlockDeviceDiagnostics() {
  	}
  }
  
@@ -1313,7 +1210,7 @@ index 7d89ed18..91d6096a 100644
  	}
  
  	// Try mounting first — if the disk already has a valid filesystem, this
-@@ -816,7 +627,7 @@ func formatAndMount(device, mountPoint, fsType string, readOnly bool, options []
+@@ -767,7 +630,7 @@ func formatAndMount(device, mountPoint, fsType string, readOnly bool, options []
  	mountCmd := exec.Command("mount", mountArgs...)
  	if mountOut, mountErr := mountCmd.CombinedOutput(); mountErr == nil {
  		logger.Printf("Mounted existing filesystem on %s at %s (type=%s)", device, mountPoint, fsType)
@@ -1322,7 +1219,7 @@ index 7d89ed18..91d6096a 100644
  	} else {
  		logger.Printf("Initial mount of %s failed (expected for new disks): %s", device, strings.TrimSpace(string(mountOut)))
  	}
-@@ -830,9 +641,9 @@ func formatAndMount(device, mountPoint, fsType string, readOnly bool, options []
+@@ -781,9 +644,9 @@ func formatAndMount(device, mountPoint, fsType string, readOnly bool, options []
  			autoMount := exec.Command("mount", mountArgs...)
  			if autoOut, autoErr := autoMount.CombinedOutput(); autoErr == nil {
  				logger.Printf("Mounted %s at %s (auto-detected type from: %s)", device, mountPoint, outStr)
@@ -1334,7 +1231,7 @@ index 7d89ed18..91d6096a 100644
  			}
  		}
  		if err != nil {
-@@ -852,25 +663,25 @@ func formatAndMount(device, mountPoint, fsType string, readOnly bool, options []
+@@ -803,23 +666,99 @@ func formatAndMount(device, mountPoint, fsType string, readOnly bool, options []
  	}
  
  	if !needsFormat {
@@ -1360,67 +1257,89 @@ index 7d89ed18..91d6096a 100644
 +		return false, fmt.Errorf("mount after format %s -> %s failed: %s: %w", device, mountPoint, strings.TrimSpace(string(mountOut)), mountErr)
  	}
  	logger.Printf("Mounted %s at %s (type=%s)", device, mountPoint, fsType)
--	return nil
 +	return true, nil
- }
- 
- // luksMagic is the 6-byte signature at the start of every LUKS1/LUKS2 volume.
-@@ -909,7 +720,7 @@ func validateEncryptParams(encryptType, keyID string) (string, error) {
- 	}
- }
- 
--func secureMount(ctx context.Context, device, mountPoint, fsType, encryptType, keyID, mapperName string, readOnly bool, mountOptions []string) error {
++}
++
++// luksMagic is the 6-byte signature at the start of every LUKS1/LUKS2 volume.
++// Defined in the LUKS on-disk format specification (unchanged since 2004).
++var luksMagic = []byte{'L', 'U', 'K', 'S', 0xba, 0xbe}
++
++func isLuks(device string) (bool, error) {
++	f, err := os.Open(device)
++	if err != nil {
++		return false, fmt.Errorf("opening device %s for LUKS check: %w", device, err)
++	}
++	defer f.Close()
++
++	header := make([]byte, len(luksMagic))
++	if _, err := io.ReadFull(f, header); err != nil {
++		return false, fmt.Errorf("reading LUKS header from %s: %w", device, err)
++	}
++
++	for i := range luksMagic {
++		if header[i] != luksMagic[i] {
++			return false, nil
++		}
++	}
++	return true, nil
++}
++
++func validateEncryptParams(encryptType, keyID string) (string, error) {
++	if keyID == "" {
++		return "", fmt.Errorf("encrypt_type %q requires a kbs-key-id but none was provided", encryptType)
++	}
++	switch strings.ToLower(encryptType) {
++	case "luks", "luks2":
++		return "luks2", nil
++	default:
++		return "", fmt.Errorf("unsupported encrypt_type %q (allowed: luks, luks2)", encryptType)
++	}
++}
++
 +func secureMount(ctx context.Context, device, mountPoint, encryptType, keyID, mapperName string) error {
- 	normalized, err := validateEncryptParams(encryptType, keyID)
- 	if err != nil {
- 		return err
-@@ -919,14 +730,10 @@ func secureMount(ctx context.Context, device, mountPoint, fsType, encryptType, k
- 	if err != nil {
- 		return fmt.Errorf("cannot determine LUKS state of %s (refusing to proceed to avoid data loss): %w", device, err)
- 	}
--	sourceType := "empty"
--	if luks {
--		sourceType = "encrypted"
++	normalized, err := validateEncryptParams(encryptType, keyID)
++	if err != nil {
++		return err
++	}
++
++	luks, err := isLuks(device)
++	if err != nil {
++		return fmt.Errorf("cannot determine LUKS state of %s (refusing to proceed to avoid data loss): %w", device, err)
++	}
 +	if !luks {
 +		return fmt.Errorf("encrypted device %s is not initialized; refusing volatile CDH empty formatting", device)
- 	}
- 
--	logger.Printf("secureMount: device=%s mountPoint=%s sourceType=%s encryptType=%s mapperName=%s",
--		device, mountPoint, sourceType, normalized, mapperName)
--
- 	client, err := newCDHClient(ctx, cdhSocketPath)
- 	if err != nil {
- 		return fmt.Errorf("connecting to CDH at %s: %w", cdhSocketPath, err)
-@@ -935,21 +742,17 @@ func secureMount(ctx context.Context, device, mountPoint, fsType, encryptType, k
- 
- 	options := map[string]string{
- 		"devicePath":     device,
--		"sourceType":     sourceType,
--		"targetType":     "fileSystem",
++	}
++
++	client, err := newCDHClient(ctx, cdhSocketPath)
++	if err != nil {
++		return fmt.Errorf("connecting to CDH at %s: %w", cdhSocketPath, err)
++	}
++	defer client.close()
++
++	options := map[string]string{
++		"devicePath":     device,
 +		"sourceType":     "encrypted",
 +		"targetType":     "device",
- 		"encryptionType": normalized,
--		"filesystemType": fsType,
- 		"key":            "kbs:///" + keyID,
- 	}
- 	if mapperName != "" {
- 		options["mapperName"] = mapperName
- 	}
--	if readOnly {
--		options["readOnly"] = "true"
--	}
- 
- 	// Upstream SecureMountResponse is empty; mount point is the path we requested.
--	if err := client.secureMount(ctx, "block-device", options, mountOptions, mountPoint); err != nil {
++		"encryptionType": normalized,
++		"key":            "kbs:///" + keyID,
++	}
++	if mapperName != "" {
++		options["mapperName"] = mapperName
++	}
++
++	// Upstream SecureMountResponse is empty; mount point is the path we requested.
 +	if err := client.secureMount(ctx, "block-device", options, nil, mountPoint); err != nil {
- 		return fmt.Errorf("CDH secure_mount failed for %s: %w", device, err)
- 	}
- 
++		return fmt.Errorf("CDH secure_mount failed for %s: %w", device, err)
++	}
++
++	logger.Printf("secureMount: CDH mounted %s at %s", device, mountPoint)
+ 	return nil
+ }
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor_test.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor_test.go
-index 6dd22264..1b796161 100644
+index 5240f068..44fd6a8e 100644
 --- a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor_test.go
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor_test.go
-@@ -102,38 +102,6 @@ func TestNewInterceptor(t *testing.T) {
+@@ -124,38 +124,6 @@ func TestNewInterceptor(t *testing.T) {
  	})
  }
  
@@ -1459,7 +1378,7 @@ index 6dd22264..1b796161 100644
  func TestInterceptorCreateContainer(t *testing.T) {
  	t.Run("adds network namespace to container spec", func(t *testing.T) {
  		nsPath := "/run/netns/podns"
-@@ -492,116 +460,6 @@ func TestInterceptorDestroySandbox(t *testing.T) {
+@@ -479,107 +447,6 @@ func TestInterceptorDestroySandbox(t *testing.T) {
  	})
  }
  
@@ -1471,11 +1390,8 @@ index 6dd22264..1b796161 100644
 -		mountSource := filepath.Join(tmpDir, "actual-mount")
 -		require.NoError(t, os.MkdirAll(mountSource, 0o755))
 -
--		mock := &mockRedirector{}
--		i := &interceptor{
--			Redirector: mock,
--			nsPath:     "/run/netns/podns",
--		}
+-		mock := &testutil.MockAgentServiceClient{}
+-		i := newTestInterceptor(mock, "/run/netns/podns")
 -
 -		req := &pb.CreateContainerRequest{
 -			ContainerId: "test-container",
@@ -1499,7 +1415,7 @@ index 6dd22264..1b796161 100644
 -		_, err := i.CreateContainer(ctx, req)
 -
 -		require.NoError(t, err)
--		assert.True(t, mock.createContainerCalled)
+-		assert.True(t, mock.CreateContainerCalled)
 -	})
 -
 -	t.Run("handles empty volume target path annotation", func(t *testing.T) {
@@ -1507,11 +1423,8 @@ index 6dd22264..1b796161 100644
 -		mountSource := filepath.Join(tmpDir, "volume")
 -		require.NoError(t, os.MkdirAll(mountSource, 0o755))
 -
--		mock := &mockRedirector{}
--		i := &interceptor{
--			Redirector: mock,
--			nsPath:     "/run/netns/podns",
--		}
+-		mock := &testutil.MockAgentServiceClient{}
+-		i := newTestInterceptor(mock, "/run/netns/podns")
 -
 -		req := &pb.CreateContainerRequest{
 -			ContainerId: "test-container",
@@ -1535,7 +1448,7 @@ index 6dd22264..1b796161 100644
 -		_, err := i.CreateContainer(ctx, req)
 -
 -		require.NoError(t, err)
--		assert.True(t, mock.createContainerCalled)
+-		assert.True(t, mock.CreateContainerCalled)
 -	})
 -
 -	t.Run("handles missing volume target path annotation", func(t *testing.T) {
@@ -1543,11 +1456,8 @@ index 6dd22264..1b796161 100644
 -		mountSource := filepath.Join(tmpDir, "volume")
 -		require.NoError(t, os.MkdirAll(mountSource, 0o755))
 -
--		mock := &mockRedirector{}
--		i := &interceptor{
--			Redirector: mock,
--			nsPath:     "/run/netns/podns",
--		}
+-		mock := &testutil.MockAgentServiceClient{}
+-		i := newTestInterceptor(mock, "/run/netns/podns")
 -
 -		req := &pb.CreateContainerRequest{
 -			ContainerId: "test-container",
@@ -1569,14 +1479,14 @@ index 6dd22264..1b796161 100644
 -		_, err := i.CreateContainer(ctx, req)
 -
 -		require.NoError(t, err)
--		assert.True(t, mock.createContainerCalled)
+-		assert.True(t, mock.CreateContainerCalled)
 -	})
 -}
 -
  func TestInterceptorCreateContainerWithMountErrors(t *testing.T) {
  	t.Run("handles mount source creation error when MkdirAll fails", func(t *testing.T) {
  		// Create a temp directory with restricted permissions to trigger MkdirAll failure
-@@ -883,83 +741,6 @@ func TestInterceptorCreateSandboxWithDNS(t *testing.T) {
+@@ -837,77 +704,6 @@ func TestInterceptorCreateSandboxWithDNS(t *testing.T) {
  	})
  }
  
@@ -1588,11 +1498,8 @@ index 6dd22264..1b796161 100644
 -		mountSource := filepath.Join(tmpDir, "mount")
 -		require.NoError(t, os.MkdirAll(mountSource, 0o755))
 -
--		mock := &mockRedirector{}
--		i := &interceptor{
--			Redirector: mock,
--			nsPath:     "/run/netns/podns",
--		}
+-		mock := &testutil.MockAgentServiceClient{}
+-		i := newTestInterceptor(mock, "/run/netns/podns")
 -
 -		req := &pb.CreateContainerRequest{
 -			ContainerId: "test-container",
@@ -1616,7 +1523,7 @@ index 6dd22264..1b796161 100644
 -		_, err := i.CreateContainer(ctx, req)
 -
 -		require.NoError(t, err)
--		assert.True(t, mock.createContainerCalled)
+-		assert.True(t, mock.CreateContainerCalled)
 -	})
 -
 -	t.Run("handles annotation with single path and comma", func(t *testing.T) {
@@ -1625,11 +1532,8 @@ index 6dd22264..1b796161 100644
 -		mountSource := filepath.Join(tmpDir, "mount")
 -		require.NoError(t, os.MkdirAll(mountSource, 0o755))
 -
--		mock := &mockRedirector{}
--		i := &interceptor{
--			Redirector: mock,
--			nsPath:     "/run/netns/podns",
--		}
+-		mock := &testutil.MockAgentServiceClient{}
+-		i := newTestInterceptor(mock, "/run/netns/podns")
 -
 -		req := &pb.CreateContainerRequest{
 -			ContainerId: "test-container",
@@ -1653,24 +1557,26 @@ index 6dd22264..1b796161 100644
 -		_, err := i.CreateContainer(ctx, req)
 -
 -		require.NoError(t, err)
--		assert.True(t, mock.createContainerCalled)
+-		assert.True(t, mock.CreateContainerCalled)
 -	})
 -}
 -
  func TestCloudVolumesJSONParseError(t *testing.T) {
  	t.Run("corrupt JSON annotation returns error instead of silently skipping", func(t *testing.T) {
  		mock := &mockRedirector{}
-@@ -1229,25 +1010,6 @@ func TestFindDataDiskBySysfsHCTL(t *testing.T) {
- 		assert.Error(t, err)
+@@ -1179,20 +975,11 @@ func TestFindDataDiskBySysfsHCTL(t *testing.T) {
  	})
  }
--
+ 
 -func TestIsTargetPathEdgeCases(t *testing.T) {
 -	t.Run("handles paths with trailing slashes", func(t *testing.T) {
 -		assert.False(t, isTargetPath("/path/to/target/", "/path/to/target"))
 -		assert.False(t, isTargetPath("/path/to/target", "/path/to/target/"))
 -	})
--
++func TestSecureMountRefusesUninitializedDevice(t *testing.T) {
++	device := filepath.Join(t.TempDir(), "plain-device")
++	require.NoError(t, os.WriteFile(device, make([]byte, 512), 0o600))
+ 
 -	t.Run("handles similar but different paths", func(t *testing.T) {
 -		assert.False(t, isTargetPath("/path/to/target", "/path/to/target2"))
 -		assert.False(t, isTargetPath("/path/to/target2", "/path/to/target"))
@@ -1681,60 +1587,10 @@ index 6dd22264..1b796161 100644
 -		assert.True(t, isTargetPath(path, path))
 -		assert.False(t, isTargetPath(path, "/path/target"))
 -	})
--}
--
- func TestCloudVolumeAnnotation_WithEncryption(t *testing.T) {
- 	jsonStr := `{
- 		"vol-0": {
-@@ -1334,23 +1096,6 @@ func TestSecureMountResponse_ProtoRoundTrip(t *testing.T) {
- 	assert.Equal(t, "/run/cloud-volumes/vol-0", decoded.GetMountPath())
- }
- 
--func TestCloudMounts_EncryptedFlagTracking(t *testing.T) {
--	inter := &interceptor{
--		cloudMounts: []cloudMount{
--			{path: "/run/cloud-volumes/vol-0", encrypted: false},
--			{path: "/run/cloud-volumes/vol-1", encrypted: true, mapperName: "caa-vol-1"},
--		},
--	}
--
--	assert.Len(t, inter.cloudMounts, 2)
--	assert.False(t, inter.cloudMounts[0].encrypted)
--	assert.Equal(t, "", inter.cloudMounts[0].mapperName)
--	assert.True(t, inter.cloudMounts[1].encrypted)
--	assert.Equal(t, "caa-vol-1", inter.cloudMounts[1].mapperName)
--	assert.Equal(t, "/run/cloud-volumes/vol-0", inter.cloudMounts[0].path)
--	assert.Equal(t, "/run/cloud-volumes/vol-1", inter.cloudMounts[1].path)
--}
--
- func TestValidateEncryptParams_RejectsEmptyKeyID(t *testing.T) {
- 	_, err := validateEncryptParams("LUKS", "")
- 	require.Error(t, err)
-@@ -1371,11 +1116,6 @@ func TestValidateEncryptParams_AcceptsValidTypes(t *testing.T) {
- 	}
- }
- 
--func TestFindMapperForMountPoint(t *testing.T) {
--	result := findMapperForMountPoint("/nonexistent/path")
--	assert.Equal(t, "", result, "should return empty for non-mounted path")
--}
--
- func TestIsLuks(t *testing.T) {
- 	t.Run("detects valid LUKS header", func(t *testing.T) {
- 		f := filepath.Join(t.TempDir(), "luks-device")
-@@ -1425,3 +1165,12 @@ func TestIsLuks(t *testing.T) {
- 		assert.True(t, result)
- 	})
- }
-+
-+func TestSecureMountRefusesUninitializedDevice(t *testing.T) {
-+	device := filepath.Join(t.TempDir(), "plain-device")
-+	require.NoError(t, os.WriteFile(device, make([]byte, 512), 0o600))
-+
 +	err := secureMount(context.Background(), device, "/run/cloud-volumes/vol-0",
 +		"luks2", "default/key/volume", "caa-vol-0")
 +	require.ErrorContains(t, err, "not initialized")
-+}
+ }
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace.go
 new file mode 100644
 index 00000000..09d75a6d
