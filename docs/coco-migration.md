@@ -1,6 +1,7 @@
 # CoCo migration validation record
 
-Status: migration in progress; the new stack is not yet a live-accepted release.
+Status: migration and live acceptance passed on 2026-11-03. The dedicated test
+infrastructure has been retired.
 
 ## Preserved baseline
 
@@ -15,9 +16,7 @@ disaster-recovery testing.
 
 The subsequent patch classification/cleanup is saved as `89173caf` on
 `codex/coco-migration-20261103`, followed by the migration work. Its complete
-offline suite passed before migration. It was not relabeled as a new cloud run.
-The previous isolated cloud environment was retired; its old endpoints must not
-be reused for new validation.
+offline suite passed before migration.
 
 ## Selected inputs
 
@@ -63,25 +62,86 @@ The [patch ledger](../patches/storage-review.md) separates generic fixes, ordina
 provider capabilities and confidential-volume policy. Both pending CAA PRs
 [#3435](https://github.com/confidential-containers/cloud-api-adaptor/pull/3435) and
 [#3437](https://github.com/confidential-containers/cloud-api-adaptor/pull/3437)
-remain verbatim patches, rather than assuming they are already merged.
+remain verbatim patches.
 
-## Validation status
+## Validated build
 
-Passed so far: selected artifact provenance, exact patch replay/tree locks,
-generic-only CAA tests, migrated CAA provider tests with the race detector,
-the complete offline suite, and official AS/KBS runtime-policy tests. These
-include adapter/guest tests, controller finalizer checks, CSI conformance,
-policy tests, guest initdata validation, and attestation-observer tests. The observer's standalone
-test now declares its existing crypto backend explicitly instead of depending
-on feature unification with the driver test suite.
+The tested release is `ab6d488b865f55e94378c65ce07fea01445a9c06`. Its handoff
+`SHA256SUMS` file has SHA-256
+`8f7a1c5370bb32905dcb785294a3473ae92921f8c71775175c017adc0ebfd252`.
+The complete release archive and validation evidence were copied back and
+verified locally before retiring the test host.
 
-The runtime-policy harness covers 15 distinct bindings, successful authorized
-resource delivery, six exact policy denials, reference registration/readback,
-policy storage and signed rejection of synthetic non-TDX evidence. It now includes
-the official image's `/usr/local/lib` search path and uses loopback AS gRPC for
-its isolated reference fixture. Deployed management still uses authenticated KBS.
+Passed: upstream artifact provenance, exact patch replay/tree locks,
+generic-only CAA tests, provider race tests, the complete project offline suite,
+official AS/KBS policy execution, native component builds, guest verity and
+measurement derivation, and clean release packaging. The offline suite includes
+driver/observer, adapter/guest, controller finalizer, CSI conformance, policy,
+build-contract and rendered-chart checks.
 
-Pending: guest/container builds and measurement derivation,
-real cloud attestation/key release, persistent-volume lifecycle and cleanup.
-Results will be updated with exact committed inputs; old live evidence is not
-used as proof for the migrated binaries.
+The guest receipt remains at `9de7ff00`. The subsequent build-only commit changed
+the CSI build network option, test PATH and build documentation; guest inputs
+were checked unchanged before packaging. The original accepted Kata shim was
+reused byte-for-byte. The new guest and all migrated runtime components were
+tested in the cloud.
+
+The official runtime-policy harness covers 15 bindings, authorized resource
+delivery, six exact policy denials, reference registration/readback, policy
+storage and signed rejection of synthetic non-TDX evidence. Its isolated
+reference fixture uses loopback AS gRPC; deployed management uses authenticated
+KBS. The harness includes the new image's `/usr/local/lib` search path, and the
+observer's standalone tests declare their crypto backend explicitly.
+
+## Live migration
+
+A dedicated ACK/TDX deployment first ran the accepted `a550a3ae` release, created
+an encrypted workspace and wrote a marker, sealed environment value and private
+file. After Stop, its control state and disk snapshots were preserved before
+installing the migrated release.
+
+The following checks passed:
+
+- The same sandbox CR, PVC, PV, cloud disk and private workspace key survived
+  migration and another Stop/Start cycle. Each start used a new role attempt and
+  workload Pod. Restart initialization remained disabled.
+- Marker and sealed-environment hashes remained identical. The workspace used
+  the encrypted ext4 mapper; recursive fsGroup permissions and directory setgid
+  inheritance worked. The administrator's Gateway configuration was preserved.
+- Independent read-only scans of the entire 2 GiB stopped disk before and after
+  migration found no plaintext marker. The LUKS UUID was unchanged. The inspection
+  did not transfer a key or unlock either clone; both clones were deleted.
+- Both roles produced real, signature-verified TDX EARs with the standard
+  `InitData` event. Own-resource requests returned 200; cross-role requests and
+  requests using unexpired EARs after Stop returned 403 on the migrated stack.
+  Native CLI conditions matched the independently verified current reports.
+- Native Delete removed the migrated sandbox's CR, PVC, PV, disk and role VMs.
+  A separate fresh sandbox recorded both roles changing from HTTP 200 before
+  Delete to HTTP 403 afterwards while their EARs were still unexpired, followed
+  by exact resource-absence checks.
+
+Both roles reported `OutOfDate` TCB status. The existing TCB acceptance policy
+was retained, and native conditions correctly displayed `AttestedWithWarning`.
+The policy was not relaxed for this validation.
+
+Delete withdraws runtime authorization and serving copies. The operator's private
+recovery key and retained volume journal remain by existing design; this is not
+a cryptographic key-erasure claim. The off-host control-state backup is encrypted
+and excludes rebuildable registry/release caches; both public release packages
+are retained separately.
+
+Kata/OpenShell pins and workload images were unchanged. This migration exercised
+native create, exec, upload/download, Stop/Start/Delete, workspace and sealed
+environment operations; external coding-provider calls were not rerun. Full
+recovery onto a replacement host/cluster, LUKS-header authentication, ciphertext
+integrity and rollback protection were not claimed or tested.
+
+## Retirement
+
+After native sandbox deletion, both Helm releases were uninstalled and the CSI
+state PVC, PV and disk were removed. Cloud readbacks confirmed absence of the
+dedicated ACK cluster, owned compute, disks, images, snapshots, OSS bucket,
+networks, load balancer, NAT, EIPs, scaling group and deployment identities.
+The temporary builder and its private network were deleted. Its dedicated API
+ACL was removed, the shared ACL's rules remained unchanged, and the temporary
+proxy tunnel was stopped. Public release packages and private validation records
+remain available locally.
