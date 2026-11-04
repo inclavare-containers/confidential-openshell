@@ -1,31 +1,194 @@
-From d555dcc1c8b6ca6a90d704d555df57eb9d9b70f9 Mon Sep 17 00:00:00 2001
+From 3c89fb780e648a656ce2d7a0cc0968b0f2425de5 Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
-Date: Tue, 3 Nov 2026 11:58:13 +0800
-Subject: [PATCH] alibabacloud: add ESSD support through the provider interface
+Date: Wed, 4 Nov 2026 11:31:52 +0800
+Subject: [PATCH] alibabacloud: add ESSD provider and minimal deployment
+ configuration
 
-Register an Alibaba Cloud provider using the existing block-volume
-interface and ECS SDK. Create ESSD PL0 volumes, recover them through
-cluster and driver tags, and retain the upstream volume-store lifecycle.
+Use existing provider and cloud-recovery interfaces, stable create tokens and SDK credential caching.
+Keep the upstream combined DaemonSet and node-local store; add Alibaba-only RRSA and storage settings.
 
-Use a stable cluster/volume ClientToken for CreateDisk. Reuse the SDK
-credential object across provider instances so its refresh cache
-survives per-RPC construction, while bounding ECS calls and preserving
-cancellation. Cover ambiguous creation and credential reuse with
-SDK-backed tests.
-
-Generated-by: OpenAI Codex
+Co-authored-by: Codex <noreply@openai.com>
 ---
+ README.md                                     |   1 +
+ .../templates/_helpers.tpl                    |   3 +
+ .../templates/bootstrap-params.yaml           |   4 +
+ .../templates/daemonset.yaml                  |  30 ++
+ .../templates/storageclass.yaml               |   7 +-
+ charts/caa-csi-block-driver/values.yaml       |  14 +-
  cmd/main.go                                   |   1 +
+ deploy/bootstrap-params-alibabacloud.yaml     |  15 +
+ deploy/daemonset-alibabacloud.yaml            | 168 +++++++++++
+ deploy/storageclass-alibabacloud.yaml         |  19 ++
+ docs/alibabacloud.md                          |  28 ++
  go.mod                                        |  15 +
  go.sum                                        | 238 +++++++++++++++
  pkg/provider/alibabacloud/credentials_test.go |  80 +++++
  pkg/provider/alibabacloud/provider.go         | 280 ++++++++++++++++++
  pkg/provider/alibabacloud/provider_test.go    | 142 +++++++++
- 6 files changed, 756 insertions(+)
+ 16 files changed, 1043 insertions(+), 2 deletions(-)
+ create mode 100644 deploy/bootstrap-params-alibabacloud.yaml
+ create mode 100644 deploy/daemonset-alibabacloud.yaml
+ create mode 100644 deploy/storageclass-alibabacloud.yaml
+ create mode 100644 docs/alibabacloud.md
  create mode 100644 pkg/provider/alibabacloud/credentials_test.go
  create mode 100644 pkg/provider/alibabacloud/provider.go
  create mode 100644 pkg/provider/alibabacloud/provider_test.go
 
+diff --git a/README.md b/README.md
+index a0d5191f..4e7c8071 100644
+--- a/README.md
++++ b/README.md
+@@ -12,6 +12,7 @@ for volume attachment to PodVMs.
+ |----------|---------|----------------|--------|
+ | **AWS** | EBS Volumes | IAM role or access key credentials | Supported |
+ | **Azure** | Managed Disks | DefaultAzureCredential (Workload Identity, Managed Identity, env vars) | Supported |
++| **Alibaba Cloud** | ESSD PL0 | Alibaba default credential chain | CSI provisioning; [CAA prerequisites](docs/alibabacloud.md) apply |
+ | **Libvirt** | Raw disk files | N/A (local) | Supported (dev/test) |
+ 
+ ## Architecture
+diff --git a/charts/caa-csi-block-driver/templates/_helpers.tpl b/charts/caa-csi-block-driver/templates/_helpers.tpl
+index 93cd7998..a58273e4 100644
+--- a/charts/caa-csi-block-driver/templates/_helpers.tpl
++++ b/charts/caa-csi-block-driver/templates/_helpers.tpl
+@@ -1,4 +1,7 @@
+ {{- define "caa-csi.validateValues" -}}
++{{- if and (eq .Values.provider "alibabacloud") .Values.alibabacloud.rrsa.enabled .Values.alibabacloud.credentialsSecret }}
++{{- fail "Choose RRSA or alibabacloud.credentialsSecret, not both" }}
++{{- end }}
+ {{- if and (eq .Values.provider "aws") .Values.aws.irsa.enabled .Values.aws.staticCredentials.enabled }}
+ {{- fail "aws.irsa.enabled and aws.staticCredentials.enabled are mutually exclusive — choose one authentication method" }}
+ {{- end }}
+diff --git a/charts/caa-csi-block-driver/templates/bootstrap-params.yaml b/charts/caa-csi-block-driver/templates/bootstrap-params.yaml
+index 850081be..d73aa08f 100644
+--- a/charts/caa-csi-block-driver/templates/bootstrap-params.yaml
++++ b/charts/caa-csi-block-driver/templates/bootstrap-params.yaml
+@@ -20,6 +20,10 @@ data:
+       "azureResourceGroup": {{ required "azure.resourceGroup is required when provider=azure" .Values.azure.resourceGroup | quote }},
+       "azureLocation": {{ required "azure.location is required when provider=azure" .Values.azure.location | quote }},
+       "azureDiskSKU": {{ .Values.azure.diskSku | quote }}
++      {{- else if eq .Values.provider "alibabacloud" }},
++      "region": {{ required "alibabacloud.region is required" .Values.alibabacloud.region | quote }},
++      "zoneId": {{ required "alibabacloud.zoneId is required" .Values.alibabacloud.zoneId | quote }},
++      "clusterId": {{ required "alibabacloud.clusterId is required" .Values.alibabacloud.clusterId | quote }}
+       {{- else if eq .Values.provider "libvirt" }},
+       "cloudProviderVolumePath": {{ .Values.libvirt.volumeDir | quote }}
+       {{- end }}
+diff --git a/charts/caa-csi-block-driver/templates/daemonset.yaml b/charts/caa-csi-block-driver/templates/daemonset.yaml
+index 377b0e18..f3192b67 100644
+--- a/charts/caa-csi-block-driver/templates/daemonset.yaml
++++ b/charts/caa-csi-block-driver/templates/daemonset.yaml
+@@ -23,6 +23,9 @@ spec:
+             - "-v=3"
+             - "--csi-address=/csi/csi.sock"
+             - "--worker-threads=5"
++            {{- if eq .Values.provider "alibabacloud" }}
++            - "--leader-election=true"
++            {{- end }}
+             - "--feature-gates=Topology=true"
+           env:
+             - name: NODE_NAME
+@@ -102,6 +105,19 @@ spec:
+                   key: AWS_SECRET_ACCESS_KEY
+             {{- end }}
+             {{- end }}
++          {{- if and (eq .Values.provider "alibabacloud") .Values.alibabacloud.credentialsSecret }}
++          envFrom:
++            - secretRef:
++                name: {{ .Values.alibabacloud.credentialsSecret | quote }}
++          {{- end }}
++            {{- if and (eq .Values.provider "alibabacloud") .Values.alibabacloud.rrsa.enabled }}
++            - name: ALIBABA_CLOUD_ROLE_ARN
++              value: {{ required "alibabacloud.rrsa.roleArn is required" .Values.alibabacloud.rrsa.roleArn | quote }}
++            - name: ALIBABA_CLOUD_OIDC_PROVIDER_ARN
++              value: {{ required "alibabacloud.rrsa.oidcProviderArn is required" .Values.alibabacloud.rrsa.oidcProviderArn | quote }}
++            - name: ALIBABA_CLOUD_OIDC_TOKEN_FILE
++              value: /var/run/secrets/ack.alibabacloud.com/rrsa-tokens/token
++            {{- end }}
+           {{- with .Values.resources.driver }}
+           resources:
+             {{- toYaml . | nindent 12 }}
+@@ -124,6 +140,11 @@ spec:
+             - mountPath: /etc/caa-csi-block
+               name: bootstrap-params
+               readOnly: true
++            {{- if and (eq .Values.provider "alibabacloud") .Values.alibabacloud.rrsa.enabled }}
++            - name: rrsa-oidc-token
++              mountPath: /var/run/secrets/ack.alibabacloud.com/rrsa-tokens
++              readOnly: true
++            {{- end }}
+             {{- if eq .Values.provider "libvirt" }}
+             - mountPath: {{ .Values.libvirt.volumeDir }}
+               name: libvirt-pool
+@@ -158,6 +179,15 @@ spec:
+           configMap:
+             name: {{ include "caa-csi.bootstrapConfigMapName" . }}
+             optional: true
++        {{- if and (eq .Values.provider "alibabacloud") .Values.alibabacloud.rrsa.enabled }}
++        - name: rrsa-oidc-token
++          projected:
++            sources:
++              - serviceAccountToken:
++                  audience: sts.aliyuncs.com
++                  expirationSeconds: 3600
++                  path: token
++        {{- end }}
+         {{- if eq .Values.provider "libvirt" }}
+         - name: libvirt-pool
+           hostPath:
+diff --git a/charts/caa-csi-block-driver/templates/storageclass.yaml b/charts/caa-csi-block-driver/templates/storageclass.yaml
+index f541c3e4..f038c0a5 100644
+--- a/charts/caa-csi-block-driver/templates/storageclass.yaml
++++ b/charts/caa-csi-block-driver/templates/storageclass.yaml
+@@ -11,7 +11,7 @@ metadata:
+ provisioner: {{ .Values.csiDriver.name }}
+ reclaimPolicy: {{ .Values.storageClass.reclaimPolicy }}
+ volumeBindingMode: {{ .Values.storageClass.volumeBindingMode }}
+-allowVolumeExpansion: {{ .Values.storageClass.allowVolumeExpansion }}
++allowVolumeExpansion: {{ and (ne .Values.provider "alibabacloud") .Values.storageClass.allowVolumeExpansion }}
+ parameters:
+   cloudProvider: {{ .Values.provider }}
+   {{- if eq .Values.provider "aws" }}
+@@ -27,6 +27,11 @@ parameters:
+   azureLocation: {{ required "azure.location is required when provider=azure" .Values.azure.location | quote }}
+   azureDiskSku: {{ .Values.azure.diskSku | quote }}
+   {{- end }}
++  {{- if eq .Values.provider "alibabacloud" }}
++  region: {{ required "alibabacloud.region is required" .Values.alibabacloud.region | quote }}
++  zoneId: {{ required "alibabacloud.zoneId is required" .Values.alibabacloud.zoneId | quote }}
++  clusterId: {{ required "alibabacloud.clusterId is required" .Values.alibabacloud.clusterId | quote }}
++  {{- end }}
+   {{- if eq .Values.provider "libvirt" }}
+   cloudProviderVolumePath: {{ .Values.libvirt.volumeDir | quote }}
+   {{- end }}
+diff --git a/charts/caa-csi-block-driver/values.yaml b/charts/caa-csi-block-driver/values.yaml
+index 43544aa8..9a234c5c 100644
+--- a/charts/caa-csi-block-driver/values.yaml
++++ b/charts/caa-csi-block-driver/values.yaml
+@@ -1,4 +1,4 @@
+-# Cloud provider: aws, azure, or libvirt
++# Cloud provider: aws, azure, alibabacloud, or libvirt
+ provider: aws
+ 
+ nameOverride: ""
+@@ -42,6 +42,18 @@ azure:
+   location: ""
+   diskSku: StandardSSD_LRS
+ 
++# Alibaba Cloud provider settings (ESSD PL0; expansion is not supported)
++alibabacloud:
++  region: ""
++  zoneId: ""
++  # Optional Secret containing the standard Alibaba credential environment variables.
++  clusterId: ""
++  credentialsSecret: ""
++  rrsa:
++    enabled: false
++    roleArn: ""
++    oidcProviderArn: ""
++
+ # Libvirt provider settings
+ libvirt:
+   volumeDir: /var/lib/caa-csi-volumes
 diff --git a/cmd/main.go b/cmd/main.go
 index f40994ad..6a31a21d 100644
 --- a/cmd/main.go
@@ -38,6 +201,260 @@ index f40994ad..6a31a21d 100644
  	_ "github.com/confidential-devhub/caa-csi-block-driver/pkg/provider/aws"
  	_ "github.com/confidential-devhub/caa-csi-block-driver/pkg/provider/azure"
  	_ "github.com/confidential-devhub/caa-csi-block-driver/pkg/provider/libvirt"
+diff --git a/deploy/bootstrap-params-alibabacloud.yaml b/deploy/bootstrap-params-alibabacloud.yaml
+new file mode 100644
+index 00000000..8126a8ee
+--- /dev/null
++++ b/deploy/bootstrap-params-alibabacloud.yaml
+@@ -0,0 +1,15 @@
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: caa-csi-block-bootstrap-params
++  namespace: caa-csi-block
++  labels:
++    app.kubernetes.io/name: caa-csi-block-driver
++    app.kubernetes.io/instance: caa-csi-block
++    app.kubernetes.io/version: 0.2.0
++    app.kubernetes.io/managed-by: Helm
++    helm.sh/chart: caa-csi-block-driver-0.2.0
++data:
++  bootstrap-params.json: "{\n  \"cloudProvider\": \"alibabacloud\",\n  \"region\"\
++    : \"REGION\",\n  \"zoneId\": \"ZONE\",\n  \"clusterId\": \"ACK_CLUSTER_ID\"\n\
++    }\n"
+diff --git a/deploy/daemonset-alibabacloud.yaml b/deploy/daemonset-alibabacloud.yaml
+new file mode 100644
+index 00000000..cc8c5a62
+--- /dev/null
++++ b/deploy/daemonset-alibabacloud.yaml
+@@ -0,0 +1,168 @@
++apiVersion: apps/v1
++kind: DaemonSet
++metadata:
++  name: caa-csi-block
++  namespace: caa-csi-block
++  labels:
++    app.kubernetes.io/name: caa-csi-block-driver
++    app.kubernetes.io/instance: caa-csi-block
++    app.kubernetes.io/version: 0.2.0
++    app.kubernetes.io/managed-by: Helm
++    helm.sh/chart: caa-csi-block-driver-0.2.0
++spec:
++  selector:
++    matchLabels:
++      app.kubernetes.io/name: caa-csi-block-driver
++      app.kubernetes.io/instance: caa-csi-block
++  template:
++    metadata:
++      labels:
++        app.kubernetes.io/name: caa-csi-block-driver
++        app.kubernetes.io/instance: caa-csi-block
++    spec:
++      serviceAccountName: caa-csi-block
++      containers:
++      - name: csi-provisioner
++        image: registry.k8s.io/sig-storage/csi-provisioner@sha256:6de50bacfd72627ffe4209e3db8ad7391d04ea6fb741bf51feab6c5dcfd80002
++        args:
++        - -v=3
++        - --csi-address=/csi/csi.sock
++        - --worker-threads=5
++        - --leader-election=true
++        - --feature-gates=Topology=true
++        env:
++        - name: NODE_NAME
++          valueFrom:
++            fieldRef:
++              fieldPath: spec.nodeName
++        - name: NAMESPACE
++          valueFrom:
++            fieldRef:
++              fieldPath: metadata.namespace
++        - name: POD_NAME
++          valueFrom:
++            fieldRef:
++              fieldPath: metadata.name
++        resources:
++          limits:
++            cpu: 100m
++            memory: 128Mi
++          requests:
++            cpu: 20m
++            memory: 32Mi
++        securityContext:
++          privileged: true
++        volumeMounts:
++        - mountPath: /csi
++          name: socket-dir
++      - name: node-driver-registrar
++        image: registry.k8s.io/sig-storage/csi-node-driver-registrar@sha256:cd21e19cd8bbd5bc56f1b4f1398a436e7897da2995d6d036c9729be3f4e456e6
++        args:
++        - --v=3
++        - --csi-address=/csi/csi.sock
++        - --kubelet-registration-path=/var/lib/kubelet/plugins/caa-csi-block/csi.sock
++        env:
++        - name: KUBE_NODE_NAME
++          valueFrom:
++            fieldRef:
++              fieldPath: spec.nodeName
++        resources:
++          limits:
++            cpu: 50m
++            memory: 64Mi
++          requests:
++            cpu: 10m
++            memory: 16Mi
++        securityContext:
++          privileged: true
++        volumeMounts:
++        - mountPath: /csi
++          name: socket-dir
++        - mountPath: /registration
++          name: registration-dir
++      - name: caa-csi-block-driver
++        image: PRIVATE_REGISTRY/openshell/caa-csi-block-driver:alibaba@sha256:PATCHED_CSI_IMAGE_SHA256
++        imagePullPolicy: IfNotPresent
++        args:
++        - --drivername=caa-csi-block.csi.confidentialcontainers.io
++        - --endpoint=unix:///csi/csi.sock
++        - --nodeid=$(KUBE_NODE_NAME)
++        env:
++        - name: KUBE_NODE_NAME
++          valueFrom:
++            fieldRef:
++              fieldPath: spec.nodeName
++        - name: CSI_CLOUD_PROVIDER
++          value: alibabacloud
++        - name: CSI_BOOTSTRAP_PARAMS_FILE
++          value: /etc/caa-csi-block/bootstrap-params.json
++        - name: ALIBABA_CLOUD_ROLE_ARN
++          value: CSI_RAM_ROLE_ARN
++        - name: ALIBABA_CLOUD_OIDC_PROVIDER_ARN
++          value: ACK_OIDC_PROVIDER_ARN
++        - name: ALIBABA_CLOUD_OIDC_TOKEN_FILE
++          value: /var/run/secrets/ack.alibabacloud.com/rrsa-tokens/token
++        resources:
++          limits:
++            cpu: 200m
++            memory: 256Mi
++          requests:
++            cpu: 50m
++            memory: 64Mi
++        securityContext:
++          privileged: true
++        volumeMounts:
++        - mountPath: /csi
++          name: socket-dir
++        - mountPath: /var/lib/kubelet/pods
++          name: mountpoint-dir
++          mountPropagation: Bidirectional
++        - mountPath: /var/lib/kubelet/plugins
++          name: plugins-dir
++          mountPropagation: Bidirectional
++        - mountPath: /run/kata-containers/shared/direct-volumes
++          name: shared-directvols
++        - mountPath: /var/lib/caa-csi-block
++          name: csi-data
++        - mountPath: /etc/caa-csi-block
++          name: bootstrap-params
++          readOnly: true
++        - name: rrsa-oidc-token
++          mountPath: /var/run/secrets/ack.alibabacloud.com/rrsa-tokens
++          readOnly: true
++      volumes:
++      - name: socket-dir
++        hostPath:
++          path: /var/lib/kubelet/plugins/caa-csi-block
++          type: DirectoryOrCreate
++      - name: mountpoint-dir
++        hostPath:
++          path: /var/lib/kubelet/pods
++          type: DirectoryOrCreate
++      - name: registration-dir
++        hostPath:
++          path: /var/lib/kubelet/plugins_registry
++          type: Directory
++      - name: plugins-dir
++        hostPath:
++          path: /var/lib/kubelet/plugins
++          type: Directory
++      - name: shared-directvols
++        hostPath:
++          path: /run/kata-containers/shared/direct-volumes/
++          type: DirectoryOrCreate
++      - name: csi-data
++        hostPath:
++          path: /var/lib/caa-csi-block
++          type: DirectoryOrCreate
++      - name: bootstrap-params
++        configMap:
++          name: caa-csi-block-bootstrap-params
++          optional: true
++      - name: rrsa-oidc-token
++        projected:
++          sources:
++          - serviceAccountToken:
++              audience: sts.aliyuncs.com
++              expirationSeconds: 3600
++              path: token
+diff --git a/deploy/storageclass-alibabacloud.yaml b/deploy/storageclass-alibabacloud.yaml
+new file mode 100644
+index 00000000..0a36fca6
+--- /dev/null
++++ b/deploy/storageclass-alibabacloud.yaml
+@@ -0,0 +1,19 @@
++apiVersion: storage.k8s.io/v1
++kind: StorageClass
++metadata:
++  name: alicloud-disk-essd-peerpod
++  labels:
++    app.kubernetes.io/name: caa-csi-block-driver
++    app.kubernetes.io/instance: caa-csi-block
++    app.kubernetes.io/version: 0.2.0
++    app.kubernetes.io/managed-by: Helm
++    helm.sh/chart: caa-csi-block-driver-0.2.0
++provisioner: caa-csi-block.csi.confidentialcontainers.io
++reclaimPolicy: Delete
++volumeBindingMode: Immediate
++allowVolumeExpansion: false
++parameters:
++  cloudProvider: alibabacloud
++  region: REGION
++  zoneId: ZONE
++  clusterId: ACK_CLUSTER_ID
+diff --git a/docs/alibabacloud.md b/docs/alibabacloud.md
+new file mode 100644
+index 00000000..afcbebac
+--- /dev/null
++++ b/docs/alibabacloud.md
+@@ -0,0 +1,28 @@
++# Alibaba Cloud ESSD
++
++This provider implements the existing block-volume and cloud-recovery interfaces.
++CAA must also support Alibaba disk attachment and guest disk-ID discovery.
++ESSD PL0 volumes support create, lookup, recovery and delete; expansion, snapshots
++and clones are not implemented.
++
++Use `provider=alibabacloud` with `alibabacloud.region`, `zoneId` and `clusterId`.
++The disk zone must match the PodVM zone. Cluster and driver tags scope recovery.
++The combined upstream DaemonSet retains its node-local volume store. Startup
++rebuilds completed records through ListManagedVolumes; no state PVC is required.
++CreateDisk uses a stable cluster/volume ClientToken, without a separate journal.
++
++For ACK RRSA, set `alibabacloud.rrsa.enabled=true`, `roleArn` and `oidcProviderArn`.
++Trust the chart's ServiceAccount in namespace caa-csi-block with audience
++sts.aliyuncs.com. The driver receives a projected token; both controller and node
++RPCs use that identity. Alternatively provide `alibabacloud.credentialsSecret`
++with SDK credential environment variables. Do not enable both methods.
++
++Required cloud actions are ecs:CreateDisk, ecs:DescribeDisks and ecs:DeleteDisk.
++Scope permissions and tags to the deployment. Keep the same cluster ID and
++bootstrap region/zone when recovering records. Cloud recovery reconstructs
++completed volumes, not arbitrary pending requests or all historical parameters.
++
++Helm is the normal install path. The new Alibaba files under deploy/ show the
++same DaemonSet, bootstrap ConfigMap and StorageClass; combine them with the
++upstream namespace, ServiceAccount, RBAC and CSIDriver resources. Replace the
++uppercase sample values and image digest before applying them.
 diff --git a/go.mod b/go.mod
 index 0d6321f6..ad2bc215 100644
 --- a/go.mod

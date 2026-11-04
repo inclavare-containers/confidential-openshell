@@ -164,8 +164,6 @@ class CloudFixture:
     def kubectl(self, args, **kwargs):
         if 'configmap' in args:
             data = {'data': {'eni_conf': json.dumps({'disable_network_policy': self.disabled_network_policy})}}
-        elif 'storageclass' in args:
-            data = {'items': [{'metadata': {'name': self.config['csi_storage_class']}}]}
         else:
             data = self.nodes
         return subprocess.CompletedProcess(args, 0, json.dumps(data), '')

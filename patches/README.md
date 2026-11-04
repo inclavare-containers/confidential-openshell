@@ -1,100 +1,56 @@
-# Upstream bases and controlled patches
+# Upstream bases and maintained patches
 
-The submodule gitlinks point to unmodified upstream commits. Build copies apply
-the following local patch queues; the main runtime therefore includes patched
-components. Exact bases and result trees are authoritative in the
-[source lock](../deployment/build/sources.lock.json).
+Builds use the exact bases and result trees in
+[sources.lock.json](../deployment/build/sources.lock.json). `repos/` stays at the
+unmodified upstream inputs; [prepare-sources.sh](../deployment/build/prepare-sources.sh)
+replays each ordered queue and verifies its checksum and result tree.
 
-| Component | Ordered series | Required behavior |
+| Component | Queue | Scope |
 | --- | --- | --- |
-| CAA | [13 patches](cloud-api-adaptor/series) | Separate generic instance-deletion handling and retained-disk protection; immutable direct-volume metadata; Alibaba per-instance image selection and retained ESSD attachment/deletion; bounded userdata, optional image-pull credential forwarding and reduced diagnostic output; guest disk discovery, stock CDH encrypted-device unlock, a measured embedded-LUKS initializer, sealed mounts and on-link Pod routes |
-| CSI | [6 patches](caa-csi-block-driver/series) | Capacity validation for recovered disks; Alibaba ESSD through existing provider interfaces; atomic v1 metadata and delegated fsGroup for the paired CAA; separate controller/node deployment; shared conformance runner and pinned build/runtime bases |
-| PeerPod controller | [2 CAA patches](peerpod-ctrl/README.md) | Apply the same generic deletion fix and retained-volume protection used by CAA |
-| Kata host Go shim | [1 patch](kata-containers/README.md) | Preserve `NoNewPrivileges` in exec requests; use the released guest agent and genpolicy unchanged |
+| CAA | [17 patches](cloud-api-adaptor/series) | Eleven common fixes/features, four Alibaba disk integration patches, two measured guest overlays |
+| CSI | [6 patches](caa-csi-block-driver/series) | Five common fixes/features and one Alibaba provider; no confidential-volume metadata schema |
+| PeerPod controller | [3 shared CAA patches](peerpod-ctrl/series) | Exact absence, deletion completion and retained-disk guard |
+| Kata host shim | [1 patch](kata-containers/0001-fix-runtime-preserve-exec-no-new-privileges.patch) | Already merged upstream; retained for the selected base |
 
-Build copies are prepared by `deployment/build/prepare-sources.sh` from local
-pinned upstream objects and the explicit `series` order. The helper verifies
-SHA256SUMS and the resulting Git tree. It refuses to overwrite an existing build
-copy. Patches are owned by their upstream repository: the PeerPod controller
-queue references two files in `cloud-api-adaptor/`, because both binaries belong
-to CAA. The controller does not inherit attachment or guest code. `repos/` stays at
-the clean upstream base. No upstream versions change.
+The [review ledger](storage-review.md) identifies each patch's single purpose,
+evidence, dependencies and validation. It is the starting point for discussing
+the final queue. Ordinary metadata, filesystem access and lifecycle handling are
+separate from measured disk/key authorization and sealed-resource admission.
+The PeerPod controller references CAA files rather than duplicating them.
 
-The [build guide](../docs/build.md) is the single source-preparation, binary/container
-and Kata-packaging route. Follow the [deployment runbook](../docs/deployment.md) for
-installation. Exact bases and result trees are in the source lock.
-CAA's sealed-volume path verifies the measured descriptor digest and successful
-CDH unsealing before exposing a private read-only mount; worker-provided plaintext
-cannot substitute for an attested release. CSI owns disk lifecycle metadata and
-does not handle workspace plaintext keys. The independent controller build uses
-only its own queue, rather than the CAA adapter queue.
+The code diffs of CAA [on-link routes (#3435)](https://github.com/confidential-containers/cloud-api-adaptor/pull/3435)
+and [image selection (#3437)](https://github.com/confidential-containers/cloud-api-adaptor/pull/3437)
+are unchanged. Their local mail-patch attribution trailers were normalized;
+transport checksums therefore differ from earlier copies. No remote PR was
+rewritten during this cleanup.
 
-Generic fixes can be removed after the selected upstream version supplies their
-behavior and the corresponding acceptance checks pass. When guest inputs change,
-rebuild the image and extract its references together.
+CSI preserves the upstream combined DaemonSet, local completed-volume store and
+cloud tag recovery. Mount properties and atomic publication extend ordinary CSI
+behavior; old metadata remains readable without mandatory version/mode labels or
+an explicit readonly field. No controller state PVC, custom pending-create
+journal, role split or production test-path switch is introduced.
 
-The [classification and review ledger](storage-review.md) separates generic fixes,
-ordinary provider support, and the confidential-volume contract. The latter waits
-for upstream storage design discussion; it is not bundled into independent
-provider fixes. The [migration record](../docs/coco-migration.md) pins the selected
-post-release CoCo sources and records validation separately from the saved main
-branch.
+The deployment pulls registry images anonymously, with HTTPS certificate checks
+and digest pinning. CAA uses its upstream image-pull Secret behavior; the local
+opt-out and diagnostic-suppression overlay have been removed. The separate CAA
+instance-create idempotency overlay and its additional tag/checks have also been
+removed. CSI's provider disk-create token is part of its distinct provisioning
+implementation and is not that removed CAA overlay.
 
-The CAA queue carries the submitted patches for
-[on-link routes (#3435)](https://github.com/confidential-containers/cloud-api-adaptor/pull/3435)
-at `e32c515ef83987587241170514f337c6f847958c` and
-[per-instance image selection (#3437)](https://github.com/confidential-containers/cloud-api-adaptor/pull/3437)
-at `e72ea9828161bc9dad15568871979d239354d28d` verbatim. The retained-disk
-patch builds on the image fix instead of carrying a second copy.
+For upstream work, common fixes must reproduce against the intended target and
+be submitted with only their actual prerequisites. fsGroup is prioritized near
+the front; its end-to-end field path is documented separately from its ownership
+implementation. The confidential guest overlays remain a separate design topic.
+Full ACK/TDX validation is deferred until the patch review converges; the current
+cleanup uses replay, compilation and targeted regression checks.
 
-The former explicit-VPC overlay bypassed discovery in restricted environments.
-CAA now uses the pinned upstream vSwitch discovery path, as the independent
-PeerPod controller already does. The maintained
-[RAM policy](../deployment/ack/ram/caa-permissions.example.json) grants
-`vpc:DescribeVSwitchAttributes` on the configured vSwitch; generated PeerPods
-values no longer supply the overlay-only `VPC_ID` setting.
-
-The measured workspace and sealed-volume/TDX patches are product overlays, not
-claims of generic upstream behavior. Their per-request disk, key and descriptor
-authorization remains in the measured guest. Moving constants into deployment
-configuration would not replace these checks. A future Kata Storage migration
-must cover filesystem flags, recursive fsGroup, readonly replay and shared mount
-cleanup before removing the current layer. Likewise, PodInfoOnMount alone does
-not supply identity to NodeUnpublishVolume; the existing ownership checks remain.
-Helm is the source for CSI raw manifests, which are retained for the upstream
-installation interface and regenerated together. The node requires privileged
-mode for its current bidirectional mount propagation.
-
-The local CSI build uses one paired v1 metadata contract. It does not carry the
-legacy writer, format-migration switches, a pending-create journal, additional
-provider interfaces or a separate credential-refresh coordinator. Completed
-volume records and tag recovery use the pinned upstream implementation. Alibaba
-storage is scoped by cluster/driver tags and uses ESSD PL0. Disk creation carries a stable
-cluster/volume ClientToken. Per-RPC providers share the SDK credential object so its native
-refresh cache survives; credential identity remains the controller process configuration.
-The Alibaba profile omits the unused resizer, while upstream provider profiles retain it.
-
-CAA uses ECS ClientToken for instance-create retries and queries current cloud
-attachments during deletion instead of maintaining a second operation/attachment
-journal. Guest disk discovery uses the same kernel serial/WWID identities as the
-measured workspace initializer. Disk-retention checks, measured disk/key binding,
-encrypted-mount validation and sealed-resource verification remain required.
-
-The Kata queue fixes no-new-privileges exec requests. The independent PeerPod
-controller queue contains both the generic exact-instance cleanup fix and the
-retained-volume protection profile; the latter belongs to the confidential-volume
-workstream. OpenShell's v0.1.6 source imports
-and existing confidential wrappers remain pinned; no upstream release is rolled
-back by this simplification.
-
-The initdata transport uses upstream cloud-config generation. The guest checks
-that decoded TOML, its SHA-384 digest and the materialized files agree. AA receives
-that exact TOML via `--initdata-toml` and owns the standard `InitData` event and
-restart handling. AS/KBS policies authorize current bindings using that verified
-event. There is no local runtime-extension RPC or AAEL encoder in CAA.
-
-Local patch commits use `Weidong Sun <sunweidong@linux.alibaba.com>` as their author,
-with scoped subjects and a rationale for the complete change. Existing sign-offs
-are retained, and AI assistance is recorded in `Generated-by` trailers. Metadata
-normalization is separate from the reviewed code/test changes; upstream submission still
-uses the target project's contribution and DCO requirements.
+Patch authors and existing human DCO sign-offs are preserved. CAA/CSI patches use
+`Co-authored-by: Codex <noreply@openai.com>`, following
+[Codex's attribution form](https://github.com/openai/codex/blob/e4a3612/codex-rs/core/src/commit_attribution.rs)
+and community co-author practice. Kata uses
+`Assisted-by: OpenAI Codex <noreply@openai.com>`, following the
+[OpenInfra policy](https://openinfra.org/legal/ai-policy/) and
+[Kata precedent](https://github.com/kata-containers/kata-containers/commit/5b9ad3c7d792156da177c1cb60465a0dec7fae55).
+AI attribution is separate from human DCO. Top-level repository commits retain
+the repository's ordinary subject/body style; the tool attribution lives in the
+maintained patch messages.

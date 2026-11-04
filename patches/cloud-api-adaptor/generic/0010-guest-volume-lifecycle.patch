@@ -1,0 +1,1141 @@
+From cf0e395c616c74ae7111769f8cbc2562c6594eb2 Mon Sep 17 00:00:00 2001
+From: Weidong Sun <sunweidong@linux.alibaba.com>
+Date: Wed, 4 Nov 2026 15:24:42 +0800
+Subject: [PATCH] volumes: track and roll back acquired guest mounts
+
+Keep ordinary filesystem mount ownership across container preparation,
+agent errors and sandbox cleanup. Validate a reused mount before borrowing
+it, retain failed cleanup for retry, and use the existing containerd mount
+library for filesystem flags. Remove the superseded host-target wait path.
+
+Exercise preparation and agent failure rollback, borrowed resources,
+mount identity and optional loop-device readonly/no-format behavior.
+
+Co-authored-by: Codex <noreply@openai.com>
+---
+ .../cloud_mount_integration_test.go           |  69 +++++
+ .../pkg/forwarder/interceptor/cloud_volume.go | 245 ++++++++++++++++
+ .../interceptor/cloud_volume_test.go          |  68 +++++
+ .../pkg/forwarder/interceptor/interceptor.go  | 263 ++++--------------
+ .../forwarder/interceptor/interceptor_test.go | 222 ---------------
+ .../interceptor/volume_transaction_test.go    |  62 +++++
+ 6 files changed, 498 insertions(+), 431 deletions(-)
+ create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_mount_integration_test.go
+ create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume.go
+ create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume_test.go
+ create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/volume_transaction_test.go
+
+diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_mount_integration_test.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_mount_integration_test.go
+new file mode 100644
+index 00000000..3159a4de
+--- /dev/null
++++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_mount_integration_test.go
+@@ -0,0 +1,69 @@
++// Copyright Confidential Containers Contributors
++// SPDX-License-Identifier: Apache-2.0
++
++package interceptor
++
++import (
++	"context"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++	"golang.org/x/sys/unix"
++)
++
++// Opt in inside a private mount namespace. Only the fresh loop device allocated
++// from this test's temporary file is formatted; no host disk is selected.
++func TestCloudFilesystemLoopDevice(t *testing.T) {
++	if os.Getenv("CAA_TEST_LOOP_MOUNT") != "1" {
++		t.Skip("requires root, loop devices and a private mount namespace")
++	}
++	directory := t.TempDir()
++	backing := filepath.Join(directory, "disk")
++	file, err := os.Create(backing)
++	require.NoError(t, err)
++	require.NoError(t, file.Truncate(64<<20))
++	require.NoError(t, file.Close())
++	output, err := exec.Command("losetup", "--find", "--show", backing).CombinedOutput()
++	require.NoError(t, err, string(output))
++	device := strings.TrimSpace(string(output))
++	t.Cleanup(func() {
++		output, err := exec.Command("losetup", "--detach", device).CombinedOutput()
++		require.NoError(t, err, string(output))
++	})
++	target := filepath.Join(directory, "mount")
++	require.NoError(t, os.Mkdir(target, 0755))
++	t.Cleanup(func() { _ = unix.Unmount(target, 0) })
++	ctx := context.Background()
++
++	// The mount operation never formats an empty disk.
++	mounted, err := mountCloudFilesystem(ctx, device, target, "ext4", false, nil)
++	require.Error(t, err)
++	require.False(t, mounted)
++	mounted, err = formatAndMount(ctx, device, target, "ext4", true, []string{"ro"})
++	require.ErrorContains(t, err, "refusing to format")
++	require.False(t, mounted)
++
++	mounted, err = formatAndMount(ctx, device, target, "ext4", false, []string{"nodev", "nosuid"})
++	require.NoError(t, err)
++	require.True(t, mounted)
++	marker := filepath.Join(target, "retained")
++	require.NoError(t, os.WriteFile(marker, []byte("retained-data"), 0600))
++	mounted, err = mountCloudFilesystem(ctx, device, target, "ext4", false, []string{"nodev", "nosuid"})
++	require.NoError(t, err)
++	require.False(t, mounted, "reused mount must not transfer cleanup ownership")
++	_, err = mountCloudFilesystem(ctx, device, target, "ext4", true, []string{"ro"})
++	require.Error(t, err, "writable mount must not satisfy readonly reuse")
++	require.NoError(t, unix.Unmount(target, 0))
++
++	mounted, err = mountCloudFilesystem(ctx, device, target, "ext4", true, []string{"ro", "nodev", "nosuid"})
++	require.NoError(t, err)
++	require.True(t, mounted)
++	data, err := os.ReadFile(marker)
++	require.NoError(t, err)
++	require.Equal(t, "retained-data", string(data))
++	require.ErrorIs(t, os.WriteFile(marker, []byte("changed"), 0600), unix.EROFS)
++}
+diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume.go
+new file mode 100644
+index 00000000..7b30e785
+--- /dev/null
++++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume.go
+@@ -0,0 +1,245 @@
++// (C) Copyright Confidential Containers Contributors
++// SPDX-License-Identifier: Apache-2.0
++
++package interceptor
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"os"
++	"path/filepath"
++	"sort"
++	"strconv"
++	"strings"
++	"syscall"
++	"time"
++
++	"github.com/confidential-containers/cloud-api-adaptor/src/cloud-api-adaptor/pkg/util"
++	ctdmount "github.com/containerd/containerd/mount"
++	pb "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/agent/protocols/grpc"
++	"github.com/moby/sys/mountinfo"
++	"golang.org/x/sys/unix"
++)
++
++// preparedCloudVolume tracks only resources acquired by one CreateContainer
++// call. Reused mounts are intentionally not owned by that call.
++type preparedCloudVolume struct {
++	sourcePath     string
++	mountedHere    bool
++	createdDirHere bool
++	unmount        func(string, int) error
++}
++
++func (v *preparedCloudVolume) owned() bool {
++	return v != nil && (v.mountedHere || v.createdDirHere)
++}
++
++func (v *preparedCloudVolume) cleanup(ctx context.Context) error {
++	if v == nil {
++		return nil
++	}
++
++	if v.mountedHere {
++		unmount := v.unmount
++		if unmount == nil {
++			unmount = syscall.Unmount
++		}
++		if err := unmount(v.sourcePath, 0); err != nil && !errors.Is(err, syscall.EINVAL) && !errors.Is(err, syscall.ENOENT) {
++			return fmt.Errorf("unmount %s: %w", v.sourcePath, err)
++		}
++		v.mountedHere = false
++	}
++	if v.createdDirHere {
++		if err := os.Remove(v.sourcePath); err != nil && !errors.Is(err, os.ErrNotExist) {
++			return fmt.Errorf("remove mount directory %s: %w", v.sourcePath, err)
++		}
++		v.createdDirHere = false
++	}
++	return nil
++}
++
++func cleanupPreparedCloudVolumes(ctx context.Context, volumes []*preparedCloudVolume) error {
++	// Rollback must finish even when the caller canceled CreateContainer.
++	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
++	defer cancel()
++	var cleanupErrors []error
++	for index := len(volumes) - 1; index >= 0; index-- {
++		if err := volumes[index].cleanup(ctx); err != nil {
++			cleanupErrors = append(cleanupErrors, err)
++		}
++	}
++	return errors.Join(cleanupErrors...)
++}
++
++func preserveOriginalError(original, cleanup error) error {
++	if cleanup == nil {
++		return original
++	}
++	return errors.Join(original, fmt.Errorf("rollback cloud volumes: %w", cleanup))
++}
++
++func (i *interceptor) trackOwnedCloudVolumes(volumes []*preparedCloudVolume) {
++	for _, volume := range volumes {
++		if volume.owned() {
++			i.cloudVolumes = append(i.cloudVolumes, volume)
++		}
++	}
++}
++
++func (i *interceptor) prepareCloudVolumes(ctx context.Context, req *pb.CreateContainerRequest, encoded string) ([]*preparedCloudVolume, error) {
++	volumes, err := util.DecodeCloudVolumeAnnotations(encoded)
++	if err != nil {
++		return nil, fmt.Errorf("corrupt cloud_volumes annotation (pod would start without volumes): %w", err)
++	}
++
++	names := make([]string, 0, len(volumes))
++	for name := range volumes {
++		names = append(names, name)
++	}
++	sort.Strings(names)
++	prepared := make([]*preparedCloudVolume, 0, len(names))
++	for _, name := range names {
++		volume, err := prepareCloudVolume(ctx, name, volumes[name])
++		if volume != nil {
++			prepared = append(prepared, volume)
++		}
++		if err != nil {
++			return prepared, err
++		}
++		if err := rewriteCloudMount(req, name, volumes[name], volume.sourcePath); err != nil {
++			return prepared, err
++		}
++	}
++	return prepared, nil
++}
++
++func prepareCloudVolume(ctx context.Context, name string, volume util.CloudVolumeAnnotation) (*preparedCloudVolume, error) {
++	lun, _ := strconv.Atoi(volume.LUN) // validated by DecodeCloudVolumeAnnotations
++
++	device, err := findDataDiskDevice(lun, volume.DiskID)
++	if err != nil {
++		return nil, fmt.Errorf("cloud volume %s device discovery: %w", name, err)
++	}
++
++	if err := os.MkdirAll(cloudVolumeMountBase, 0o755); err != nil {
++		return nil, fmt.Errorf("create cloud volume directory: %w", err)
++	}
++	prepared := &preparedCloudVolume{sourcePath: filepath.Join(cloudVolumeMountBase, name)}
++	if err := os.Mkdir(prepared.sourcePath, 0o755); err == nil {
++		prepared.createdDirHere = true
++	} else if !errors.Is(err, os.ErrExist) {
++		return prepared, fmt.Errorf("create mount point for %s: %w", name, err)
++	} else if info, statErr := os.Lstat(prepared.sourcePath); statErr != nil || !info.IsDir() {
++		if statErr != nil {
++			err = statErr
++		} else {
++			err = fmt.Errorf("existing path is not a directory")
++		}
++		return prepared, fmt.Errorf("use mount point for %s: %w", name, err)
++	}
++
++	prepared.mountedHere, err = formatAndMount(ctx, device, prepared.sourcePath, volume.FSType, volume.ReadOnly, volume.Options)
++	if err != nil {
++		return prepared, fmt.Errorf("mount cloud volume %s: %w", name, err)
++	}
++	if err := applyCloudVolumeFSGroup(prepared.sourcePath, volume.FSGroup, volume.ReadOnly); err != nil {
++		return prepared, err
++	}
++	return prepared, nil
++}
++
++// Mounting itself never formats. The plain-volume formatter decides whether
++// a new filesystem is needed before calling this operation again.
++func mountCloudFilesystem(ctx context.Context, device, mountPoint, fsType string, readOnly bool, options []string) (bool, error) {
++	if mounted, err := mountedCloudDevice(device, mountPoint, fsType, readOnly, options); err != nil || mounted {
++		return false, err
++	}
++	if err := ctx.Err(); err != nil {
++		return false, err
++	}
++	mountErr := ctdmount.All([]ctdmount.Mount{{Type: fsType, Source: device, Options: options}}, mountPoint)
++
++	// Observe ownership independently of exit status and validation so a
++	// partial or incorrect mount is still owned and unwound during rollback.
++	mounted, inspectErr := mountinfo.Mounted(mountPoint)
++	if inspectErr != nil {
++		return mounted, errors.Join(mountErr, inspectErr)
++	}
++	if mounted {
++		_, validateErr := mountedCloudDevice(device, mountPoint, fsType, readOnly, options)
++		return true, errors.Join(mountErr, validateErr)
++	}
++	return false, errors.Join(mountErr, fmt.Errorf("filesystem was not mounted at %s", mountPoint))
++}
++
++func rewriteCloudMount(req *pb.CreateContainerRequest, name string, volume util.CloudVolumeAnnotation, source string) error {
++	matched := -1
++	for index, mount := range req.OCI.Mounts {
++		if mount.Destination != volume.MountPoint {
++			continue
++		}
++		if matched >= 0 {
++			return fmt.Errorf("cloud volume %s mount point %q is ambiguous in container mounts", name, volume.MountPoint)
++		}
++		matched = index
++	}
++	if matched < 0 {
++		return fmt.Errorf("cloud volume %s mount point %q is absent from container mounts", name, volume.MountPoint)
++	}
++	mount := req.OCI.Mounts[matched]
++	mount.Source = source
++	mount.Type = "bind"
++	mount.Options = normalizeBindMountOptions(mount.Options, volume.ReadOnly)
++	return nil
++}
++
++// mountedCloudDevice rejects reuse of a mount point backed by a different
++// device, filesystem, or access mode.
++func mountedCloudDevice(device, mountPoint, fsType string, readOnly bool, options []string) (bool, error) {
++	resolved, err := filepath.EvalSymlinks(mountPoint)
++	if err != nil {
++		return false, err
++	}
++	mounts, err := mountinfo.GetMounts(func(info *mountinfo.Info) (skip, stop bool) {
++		return info.Mountpoint != resolved, false
++	})
++	if err != nil || len(mounts) == 0 {
++		return false, err
++	}
++	mount := mounts[len(mounts)-1]
++	var stat unix.Stat_t
++	if err := unix.Stat(device, &stat); err != nil {
++		return false, fmt.Errorf("stat mounted device %s: %w", device, err)
++	}
++	if err := validateReusableCloudMount(mountPoint, mount, &stat, fsType, readOnly, options); err != nil {
++		return false, err
++	}
++	return true, nil
++}
++
++func validateReusableCloudMount(mountPoint string, mount *mountinfo.Info, stat *unix.Stat_t, fsType string, readOnly bool, options []string) error {
++	if mount.Root != "/" {
++		return fmt.Errorf("mount point %s exposes filesystem root %q, expected /", mountPoint, mount.Root)
++	}
++	if stat.Mode&unix.S_IFMT != unix.S_IFBLK || mount.Major != int(unix.Major(uint64(stat.Rdev))) ||
++		mount.Minor != int(unix.Minor(uint64(stat.Rdev))) || mount.FSType != fsType {
++		return fmt.Errorf("mount point %s is backed by an unexpected device or filesystem", mountPoint)
++	}
++	actual := make(map[string]bool)
++	for _, option := range strings.Split(mount.Options+","+mount.VFSOptions, ",") {
++		actual[option] = true
++	}
++	expected := map[string]bool{"ro": readOnly, "nodev": false, "noexec": false, "nosuid": false}
++	for _, option := range options {
++		if _, tracked := expected[option]; tracked {
++			expected[option] = true
++		}
++	}
++	for _, option := range []string{"ro", "nodev", "noexec", "nosuid"} {
++		if actual[option] != expected[option] {
++			return fmt.Errorf("mount point %s option %s=%t, expected %t", mountPoint, option, actual[option], expected[option])
++		}
++	}
++	return nil
++}
+diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume_test.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume_test.go
+new file mode 100644
+index 00000000..f311e283
+--- /dev/null
++++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume_test.go
+@@ -0,0 +1,68 @@
++// (C) Copyright Confidential Containers Contributors
++// SPDX-License-Identifier: Apache-2.0
++
++package interceptor
++
++import (
++	"errors"
++	"testing"
++
++	"github.com/confidential-containers/cloud-api-adaptor/src/cloud-api-adaptor/pkg/util"
++	pb "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/agent/protocols/grpc"
++	"github.com/moby/sys/mountinfo"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	"golang.org/x/sys/unix"
++)
++
++func TestPreserveOriginalError(t *testing.T) {
++	original := errors.New("create container failed")
++	assert.Same(t, original, preserveOriginalError(original, nil))
++	combined := preserveOriginalError(original, errors.New("cleanup failed"))
++	assert.ErrorIs(t, combined, original)
++	assert.ErrorContains(t, combined, "cleanup failed")
++}
++
++func TestValidateReusableCloudMountRequiresFilesystemRoot(t *testing.T) {
++	stat := &unix.Stat_t{Mode: unix.S_IFBLK, Rdev: unix.Mkdev(8, 1)}
++	mount := &mountinfo.Info{
++		Major: 8, Minor: 1, Root: "/workspace", FSType: "ext4", Options: "rw,relatime",
++	}
++
++	err := validateReusableCloudMount("/run/cloud-volumes/vol-0", mount, stat, "ext4", false, nil)
++	require.ErrorContains(t, err, "filesystem root")
++
++	mount.Root = "/"
++	require.NoError(t, validateReusableCloudMount("/run/cloud-volumes/vol-0", mount, stat, "ext4", false, nil))
++}
++
++func TestRewriteCloudMountRejectsDuplicateDestination(t *testing.T) {
++	req := &pb.CreateContainerRequest{OCI: &pb.Spec{Mounts: []*pb.Mount{
++		{Destination: "/workspace", Source: "/host-controlled"},
++		{Destination: "/workspace", Source: "/csi-source"},
++	}}}
++	volume := util.CloudVolumeAnnotation{MountPoint: "/workspace", ReadOnly: true}
++
++	err := rewriteCloudMount(req, "vol-0", volume, "/run/cloud-volumes/vol-0")
++	require.ErrorContains(t, err, "ambiguous")
++	assert.Equal(t, "/host-controlled", req.OCI.Mounts[0].Source)
++	assert.Equal(t, "/csi-source", req.OCI.Mounts[1].Source)
++}
++
++func TestValidateReusableCloudMountRequiresSecurityOptions(t *testing.T) {
++	stat := &unix.Stat_t{Mode: unix.S_IFBLK, Rdev: unix.Mkdev(8, 1)}
++	mount := &mountinfo.Info{
++		Major: 8, Minor: 1, Root: "/", FSType: "ext4",
++		Options: "ro,nosuid,nodev,relatime", VFSOptions: "rw",
++	}
++
++	require.NoError(t, validateReusableCloudMount(
++		"/run/cloud-volumes/vol-0", mount, stat, "ext4", true,
++		[]string{"nodev", "nosuid", "ro"},
++	))
++	err := validateReusableCloudMount(
++		"/run/cloud-volumes/vol-0", mount, stat, "ext4", true,
++		[]string{"nodev", "nosuid", "noexec", "ro"},
++	)
++	require.ErrorContains(t, err, "option noexec=false, expected true")
++}
+diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
+index 9332f7e4..723c2e0e 100644
+--- a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
++++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
+@@ -5,21 +5,20 @@ package interceptor
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"fmt"
+ 	"log"
+ 	"net"
+ 	"os"
+ 	"os/exec"
+ 	"path/filepath"
+-	"sort"
+ 	"strconv"
+ 	"strings"
+-	"syscall"
++	"sync"
+ 	"time"
+ 
+ 	retry "github.com/avast/retry-go/v4"
+ 	pb "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/agent/protocols/grpc"
+-	"github.com/moby/sys/mountinfo"
+ 	specs "github.com/opencontainers/runtime-spec/specs-go"
+ 	"google.golang.org/protobuf/types/known/emptypb"
+ 
+@@ -28,10 +27,7 @@ import (
+ )
+ 
+ const (
+-	volumeTargetPathKey  = "io.confidentialcontainers.org.peerpodvolumes.target_path"
+ 	cloudVolumeMountBase = "/run/cloud-volumes"
+-	volumeCheckInterval  = 5 * time.Second
+-	volumeCheckTimeout   = 3 * time.Minute
+ )
+ 
+ var allowedFSTypes = map[string]bool{
+@@ -49,22 +45,9 @@ type Interceptor interface {
+ type interceptor struct {
+ 	agentproto.Redirector
+ 
+-	nsPath          string
+-	cloudMountPaths []string
+-}
+-
+-// unmountCloudVolumes unmounts all cloud volume mount points in reverse order.
+-// Called during DestroySandbox to clean up before the PodVM is terminated.
+-func (i *interceptor) unmountCloudVolumes() {
+-	for idx := len(i.cloudMountPaths) - 1; idx >= 0; idx-- {
+-		mp := i.cloudMountPaths[idx]
+-		if err := syscall.Unmount(mp, 0); err != nil {
+-			logger.Printf("WARNING: failed to unmount cloud volume %s: %v", mp, err)
+-		} else {
+-			logger.Printf("Unmounted cloud volume %s", mp)
+-		}
+-	}
+-	i.cloudMountPaths = nil
++	nsPath        string
++	cloudVolumeMu sync.Mutex
++	cloudVolumes  []*preparedCloudVolume
+ }
+ 
+ func dial(ctx context.Context, agentSocket string) (net.Conn, error) {
+@@ -109,6 +92,15 @@ func NewInterceptor(agentSocket, nsPath string) Interceptor {
+ }
+ 
+ func (i *interceptor) CreateContainer(ctx context.Context, req *pb.CreateContainerRequest) (*emptypb.Empty, error) {
++	return i.createContainer(ctx, req, i.prepareCloudVolumes)
++}
++
++func (i *interceptor) createContainer(ctx context.Context, req *pb.CreateContainerRequest,
++	prepare func(context.Context, *pb.CreateContainerRequest, string) ([]*preparedCloudVolume, error),
++) (res *emptypb.Empty, err error) {
++	if req == nil || req.OCI == nil || req.OCI.Linux == nil {
++		return nil, errors.New("CreateContainer lacks OCI Linux specification")
++	}
+ 
+ 	logger.Printf("CreateContainer: containerID:%s", req.ContainerId)
+ 
+@@ -123,92 +115,27 @@ func (i *interceptor) CreateContainer(ctx context.Context, req *pb.CreateContain
+ 		logger.Printf("    %s: %q", ns.Type, ns.Path)
+ 	}
+ 
+-	// Handle cloud volumes: detect device, format if needed, mount, and
+-	// bind-mount into the container's mount namespace.
+-	if cvJSON, ok := req.OCI.Annotations[util.CloudVolumesAnnotationKey]; ok && cvJSON != "" {
+-		cloudVolumes, err := util.DecodeCloudVolumeAnnotations(cvJSON)
+-		if err != nil {
+-			return nil, fmt.Errorf("corrupt cloud_volumes annotation (pod would start without volumes): %w", err)
+-		}
+-
+-		volNames := make([]string, 0, len(cloudVolumes))
+-		for k := range cloudVolumes {
+-			volNames = append(volNames, k)
+-		}
+-		sort.Strings(volNames)
+-
+-		for _, volName := range volNames {
+-			volInfo := cloudVolumes[volName]
+-			mountPoint := volInfo.MountPoint
+-			fsType := volInfo.FSType
+-			options := append([]string(nil), volInfo.Options...)
+-			readOnly := volInfo.ReadOnly
+-			lunStr := volInfo.LUN
+-			if mountPoint == "" || lunStr == "" {
+-				return nil, fmt.Errorf("cloud volume %s missing required mount_point or lun field", volName)
+-			}
+-
+-			safeName := filepath.Base(volName)
+-			if safeName != volName || safeName == "." || safeName == ".." {
+-				return nil, fmt.Errorf("cloud volume %q has unsafe name", volName)
+-			}
+-
+-			if fsType == "" {
+-				fsType = "ext4"
+-			}
+-			if !allowedFSTypes[fsType] {
+-				return nil, fmt.Errorf("cloud volume %s requests unsupported filesystem type %q (allowed: ext4, ext3, xfs)", volName, fsType)
+-			}
+-
+-			lunIdx, err := strconv.Atoi(lunStr)
+-			if err != nil {
+-				return nil, fmt.Errorf("cloud volume %s has invalid lun %q: %w", volName, lunStr, err)
+-			}
++	var preparedVolumes []*preparedCloudVolume
+ 
+-			diskID := volInfo.DiskID
+-			device, err := findDataDiskDevice(lunIdx, diskID)
++	if cvJSON, ok := req.OCI.Annotations[util.CloudVolumesAnnotationKey]; ok && cvJSON != "" {
++		// Serialize acquisition with sandbox cleanup and other container retries.
++		i.cloudVolumeMu.Lock()
++		defer i.cloudVolumeMu.Unlock()
++		// One transaction boundary covers every later return, including
++		// preparation errors and a canceled/failed agent RPC. Keep ownership of
++		// anything rollback could not release so DestroySandbox can retry it.
++		defer func() {
+ 			if err != nil {
+-				return nil, fmt.Errorf("cloud volume %s: %w", volName, err)
+-			}
+-			logger.Printf("cloud volume %s: LUN %d -> device %s", volName, lunIdx, device)
+-
+-			hostMountPoint := filepath.Join(cloudVolumeMountBase, safeName)
+-			if err := os.MkdirAll(hostMountPoint, 0o755); err != nil {
+-				return nil, fmt.Errorf("creating mount point for %s: %w", volName, err)
+-			}
+-
+-			if err := waitForDevice(device); err != nil {
+-				return nil, fmt.Errorf("cloud volume %s device %s not available: %w", volName, device, err)
+-			}
+-
+-			if err := formatAndMount(device, hostMountPoint, fsType, readOnly, options); err != nil {
+-				return nil, fmt.Errorf("failed to mount cloud volume %s at %s: %w", volName, hostMountPoint, err)
+-			}
+-			i.cloudMountPaths = append(i.cloudMountPaths, hostMountPoint)
+-
+-			if err := applyCloudVolumeFSGroup(hostMountPoint, volInfo.FSGroup, readOnly); err != nil {
+-				return nil, err
+-			}
+-
+-			rewrote := false
+-			for idx, m := range req.OCI.Mounts {
+-				if m.Destination == mountPoint {
+-					req.OCI.Mounts[idx].Source = hostMountPoint
+-					req.OCI.Mounts[idx].Type = "bind"
+-					req.OCI.Mounts[idx].Options = normalizeBindMountOptions(req.OCI.Mounts[idx].Options, readOnly)
+-					logger.Printf("cloud volume %s: rewrote mount source to %s", volName, hostMountPoint)
+-					rewrote = true
+-					break
+-				}
+-			}
+-			if !rewrote {
+-				logger.Printf("WARNING: cloud volume %s mount_point %q not found in container mounts", volName, mountPoint)
++				err = preserveOriginalError(err, cleanupPreparedCloudVolumes(ctx, preparedVolumes))
+ 			}
++			i.trackOwnedCloudVolumes(preparedVolumes)
++		}()
++		preparedVolumes, err = prepare(ctx, req, cvJSON)
++		if err != nil {
++			return nil, err
+ 		}
+ 	}
+ 
+-	volumeTargetPath := req.OCI.Annotations[volumeTargetPathKey]
+-	volumeTargetPathSlice := strings.Split(volumeTargetPath, ",")
+ 	if len(req.OCI.Mounts) > 0 {
+ 		for _, m := range req.OCI.Mounts {
+ 			if _, err := os.Stat(m.Source); os.IsNotExist(err) && m.Type == "bind" {
+@@ -217,31 +144,16 @@ func (i *interceptor) CreateContainer(ctx context.Context, req *pb.CreateContain
+ 					logger.Printf("Failed to create dir: %v", err)
+ 				}
+ 			}
+-			for _, s := range volumeTargetPathSlice {
+-				if isTargetPath(m.Source, strings.TrimSpace(s)) {
+-					logger.Printf("Waiting for device mounted to: %s", m.Source)
+-					err := waitForDeviceMounted(ctx, m.Source)
+-					if err != nil {
+-						return nil, err
+-					}
+-				}
+-			}
+ 		}
+ 	}
+ 
+-	res, err := i.Redirector.CreateContainer(ctx, req)
+-
++	res, err = i.Redirector.CreateContainer(ctx, req)
+ 	if err != nil {
+ 		logger.Printf("CreateContainer failed with error: %v", err)
+ 	}
+-
+ 	return res, err
+ }
+ 
+-func isTargetPath(path, targetPath string) bool {
+-	return targetPath != "" && targetPath == path
+-}
+-
+ func normalizeBindMountOptions(options []string, readOnly bool) []string {
+ 	result := make([]string, 0, len(options)+1)
+ 	seen := make(map[string]struct{}, len(options)+1)
+@@ -265,43 +177,6 @@ func normalizeBindMountOptions(options []string, readOnly bool) []string {
+ 	return result
+ }
+ 
+-func waitForDeviceMounted(ctx context.Context, path string) error {
+-
+-	ctx, cancel := context.WithTimeout(ctx, volumeCheckTimeout)
+-	defer cancel()
+-
+-	err := retry.Do(
+-		func() error {
+-			isMounted, err := mountinfo.Mounted(path)
+-			if err != nil {
+-				logger.Printf("Mounted check error: %v", err)
+-				return err
+-			}
+-
+-			if isMounted {
+-				logger.Printf("Device has been mounted to %s", path)
+-				return nil
+-			} else {
+-				err = fmt.Errorf("Device has not been mounted to %s", path)
+-				logger.Print(err)
+-				return err
+-			}
+-		},
+-		retry.Attempts(0),
+-		retry.Context(ctx),
+-		retry.MaxDelay(volumeCheckInterval),
+-	)
+-
+-	if err != nil {
+-		err = fmt.Errorf("Timeout waiting for device to mount to %s: %w", path, err)
+-		logger.Print(err)
+-		return err
+-	}
+-
+-	return nil
+-
+-}
+-
+ func (i *interceptor) StartContainer(ctx context.Context, req *pb.StartContainerRequest) (*emptypb.Empty, error) {
+ 
+ 	logger.Printf("StartContainer: containerID:%s", req.ContainerId)
+@@ -356,12 +231,19 @@ func (i *interceptor) DestroySandbox(ctx context.Context, req *pb.DestroySandbox
+ 
+ 	logger.Printf("DestroySandbox")
+ 
+-	i.unmountCloudVolumes()
++	i.cloudVolumeMu.Lock()
++	if err := cleanupPreparedCloudVolumes(ctx, i.cloudVolumes); err != nil {
++		logger.Printf("WARNING: failed to clean up cloud volumes: %v", err)
++	} else {
++		i.cloudVolumes = nil
++	}
++	i.cloudVolumeMu.Unlock()
+ 
+ 	res, err := i.Redirector.DestroySandbox(ctx, req)
+ 
+ 	if err != nil {
+ 		logger.Printf("DestroySandbox failed with error: %v", err)
++
+ 	}
+ 
+ 	return res, err
+@@ -708,64 +590,32 @@ func dumpBlockDeviceDiagnostics() {
+ 	}
+ }
+ 
+-func waitForDevice(device string) error {
+-	for attempt := 0; attempt < 30; attempt++ {
+-		if strings.HasPrefix(device, "/dev/disk/") {
+-			if _, err := os.Lstat(device); err == nil {
+-				return nil
+-			}
+-		} else {
+-			devName := filepath.Base(device)
+-			if _, err := os.Stat(filepath.Join("/sys/block", devName)); err == nil {
+-				return nil
+-			}
+-		}
+-		time.Sleep(2 * time.Second)
+-	}
+-	return fmt.Errorf("device %s not available after 60s", device)
+-}
+-
+-func formatAndMount(device, mountPoint, fsType string, readOnly bool, options []string) error {
++func formatAndMount(ctx context.Context, device, mountPoint, fsType string, readOnly bool, options []string) (bool, error) {
+ 	if fsType == "" {
+ 		fsType = "ext4"
+ 	}
+ 	if !allowedFSTypes[fsType] {
+-		return fmt.Errorf("unsupported filesystem type %q", fsType)
++		return false, fmt.Errorf("unsupported filesystem type %q", fsType)
+ 	}
+ 
+-	if alreadyMounted, err := mountinfo.Mounted(mountPoint); err == nil && alreadyMounted {
+-		logger.Printf("Mount point %s is already mounted, treating as success", mountPoint)
+-		return nil
++	// A conflicting existing mount is not evidence that a disk needs formatting.
++	if alreadyMounted, err := mountedCloudDevice(device, mountPoint, fsType, readOnly, options); err != nil || alreadyMounted {
++		return false, err
+ 	}
+ 
+-	// Try mounting first — if the disk already has a valid filesystem, this
+-	// avoids any risk of accidentally reformatting it.
+-	mountArgs := []string{"-t", fsType}
+-	if len(options) > 0 {
+-		mountArgs = append(mountArgs, "-o", strings.Join(options, ","))
+-	}
+-	mountArgs = append(mountArgs, device, mountPoint)
+-	mountCmd := exec.Command("mount", mountArgs...)
+-	if mountOut, mountErr := mountCmd.CombinedOutput(); mountErr == nil {
+-		logger.Printf("Mounted existing filesystem on %s at %s (type=%s)", device, mountPoint, fsType)
+-		return nil
+-	} else {
+-		logger.Printf("Initial mount of %s failed (expected for new disks): %s", device, strings.TrimSpace(string(mountOut)))
++	// Retain the upstream mount-before-format decision and use the same mount
++	// operation before and after filesystem creation.
++	if mounted, err := mountCloudFilesystem(ctx, device, mountPoint, fsType, readOnly, options); err == nil || mounted {
++		return mounted, err
+ 	}
+ 
+ 	// Mount failed — check if there's any filesystem using blkid with retries.
+ 	needsFormat := false
+ 	for attempt := 0; attempt < 3; attempt++ {
+-		out, err := exec.Command("blkid", "-p", device).CombinedOutput()
++		out, err := exec.CommandContext(ctx, "blkid", "-p", device).CombinedOutput()
+ 		outStr := strings.TrimSpace(string(out))
+ 		if err == nil && len(outStr) > 0 {
+-			autoMount := exec.Command("mount", mountArgs...)
+-			if autoOut, autoErr := autoMount.CombinedOutput(); autoErr == nil {
+-				logger.Printf("Mounted %s at %s (auto-detected type from: %s)", device, mountPoint, outStr)
+-				return nil
+-			} else {
+-				return fmt.Errorf("device %s has filesystem signature (%s) but mount failed: %s", device, outStr, strings.TrimSpace(string(autoOut)))
+-			}
++			return mountCloudFilesystem(ctx, device, mountPoint, fsType, readOnly, options)
+ 		}
+ 		if err != nil {
+ 			// Exit code 2 = no valid filesystem found (safe to format)
+@@ -784,23 +634,18 @@ func formatAndMount(device, mountPoint, fsType string, readOnly bool, options []
+ 	}
+ 
+ 	if !needsFormat {
+-		return fmt.Errorf("cannot determine filesystem state of %s after retries; refusing to format to protect data", device)
++		return false, fmt.Errorf("cannot determine filesystem state of %s after retries; refusing to format to protect data", device)
+ 	}
+ 	if readOnly {
+-		return fmt.Errorf("readonly device %s has no filesystem; refusing to format", device)
++		return false, fmt.Errorf("readonly device %s has no filesystem; refusing to format", device)
+ 	}
+ 
+ 	logger.Printf("No filesystem on %s, formatting as %s", device, fsType)
+-	mkfsCmd := exec.Command("mkfs."+fsType, device)
++	mkfsCmd := exec.CommandContext(ctx, "mkfs."+fsType, device)
+ 	if mkfsOut, mkfsErr := mkfsCmd.CombinedOutput(); mkfsErr != nil {
+-		return fmt.Errorf("mkfs.%s on %s failed: %s: %w", fsType, device, strings.TrimSpace(string(mkfsOut)), mkfsErr)
++		return false, fmt.Errorf("mkfs.%s on %s failed: %s: %w", fsType, device, strings.TrimSpace(string(mkfsOut)), mkfsErr)
+ 	}
+ 	logger.Printf("Formatted %s as %s", device, fsType)
+ 
+-	mountCmd2 := exec.Command("mount", mountArgs...)
+-	if mountOut, mountErr := mountCmd2.CombinedOutput(); mountErr != nil {
+-		return fmt.Errorf("mount after format %s -> %s failed: %s: %w", device, mountPoint, strings.TrimSpace(string(mountOut)), mountErr)
+-	}
+-	logger.Printf("Mounted %s at %s (type=%s)", device, mountPoint, fsType)
+-	return nil
++	return mountCloudFilesystem(ctx, device, mountPoint, fsType, readOnly, options)
+ }
+diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor_test.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor_test.go
+index 5240f068..1667da16 100644
+--- a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor_test.go
++++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor_test.go
+@@ -124,38 +124,6 @@ func TestNewInterceptor(t *testing.T) {
+ 	})
+ }
+ 
+-func TestIsTargetPath(t *testing.T) {
+-	t.Run("returns false when target path is empty", func(t *testing.T) {
+-		path := "/path/to/target"
+-		assert.False(t, isTargetPath(path, ""))
+-	})
+-
+-	t.Run("returns false when both paths are empty", func(t *testing.T) {
+-		assert.False(t, isTargetPath("", ""))
+-	})
+-
+-	t.Run("returns false when paths do not match", func(t *testing.T) {
+-		path := "/path/to/target"
+-		assert.False(t, isTargetPath(path, "mock path"))
+-		assert.False(t, isTargetPath(path, "/different/path"))
+-	})
+-
+-	t.Run("returns true when paths match exactly", func(t *testing.T) {
+-		path := "/path/to/target"
+-		assert.True(t, isTargetPath(path, "/path/to/target"))
+-	})
+-
+-	t.Run("returns false when path is empty but target is not", func(t *testing.T) {
+-		assert.False(t, isTargetPath("", "/path/to/target"))
+-	})
+-
+-	t.Run("handles paths with special characters", func(t *testing.T) {
+-		path := "/path/to/target-with_special.chars"
+-		assert.True(t, isTargetPath(path, path))
+-		assert.False(t, isTargetPath(path, "/path/to/target"))
+-	})
+-}
+-
+ func TestInterceptorCreateContainer(t *testing.T) {
+ 	t.Run("adds network namespace to container spec", func(t *testing.T) {
+ 		nsPath := "/run/netns/podns"
+@@ -479,107 +447,6 @@ func TestInterceptorDestroySandbox(t *testing.T) {
+ 	})
+ }
+ 
+-func TestInterceptorWithAnnotations(t *testing.T) {
+-	t.Run("handles volume target path annotation without matching mount", func(t *testing.T) {
+-		tmpDir := t.TempDir()
+-		// Create annotation path but use different mount source to avoid device wait
+-		annotationPath := filepath.Join(tmpDir, "annotation-volume")
+-		mountSource := filepath.Join(tmpDir, "actual-mount")
+-		require.NoError(t, os.MkdirAll(mountSource, 0o755))
+-
+-		mock := &testutil.MockAgentServiceClient{}
+-		i := newTestInterceptor(mock, "/run/netns/podns")
+-
+-		req := &pb.CreateContainerRequest{
+-			ContainerId: "test-container",
+-			OCI: &pb.Spec{
+-				Linux: &pb.Linux{
+-					Namespaces: []*pb.LinuxNamespace{},
+-				},
+-				Annotations: map[string]string{
+-					volumeTargetPathKey: annotationPath,
+-				},
+-				Mounts: []*pb.Mount{
+-					{
+-						Source: mountSource,
+-						Type:   "bind",
+-					},
+-				},
+-			},
+-		}
+-
+-		ctx := context.Background()
+-		_, err := i.CreateContainer(ctx, req)
+-
+-		require.NoError(t, err)
+-		assert.True(t, mock.CreateContainerCalled)
+-	})
+-
+-	t.Run("handles empty volume target path annotation", func(t *testing.T) {
+-		tmpDir := t.TempDir()
+-		mountSource := filepath.Join(tmpDir, "volume")
+-		require.NoError(t, os.MkdirAll(mountSource, 0o755))
+-
+-		mock := &testutil.MockAgentServiceClient{}
+-		i := newTestInterceptor(mock, "/run/netns/podns")
+-
+-		req := &pb.CreateContainerRequest{
+-			ContainerId: "test-container",
+-			OCI: &pb.Spec{
+-				Linux: &pb.Linux{
+-					Namespaces: []*pb.LinuxNamespace{},
+-				},
+-				Annotations: map[string]string{
+-					volumeTargetPathKey: "",
+-				},
+-				Mounts: []*pb.Mount{
+-					{
+-						Source: mountSource,
+-						Type:   "bind",
+-					},
+-				},
+-			},
+-		}
+-
+-		ctx := context.Background()
+-		_, err := i.CreateContainer(ctx, req)
+-
+-		require.NoError(t, err)
+-		assert.True(t, mock.CreateContainerCalled)
+-	})
+-
+-	t.Run("handles missing volume target path annotation", func(t *testing.T) {
+-		tmpDir := t.TempDir()
+-		mountSource := filepath.Join(tmpDir, "volume")
+-		require.NoError(t, os.MkdirAll(mountSource, 0o755))
+-
+-		mock := &testutil.MockAgentServiceClient{}
+-		i := newTestInterceptor(mock, "/run/netns/podns")
+-
+-		req := &pb.CreateContainerRequest{
+-			ContainerId: "test-container",
+-			OCI: &pb.Spec{
+-				Linux: &pb.Linux{
+-					Namespaces: []*pb.LinuxNamespace{},
+-				},
+-				Annotations: map[string]string{},
+-				Mounts: []*pb.Mount{
+-					{
+-						Source: mountSource,
+-						Type:   "bind",
+-					},
+-				},
+-			},
+-		}
+-
+-		ctx := context.Background()
+-		_, err := i.CreateContainer(ctx, req)
+-
+-		require.NoError(t, err)
+-		assert.True(t, mock.CreateContainerCalled)
+-	})
+-}
+-
+ func TestInterceptorCreateContainerWithMountErrors(t *testing.T) {
+ 	t.Run("handles mount source creation error when MkdirAll fails", func(t *testing.T) {
+ 		// Create a temp directory with restricted permissions to trigger MkdirAll failure
+@@ -837,77 +704,6 @@ func TestInterceptorCreateSandboxWithDNS(t *testing.T) {
+ 	})
+ }
+ 
+-func TestInterceptorWithComplexAnnotations(t *testing.T) {
+-	t.Run("handles annotation with whitespace in paths", func(t *testing.T) {
+-		tmpDir := t.TempDir()
+-		path1 := filepath.Join(tmpDir, "path1")
+-		path2 := filepath.Join(tmpDir, "path2")
+-		mountSource := filepath.Join(tmpDir, "mount")
+-		require.NoError(t, os.MkdirAll(mountSource, 0o755))
+-
+-		mock := &testutil.MockAgentServiceClient{}
+-		i := newTestInterceptor(mock, "/run/netns/podns")
+-
+-		req := &pb.CreateContainerRequest{
+-			ContainerId: "test-container",
+-			OCI: &pb.Spec{
+-				Linux: &pb.Linux{
+-					Namespaces: []*pb.LinuxNamespace{},
+-				},
+-				Annotations: map[string]string{
+-					volumeTargetPathKey: path1 + " , " + path2 + " ",
+-				},
+-				Mounts: []*pb.Mount{
+-					{
+-						Source: mountSource,
+-						Type:   "bind",
+-					},
+-				},
+-			},
+-		}
+-
+-		ctx := context.Background()
+-		_, err := i.CreateContainer(ctx, req)
+-
+-		require.NoError(t, err)
+-		assert.True(t, mock.CreateContainerCalled)
+-	})
+-
+-	t.Run("handles annotation with single path and comma", func(t *testing.T) {
+-		tmpDir := t.TempDir()
+-		annotationPath := filepath.Join(tmpDir, "annotation")
+-		mountSource := filepath.Join(tmpDir, "mount")
+-		require.NoError(t, os.MkdirAll(mountSource, 0o755))
+-
+-		mock := &testutil.MockAgentServiceClient{}
+-		i := newTestInterceptor(mock, "/run/netns/podns")
+-
+-		req := &pb.CreateContainerRequest{
+-			ContainerId: "test-container",
+-			OCI: &pb.Spec{
+-				Linux: &pb.Linux{
+-					Namespaces: []*pb.LinuxNamespace{},
+-				},
+-				Annotations: map[string]string{
+-					volumeTargetPathKey: annotationPath + ",",
+-				},
+-				Mounts: []*pb.Mount{
+-					{
+-						Source: mountSource,
+-						Type:   "bind",
+-					},
+-				},
+-			},
+-		}
+-
+-		ctx := context.Background()
+-		_, err := i.CreateContainer(ctx, req)
+-
+-		require.NoError(t, err)
+-		assert.True(t, mock.CreateContainerCalled)
+-	})
+-}
+-
+ func TestCloudVolumesJSONParseError(t *testing.T) {
+ 	t.Run("corrupt JSON annotation returns error instead of silently skipping", func(t *testing.T) {
+ 		mock := &mockRedirector{}
+@@ -1178,21 +974,3 @@ func TestFindDataDiskBySysfsHCTL(t *testing.T) {
+ 		assert.Error(t, err)
+ 	})
+ }
+-
+-func TestIsTargetPathEdgeCases(t *testing.T) {
+-	t.Run("handles paths with trailing slashes", func(t *testing.T) {
+-		assert.False(t, isTargetPath("/path/to/target/", "/path/to/target"))
+-		assert.False(t, isTargetPath("/path/to/target", "/path/to/target/"))
+-	})
+-
+-	t.Run("handles similar but different paths", func(t *testing.T) {
+-		assert.False(t, isTargetPath("/path/to/target", "/path/to/target2"))
+-		assert.False(t, isTargetPath("/path/to/target2", "/path/to/target"))
+-	})
+-
+-	t.Run("handles paths with dots", func(t *testing.T) {
+-		path := "/path/to/../target"
+-		assert.True(t, isTargetPath(path, path))
+-		assert.False(t, isTargetPath(path, "/path/target"))
+-	})
+-}
+diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/volume_transaction_test.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/volume_transaction_test.go
+new file mode 100644
+index 00000000..e526a173
+--- /dev/null
++++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/volume_transaction_test.go
+@@ -0,0 +1,62 @@
++// (C) Copyright Confidential Containers Contributors
++// SPDX-License-Identifier: Apache-2.0
++
++package interceptor
++
++import (
++	"context"
++	"errors"
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/confidential-containers/cloud-api-adaptor/src/cloud-api-adaptor/pkg/util"
++	pb "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/agent/protocols/grpc"
++	"github.com/stretchr/testify/require"
++)
++
++func TestCreateContainerRollsBackPreparationAndAgentFailure(t *testing.T) {
++	for _, tc := range []struct {
++		name                               string
++		preparationFailure, cleanupFailure bool
++	}{
++		{name: "agent rejection"}, {name: "preparation failure", preparationFailure: true}, {name: "failed rollback retained for destroy", cleanupFailure: true},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			owned := filepath.Join(t.TempDir(), "owned")
++			require.NoError(t, os.Mkdir(owned, 0700))
++			borrowed := filepath.Join(t.TempDir(), "borrowed")
++			require.NoError(t, os.Mkdir(borrowed, 0700))
++			unmountErr := errors.New("device busy")
++			cleaned := false
++			v := &preparedCloudVolume{sourcePath: owned, createdDirHere: true, mountedHere: true, unmount: func(string, int) error {
++				cleaned = true
++				if tc.cleanupFailure {
++					return unmountErr
++				}
++				return nil
++			}}
++			i := &interceptor{Redirector: &mockRedirector{createContainerError: errors.New("agent rejected container")}}
++			req := &pb.CreateContainerRequest{OCI: &pb.Spec{Linux: &pb.Linux{}, Annotations: map[string]string{util.CloudVolumesAnnotationKey: "{}"}}}
++			_, err := i.createContainer(context.Background(), req, func(context.Context, *pb.CreateContainerRequest, string) ([]*preparedCloudVolume, error) {
++				volumes := []*preparedCloudVolume{v, {sourcePath: borrowed}}
++				if tc.preparationFailure {
++					return volumes, errors.New("preparation failed")
++				}
++				return volumes, nil
++			})
++			require.Error(t, err)
++			require.True(t, cleaned, "early error skipped resource rollback")
++			require.DirExists(t, borrowed, "rollback removed a borrowed resource")
++			if tc.cleanupFailure {
++				require.ErrorIs(t, err, unmountErr)
++				require.Len(t, i.cloudVolumes, 1, "failed cleanup lost ownership")
++				tc.cleanupFailure = false
++				require.NoError(t, cleanupPreparedCloudVolumes(context.Background(), i.cloudVolumes))
++			} else {
++				require.Empty(t, i.cloudVolumes)
++			}
++			require.NoDirExists(t, owned)
++		})
++	}
++}
+-- 
+2.43.7
+

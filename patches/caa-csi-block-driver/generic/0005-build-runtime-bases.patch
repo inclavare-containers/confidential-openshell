@@ -1,13 +1,11 @@
-From a53e5082e0cd3e82228ae28ce4e0e6d63f2008be Mon Sep 17 00:00:00 2001
+From 8337aba4c1b0499a66110bb0d678d7e5f69e974d Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
-Date: Tue, 3 Nov 2026 11:58:13 +0800
+Date: Wed, 4 Nov 2026 11:31:52 +0800
 Subject: [PATCH] build: pin supported build and runtime base images
 
-Pin the Go 1.26.7 Alpine 3.24 builder and Alpine 3.24.3 runtime by
-multi-platform manifest digest. Retain cross-compilation and the
-existing image layout while removing dependence on mutable base tags.
+Keep digest-pinned multi-platform build and runtime inputs.
 
-Generated-by: OpenAI Codex
+Co-authored-by: Codex <noreply@openai.com>
 ---
  Dockerfile | 6 ++++--
  1 file changed, 4 insertions(+), 2 deletions(-)

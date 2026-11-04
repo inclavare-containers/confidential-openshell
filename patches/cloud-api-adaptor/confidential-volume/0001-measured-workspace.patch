@@ -1,0 +1,1195 @@
+From e213b4c94403b40f4b3adf7609701a5c19ce9805 Mon Sep 17 00:00:00 2001
+From: Weidong Sun <sunweidong@linux.alibaba.com>
+Date: Wed, 4 Nov 2026 15:24:44 +0800
+Subject: [PATCH] guest: authorize encrypted workspaces through measured policy
+
+Bind disk and key selection to measured workspace policy. Use CDH to open
+existing encrypted devices and the measured initializer for authorized
+first use. Extend guest mount ownership to mapper, readonly-device and
+initializer resources so failures unwind in dependency order.
+
+Validate active LUKS2 parameters and enforce readonly before exposing the
+workspace. Host metadata never supplies its encryption authorization.
+
+Co-authored-by: Codex <noreply@openai.com>
+---
+ .../cmd/agent-protocol-forwarder/main.go      |  26 +-
+ .../cmd/agent-protocol-forwarder/main_test.go |  19 ++
+ .../pkg/forwarder/interceptor/cdh_client.go   |  59 ++++
+ .../pkg/forwarder/interceptor/cloud_volume.go | 251 ++++++++++++++++-
+ .../interceptor/cloud_volume_test.go          |  98 +++++++
+ .../pkg/forwarder/interceptor/interceptor.go  |  82 +++++-
+ .../forwarder/interceptor/interceptor_test.go |   9 +
+ .../pkg/forwarder/interceptor/workspace.go    | 258 ++++++++++++++++++
+ .../forwarder/interceptor/workspace_test.go   | 120 ++++++++
+ 9 files changed, 894 insertions(+), 28 deletions(-)
+ create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/cdh_client.go
+ create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace.go
+ create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace_test.go
+
+diff --git a/src/cloud-api-adaptor/cmd/agent-protocol-forwarder/main.go b/src/cloud-api-adaptor/cmd/agent-protocol-forwarder/main.go
+index 189a3595..e36fccec 100644
+--- a/src/cloud-api-adaptor/cmd/agent-protocol-forwarder/main.go
++++ b/src/cloud-api-adaptor/cmd/agent-protocol-forwarder/main.go
+@@ -9,6 +9,7 @@ import (
+ 	"flag"
+ 	"fmt"
+ 	"os"
++	"strconv"
+ 
+ 	"github.com/confidential-containers/cloud-api-adaptor/src/cloud-api-adaptor/cmd"
+ 	daemon "github.com/confidential-containers/cloud-api-adaptor/src/cloud-api-adaptor/pkg/forwarder"
+@@ -22,13 +23,14 @@ const (
+ )
+ 
+ type Config struct {
+-	tlsConfig           *tlsutil.TLSConfig
+-	daemonConfig        daemon.Config
+-	configPath          string
+-	listenAddr          string
+-	kataAgentSocketPath string
+-	podNamespace        string
+-	HostInterface       string
++	tlsConfig               *tlsutil.TLSConfig
++	daemonConfig            daemon.Config
++	configPath              string
++	listenAddr              string
++	kataAgentSocketPath     string
++	podNamespace            string
++	HostInterface           string
++	requireEncryptedVolumes bool
+ }
+ 
+ func load(path string, obj interface{}) error {
+@@ -52,6 +54,13 @@ func (cfg *Config) Setup() (cmd.Starter, error) {
+ 		tlsConfig   tlsutil.TLSConfig
+ 		services    []cmd.Service
+ 	)
++	if value, exists := os.LookupEnv("ENCRYPTED_VOLUMES_REQUIRED"); exists && value != "" {
++		required, err := strconv.ParseBool(value)
++		if err != nil {
++			return nil, fmt.Errorf("invalid ENCRYPTED_VOLUMES_REQUIRED value %q: %w", value, err)
++		}
++		cfg.requireEncryptedVolumes = required
++	}
+ 
+ 	cmd.Parse(programName, os.Args, func(flags *flag.FlagSet) {
+ 		flags.BoolVar(&showVersion, "version", false, "Show version")
+@@ -65,6 +74,7 @@ func (cfg *Config) Setup() (cmd.Starter, error) {
+ 		flags.StringVar(&tlsConfig.KeyFile, "cert-key", "", "cert key")
+ 		flags.BoolVar(&tlsConfig.SkipVerify, "tls-skip-verify", false, "Skip TLS certificate verification - use it only for testing")
+ 		flags.BoolVar(&disableTLS, "disable-tls", false, "Disable TLS encryption - use it only for testing")
++		flags.BoolVar(&cfg.requireEncryptedVolumes, "require-encrypted-volumes", cfg.requireEncryptedVolumes, "Require encrypted volumes for guest data volumes")
+ 	})
+ 
+ 	cmd.ShowVersion(programName)
+@@ -81,7 +91,7 @@ func (cfg *Config) Setup() (cmd.Starter, error) {
+ 		cfg.tlsConfig = &tlsConfig
+ 	}
+ 
+-	interceptor := interceptor.NewInterceptor(cfg.kataAgentSocketPath, cfg.podNamespace)
++	interceptor := interceptor.NewInterceptorWithEncryptedVolumes(cfg.kataAgentSocketPath, cfg.podNamespace, cfg.requireEncryptedVolumes)
+ 
+ 	podNode := podnetwork.NewPodNode(cfg.podNamespace, cfg.HostInterface, cfg.daemonConfig.PodNetwork)
+ 
+diff --git a/src/cloud-api-adaptor/cmd/agent-protocol-forwarder/main_test.go b/src/cloud-api-adaptor/cmd/agent-protocol-forwarder/main_test.go
+index 829589f2..4c494076 100644
+--- a/src/cloud-api-adaptor/cmd/agent-protocol-forwarder/main_test.go
++++ b/src/cloud-api-adaptor/cmd/agent-protocol-forwarder/main_test.go
+@@ -129,6 +129,25 @@ func TestConfigSetup(t *testing.T) {
+ 		assert.Nil(t, cfg.tlsConfig)
+ 	})
+ 
++	t.Run("requires encrypted volumes from environment", func(t *testing.T) {
++		t.Setenv("ENCRYPTED_VOLUMES_REQUIRED", "true")
++		_, cleanup := setupTestConfig(t, `{"pod-namespace": "test-ns"}`)
++		defer cleanup()
++
++		cfg := &Config{}
++		starter, err := cfg.Setup()
++		require.NoError(t, err)
++		assert.NotNil(t, starter)
++		assert.True(t, cfg.requireEncryptedVolumes)
++	})
++
++	t.Run("rejects invalid encrypted volumes environment", func(t *testing.T) {
++		t.Setenv("ENCRYPTED_VOLUMES_REQUIRED", "sometimes")
++		cfg := &Config{}
++		_, err := cfg.Setup()
++		assert.ErrorContains(t, err, "invalid ENCRYPTED_VOLUMES_REQUIRED")
++	})
++
+ 	t.Run("config with tls-skip-verify flag", func(t *testing.T) {
+ 		_, cleanup := setupTestConfig(t, `{"pod-namespace": "test-ns"}`,
+ 			"-tls-skip-verify",
+diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/cdh_client.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/cdh_client.go
+new file mode 100644
+index 00000000..a87c24fd
+--- /dev/null
++++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/cdh_client.go
+@@ -0,0 +1,59 @@
++// (C) Copyright Confidential Containers Contributors
++// SPDX-License-Identifier: Apache-2.0
++
++package interceptor
++
++import (
++	"context"
++	"fmt"
++
++	"github.com/containerd/ttrpc"
++
++	"github.com/confidential-containers/cloud-api-adaptor/src/cloud-api-adaptor/pkg/forwarder/interceptor/cdhpb"
++)
++
++const (
++	cdhServiceName = "api.SecureMountService"
++)
++
++type cdhClient struct {
++	client *ttrpc.Client
++}
++
++func newCDHClient(ctx context.Context, socketPath string) (*cdhClient, error) {
++	conn, err := dial(ctx, socketPath)
++	if err != nil {
++		return nil, err
++	}
++	return &cdhClient{client: ttrpc.NewClient(conn)}, nil
++}
++
++func (c *cdhClient) close() {
++	if err := c.client.Close(); err != nil {
++		logger.Printf("WARNING: closing CDH ttrpc client: %v", err)
++	}
++}
++
++func (c *cdhClient) getResource(ctx context.Context, uri string) ([]byte, error) {
++	resp := &cdhpb.GetResourceResponse{}
++	if err := c.client.Call(ctx, "api.GetResourceService", "GetResource", &cdhpb.GetResourceRequest{ResourcePath: uri}, resp); err != nil {
++		return nil, fmt.Errorf("CDH GetResource RPC failed: %w", err)
++	}
++	return resp.GetResource(), nil
++}
++
++func (c *cdhClient) secureMount(ctx context.Context, volumeType string, options map[string]string, flags []string, mountPoint string) error {
++	req := &cdhpb.SecureMountRequest{
++		VolumeType: volumeType,
++		Options:    options,
++		Flags:      flags,
++		MountPoint: mountPoint,
++	}
++	resp := &cdhpb.SecureMountResponse{}
++
++	if err := c.client.Call(ctx, cdhServiceName, "SecureMount", req, resp); err != nil {
++		return fmt.Errorf("CDH SecureMount RPC failed: %w", err)
++	}
++
++	return nil
++}
+diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume.go
+index 7b30e785..a0de589b 100644
+--- a/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume.go
++++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume.go
+@@ -8,6 +8,7 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"os"
++	"os/exec"
+ 	"path/filepath"
+ 	"sort"
+ 	"strconv"
+@@ -23,22 +24,39 @@ import (
+ )
+ 
+ // preparedCloudVolume tracks only resources acquired by one CreateContainer
+-// call. Reused mounts are intentionally not owned by that call.
++// call. Reused mounts and mappers are intentionally not owned by that call.
+ type preparedCloudVolume struct {
+-	sourcePath     string
+-	mountedHere    bool
+-	createdDirHere bool
+-	unmount        func(string, int) error
++	initializerProcessGroup int
++	sourcePath              string
++	mountedHere             bool
++	createdDirHere          bool
++	rawDevice               string
++	setRawReadOnlyHere      bool
++	cdhDevicePath           string
++	createdCDHPathHere      bool
++	setReadOnly             func(context.Context, string, bool) error
++	cdhMapperName           string
++	cdhMapperPath           string
++	openedCDHMapperHere     bool
++	unmount                 func(string, int) error
++	closeCDHMapper          func(context.Context, string, string) error
+ }
+ 
+ func (v *preparedCloudVolume) owned() bool {
+-	return v != nil && (v.mountedHere || v.createdDirHere)
++	return v != nil && (v.mountedHere || v.createdDirHere ||
++		v.openedCDHMapperHere || v.setRawReadOnlyHere || v.createdCDHPathHere || v.initializerProcessGroup != 0)
+ }
+ 
+ func (v *preparedCloudVolume) cleanup(ctx context.Context) error {
+ 	if v == nil {
+ 		return nil
+ 	}
++	if v.initializerProcessGroup != 0 {
++		if err := waitInitializerProcessGroup(ctx, v.initializerProcessGroup); err != nil {
++			return err
++		}
++		v.initializerProcessGroup = 0
++	}
+ 
+ 	if v.mountedHere {
+ 		unmount := v.unmount
+@@ -50,6 +68,32 @@ func (v *preparedCloudVolume) cleanup(ctx context.Context) error {
+ 		}
+ 		v.mountedHere = false
+ 	}
++	if v.createdCDHPathHere {
++		if err := os.Remove(v.cdhDevicePath); err != nil && !errors.Is(err, os.ErrNotExist) {
++			return fmt.Errorf("remove CDH device path: %w", err)
++		}
++		v.createdCDHPathHere = false
++	}
++	if v.openedCDHMapperHere {
++		closeMapper := v.closeCDHMapper
++		if closeMapper == nil {
++			closeMapper = closeCryptsetupMapper
++		}
++		if err := closeMapper(ctx, v.cdhMapperName, v.cdhMapperPath); err != nil {
++			return err
++		}
++		v.openedCDHMapperHere = false
++	}
++	if v.setRawReadOnlyHere {
++		setMode := v.setReadOnly
++		if setMode == nil {
++			setMode = setBlockDeviceMode
++		}
++		if err := setMode(ctx, v.rawDevice, false); err != nil {
++			return err
++		}
++		v.setRawReadOnlyHere = false
++	}
+ 	if v.createdDirHere {
+ 		if err := os.Remove(v.sourcePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+ 			return fmt.Errorf("remove mount directory %s: %w", v.sourcePath, err)
+@@ -92,6 +136,17 @@ func (i *interceptor) prepareCloudVolumes(ctx context.Context, req *pb.CreateCon
+ 	if err != nil {
+ 		return nil, fmt.Errorf("corrupt cloud_volumes annotation (pod would start without volumes): %w", err)
+ 	}
++	var workspace *workspacePolicy
++	if i.requireEncryptedVolumes && len(volumes) != 0 {
++		if i.workspace == nil {
++			policy, err := loadWorkspacePolicy(workspaceInitdataPath)
++			if err != nil {
++				return nil, fmt.Errorf("encrypted volumes are required: %w", err)
++			}
++			i.workspace = &policy
++		}
++		workspace = i.workspace
++	}
+ 
+ 	names := make([]string, 0, len(volumes))
+ 	for name := range volumes {
+@@ -100,7 +155,7 @@ func (i *interceptor) prepareCloudVolumes(ctx context.Context, req *pb.CreateCon
+ 	sort.Strings(names)
+ 	prepared := make([]*preparedCloudVolume, 0, len(names))
+ 	for _, name := range names {
+-		volume, err := prepareCloudVolume(ctx, name, volumes[name])
++		volume, err := prepareCloudVolume(ctx, name, volumes[name], workspace)
+ 		if volume != nil {
+ 			prepared = append(prepared, volume)
+ 		}
+@@ -114,9 +169,13 @@ func (i *interceptor) prepareCloudVolumes(ctx context.Context, req *pb.CreateCon
+ 	return prepared, nil
+ }
+ 
+-func prepareCloudVolume(ctx context.Context, name string, volume util.CloudVolumeAnnotation) (*preparedCloudVolume, error) {
++func prepareCloudVolume(ctx context.Context, name string, volume util.CloudVolumeAnnotation, workspace *workspacePolicy) (*preparedCloudVolume, error) {
+ 	lun, _ := strconv.Atoi(volume.LUN) // validated by DecodeCloudVolumeAnnotations
+-
++	if workspace != nil {
++		if err := workspace.authorize(volume); err != nil {
++			return nil, fmt.Errorf("cloud volume %s: %w", name, err)
++		}
++	}
+ 	device, err := findDataDiskDevice(lun, volume.DiskID)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("cloud volume %s device discovery: %w", name, err)
+@@ -125,7 +184,7 @@ func prepareCloudVolume(ctx context.Context, name string, volume util.CloudVolum
+ 	if err := os.MkdirAll(cloudVolumeMountBase, 0o755); err != nil {
+ 		return nil, fmt.Errorf("create cloud volume directory: %w", err)
+ 	}
+-	prepared := &preparedCloudVolume{sourcePath: filepath.Join(cloudVolumeMountBase, name)}
++	prepared := &preparedCloudVolume{sourcePath: filepath.Join(cloudVolumeMountBase, name), rawDevice: device}
+ 	if err := os.Mkdir(prepared.sourcePath, 0o755); err == nil {
+ 		prepared.createdDirHere = true
+ 	} else if !errors.Is(err, os.ErrExist) {
+@@ -139,6 +198,20 @@ func prepareCloudVolume(ctx context.Context, name string, volume util.CloudVolum
+ 		return prepared, fmt.Errorf("use mount point for %s: %w", name, err)
+ 	}
+ 
++	if workspace != nil {
++		if err := ensureWorkspaceInitialized(ctx, device, volume, *workspace, func(ctx context.Context, device, diskID, fsType, uri string) error {
++			return initializeWorkspaceVolume(ctx, device, diskID, fsType, uri, prepared)
++		}); err != nil {
++			return prepared, err
++		}
++		if err := prepareCDHCloudVolume(ctx, prepared, name, device, volume, workspace.KeyURI); err != nil {
++			return prepared, err
++		}
++		if err := applyCloudVolumeFSGroup(prepared.sourcePath, volume.FSGroup, volume.ReadOnly); err != nil {
++			return prepared, err
++		}
++		return prepared, nil
++	}
+ 	prepared.mountedHere, err = formatAndMount(ctx, device, prepared.sourcePath, volume.FSType, volume.ReadOnly, volume.Options)
+ 	if err != nil {
+ 		return prepared, fmt.Errorf("mount cloud volume %s: %w", name, err)
+@@ -149,8 +222,103 @@ func prepareCloudVolume(ctx context.Context, name string, volume util.CloudVolum
+ 	return prepared, nil
+ }
+ 
+-// Mounting itself never formats. The plain-volume formatter decides whether
+-// a new filesystem is needed before calling this operation again.
++// CDH's filesystem mount ignores readonly/flags. Ask it only to open
++// the encrypted device, then enforce underlay, mapper and filesystem modes here.
++func prepareCDHCloudVolume(ctx context.Context, prepared *preparedCloudVolume, name, device string, volume util.CloudVolumeAnnotation, keyURI string) error {
++	prepared.cdhMapperName = "caa-" + name
++	prepared.cdhMapperPath = filepath.Join("/dev/mapper", prepared.cdhMapperName)
++	prepared.cdhDevicePath = filepath.Join(cloudVolumeMountBase, "."+prepared.cdhMapperName+".device")
++	mapperExisted, err := blockDeviceExists(prepared.cdhMapperPath)
++	if err != nil {
++		return err
++	}
++	if mapperExisted {
++		if err := verifyCDHMapper(ctx, prepared.cdhMapperPath, device); err != nil {
++			return err
++		}
++		if volume.ReadOnly {
++			for _, path := range []string{device, prepared.cdhMapperPath} {
++				ro, err := blockDeviceReadOnly(ctx, path)
++				if err != nil {
++					return err
++				}
++				if !ro {
++					return fmt.Errorf("reused encrypted device %s is writable after a readonly request", path)
++				}
++			}
++		}
++		mounted, err := mountedCloudDevice(prepared.cdhMapperPath, prepared.sourcePath, volume.FSType, volume.ReadOnly, volume.Options)
++		if err != nil || mounted {
++			return err
++		}
++	} else {
++		if mounted, err := mountinfo.Mounted(prepared.sourcePath); err != nil {
++			return err
++		} else if mounted {
++			return fmt.Errorf("mount point for %s is already backed by an unexpected device", name)
++		}
++		if _, err := os.Lstat(prepared.cdhDevicePath); !errors.Is(err, os.ErrNotExist) {
++			return fmt.Errorf("CDH device path for %s must not already exist", name)
++		}
++		if volume.ReadOnly {
++			ro, err := blockDeviceReadOnly(ctx, device)
++			if err != nil {
++				return err
++			}
++			if !ro {
++				prepared.setRawReadOnlyHere = true
++				if err := setBlockDeviceMode(ctx, device, true); err != nil {
++					return err
++				}
++			}
++		}
++		// Mark acquisition before RPC so an applied-but-unreported open is
++		// reclaimed, while mappings borrowed from an earlier call stay open.
++		prepared.openedCDHMapperHere = true
++		secureErr := secureMount(ctx, device, prepared.cdhDevicePath, keyURI, prepared.cdhMapperName)
++		exists, statErr := blockDeviceExists(prepared.cdhMapperPath)
++		if !exists && statErr == nil {
++			prepared.openedCDHMapperHere = false
++		}
++		if target, err := os.Readlink(prepared.cdhDevicePath); err == nil && target == prepared.cdhMapperPath {
++			prepared.createdCDHPathHere = true
++		}
++		if secureErr != nil || statErr != nil {
++			return errors.Join(secureErr, statErr)
++		}
++		if !exists || !prepared.createdCDHPathHere {
++			return fmt.Errorf("CDH did not open expected encrypted device for %s", name)
++		}
++		if err := verifyCDHMapper(ctx, prepared.cdhMapperPath, device); err != nil {
++			return err
++		}
++		if volume.ReadOnly {
++			if err := setBlockDeviceMode(ctx, prepared.cdhMapperPath, true); err != nil {
++				return err
++			}
++			for _, path := range []string{device, prepared.cdhMapperPath} {
++				ro, err := blockDeviceReadOnly(ctx, path)
++				if err != nil {
++					return err
++				}
++				if !ro {
++					return fmt.Errorf("encrypted device %s remains writable", path)
++				}
++			}
++		}
++	}
++	// Existing encrypted data is never repaired or formatted. Only the
++	// measured first-use initializer may create its embedded header and FS.
++	output, err := exec.CommandContext(ctx, "blkid", "-p", "-s", "TYPE", "-o", "value", prepared.cdhMapperPath).CombinedOutput()
++	if err != nil || strings.TrimSpace(string(output)) != volume.FSType {
++		return fmt.Errorf("encrypted device for %s lacks expected filesystem %s; refusing to format", name, volume.FSType)
++	}
++	prepared.mountedHere, err = mountCloudFilesystem(ctx, prepared.cdhMapperPath, prepared.sourcePath, volume.FSType, volume.ReadOnly, volume.Options)
++	return err
++}
++
++// The shared mount operation never formats. Only the upstream plain-volume
++// formatter or measured first-use initializer can create a filesystem.
+ func mountCloudFilesystem(ctx context.Context, device, mountPoint, fsType string, readOnly bool, options []string) (bool, error) {
+ 	if mounted, err := mountedCloudDevice(device, mountPoint, fsType, readOnly, options); err != nil || mounted {
+ 		return false, err
+@@ -161,7 +329,7 @@ func mountCloudFilesystem(ctx context.Context, device, mountPoint, fsType string
+ 	mountErr := ctdmount.All([]ctdmount.Mount{{Type: fsType, Source: device, Options: options}}, mountPoint)
+ 
+ 	// Observe ownership independently of exit status and validation so a
+-	// partial or incorrect mount is still owned and unwound during rollback.
++	// partial/incorrect mount is still unwound before its mapper closes.
+ 	mounted, inspectErr := mountinfo.Mounted(mountPoint)
+ 	if inspectErr != nil {
+ 		return mounted, errors.Join(mountErr, inspectErr)
+@@ -173,6 +341,63 @@ func mountCloudFilesystem(ctx context.Context, device, mountPoint, fsType string
+ 	return false, errors.Join(mountErr, fmt.Errorf("filesystem was not mounted at %s", mountPoint))
+ }
+ 
++func verifyCDHMapper(ctx context.Context, mapper, device string) error {
++	resolved, err := filepath.EvalSymlinks(mapper)
++	if err != nil {
++		return err
++	}
++	if !blockDeviceGraphContains("/sys/class/block", filepath.Base(resolved), filepath.Base(device)) {
++		return fmt.Errorf("encrypted mapper %s is not backed by expected device %s", mapper, device)
++	}
++	return verifyWorkspaceMapperEncryption(ctx, mapper)
++}
++
++// Inspect the active kernel mapping, not the mutable on-disk header. The
++// first-use initializer fixes these parameters; CDH opens existing volumes.
++func verifyWorkspaceMapperEncryption(ctx context.Context, mapper string) error {
++	command := exec.CommandContext(ctx, "cryptsetup", "status", mapper)
++	command.Env = append(os.Environ(), "LC_ALL=C")
++	status, err := command.Output()
++	if err != nil {
++		return fmt.Errorf("inspect workspace encryption: %w", err)
++	}
++	return validateWorkspaceMapperStatus(string(status))
++}
++
++func validateWorkspaceMapperStatus(status string) error {
++	fields := make(map[string]string)
++	for _, line := range strings.Split(status, "\n") {
++		key, value, ok := strings.Cut(line, ":")
++		if ok {
++			fields[strings.TrimSpace(key)] = strings.Join(strings.Fields(value), " ")
++		}
++	}
++	if fields["type"] != "LUKS2" || fields["cipher"] != "aes-xts-plain64" ||
++		fields["keysize"] != "512 [bits]" || fields["sector size"] != "4096 [bytes]" {
++		return errors.New("workspace mapper does not use required LUKS2 AES-XTS-512 encryption with 4096-byte sectors")
++	}
++	return nil
++}
++
++func closeCryptsetupMapper(ctx context.Context, name, path string) error {
++	exists, err := blockDeviceExists(path)
++	if err != nil || !exists {
++		return err
++	}
++	output, closeErr := exec.CommandContext(ctx, "cryptsetup", "close", name).CombinedOutput()
++	exists, statErr := blockDeviceExists(path)
++	if statErr != nil {
++		return errors.Join(closeErr, statErr)
++	}
++	if closeErr != nil && exists {
++		return fmt.Errorf("close CDH mapper %s: %s: %w", name, strings.TrimSpace(string(output)), closeErr)
++	}
++	if exists {
++		return fmt.Errorf("CDH mapper %s remains open after close", name)
++	}
++	return nil
++}
++
+ func rewriteCloudMount(req *pb.CreateContainerRequest, name string, volume util.CloudVolumeAnnotation, source string) error {
+ 	matched := -1
+ 	for index, mount := range req.OCI.Mounts {
+diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume_test.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume_test.go
+index f311e283..b106e6c4 100644
+--- a/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume_test.go
++++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume_test.go
+@@ -4,7 +4,11 @@
+ package interceptor
+ 
+ import (
++	"context"
+ 	"errors"
++	"os"
++	"path/filepath"
++	"strings"
+ 	"testing"
+ 
+ 	"github.com/confidential-containers/cloud-api-adaptor/src/cloud-api-adaptor/pkg/util"
+@@ -15,6 +19,89 @@ import (
+ 	"golang.org/x/sys/unix"
+ )
+ 
++func TestPreparedCloudVolumeCleanupOwnsResourcesIndependently(t *testing.T) {
++	directory := filepath.Join(t.TempDir(), "volume")
++	require.NoError(t, os.Mkdir(directory, 0o755))
++	events := []string{}
++	mapperExists := true
++	rawReadOnly := true
++	volume := &preparedCloudVolume{
++		sourcePath: directory, mountedHere: true, createdDirHere: true,
++		cdhMapperName: "caa-vol-0", cdhMapperPath: "/dev/mapper/caa-vol-0", rawDevice: "/dev/vdb",
++		openedCDHMapperHere: true, setRawReadOnlyHere: true,
++		closeCDHMapper: func(context.Context, string, string) error {
++			events = append(events, "close")
++			mapperExists = false
++			return nil
++		},
++		setReadOnly: func(_ context.Context, _ string, value bool) error {
++			events = append(events, "setrw")
++			rawReadOnly = value
++			return nil
++		},
++		unmount: func(string, int) error {
++			events = append(events, "unmount")
++			return nil
++		},
++	}
++
++	require.NoError(t, volume.cleanup(context.Background()))
++	assert.Equal(t, []string{"unmount", "close", "setrw"}, events)
++	assert.NoDirExists(t, directory)
++	assert.False(t, mapperExists)
++	assert.False(t, rawReadOnly)
++
++	// Cleanup is idempotent and performs no second release.
++	require.NoError(t, volume.cleanup(context.Background()))
++	assert.Equal(t, []string{"unmount", "close", "setrw"}, events)
++}
++
++func TestPreparedCloudVolumeDoesNotCloseReusedMapper(t *testing.T) {
++	closed := false
++	volume := &preparedCloudVolume{
++		cdhMapperName: "reused", cdhMapperPath: "/dev/mapper/reused",
++		closeCDHMapper: func(context.Context, string, string) error { closed = true; return nil },
++	}
++	require.NoError(t, volume.cleanup(context.Background()))
++	assert.False(t, closed)
++}
++
++func TestPreparedCloudVolumeCleanupRetriesInDependencyOrder(t *testing.T) {
++	directory := filepath.Join(t.TempDir(), "volume")
++	require.NoError(t, os.Mkdir(directory, 0o755))
++	closeCalled := false
++	unmountFails := true
++	volume := &preparedCloudVolume{
++		sourcePath: directory, mountedHere: true, createdDirHere: true,
++		cdhMapperName: "owned", cdhMapperPath: "/dev/mapper/owned", openedCDHMapperHere: true,
++		closeCDHMapper: func(context.Context, string, string) error { closeCalled = true; return nil },
++		unmount: func(string, int) error {
++			if unmountFails {
++				return errors.New("busy")
++			}
++			return nil
++		},
++	}
++
++	assert.ErrorContains(t, volume.cleanup(context.Background()), "busy")
++	assert.False(t, closeCalled, "mapper must remain open while its filesystem is mounted")
++	assert.DirExists(t, directory)
++
++	unmountFails = false
++	require.NoError(t, volume.cleanup(context.Background()))
++	assert.True(t, closeCalled)
++	assert.NoDirExists(t, directory)
++}
++
++func TestEncryptedVolumeRequiredNeverFallsBackToRawDisk(t *testing.T) {
++	policy := testWorkspacePolicy()
++	i := &interceptor{requireEncryptedVolumes: true, workspace: &policy}
++	req := &pb.CreateContainerRequest{OCI: &pb.Spec{Mounts: []*pb.Mount{{Destination: "/data"}}}}
++	_, err := i.prepareCloudVolumes(context.Background(), req,
++		`{"vol-0":{"mount_point":"/data","fs_type":"ext4","lun":"0","disk_id":"d-replaced","readonly":false}}`)
++	assert.ErrorContains(t, err, "not bound by measured workspace policy")
++}
++
+ func TestPreserveOriginalError(t *testing.T) {
+ 	original := errors.New("create container failed")
+ 	assert.Same(t, original, preserveOriginalError(original, nil))
+@@ -66,3 +153,14 @@ func TestValidateReusableCloudMountRequiresSecurityOptions(t *testing.T) {
+ 	)
+ 	require.ErrorContains(t, err, "option noexec=false, expected true")
+ }
++
++func TestWorkspaceMapperEncryptionParameters(t *testing.T) {
++	valid := "/dev/mapper/caa-vol-0 is active.\n  type: LUKS2\n  cipher: aes-xts-plain64\n  keysize: 512 [bits]\n  sector size: 4096 [bytes]\n"
++	require.NoError(t, validateWorkspaceMapperStatus(valid))
++	for _, change := range [][2]string{{"LUKS2", "PLAIN"}, {"aes-xts-plain64", "cipher_null-ecb"}, {"512 [bits]", "256 [bits]"}, {"4096 [bytes]", "512 [bytes]"}} {
++		t.Run(change[1], func(t *testing.T) {
++			require.Error(t, validateWorkspaceMapperStatus(strings.Replace(valid, change[0], change[1], 1)))
++		})
++	}
++	require.Error(t, validateWorkspaceMapperStatus("inactive"))
++}
+diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
+index 0c5499be..1ba459af 100644
+--- a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
++++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
+@@ -7,6 +7,7 @@ import (
+ 	"context"
+ 	"errors"
+ 	"fmt"
++	"io"
+ 	"log"
+ 	"net"
+ 	"os"
+@@ -28,6 +29,7 @@ import (
+ 
+ const (
+ 	cloudVolumeMountBase = "/run/cloud-volumes"
++	cdhSocketPath        = "/run/confidential-containers/cdh.sock"
+ )
+ 
+ var allowedFSTypes = map[string]bool{
+@@ -45,9 +47,11 @@ type Interceptor interface {
+ type interceptor struct {
+ 	agentproto.Redirector
+ 
+-	nsPath        string
+-	cloudVolumeMu sync.Mutex
+-	cloudVolumes  []*preparedCloudVolume
++	nsPath                  string
++	requireEncryptedVolumes bool
++	workspace               *workspacePolicy
++	cloudVolumeMu           sync.Mutex
++	cloudVolumes            []*preparedCloudVolume
+ }
+ 
+ func dial(ctx context.Context, agentSocket string) (net.Conn, error) {
+@@ -78,6 +82,10 @@ func dial(ctx context.Context, agentSocket string) (net.Conn, error) {
+ }
+ 
+ func NewInterceptor(agentSocket, nsPath string) Interceptor {
++	return NewInterceptorWithEncryptedVolumes(agentSocket, nsPath, false)
++}
++
++func NewInterceptorWithEncryptedVolumes(agentSocket, nsPath string, required bool) Interceptor {
+ 
+ 	agentDialer := func(ctx context.Context) (net.Conn, error) {
+ 		return dial(ctx, agentSocket)
+@@ -86,8 +94,9 @@ func NewInterceptor(agentSocket, nsPath string) Interceptor {
+ 	redirector := agentproto.NewRedirector(agentDialer)
+ 
+ 	return &interceptor{
+-		Redirector: redirector,
+-		nsPath:     nsPath,
++		Redirector:              redirector,
++		nsPath:                  nsPath,
++		requireEncryptedVolumes: required,
+ 	}
+ }
+ 
+@@ -621,8 +630,8 @@ func formatAndMount(ctx context.Context, device, mountPoint, fsType string, read
+ 		return false, err
+ 	}
+ 
+-	// Retain the upstream mount-before-format decision and use the same mount
+-	// operation before and after filesystem creation.
++	// Retain the upstream mount-before-format decision, using the same mount
++	// implementation as encrypted volumes.
+ 	if mounted, err := mountCloudFilesystem(ctx, device, mountPoint, fsType, readOnly, options); err == nil || mounted {
+ 		return mounted, err
+ 	}
+@@ -667,3 +676,62 @@ func formatAndMount(ctx context.Context, device, mountPoint, fsType string, read
+ 
+ 	return mountCloudFilesystem(ctx, device, mountPoint, fsType, readOnly, options)
+ }
++
++// luksMagic is the 6-byte signature at the start of every LUKS1/LUKS2 volume.
++// Defined in the LUKS on-disk format specification (unchanged since 2004).
++var luksMagic = []byte{'L', 'U', 'K', 'S', 0xba, 0xbe}
++
++func isLuks(device string) (bool, error) {
++	f, err := os.Open(device)
++	if err != nil {
++		return false, fmt.Errorf("opening device %s for LUKS check: %w", device, err)
++	}
++	defer f.Close()
++
++	header := make([]byte, len(luksMagic))
++	if _, err := io.ReadFull(f, header); err != nil {
++		return false, fmt.Errorf("reading LUKS header from %s: %w", device, err)
++	}
++
++	for i := range luksMagic {
++		if header[i] != luksMagic[i] {
++			return false, nil
++		}
++	}
++	return true, nil
++}
++
++func secureMount(ctx context.Context, device, mountPoint, keyURI, mapperName string) error {
++	luks, err := isLuks(device)
++	if err != nil {
++		return fmt.Errorf("cannot determine LUKS state of %s (refusing to proceed to avoid data loss): %w", device, err)
++	}
++	if !luks {
++		return fmt.Errorf("encrypted device %s is not initialized; refusing volatile CDH empty formatting", device)
++	}
++
++	client, err := newCDHClient(ctx, cdhSocketPath)
++	if err != nil {
++		return fmt.Errorf("connecting to CDH at %s: %w", cdhSocketPath, err)
++	}
++	defer client.close()
++
++	options := map[string]string{
++		"devicePath":     device,
++		"sourceType":     "encrypted",
++		"targetType":     "device",
++		"encryptionType": "luks2",
++		"key":            keyURI,
++	}
++	if mapperName != "" {
++		options["mapperName"] = mapperName
++	}
++
++	// Upstream SecureMountResponse is empty; mount point is the path we requested.
++	if err := client.secureMount(ctx, "block-device", options, nil, mountPoint); err != nil {
++		return fmt.Errorf("CDH secure_mount failed for %s: %w", device, err)
++	}
++
++	logger.Printf("secureMount: CDH mounted %s at %s", device, mountPoint)
++	return nil
++}
+diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor_test.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor_test.go
+index 1667da16..30148ea6 100644
+--- a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor_test.go
++++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor_test.go
+@@ -974,3 +974,12 @@ func TestFindDataDiskBySysfsHCTL(t *testing.T) {
+ 		assert.Error(t, err)
+ 	})
+ }
++
++func TestSecureMountRefusesUninitializedDevice(t *testing.T) {
++	device := filepath.Join(t.TempDir(), "plain-device")
++	require.NoError(t, os.WriteFile(device, make([]byte, 512), 0o600))
++
++	err := secureMount(context.Background(), device, "/run/cloud-volumes/vol-0",
++		"kbs:///default/key/volume", "caa-vol-0")
++	require.ErrorContains(t, err, "not initialized")
++}
+diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace.go
+new file mode 100644
+index 00000000..7a29d1ec
+--- /dev/null
++++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace.go
+@@ -0,0 +1,258 @@
++// (C) Copyright Confidential Containers Contributors
++// SPDX-License-Identifier: Apache-2.0
++
++package interceptor
++
++import (
++	"bytes"
++	"context"
++	"errors"
++	"fmt"
++	"golang.org/x/sys/unix"
++	"io"
++	"net/url"
++	"os"
++	"os/exec"
++	"strings"
++	"syscall"
++	"time"
++
++	"github.com/confidential-containers/cloud-api-adaptor/src/cloud-api-adaptor/pkg/initdata"
++	"github.com/confidential-containers/cloud-api-adaptor/src/cloud-api-adaptor/pkg/util"
++	toml "github.com/pelletier/go-toml/v2"
++)
++
++const (
++	workspacePolicyName   = "workspace.toml"
++	workspaceInitdataPath = "/run/peerpod/initdata"
++	workspaceInitializer  = "/usr/libexec/peerpod/initialize-workspace-volume"
++	workspaceMaxInitdata  = 2 << 20
++)
++
++// The disk list comes from the operator's workspace journal, measured as exact
++// initdata bytes. Host-provided annotations cannot authorize another disk/key.
++type workspacePolicy struct {
++	Version         string   `toml:"version"`
++	KeyURI          string   `toml:"key_uri"`
++	DiskIDs         []string `toml:"disk_ids"`
++	AllowInitialize bool     `toml:"allow_initialize"`
++	EncryptionType  string   `toml:"encryption_type"`
++	FilesystemType  string   `toml:"filesystem_type"`
++}
++
++func loadWorkspacePolicy(path string) (workspacePolicy, error) {
++	var policy workspacePolicy
++	info, err := os.Lstat(path)
++	if err != nil {
++		return policy, err
++	}
++	if !info.Mode().IsRegular() || info.Size() > workspaceMaxInitdata {
++		return policy, errors.New("measured initdata must be a bounded regular file")
++	}
++	file, err := os.Open(path)
++	if err != nil {
++		return policy, err
++	}
++	defer file.Close()
++	parsed, err := initdata.Parse(io.LimitReader(file, workspaceMaxInitdata+1))
++	if err != nil {
++		return policy, fmt.Errorf("parse measured initdata: %w", err)
++	}
++	raw, ok := parsed.Body.Data[workspacePolicyName]
++	if !ok {
++		return policy, fmt.Errorf("measured initdata is missing %s", workspacePolicyName)
++	}
++	if err := toml.NewDecoder(strings.NewReader(raw)).DisallowUnknownFields().Decode(&policy); err != nil {
++		return policy, fmt.Errorf("parse %s: %w", workspacePolicyName, err)
++	}
++	if policy.Version != "0.1.0" || policy.EncryptionType != "luks2" || policy.FilesystemType != "ext4" {
++		return policy, errors.New("workspace policy requires version 0.1.0, luks2 and ext4")
++	}
++	if err := validateKBSResourceURI(policy.KeyURI); err != nil {
++		return policy, err
++	}
++	if len(policy.DiskIDs) == 0 || len(policy.DiskIDs) > util.MaxDirectVolumesPerPod {
++		return policy, errors.New("workspace policy requires a bounded nonempty disk_ids list")
++	}
++	seen := map[string]bool{}
++	for _, id := range policy.DiskIDs {
++		if !alibabaDiskIDPattern.MatchString(id) || seen[id] {
++			return policy, fmt.Errorf("invalid or duplicate workspace disk_id %q", id)
++		}
++		seen[id] = true
++	}
++	return policy, nil
++}
++
++func validateKBSResourceURI(value string) error {
++	resource, err := url.Parse(value)
++	if err != nil || resource.Scheme != "kbs" || resource.Host != "" || resource.RawQuery != "" || resource.Fragment != "" || resource.RawPath != "" || !strings.HasPrefix(value, "kbs:///") {
++		return errors.New("key_uri must be an unescaped kbs:/// resource URI")
++	}
++	parts := strings.Split(strings.TrimPrefix(resource.Path, "/"), "/")
++	if len(parts) != 3 {
++		return errors.New("key_uri must identify a KBS repository, type, and tag")
++	}
++	for _, part := range parts {
++		if part == "" || part == "." || part == ".." || strings.TrimSpace(part) != part {
++			return errors.New("key_uri has an invalid resource component")
++		}
++	}
++	return nil
++}
++
++func (p workspacePolicy) authorize(volume util.CloudVolumeAnnotation) error {
++	bound := false
++	for _, id := range p.DiskIDs {
++		bound = bound || id == volume.DiskID
++	}
++	if !bound || !alibabaDiskIDPattern.MatchString(volume.DiskID) {
++		return errors.New("disk ID is not bound by measured workspace policy")
++	}
++	if volume.FSType != p.FilesystemType {
++		return errors.New("filesystem differs from measured workspace policy")
++	}
++	return nil
++}
++
++func ensureWorkspaceInitialized(ctx context.Context, device string, volume util.CloudVolumeAnnotation, policy workspacePolicy, initialize func(context.Context, string, string, string, string) error) error {
++	luks, err := isLuks(device)
++	if err != nil {
++		return err
++	}
++	if luks {
++		return nil
++	}
++	if volume.ReadOnly {
++		return errors.New("readonly workspace device is not initialized")
++	}
++	if !policy.AllowInitialize {
++		return errors.New("workspace initialization is disabled by measured policy")
++	}
++	if err := initialize(ctx, device, volume.DiskID, volume.FSType, policy.KeyURI); err != nil {
++		return fmt.Errorf("initialize workspace device: %w", err)
++	}
++	luks, err = isLuks(device)
++	if err != nil {
++		return err
++	}
++	if !luks {
++		return errors.New("workspace initializer did not create an embedded LUKS header")
++	}
++	return nil
++}
++
++func initializeWorkspaceVolume(ctx context.Context, device, diskID, fsType, keyURI string, prepared *preparedCloudVolume) error {
++	var stat unix.Stat_t
++	if err := unix.Stat(device, &stat); err != nil {
++		return err
++	}
++	if stat.Mode&unix.S_IFMT != unix.S_IFBLK {
++		return errors.New("workspace initializer requires a block device")
++	}
++	name := fmt.Sprintf("workspace-init-%d-%d", unix.Major(uint64(stat.Rdev)), unix.Minor(uint64(stat.Rdev)))
++	path := "/dev/mapper/" + name
++	if exists, err := blockDeviceExists(path); err != nil {
++		return err
++	} else if exists {
++		return errors.New("workspace initializer mapper already exists; refusing to borrow it")
++	}
++	// Reuse existing mapper ownership while this first-use helper is active.
++	// After success its temporary mapper must be closed before CDH opens one.
++	prepared.cdhMapperName, prepared.cdhMapperPath = name, path
++	prepared.openedCDHMapperHere = true
++	client, err := newCDHClient(ctx, cdhSocketPath)
++	if err != nil {
++		return err
++	}
++	defer client.close()
++	key, err := client.getResource(ctx, keyURI)
++	if err != nil {
++		return err
++	}
++	defer clear(key)
++	if len(key) != 32 {
++		return errors.New("workspace key must be exactly 32 bytes")
++	}
++	// The measured helper rechecks disk identity, policy and the entire blank
++	// device before formatting. The key travels only through a private pipe.
++	command := exec.CommandContext(ctx, workspaceInitializer, device, diskID, fsType, keyURI)
++	command.Stdin = bytes.NewReader(key)
++	if err := runWorkspaceInitializer(ctx, command, prepared); err != nil {
++		return fmt.Errorf("workspace initializer failed: %w", err)
++	}
++	if exists, err := blockDeviceExists(path); err != nil {
++		return err
++	} else if exists {
++		return errors.New("workspace initializer left its temporary mapper open")
++	}
++	prepared.openedCDHMapperHere = false
++	return nil
++}
++
++func runWorkspaceInitializer(ctx context.Context, command *exec.Cmd, prepared *preparedCloudVolume) error {
++	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
++	command.Cancel = func() error { return syscall.Kill(-command.Process.Pid, syscall.SIGKILL) }
++	command.WaitDelay = 5 * time.Second
++	err := command.Run()
++	if ctx.Err() != nil && command.Process != nil {
++		// Cleanup waits until every descendant has exited, before inspecting
++		// or closing a mapper that cryptsetup could have acquired late.
++		prepared.initializerProcessGroup = command.Process.Pid
++	}
++	return err
++}
++
++func waitInitializerProcessGroup(ctx context.Context, pid int) error {
++	for {
++		err := syscall.Kill(-pid, 0)
++		if errors.Is(err, syscall.ESRCH) {
++			return nil
++		}
++		if err != nil {
++			return fmt.Errorf("inspect workspace initializer process group: %w", err)
++		}
++		select {
++		case <-ctx.Done():
++			return fmt.Errorf("wait for workspace initializer descendants: %w", ctx.Err())
++		case <-time.After(20 * time.Millisecond):
++		}
++	}
++}
++
++func blockDeviceReadOnly(ctx context.Context, device string) (bool, error) {
++	output, err := exec.CommandContext(ctx, "blockdev", "--getro", device).CombinedOutput()
++	if err != nil {
++		return false, fmt.Errorf("query readonly state for %s: %w", device, err)
++	}
++	value := strings.TrimSpace(string(output))
++	if value != "0" && value != "1" {
++		return false, fmt.Errorf("invalid readonly state for %s", device)
++	}
++	return value == "1", nil
++}
++
++func setBlockDeviceMode(ctx context.Context, device string, readOnly bool) error {
++	mode := "--setrw"
++	if readOnly {
++		mode = "--setro"
++	}
++	if err := exec.CommandContext(ctx, "blockdev", mode, device).Run(); err != nil {
++		return fmt.Errorf("set block device %s mode %s: %w", device, mode, err)
++	}
++	return nil
++}
++
++func blockDeviceExists(path string) (bool, error) {
++	info, err := os.Stat(path)
++	if errors.Is(err, os.ErrNotExist) {
++		return false, nil
++	}
++	if err != nil {
++		return false, err
++	}
++	if info.Mode()&os.ModeDevice == 0 || info.Mode()&os.ModeCharDevice != 0 {
++		return false, fmt.Errorf("expected block device at %s", path)
++	}
++	return true, nil
++}
+diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace_test.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace_test.go
+new file mode 100644
+index 00000000..45551431
+--- /dev/null
++++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace_test.go
+@@ -0,0 +1,120 @@
++// (C) Copyright Confidential Containers Contributors
++// SPDX-License-Identifier: Apache-2.0
++
++package interceptor
++
++import (
++	"context"
++	"errors"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/confidential-containers/cloud-api-adaptor/src/cloud-api-adaptor/pkg/initdata"
++	"github.com/confidential-containers/cloud-api-adaptor/src/cloud-api-adaptor/pkg/util"
++	"github.com/stretchr/testify/require"
++)
++
++const testWorkspaceDocument = `version = "0.1.0"
++key_uri = "kbs:///default/openshell/workspace-key"
++disk_ids = ["d-abc123", "d-second456"]
++allow_initialize = true
++encryption_type = "luks2"
++filesystem_type = "ext4"
++`
++
++func testWorkspacePolicy() workspacePolicy {
++	return workspacePolicy{Version: "0.1.0", KeyURI: "kbs:///default/openshell/workspace-key", DiskIDs: []string{"d-abc123", "d-second456"}, AllowInitialize: true, EncryptionType: "luks2", FilesystemType: "ext4"}
++}
++
++func writeWorkspaceInitdata(t *testing.T, document string) string {
++	t.Helper()
++	encoded, err := initdata.Encode("version = \"0.1.0\"\nalgorithm = \"sha384\"\n[data]\n\"workspace.toml\" = '''\n" + document + "'''\n")
++	require.NoError(t, err)
++	path := filepath.Join(t.TempDir(), "initdata")
++	require.NoError(t, os.WriteFile(path, []byte(encoded), 0o600))
++	return path
++}
++
++func TestWorkspaceMeasuredPolicyRejectsUnboundDiskAndKey(t *testing.T) {
++	policy, err := loadWorkspacePolicy(writeWorkspaceInitdata(t, testWorkspaceDocument))
++	require.NoError(t, err)
++	volume := util.CloudVolumeAnnotation{DiskID: "d-second456", FSType: "ext4"}
++	require.NoError(t, policy.authorize(volume))
++	volume.DiskID = "d-replaced"
++	require.ErrorContains(t, policy.authorize(volume), "not bound")
++	volume.DiskID = "d-abc123"
++	volume.FSType = "xfs"
++	require.ErrorContains(t, policy.authorize(volume), "filesystem differs")
++	for _, document := range []string{
++		testWorkspaceDocument + "unknown = true\n",
++		strings.Replace(testWorkspaceDocument, "[\"d-abc123\", \"d-second456\"]", "[]", 1),
++		strings.Replace(testWorkspaceDocument, "d-second456", "d-abc123", 1),
++		strings.Replace(testWorkspaceDocument, "luks2", "plain", 1),
++	} {
++		_, err := loadWorkspacePolicy(writeWorkspaceInitdata(t, document))
++		require.Error(t, err)
++	}
++}
++
++func TestWorkspaceInitializeGateAndAppliedFailure(t *testing.T) {
++	device := filepath.Join(t.TempDir(), "device")
++	require.NoError(t, os.WriteFile(device, make([]byte, 4096), 0o600))
++	volume := util.CloudVolumeAnnotation{DiskID: "d-abc123", FSType: "ext4", ReadOnly: true}
++	policy := testWorkspacePolicy()
++	called := false
++	initialize := func(context.Context, string, string, string, string) error {
++		called = true
++		return errors.New("must not run")
++	}
++	require.ErrorContains(t, ensureWorkspaceInitialized(context.Background(), device, volume, policy, initialize), "readonly")
++	require.False(t, called)
++	volume.ReadOnly = false
++	policy.AllowInitialize = false
++	require.ErrorContains(t, ensureWorkspaceInitialized(context.Background(), device, volume, policy, initialize), "disabled")
++	require.False(t, called)
++	policy.AllowInitialize = true
++	initialize = func(_ context.Context, device, disk, fs, uri string) error {
++		require.Equal(t, "d-abc123", disk)
++		require.Equal(t, policy.KeyURI, uri)
++		// Applied failures stay failures. A retry recognizes the embedded
++		// header and must never format this device a second time.
++		require.NoError(t, os.WriteFile(device, append(luksMagic, make([]byte, 4096)...), 0o600))
++		return errors.New("initialization interrupted")
++	}
++	require.ErrorContains(t, ensureWorkspaceInitialized(context.Background(), device, volume, policy, initialize), "interrupted")
++	initialize = func(context.Context, string, string, string, string) error {
++		t.Fatal("formatted an existing LUKS device")
++		return nil
++	}
++	require.NoError(t, ensureWorkspaceInitialized(context.Background(), device, volume, policy, initialize))
++}
++
++func TestKBSResourceURIRejectsAliases(t *testing.T) {
++	require.NoError(t, validateKBSResourceURI("kbs:///default/openshell/workspace-key"))
++	for _, invalid := range []string{"kbs://host/default/type/tag", "kbs:///default/type/..", "kbs:///default/type/tag?q=1", "kbs:///default/type/%74ag", "https://host/key", "kbs:///a/b/c/d"} {
++		require.Error(t, validateKBSResourceURI(invalid), invalid)
++	}
++}
++
++func TestWorkspaceCanceledInitializerRollsBackWithIndependentContext(t *testing.T) {
++	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
++	defer cancel()
++	prepared := &preparedCloudVolume{openedCDHMapperHere: true, cdhMapperName: "owned-initializer", cdhMapperPath: "/dev/mapper/owned-initializer"}
++	closed := false
++	prepared.closeCDHMapper = func(ctx context.Context, _, _ string) error {
++		require.NoError(t, ctx.Err(), "rollback borrowed the canceled request context")
++		require.Zero(t, prepared.initializerProcessGroup, "mapper closed before initializer process group exited")
++		closed = true
++		return nil
++	}
++	command := exec.CommandContext(ctx, "/bin/sh", "-c", "exec sleep 30")
++	require.Error(t, runWorkspaceInitializer(ctx, command, prepared))
++	require.NotZero(t, prepared.initializerProcessGroup)
++	require.NoError(t, cleanupPreparedCloudVolumes(ctx, []*preparedCloudVolume{prepared}))
++	require.True(t, closed)
++	require.False(t, prepared.owned())
++}
+-- 
+2.43.7
+

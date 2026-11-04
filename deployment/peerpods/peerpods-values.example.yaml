@@ -23,7 +23,6 @@ providerConfigs:
     ALIBABA_CLOUD_OIDC_TOKEN_FILE: /var/run/secrets/ack.alibabacloud.com/rrsa-tokens/token
     IMAGEID: APPROVED_PODVM_IMAGE_ID
     INITDATA: GZIP_BASE64_DENY_ONLY_INITDATA
-    DISABLE_IMAGE_PULL_SECRETS: "true"
     PODVM_INSTANCE_TYPE: ecs.g9i.xlarge
     PAUSE_IMAGE: PRIVATE_REGISTRY/openshell/mirror/pause@sha256:PAUSE_IMAGE_SHA256
     REGION: REGION

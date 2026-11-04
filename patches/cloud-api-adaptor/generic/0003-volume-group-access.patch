@@ -1,11 +1,11 @@
-From 2bdbe638a97258d1cb6abedcc84f51828526121a Mon Sep 17 00:00:00 2001
+From 7bb1c70087f6a8f8519ac2e746cbbedfba1d3a4b Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
 Date: Tue, 3 Nov 2026 20:11:26 +0800
 Subject: [PATCH] volumes: apply fsGroup to retained contents
 
 Apply group ownership and access recursively while preserving file owners and existing execute bits. Set directory setgid for new files, avoid following symlinks, and report failures to the caller.
 
-Generated-by: OpenAI Codex
+Co-authored-by: Codex <noreply@openai.com>
 ---
  .../pkg/forwarder/interceptor/fsgroup.go      | 64 +++++++++++++++
  .../pkg/forwarder/interceptor/fsgroup_test.go | 78 +++++++++++++++++++

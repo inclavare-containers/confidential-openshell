@@ -15,6 +15,5 @@
   "worker_image_id": "",
   "worker_count": 1,
   "service_cidr": "172.21.0.0/20",
-  "oss_bucket": "",
-  "csi_storage_class": "alicloud-disk-essd"
+  "oss_bucket": ""
 }

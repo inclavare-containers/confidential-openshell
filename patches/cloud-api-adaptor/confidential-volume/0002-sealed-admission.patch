@@ -1,26 +1,29 @@
-From 411718f9c35c2988de1db7a4af8ef037016947a2 Mon Sep 17 00:00:00 2001
+From 36f3bd26a9a7773c527bc746a5ab2196a9a28bd9 Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
-Date: Tue, 3 Nov 2026 20:11:27 +0800
-Subject: [PATCH] guest: verify sealed mounts before container creation
+Date: Wed, 4 Nov 2026 15:24:46 +0800
+Subject: [PATCH] guest: admit measured sealed-resource mounts
 
-Match sealed descriptors to measured initdata before CDH unsealing and keep plaintext confined to private mounts. Roll back resources acquired by failed container creation while retaining ownership when cleanup must be retried.
+Verify manifest-authorized descriptors after cloud mount rewriting and
+before container dispatch. Read bounded inputs through os.Root and write
+only verified plaintext into private tmpfs. Clean the private files when
+container creation fails or container/sandbox removal succeeds.
 
-Use upstream AA startup binding for initdata; no local runtime-measurement RPC or event encoder is required.
+Extend the existing mount transaction with a sealed-rejection regression;
+plain-volume rollback remains owned by the generic lifecycle patch.
 
-Generated-by: OpenAI Codex
+Co-authored-by: Codex <noreply@openai.com>
 ---
  .../cmd/agent-protocol-forwarder/main.go      |  14 +-
- .../pkg/forwarder/interceptor/cdh_client.go   |  14 +-
- .../pkg/forwarder/interceptor/cloud_volume.go |  15 +-
+ .../pkg/forwarder/interceptor/cdh_client.go   |  12 +-
+ .../pkg/forwarder/interceptor/cloud_volume.go |   3 +
  .../interceptor/cloud_volume_test.go          |   9 +
- .../pkg/forwarder/interceptor/interceptor.go  | 100 ++++++-
- .../forwarder/interceptor/sealed_volume.go    | 262 ++++++++++++++++++
- .../interceptor/sealed_volume_test.go         | 177 ++++++++++++
- .../interceptor/volume_transaction_test.go    |  62 +++++
- 8 files changed, 633 insertions(+), 20 deletions(-)
+ .../pkg/forwarder/interceptor/interceptor.go  |  74 +++++-
+ .../forwarder/interceptor/sealed_volume.go    | 216 ++++++++++++++++++
+ .../interceptor/sealed_volume_test.go         | 211 +++++++++++++++++
+ .../interceptor/volume_transaction_test.go    |  19 ++
+ 8 files changed, 552 insertions(+), 6 deletions(-)
  create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/sealed_volume.go
  create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/sealed_volume_test.go
- create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/volume_transaction_test.go
 
 diff --git a/src/cloud-api-adaptor/cmd/agent-protocol-forwarder/main.go b/src/cloud-api-adaptor/cmd/agent-protocol-forwarder/main.go
 index e36fccec..edcae783 100644
@@ -51,22 +54,20 @@ index e36fccec..edcae783 100644
  	return cmd.NewStarter(services...), nil
  }
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/cdh_client.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/cdh_client.go
-index bb486508..680ee217 100644
+index a87c24fd..9f5c829f 100644
 --- a/src/cloud-api-adaptor/pkg/forwarder/interceptor/cdh_client.go
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/cdh_client.go
-@@ -14,7 +14,10 @@ import (
- 	"github.com/confidential-containers/cloud-api-adaptor/src/cloud-api-adaptor/pkg/forwarder/interceptor/cdhpb"
+@@ -13,7 +13,8 @@ import (
  )
  
--const cdhServiceName = "api.SecureMountService"
-+const (
+ const (
+-	cdhServiceName = "api.SecureMountService"
 +	cdhServiceName       = "api.SecureMountService"
 +	cdhSealedServiceName = "api.SealedSecretService"
-+)
+ )
  
  type cdhClient struct {
- 	client *ttrpc.Client
-@@ -80,3 +83,12 @@ func (c *cdhClient) secureMount(ctx context.Context, volumeType string, options
+@@ -57,3 +58,12 @@ func (c *cdhClient) secureMount(ctx context.Context, volumeType string, options
  
  	return nil
  }
@@ -80,10 +81,10 @@ index bb486508..680ee217 100644
 +	return resp.GetPlaintext(), nil
 +}
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume.go
-index b7dd0c3c..ceef6837 100644
+index a0de589b..80b7befc 100644
 --- a/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume.go
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume.go
-@@ -135,6 +135,9 @@ func (i *interceptor) prepareCloudVolumes(ctx context.Context, req *pb.CreateCon
+@@ -136,6 +136,9 @@ func (i *interceptor) prepareCloudVolumes(ctx context.Context, req *pb.CreateCon
  	if err != nil {
  		return nil, fmt.Errorf("corrupt cloud_volumes annotation (pod would start without volumes): %w", err)
  	}
@@ -93,51 +94,11 @@ index b7dd0c3c..ceef6837 100644
  	var workspace *workspacePolicy
  	if i.requireEncryptedVolumes && len(volumes) != 0 {
  		if i.workspace == nil {
-@@ -159,10 +162,10 @@ func (i *interceptor) prepareCloudVolumes(ctx context.Context, req *pb.CreateCon
- 			prepared = append(prepared, volume)
- 		}
- 		if err != nil {
--			return prepared, preserveOriginalError(err, cleanupPreparedCloudVolumes(ctx, prepared))
-+			return prepared, err
- 		}
- 		if err := rewriteCloudMount(req, name, volumes[name], volume.sourcePath); err != nil {
--			return prepared, preserveOriginalError(err, cleanupPreparedCloudVolumes(ctx, prepared))
-+			return prepared, err
- 		}
- 	}
- 	return prepared, nil
-@@ -207,14 +210,14 @@ func prepareCloudVolume(ctx context.Context, name string, volume util.CloudVolum
- 			if err := ensureWorkspaceInitialized(ctx, device, volume, *workspace, func(ctx context.Context, device, diskID, fsType, uri string) error {
- 				return initializeWorkspaceVolume(ctx, device, diskID, fsType, uri, prepared)
- 			}); err != nil {
--				return prepared, preserveOriginalError(err, cleanupPreparedCloudVolumes(ctx, prepared))
-+				return prepared, err
- 			}
- 		}
- 		if err := prepareCDHCloudVolume(ctx, prepared, name, device, volume, workspace != nil); err != nil {
--			return prepared, preserveOriginalError(err, cleanupPreparedCloudVolumes(ctx, prepared))
-+			return prepared, err
- 		}
- 		if err := applyCloudVolumeFSGroup(prepared.sourcePath, volume.FSGroup, volume.ReadOnly); err != nil {
--			return prepared, preserveOriginalError(err, cleanupPreparedCloudVolumes(ctx, prepared))
-+			return prepared, err
- 		}
- 		return prepared, nil
- 	}
-@@ -223,7 +226,7 @@ func prepareCloudVolume(ctx context.Context, name string, volume util.CloudVolum
- 		return prepared, fmt.Errorf("mount cloud volume %s: %w", name, err)
- 	}
- 	if err := applyCloudVolumeFSGroup(prepared.sourcePath, volume.FSGroup, volume.ReadOnly); err != nil {
--		return prepared, preserveOriginalError(err, cleanupPreparedCloudVolumes(ctx, prepared))
-+		return prepared, err
- 	}
- 	return prepared, nil
- }
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume_test.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume_test.go
-index 0efb07b7..6d05d087 100644
+index b106e6c4..ec183811 100644
 --- a/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume_test.go
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/cloud_volume_test.go
-@@ -158,6 +158,15 @@ func TestValidateReusableCloudMountRequiresSecurityOptions(t *testing.T) {
+@@ -154,6 +154,15 @@ func TestValidateReusableCloudMountRequiresSecurityOptions(t *testing.T) {
  	require.ErrorContains(t, err, "option noexec=false, expected true")
  }
  
@@ -154,10 +115,10 @@ index 0efb07b7..6d05d087 100644
  	valid := "/dev/mapper/caa-vol-0 is active.\n  type: LUKS2\n  cipher: aes-xts-plain64\n  keysize: 512 [bits]\n  sector size: 4096 [bytes]\n"
  	require.NoError(t, validateWorkspaceMapperStatus(valid))
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
-index 2740e6c0..8d95e59f 100644
+index 1ba459af..c81ec839 100644
 --- a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
-@@ -54,6 +54,7 @@ type interceptor struct {
+@@ -52,6 +52,7 @@ type interceptor struct {
  	workspace               *workspacePolicy
  	cloudVolumeMu           sync.Mutex
  	cloudVolumes            []*preparedCloudVolume
@@ -165,7 +126,7 @@ index 2740e6c0..8d95e59f 100644
  }
  
  func dial(ctx context.Context, agentSocket string) (net.Conn, error) {
-@@ -102,7 +103,26 @@ func NewInterceptorWithEncryptedVolumes(agentSocket, nsPath string, required boo
+@@ -100,6 +101,16 @@ func NewInterceptorWithEncryptedVolumes(agentSocket, nsPath string, required boo
  	}
  }
  
@@ -180,19 +141,9 @@ index 2740e6c0..8d95e59f 100644
 +}
 +
  func (i *interceptor) CreateContainer(ctx context.Context, req *pb.CreateContainerRequest) (*emptypb.Empty, error) {
-+	return i.createContainer(ctx, req, i.prepareCloudVolumes)
-+}
-+
-+func (i *interceptor) createContainer(ctx context.Context, req *pb.CreateContainerRequest,
-+	prepare func(context.Context, *pb.CreateContainerRequest, string) ([]*preparedCloudVolume, error),
-+) (res *emptypb.Empty, err error) {
-+	if req == nil || req.OCI == nil || req.OCI.Linux == nil {
-+		return nil, errors.New("CreateContainer lacks OCI Linux specification")
-+	}
- 
- 	logger.Printf("CreateContainer: containerID:%s", req.ContainerId)
- 
-@@ -118,17 +138,65 @@ func (i *interceptor) CreateContainer(ctx context.Context, req *pb.CreateContain
+ 	return i.createContainer(ctx, req, i.prepareCloudVolumes)
+ }
+@@ -125,13 +136,19 @@ func (i *interceptor) createContainer(ctx context.Context, req *pb.CreateContain
  	}
  
  	var preparedVolumes []*preparedCloudVolume
@@ -202,24 +153,19 @@ index 2740e6c0..8d95e59f 100644
 +			_ = os.RemoveAll(verifiedSecrets)
 +		}
 +	}()
+ 
  	if cvJSON, ok := req.OCI.Annotations[util.CloudVolumesAnnotationKey]; ok && cvJSON != "" {
  		// Serialize acquisition with sandbox cleanup and other container retries.
  		i.cloudVolumeMu.Lock()
  		defer i.cloudVolumeMu.Unlock()
--		var err error
--		preparedVolumes, err = i.prepareCloudVolumes(ctx, req, cvJSON)
--		if err != nil {
+-		// One transaction boundary covers every later return, including
+-		// preparation errors and a canceled/failed agent RPC. Keep ownership of
 +		// One transaction boundary covers every later return, including sealed
 +		// descriptor rejection and a canceled/failed agent RPC. Keep ownership of
-+		// anything rollback could not release so DestroySandbox can retry it.
-+		defer func() {
-+			if err != nil {
-+				err = preserveOriginalError(err, cleanupPreparedCloudVolumes(ctx, preparedVolumes))
-+			}
- 			i.trackOwnedCloudVolumes(preparedVolumes)
-+		}()
-+		preparedVolumes, err = prepare(ctx, req, cvJSON)
-+		if err != nil {
+ 		// anything rollback could not release so DestroySandbox can retry it.
+ 		defer func() {
+ 			if err != nil {
+@@ -144,6 +161,41 @@ func (i *interceptor) createContainer(ctx context.Context, req *pb.CreateContain
  			return nil, err
  		}
  	}
@@ -261,26 +207,7 @@ index 2740e6c0..8d95e59f 100644
  
  	if len(req.OCI.Mounts) > 0 {
  		for _, m := range req.OCI.Mounts {
-@@ -141,17 +209,10 @@ func (i *interceptor) CreateContainer(ctx context.Context, req *pb.CreateContain
- 		}
- 	}
- 
--	res, err := i.Redirector.CreateContainer(ctx, req)
--
-+	res, err = i.Redirector.CreateContainer(ctx, req)
- 	if err != nil {
- 		logger.Printf("CreateContainer failed with error: %v", err)
--		cleanupErr := cleanupPreparedCloudVolumes(ctx, preparedVolumes)
--		i.trackOwnedCloudVolumes(preparedVolumes)
--		err = preserveOriginalError(err, cleanupErr)
--	} else {
--		i.trackOwnedCloudVolumes(preparedVolumes)
- 	}
--
- 	return res, err
- }
- 
-@@ -192,6 +253,13 @@ func (i *interceptor) StartContainer(ctx context.Context, req *pb.StartContainer
+@@ -200,6 +252,13 @@ func (i *interceptor) StartContainer(ctx context.Context, req *pb.StartContainer
  }
  
  func (i *interceptor) RemoveContainer(ctx context.Context, req *pb.RemoveContainerRequest) (*emptypb.Empty, error) {
@@ -294,7 +221,7 @@ index 2740e6c0..8d95e59f 100644
  
  	logger.Printf("RemoveContainer: containerID:%s", req.ContainerId)
  
-@@ -199,6 +267,10 @@ func (i *interceptor) RemoveContainer(ctx context.Context, req *pb.RemoveContain
+@@ -207,6 +266,10 @@ func (i *interceptor) RemoveContainer(ctx context.Context, req *pb.RemoveContain
  
  	if err != nil {
  		logger.Printf("RemoveContainer failed with error: %v", err)
@@ -305,10 +232,11 @@ index 2740e6c0..8d95e59f 100644
  	}
  	return res, err
  }
-@@ -244,6 +316,12 @@ func (i *interceptor) DestroySandbox(ctx context.Context, req *pb.DestroySandbox
+@@ -252,7 +315,12 @@ func (i *interceptor) DestroySandbox(ctx context.Context, req *pb.DestroySandbox
  
  	if err != nil {
  		logger.Printf("DestroySandbox failed with error: %v", err)
+-
 +	} else if i.sealedGate != nil {
 +		i.sealedGate.mu.Lock()
 +		defer i.sealedGate.mu.Unlock()
@@ -320,10 +248,10 @@ index 2740e6c0..8d95e59f 100644
  	return res, err
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/sealed_volume.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/sealed_volume.go
 new file mode 100644
-index 00000000..b5a7d236
+index 00000000..64608354
 --- /dev/null
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/sealed_volume.go
-@@ -0,0 +1,262 @@
+@@ -0,0 +1,216 @@
 +// Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -340,7 +268,6 @@ index 00000000..b5a7d236
 +	"os"
 +	"path/filepath"
 +	"regexp"
-+	"sort"
 +	"strings"
 +	"sync"
 +
@@ -362,8 +289,7 @@ index 00000000..b5a7d236
 +	sealedContainerID    = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$`)
 +)
 +
-+// The manifest is materialized by measured initdata in the guest. This layer
-+// deliberately needs no knowledge of the operator's role or Secret names.
++// The manifest is supplied by measured initdata in the guest.
 +type sealedVolumeManifest struct {
 +	Schema           int               `json:"schema"`
 +	Container        string            `json:"sealed_volume_container"`
@@ -372,53 +298,64 @@ index 00000000..b5a7d236
 +}
 +
 +type sealedVolumeGate struct {
-+	manifest     sealedVolumeManifest
-+	privateRoot  string
-+	sharedRoot   string
-+	requireTmpfs bool
-+	mu           sync.Mutex
++	manifest                sealedVolumeManifest
++	privateRoot, sharedRoot string
++	requireTmpfs            bool
++	mu                      sync.Mutex
++}
++
++// Read only regular, bounded files. O_NONBLOCK prevents a substituted FIFO
++// from blocking before its type can be checked; os.Root confines symlinks.
++func readSealedFile(root *os.Root, name string, limit int64, flags int) ([]byte, error) {
++	file, err := root.OpenFile(name, os.O_RDONLY|unix.O_NONBLOCK|flags, 0)
++	if err != nil {
++		return nil, err
++	}
++	defer file.Close()
++	info, err := file.Stat()
++	if err != nil {
++		return nil, err
++	}
++	if !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > limit {
++		return nil, errors.New("sealed input must be a bounded regular file")
++	}
++	data, err := io.ReadAll(io.LimitReader(file, limit+1))
++	if len(data) > int(limit) {
++		return nil, errors.New("sealed input exceeds size limit")
++	}
++	return data, err
 +}
 +
 +func loadSealedVolumeGate(path string) (*sealedVolumeGate, error) {
-+	if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path {
-+		return nil, errors.New("sealed-volume manifest path must be absolute and canonical")
++	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
++		return nil, errors.New("manifest path must be absolute and clean")
 +	}
-+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
++	root, err := os.OpenRoot(filepath.Dir(path))
 +	if err != nil {
-+		return nil, fmt.Errorf("open measured sealed-volume manifest: %w", err)
++		return nil, err
 +	}
-+	file := os.NewFile(uintptr(fd), path)
-+	defer file.Close()
-+	info, err := file.Stat()
-+	if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > sealedVolumeMaxManifest {
-+		return nil, errors.New("measured sealed-volume manifest must be a bounded regular file")
-+	}
-+	data, err := io.ReadAll(io.LimitReader(file, sealedVolumeMaxManifest+1))
-+	if err != nil || len(data) > sealedVolumeMaxManifest {
-+		return nil, errors.New("read measured sealed-volume manifest failed")
++	defer root.Close()
++	data, err := readSealedFile(root, filepath.Base(path), sealedVolumeMaxManifest, unix.O_NOFOLLOW)
++	if err != nil {
++		return nil, err
 +	}
 +	var manifest sealedVolumeManifest
 +	if err := json.Unmarshal(data, &manifest); err != nil {
-+		return nil, fmt.Errorf("parse measured sealed-volume manifest: %w", err)
++		return nil, err
 +	}
 +	if err := validateSealedVolumeManifest(manifest); err != nil {
 +		return nil, err
 +	}
-+	return &sealedVolumeGate{manifest: manifest, privateRoot: sealedVolumePrivateRoot,
-+		sharedRoot: sharedContainersRoot, requireTmpfs: true}, nil
++	return &sealedVolumeGate{manifest: manifest, privateRoot: sealedVolumePrivateRoot, sharedRoot: sharedContainersRoot, requireTmpfs: true}, nil
 +}
 +
 +func validateSealedVolumeManifest(m sealedVolumeManifest) error {
-+	if m.Schema != 1 || !sealedContainerID.MatchString(m.Container) ||
-+		!filepath.IsAbs(m.Destination) || filepath.Clean(m.Destination) != m.Destination ||
-+		m.Destination == "/" || len(m.DescriptorSHA256) == 0 ||
-+		len(m.DescriptorSHA256) > sealedVolumeMaxFiles {
-+		return errors.New("invalid measured sealed-volume manifest shape")
++	if m.Schema != 1 || !sealedContainerID.MatchString(m.Container) || !filepath.IsAbs(m.Destination) || filepath.Clean(m.Destination) != m.Destination || m.Destination == "/" || len(m.DescriptorSHA256) == 0 || len(m.DescriptorSHA256) > sealedVolumeMaxFiles {
++		return errors.New("invalid measured sealed-volume manifest")
 +	}
 +	for name, digest := range m.DescriptorSHA256 {
-+		if !sealedVolumeFilename.MatchString(name) || name == "." || name == ".." ||
-+			!sealedVolumeDigest.MatchString(digest) {
-+			return errors.New("invalid measured sealed-volume filename or digest")
++		if !sealedVolumeFilename.MatchString(name) || name == "." || name == ".." || !sealedVolumeDigest.MatchString(digest) {
++			return errors.New("invalid sealed filename or digest")
 +		}
 +	}
 +	return nil
@@ -430,14 +367,14 @@ index 00000000..b5a7d236
 +
 +func (g *sealedVolumeGate) privateDirectory(containerID string) (string, error) {
 +	if !sealedContainerID.MatchString(containerID) || containerID == "." || containerID == ".." {
-+		return "", errors.New("invalid container ID for verified secret directory")
++		return "", errors.New("invalid container ID")
 +	}
 +	if err := os.MkdirAll(g.privateRoot, 0700); err != nil {
-+		return "", fmt.Errorf("create verified-secret root: %w", err)
++		return "", err
 +	}
-+	rootInfo, err := os.Lstat(g.privateRoot)
-+	if err != nil || !rootInfo.IsDir() || rootInfo.Mode().Perm() != 0700 {
-+		return "", errors.New("verified-secret root is not a private directory")
++	info, err := os.Lstat(g.privateRoot)
++	if err != nil || !info.IsDir() || info.Mode().Perm() != 0700 {
++		return "", errors.New("verified-secret root is not private")
 +	}
 +	if g.requireTmpfs {
 +		var stat unix.Statfs_t
@@ -446,135 +383,80 @@ index 00000000..b5a7d236
 +		}
 +	}
 +	path := filepath.Join(g.privateRoot, containerID)
-+	if err := os.Mkdir(path, 0750); err != nil {
-+		return "", fmt.Errorf("create new verified-secret directory: %w", err)
-+	}
-+	return path, nil
++	return path, os.Mkdir(path, 0750)
 +}
 +
-+func readSealedDescriptor(directory, name string) ([]byte, error) {
-+	rootFD, err := unix.Open(directory, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
-+	if err != nil {
-+		return nil, fmt.Errorf("open bootstrap mount root: %w", err)
-+	}
-+	defer unix.Close(rootFD)
-+	fd, err := unix.Openat2(rootFD, name, &unix.OpenHow{
-+		Flags:   unix.O_RDONLY | unix.O_CLOEXEC,
-+		Resolve: unix.RESOLVE_BENEATH | unix.RESOLVE_NO_MAGICLINKS,
-+	})
-+	if err != nil {
-+		return nil, fmt.Errorf("open sealed descriptor %s beneath mount: %w", name, err)
-+	}
-+	file := os.NewFile(uintptr(fd), name)
-+	defer file.Close()
-+	info, err := file.Stat()
-+	if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > sealedVolumeMaxFile {
-+		return nil, fmt.Errorf("sealed descriptor %s is not a bounded regular file", name)
-+	}
-+	data, err := io.ReadAll(io.LimitReader(file, sealedVolumeMaxFile+1))
-+	if err != nil || len(data) > sealedVolumeMaxFile {
-+		return nil, fmt.Errorf("read sealed descriptor %s failed", name)
-+	}
-+	if !strings.HasPrefix(string(data), "sealed.") {
-+		return nil, fmt.Errorf("descriptor %s is not a native sealed JWS", name)
-+	}
-+	return data, nil
-+}
-+
-+func (g *sealedVolumeGate) verifyAndUnseal(ctx context.Context, req *pb.CreateContainerRequest,
-+	unseal func(context.Context, []byte) ([]byte, error)) (string, error) {
++func (g *sealedVolumeGate) verifyAndUnseal(ctx context.Context, req *pb.CreateContainerRequest, unseal func(context.Context, []byte) ([]byte, error)) (private string, err error) {
 +	if req == nil || req.OCI == nil || req.OCI.Process == nil || req.OCI.Process.User == nil {
-+		return "", errors.New("CreateContainer lacks process identity for verified secrets")
++		return "", errors.New("CreateContainer lacks process identity")
 +	}
-+	if !sealedContainerID.MatchString(req.ContainerId) ||
-+		req.OCI.Root == nil || req.OCI.Root.Path != filepath.Join("/run/kata-containers", req.ContainerId, "rootfs") {
++	if !sealedContainerID.MatchString(req.ContainerId) || req.OCI.Root == nil || req.OCI.Root.Path != filepath.Join("/run/kata-containers", req.ContainerId, "rootfs") {
 +		return "", errors.New("container ID does not match OCI root bundle")
 +	}
 +	var target *pb.Mount
-+	baseName := filepath.Base(g.manifest.Destination)
-+	expectedSource := regexp.MustCompile(`^` + regexp.QuoteMeta(g.sharedRoot) + `(?:/passthrough)?/(?:watchable/)?` + regexp.QuoteMeta(req.ContainerId) + `-[a-z0-9]{16}-` + regexp.QuoteMeta(baseName) + `$`)
-+	for _, mount := range req.OCI.Mounts {
-+		if mount.Destination == g.manifest.Destination {
-+			if target != nil || mount.Type != "bind" || !expectedSource.MatchString(mount.Source) ||
-+				!hasMountOption(mount.Options, "ro") || hasMountOption(mount.Options, "rw") {
++	for _, m := range req.OCI.Mounts {
++		if m.Destination == g.manifest.Destination {
++			if target != nil || m.Type != "bind" || !hasMountOption(m.Options, "ro") || hasMountOption(m.Options, "rw") {
 +				return "", errors.New("invalid sealed-volume bind mount")
 +			}
-+			target = mount
++			target = m
 +		}
 +	}
 +	if target == nil {
-+		return "", errors.New("expected sealed-volume bind mount is absent")
++		return "", errors.New("expected sealed-volume mount is absent")
 +	}
-+	entries, err := os.ReadDir(target.Source)
-+	if err != nil {
-+		return "", fmt.Errorf("read sealed-volume source: %w", err)
-+	}
-+	visible := make([]string, 0, len(entries))
-+	for _, entry := range entries {
-+		if !strings.HasPrefix(entry.Name(), "..") {
-+			visible = append(visible, entry.Name())
-+		}
-+	}
-+	if len(visible) != len(g.manifest.DescriptorSHA256) {
-+		return "", errors.New("sealed-volume filenames differ from measured manifest")
-+	}
-+	for _, name := range visible {
-+		if _, ok := g.manifest.DescriptorSHA256[name]; !ok {
-+			return "", errors.New("sealed-volume contains an unexpected filename")
-+		}
-+	}
-+	sort.Strings(visible)
-+	private, err := g.privateDirectory(req.ContainerId)
++	// Root confinement replaces assumptions about Kata's generated directory name.
++	shared, err := os.OpenRoot(g.sharedRoot)
 +	if err != nil {
 +		return "", err
 +	}
-+	complete := false
++	defer shared.Close()
++	relative, err := filepath.Rel(g.sharedRoot, target.Source)
++	if err != nil {
++		return "", err
++	}
++	source, err := shared.OpenRoot(relative)
++	if err != nil {
++		return "", err
++	}
++	defer source.Close()
++	private, err = g.privateDirectory(req.ContainerId)
++	if err != nil {
++		return "", err
++	}
++	// A fresh private directory receives only measured filenames. Extra host
++	// files, including preseeded *.unsealed files, can never enter the container.
++	directory := private
 +	defer func() {
-+		if !complete {
-+			_ = os.RemoveAll(private)
++		if err != nil {
++			_ = os.RemoveAll(directory)
 +		}
 +	}()
 +	if err = os.Chown(private, 0, int(req.OCI.Process.User.GID)); err != nil {
-+		return "", fmt.Errorf("set verified-secret directory group: %w", err)
++		return "", err
 +	}
-+	for _, name := range visible {
-+		var sealed []byte
-+		sealed, err = readSealedDescriptor(target.Source, name)
-+		if err != nil {
-+			return "", err
++	for name, expected := range g.manifest.DescriptorSHA256 {
++		sealed, readErr := readSealedFile(source, name, sealedVolumeMaxFile, 0)
++		if readErr != nil {
++			return "", readErr
 +		}
 +		digest := sha256.Sum256(sealed)
-+		if hex.EncodeToString(digest[:]) != g.manifest.DescriptorSHA256[name] {
-+			return "", fmt.Errorf("sealed descriptor %s differs from measured manifest", name)
++		if !strings.HasPrefix(string(sealed), "sealed.") || hex.EncodeToString(digest[:]) != expected {
++			return "", fmt.Errorf("descriptor %s differs from measured manifest", name)
 +		}
-+		var plaintext []byte
-+		plaintext, err = unseal(ctx, sealed)
-+		if err != nil || len(plaintext) == 0 || len(plaintext) > sealedVolumeMaxFile {
-+			return "", fmt.Errorf("CDH failed to unseal measured descriptor %s: %v", name, err)
++		plaintext, unsealErr := unseal(ctx, sealed)
++		if unsealErr != nil || len(plaintext) == 0 || len(plaintext) > sealedVolumeMaxFile {
++			return "", fmt.Errorf("CDH failed to unseal %s: %v", name, unsealErr)
 +		}
 +		output := filepath.Join(private, name)
-+		fd, openErr := unix.Open(output, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0440)
-+		err = openErr
-+		if err != nil {
-+			return "", fmt.Errorf("create private unsealed file: %w", err)
-+		}
-+		file := os.NewFile(uintptr(fd), output)
-+		if _, err = file.Write(plaintext); err == nil {
-+			err = file.Sync()
-+		}
-+		closeErr := file.Close()
-+		if err == nil {
-+			err = closeErr
-+		}
-+		if err != nil {
-+			return "", fmt.Errorf("write private unsealed file: %w", err)
++		if err = os.WriteFile(output, plaintext, 0440); err != nil {
++			return "", err
 +		}
 +		if err = os.Chown(output, 0, int(req.OCI.Process.User.GID)); err != nil {
-+			return "", fmt.Errorf("set private unsealed file group: %w", err)
++			return "", err
 +		}
 +	}
 +	target.Source = private
-+	complete = true
 +	return private, nil
 +}
 +
@@ -588,10 +470,10 @@ index 00000000..b5a7d236
 +}
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/sealed_volume_test.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/sealed_volume_test.go
 new file mode 100644
-index 00000000..47e4b047
+index 00000000..11c9d89f
 --- /dev/null
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/sealed_volume_test.go
-@@ -0,0 +1,177 @@
+@@ -0,0 +1,211 @@
 +package interceptor
 +
 +import (
@@ -602,6 +484,8 @@ index 00000000..47e4b047
 +	"path/filepath"
 +	"strings"
 +	"testing"
++
++	"golang.org/x/sys/unix"
 +
 +	pb "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/agent/protocols/grpc"
 +)
@@ -643,6 +527,29 @@ index 00000000..47e4b047
 +
 +func TestSealedVolumeUnsealAndRewrite(t *testing.T) {
 +	gate, req, source := sealedFixture(t)
++	// Only authorized outputs are exposed, independent of host directory naming.
++	renamed := filepath.Join(gate.sharedRoot, "upstream-generated-name")
++	if err := os.Rename(source, renamed); err != nil {
++		t.Fatal(err)
++	}
++	source, req.OCI.Mounts[0].Source = renamed, renamed
++	// Kubernetes projected Secrets use in-root relative symlinks.
++	dataDirectory := filepath.Join(source, "..version")
++	if err := os.Mkdir(dataDirectory, 0700); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.Rename(filepath.Join(source, "tls.key"), filepath.Join(dataDirectory, "tls.key")); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.Symlink("..version", filepath.Join(source, "..data")); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.Symlink("..data/tls.key", filepath.Join(source, "tls.key")); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(filepath.Join(source, "tls.key.unsealed"), []byte("evil"), 0600); err != nil {
++		t.Fatal(err)
++	}
 +	private, err := gate.verifyAndUnseal(context.Background(), req,
 +		func(_ context.Context, sealed []byte) ([]byte, error) {
 +			if string(sealed) != "sealed.test-jws" {
@@ -659,6 +566,9 @@ index 00000000..47e4b047
 +	got, err := os.ReadFile(filepath.Join(private, "tls.key"))
 +	if err != nil || string(got) != "plaintext" {
 +		t.Fatalf("private plaintext: %q, %v", got, err)
++	}
++	if _, err := os.Stat(filepath.Join(private, "tls.key.unsealed")); !os.IsNotExist(err) {
++		t.Fatal("host file reached private output")
 +	}
 +	info, err := os.Stat(filepath.Join(private, "tls.key"))
 +	if err != nil || info.Mode().Perm() != 0440 {
@@ -677,8 +587,14 @@ index 00000000..47e4b047
 +		{"different sealed descriptor", func(t *testing.T, _ *pb.CreateContainerRequest, source string) {
 +			os.WriteFile(filepath.Join(source, "tls.key"), []byte("sealed.other"), 0600)
 +		}},
-+		{"preseed unsealed file", func(t *testing.T, _ *pb.CreateContainerRequest, source string) {
-+			os.WriteFile(filepath.Join(source, "tls.key.unsealed"), []byte("evil"), 0600)
++		{"FIFO", func(t *testing.T, _ *pb.CreateContainerRequest, source string) {
++			name := filepath.Join(source, "tls.key")
++			if err := os.Remove(name); err != nil {
++				t.Fatal(err)
++			}
++			if err := unix.Mkfifo(name, 0600); err != nil {
++				t.Fatal(err)
++			}
 +		}},
 +		{"writable bind", func(_ *testing.T, req *pb.CreateContainerRequest, _ string) {
 +			req.OCI.Mounts[0].Options = []string{"rbind", "rw"}
@@ -699,7 +615,7 @@ index 00000000..47e4b047
 +			if err == nil {
 +				t.Fatal("tampered mount was accepted")
 +			}
-+			if called && mutation.name != "preseed unsealed file" {
++			if called {
 +				t.Fatal("CDH received tampered descriptor")
 +			}
 +			if _, statErr := os.Stat(filepath.Join(gate.privateRoot, req.ContainerId)); !os.IsNotExist(statErr) {
@@ -770,72 +686,31 @@ index 00000000..47e4b047
 +	}
 +}
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/volume_transaction_test.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/volume_transaction_test.go
-new file mode 100644
-index 00000000..021ee0c1
---- /dev/null
+index e526a173..a7cdb64e 100644
+--- a/src/cloud-api-adaptor/pkg/forwarder/interceptor/volume_transaction_test.go
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/volume_transaction_test.go
-@@ -0,0 +1,62 @@
-+// (C) Copyright Confidential Containers Contributors
-+// SPDX-License-Identifier: Apache-2.0
+@@ -60,3 +60,22 @@ func TestCreateContainerRollsBackPreparationAndAgentFailure(t *testing.T) {
+ 		})
+ 	}
+ }
 +
-+package interceptor
-+
-+import (
-+	"context"
-+	"errors"
-+	"os"
-+	"path/filepath"
-+	"testing"
-+
-+	"github.com/confidential-containers/cloud-api-adaptor/src/cloud-api-adaptor/pkg/util"
-+	pb "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/agent/protocols/grpc"
-+	"github.com/stretchr/testify/require"
-+)
-+
-+func TestCreateContainerRollsBackBeforeAndAfterSealedGate(t *testing.T) {
-+	for _, tc := range []struct {
-+		name                               string
-+		preparationFailure, cleanupFailure bool
-+	}{
-+		{name: "sealed rejection"}, {name: "preparation failure", preparationFailure: true}, {name: "failed rollback retained for destroy", cleanupFailure: true},
-+	} {
-+		t.Run(tc.name, func(t *testing.T) {
-+			owned := filepath.Join(t.TempDir(), "owned")
-+			require.NoError(t, os.Mkdir(owned, 0700))
-+			borrowed := filepath.Join(t.TempDir(), "borrowed")
-+			require.NoError(t, os.Mkdir(borrowed, 0700))
-+			unmountErr := errors.New("device busy")
-+			cleaned := false
-+			v := &preparedCloudVolume{sourcePath: owned, createdDirHere: true, mountedHere: true, unmount: func(string, int) error {
-+				cleaned = true
-+				if tc.cleanupFailure {
-+					return unmountErr
-+				}
-+				return nil
-+			}}
-+			i := &interceptor{sealedGate: &sealedVolumeGate{manifest: sealedVolumeManifest{Container: "bootstrap", Destination: "/secrets"}}}
-+			req := &pb.CreateContainerRequest{OCI: &pb.Spec{Linux: &pb.Linux{}, Annotations: map[string]string{util.CloudVolumesAnnotationKey: "{}", "io.kubernetes.cri.container-name": "unmeasured"}, Mounts: []*pb.Mount{{Destination: "/secrets"}}}}
-+			_, err := i.createContainer(context.Background(), req, func(context.Context, *pb.CreateContainerRequest, string) ([]*preparedCloudVolume, error) {
-+				volumes := []*preparedCloudVolume{v, {sourcePath: borrowed}}
-+				if tc.preparationFailure {
-+					return volumes, errors.New("preparation failed")
-+				}
-+				return volumes, nil
-+			})
-+			require.Error(t, err)
-+			require.True(t, cleaned, "early error skipped resource rollback")
-+			require.DirExists(t, borrowed, "rollback removed a borrowed resource")
-+			if tc.cleanupFailure {
-+				require.ErrorIs(t, err, unmountErr)
-+				require.Len(t, i.cloudVolumes, 1, "failed cleanup lost ownership")
-+				tc.cleanupFailure = false
-+				require.NoError(t, cleanupPreparedCloudVolumes(context.Background(), i.cloudVolumes))
-+			} else {
-+				require.Empty(t, i.cloudVolumes)
-+			}
-+			require.NoDirExists(t, owned)
-+		})
-+	}
++func TestCreateContainerRollsBackSealedRejection(t *testing.T) {
++	owned := filepath.Join(t.TempDir(), "owned")
++	require.NoError(t, os.Mkdir(owned, 0700))
++	cleaned := false
++	volume := &preparedCloudVolume{sourcePath: owned, createdDirHere: true, mountedHere: true,
++		unmount: func(string, int) error { cleaned = true; return nil }}
++	i := &interceptor{sealedGate: &sealedVolumeGate{manifest: sealedVolumeManifest{Container: "bootstrap", Destination: "/secrets"}}}
++	req := &pb.CreateContainerRequest{OCI: &pb.Spec{Linux: &pb.Linux{},
++		Annotations: map[string]string{util.CloudVolumesAnnotationKey: "{}", "io.kubernetes.cri.container-name": "unmeasured"},
++		Mounts:      []*pb.Mount{{Destination: "/secrets"}}}}
++	_, err := i.createContainer(context.Background(), req, func(context.Context, *pb.CreateContainerRequest, string) ([]*preparedCloudVolume, error) {
++		return []*preparedCloudVolume{volume}, nil
++	})
++	require.ErrorContains(t, err, "unmeasured container")
++	require.True(t, cleaned)
++	require.NoDirExists(t, owned)
++	require.Empty(t, i.cloudVolumes)
 +}
 -- 
 2.43.7

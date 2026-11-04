@@ -11,8 +11,9 @@ fixes in #2291. Test an override followed by a request for the default
 image with both unset and configured system disk sizes.
 
 Fixes: #3436
-Generated-by: OpenAI Codex
 Signed-off-by: Weidong Sun <sunweidong@linux.alibaba.com>
+
+Co-authored-by: Codex <noreply@openai.com>
 ---
  src/cloud-providers/alibabacloud/provider.go  |  9 +--
  .../alibabacloud/provider_test.go             | 57 +++++++++++++++++++

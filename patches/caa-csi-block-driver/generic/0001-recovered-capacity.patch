@@ -1,13 +1,11 @@
-From 9a6f1eb82d89d330023d9b1142dcc343f24e5657 Mon Sep 17 00:00:00 2001
+From 0848764355780d20e7dbd2b546c6b089c0445444 Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
-Date: Tue, 3 Nov 2026 11:58:13 +0800
-Subject: [PATCH] controller: validate actual capacity on recovered volumes
+Date: Wed, 4 Nov 2026 11:31:52 +0800
+Subject: [PATCH] controller: validate actual recovered capacity
 
-Use the requested capacity range for cached and cloud-recovered volumes.
-Reject incompatible existing disks before saving a record and report the
-actual provider capacity after rounding instead of the requested size.
+Preserve the requested range for cached and recovered disks and report the provider actual capacity.
 
-Generated-by: OpenAI Codex
+Co-authored-by: Codex <noreply@openai.com>
 ---
  pkg/driver/capacity_test.go    | 83 ++++++++++++++++++++++++++++++++++
  pkg/driver/controllerserver.go | 24 ++++++++--

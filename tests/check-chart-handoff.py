@@ -95,48 +95,31 @@ def assert_resources(resources):
         matches = [r for r in resources if r['kind'] == kind and r['metadata']['name'] == name]
         require(len(matches) == 1, f'expected one {kind}/{name}, got {len(matches)}')
         return matches[0]
-    controller = one('Deployment', 'caa-csi-block-controller')
     node = one('DaemonSet', 'caa-csi-block')
-    pvc = one('PersistentVolumeClaim', 'caa-csi-block-controller-state')
     storage = one('StorageClass', 'alicloud-disk-essd-peerpod')
-    require(sum(r['kind'] == 'Deployment' for r in resources) == 1, 'unexpected extra CSI deployment')
-    require(controller['spec']['replicas'] == 1 and controller['spec']['strategy']['type'] == 'Recreate',
-            'controller must be single-replica/Recreate')
-    for resource in [controller, node, pvc]:
-        require(resource['metadata']['namespace'] == 'caa-csi-block', 'wrong CSI resource namespace')
-    require(pvc['metadata']['annotations']['helm.sh/resource-policy'] == 'keep', 'controller PVC must survive Helm uninstall')
-    require(pvc['spec']['accessModes'] == ['ReadWriteOnce'] and pvc['spec']['storageClassName'] == 'ACK_HOST_ESSD_STORAGE_CLASS'
-            and pvc['spec']['resources']['requests']['storage'] == '20Gi', 'incorrect durable controller storage')
-    control_pod = controller['spec']['template']['spec']
+    require(not any(r['kind'] in ('Deployment', 'PersistentVolumeClaim') for r in resources),
+            'combined CSI must not require a controller Deployment or state PVC')
+    require(node['metadata']['namespace'] == 'caa-csi-block', 'wrong CSI resource namespace')
     node_pod = node['spec']['template']['spec']
-    control = {c['name']: c for c in control_pod['containers']}
-    nodes = {c['name']: c for c in node_pod['containers']}
-    require(set(control) == {'csi-provisioner', 'caa-csi-block-controller'}, 'controller sidecar split changed')
-    require(set(nodes) == {'node-driver-registrar', 'caa-csi-block-driver'}, 'node must not run provisioner/controller')
-    driver = control['caa-csi-block-controller']
-    require('--component=controller' in driver['args'] and '--volume-store-dir=/var/lib/caa-csi-block/volumes' in driver['args'],
-            'controller volume store is not configured')
-    require('--leader-election=true' in control['csi-provisioner']['args'], 'provisioner leader election missing')
-    require('--component=node' in nodes['caa-csi-block-driver']['args'] and '--nodeid=$(KUBE_NODE_NAME)' in nodes['caa-csi-block-driver']['args'],
-            'node mode/identity missing')
-    node_role = one('ClusterRole', 'caa-csi-block-node')
-    require(node_role['rules'] == [{'apiGroups': [''], 'resources': ['nodes'], 'verbs': ['get']}],
-            'node topology lookup must not gain controller privileges')
-    require(not any(m['name'] == 'node-api-access' for m in nodes['node-driver-registrar']['volumeMounts']),
-            'registrar must not receive node API token')
-    require(node_pod['automountServiceAccountToken'] is False, 'node token automount must stay disabled')
-    require(control_pod['serviceAccountName'] != node_pod['serviceAccountName'], 'controller/node service accounts must differ')
-    node_sa = one('ServiceAccount', node_pod['serviceAccountName'])
-    require(node_sa['automountServiceAccountToken'] is False, 'node ServiceAccount token automount enabled')
+    containers = {c['name']: c for c in node_pod['containers']}
+    require(set(containers) == {'csi-provisioner', 'node-driver-registrar', 'caa-csi-block-driver'},
+            'combined CSI containers changed')
+    driver = containers['caa-csi-block-driver']
+    require('--nodeid=$(KUBE_NODE_NAME)' in driver['args'], 'node identity missing')
+    require(not any(a.startswith('--component=') for a in driver['args']), 'unexpected split service mode')
+    require('--leader-election=true' in containers['csi-provisioner']['args'], 'provisioner leader election missing')
+    csi = one('CSIDriver', 'caa-csi-block.csi.confidentialcontainers.io')
+    require(csi['spec']['podInfoOnMount'] is True, 'CSI must receive Pod identity from kubelet')
     binding = one('ClusterRoleBinding', 'caa-csi-block')
-    require(binding['subjects'] == [{'kind': 'ServiceAccount', 'name': control_pod['serviceAccountName'], 'namespace': 'caa-csi-block'}],
-            'controller privileges must not be granted to node')
-    volumes = {v['name']: v for v in control_pod['volumes']}
+    require(binding['subjects'] == [{'kind': 'ServiceAccount', 'name': node_pod['serviceAccountName'], 'namespace': 'caa-csi-block'}],
+            'CSI ServiceAccount binding is incorrect')
+    volumes = {v['name']: v for v in node_pod['volumes']}
     mounts = {m['name']: m for m in driver['volumeMounts']}
-    require(volumes['controller-state'] == {'name': 'controller-state', 'persistentVolumeClaim': {'claimName': pvc['metadata']['name']}},
-            'controller volume store must use the PVC, not emptyDir/hostPath')
-    require(mounts['controller-state']['mountPath'] == '/var/lib/caa-csi-block', 'controller volume store mount missing')
-    require(all('hostPath' not in v for v in control_pod['volumes']), 'controller must not mount worker host paths')
+    require(volumes['csi-data']['hostPath']['path'] == '/var/lib/caa-csi-block'
+            and mounts['csi-data']['mountPath'] == '/var/lib/caa-csi-block', 'upstream node-local store missing')
+    require(not any(m['name'] == 'rrsa-oidc-token' for name, c in containers.items()
+                    if name != 'caa-csi-block-driver' for m in c.get('volumeMounts', [])),
+            'CSI sidecars must not receive the cloud token')
     env = {e['name']: e.get('value') for e in driver['env']}
     require(env['CSI_CLOUD_PROVIDER'] == 'alibabacloud', 'wrong CSI cloud provider')
     require(env['ALIBABA_CLOUD_ROLE_ARN'] == 'CSI_RAM_ROLE_ARN' and env['ALIBABA_CLOUD_OIDC_PROVIDER_ARN'] == 'ACK_OIDC_PROVIDER_ARN',
@@ -148,9 +131,6 @@ def assert_resources(resources):
     require(mounts['rrsa-oidc-token']['readOnly'] is True and mounts['rrsa-oidc-token']['mountPath'] == '/var/run/secrets/ack.alibabacloud.com/rrsa-tokens',
             'RRSA token mount missing')
     require(not any('ACCESS_KEY' in key for key in env), 'static cloud credentials must not accompany RRSA')
-    serialized_node = json.dumps(node_pod)
-    require(all(value not in serialized_node for value in ['ALIBABA_CLOUD_', 'rrsa-oidc-token', 'controller-state', 'bootstrap-params']),
-            'controller credentials/state leaked into node spec')
     require(storage['provisioner'] == 'caa-csi-block.csi.confidentialcontainers.io' and storage['allowVolumeExpansion'] is False
             and storage['volumeBindingMode'] == 'Immediate' and storage['reclaimPolicy'] == 'Delete', 'incorrect PeerPod StorageClass semantics')
     expected = {'cloudProvider': 'alibabacloud', 'region': 'REGION', 'zoneId': 'ZONE', 'clusterId': 'ACK_CLUSTER_ID'}
@@ -262,7 +242,7 @@ class HandoffTests(unittest.TestCase):
         self.checksums()
         result = self.run_consumer()
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn('expected one Deployment/caa-csi-block-controller, got 0', result.stderr)
+        self.assertIn('provisioner leader election missing', result.stderr)
         self.assertTrue((self.bundle / 'rendered.yaml').exists(), 'Helm must succeed while the semantic assertion rejects the upstream chart')
 
     def test_unapproved_checksum_list_fails_before_render(self):

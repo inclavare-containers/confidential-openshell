@@ -1,0 +1,357 @@
+From 6fa0191185b3d06cfc2eed17179faa96ea57d2a9 Mon Sep 17 00:00:00 2001
+From: Weidong Sun <sunweidong@linux.alibaba.com>
+Date: Wed, 4 Nov 2026 15:23:27 +0800
+Subject: [PATCH] volumes: resolve missing Pod UID before selecting CSI disks
+
+Kata remote CreateVM can send only the Pod name and namespace. When its
+annotations omit a UID, the existing scan includes direct volumes from
+other Pods on the worker.
+
+Resolve the UID through the existing PeerPod Kubernetes client once a CSI
+entry is found, and fail selection if the lookup cannot identify the Pod.
+Keep the existing annotation/CRI-O paths and metadata format. Reuse the
+volume fixtures and cover the missing-UID path through a local API server.
+
+Signed-off-by: Weidong Sun <sunweidong@linux.alibaba.com>
+
+Co-authored-by: Codex <noreply@openai.com>
+---
+ .../pkg/adaptor/cloud/cloud.go                |  7 ++-
+ .../pkg/adaptor/k8sops/peerpod.go             | 16 +++++
+ .../pkg/adaptor/k8sops/peerpod_test.go        | 55 ++++++++++++++++
+ src/cloud-api-adaptor/pkg/util/cloud.go       | 25 ++++++--
+ .../pkg/util/cloud_csi_test.go                | 62 ++++++++++++-------
+ 5 files changed, 138 insertions(+), 27 deletions(-)
+ create mode 100644 src/cloud-api-adaptor/pkg/adaptor/k8sops/peerpod_test.go
+
+diff --git a/src/cloud-api-adaptor/pkg/adaptor/cloud/cloud.go b/src/cloud-api-adaptor/pkg/adaptor/cloud/cloud.go
+index 9a97384c..679abc1f 100644
+--- a/src/cloud-api-adaptor/pkg/adaptor/cloud/cloud.go
++++ b/src/cloud-api-adaptor/pkg/adaptor/cloud/cloud.go
+@@ -195,7 +195,12 @@ func (s *cloudService) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (r
+ 	image := util.GetImageFromAnnotation(req.Annotations)
+ 
+ 	// Get CSI volumes that need to be attached to the PodVM
+-	csiVolumes := util.GetCSIVolumesForPod(req.Annotations)
++	csiVolumes, err := util.GetCSIVolumesForPod(req.Annotations, func() (string, error) {
++		return s.ppService.GetPodUID(ctx, pod, namespace)
++	})
++	if err != nil {
++		return nil, fmt.Errorf("resolve CSI volumes: %w", err)
++	}
+ 	if len(csiVolumes) > 0 {
+ 		logger.Printf("Found %d CSI volumes to attach to PodVM", len(csiVolumes))
+ 	}
+diff --git a/src/cloud-api-adaptor/pkg/adaptor/k8sops/peerpod.go b/src/cloud-api-adaptor/pkg/adaptor/k8sops/peerpod.go
+index 918908da..e5c47267 100644
+--- a/src/cloud-api-adaptor/pkg/adaptor/k8sops/peerpod.go
++++ b/src/cloud-api-adaptor/pkg/adaptor/k8sops/peerpod.go
+@@ -91,6 +91,22 @@ func (s *PeerPodService) getPod(podname string, podns string) (*v1.Pod, error) {
+ 	return pod, nil
+ }
+ 
++// GetPodUID resolves the Pod identity for a remote hypervisor request that
++// provides only a name and namespace.
++func (s *PeerPodService) GetPodUID(ctx context.Context, podname, podns string) (string, error) {
++	if s == nil || s.client == nil {
++		return "", errors.New("PeerPodService Kubernetes client is unavailable")
++	}
++	pod, err := s.client.CoreV1().Pods(podns).Get(ctx, podname, metav1.GetOptions{})
++	if err != nil {
++		return "", err
++	}
++	if pod.UID == "" {
++		return "", fmt.Errorf("pod %s/%s has an empty UID", podns, podname)
++	}
++	return string(pod.UID), nil
++}
++
+ // make the pod an owner of a PeerPod
+ func (s *PeerPodService) OwnPeerPod(podname string, podns string, instanceID string) error {
+ 	pod, err := s.getPod(podname, podns)
+diff --git a/src/cloud-api-adaptor/pkg/adaptor/k8sops/peerpod_test.go b/src/cloud-api-adaptor/pkg/adaptor/k8sops/peerpod_test.go
+new file mode 100644
+index 00000000..c60432a4
+--- /dev/null
++++ b/src/cloud-api-adaptor/pkg/adaptor/k8sops/peerpod_test.go
+@@ -0,0 +1,55 @@
++// Copyright Confidential Containers Contributors
++// SPDX-License-Identifier: Apache-2.0
++
++package k8sops
++
++import (
++	"context"
++	"encoding/base64"
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/confidential-containers/cloud-api-adaptor/src/cloud-api-adaptor/pkg/util"
++	cri "github.com/containerd/containerd/pkg/cri/annotations"
++	"github.com/stretchr/testify/require"
++	"k8s.io/client-go/kubernetes"
++	"k8s.io/client-go/rest"
++)
++
++func TestCSISelectionResolvesRemotePodUID(t *testing.T) {
++	calls := 0
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		require.Equal(t, "/api/v1/namespaces/default/pods/pod-a", r.URL.Path)
++		calls++
++		w.Header().Set("Content-Type", "application/json")
++		_, err := w.Write([]byte(`{"apiVersion":"v1","kind":"Pod","metadata":{"name":"pod-a","namespace":"default","uid":"uid-a"}}`))
++		require.NoError(t, err)
++	}))
++	defer server.Close()
++	client, err := kubernetes.NewForConfig(&rest.Config{Host: server.URL})
++	require.NoError(t, err)
++	service := &PeerPodService{client: client}
++	directory := t.TempDir()
++	previous := util.KataDirectVolumesDir
++	util.KataDirectVolumesDir = directory
++	defer func() { util.KataDirectVolumesDir = previous }()
++	for _, volume := range []struct{ uid, name, disk string }{{"uid-a", "pvc-1", "disk-a"}, {"uid-b", "pvc-2", "disk-b"}, {"uid-a", "pvc-3", "disk-c"}} {
++		target := "/var/lib/kubelet/pods/" + volume.uid + "/volumes/kubernetes.io~csi/" + volume.name + "/mount"
++		record := filepath.Join(directory, base64.URLEncoding.EncodeToString([]byte(target)))
++		require.NoError(t, os.Mkdir(record, 0755))
++		data, err := json.Marshal(map[string]string{"device": volume.disk, "fstype": "ext4"})
++		require.NoError(t, err)
++		require.NoError(t, os.WriteFile(filepath.Join(record, "mountInfo.json"), data, 0600))
++	}
++	annotations := map[string]string{cri.SandboxName: "pod-a", cri.SandboxNamespace: "default"}
++	volumes, err := util.GetCSIVolumesForPod(annotations, func() (string, error) { return service.GetPodUID(context.Background(), "pod-a", "default") })
++	require.NoError(t, err)
++	require.Equal(t, 1, calls, "lookup must be shared across volume entries")
++	require.Len(t, volumes, 2)
++	require.Equal(t, "disk-a", volumes[0].DiskID)
++	require.Equal(t, "disk-c", volumes[1].DiskID)
++}
+diff --git a/src/cloud-api-adaptor/pkg/util/cloud.go b/src/cloud-api-adaptor/pkg/util/cloud.go
+index 39f3f462..eade8bad 100644
+--- a/src/cloud-api-adaptor/pkg/util/cloud.go
++++ b/src/cloud-api-adaptor/pkg/util/cloud.go
+@@ -180,15 +180,16 @@ type CloudVolumeAnnotation struct {
+ // mountInfo.json files written by the CSI block driver. Each file
+ // describes a cloud volume that should be attached to the PodVM.
+ // Volumes are filtered by pod UID (from annotations) to prevent
+-// cross-pod volume leakage on multi-tenant nodes.
+-func GetCSIVolumesForPod(annotations map[string]string) []provider.CloudVolume {
++// cross-pod volume leakage on multi-tenant nodes. If annotations omit the UID,
++// lookupPodUID is called once, and only when a CSI volume entry is present.
++func GetCSIVolumesForPod(annotations map[string]string, lookupPodUID func() (string, error)) ([]provider.CloudVolume, error) {
+ 	var volumes []provider.CloudVolume
+ 
+ 	podUID := GetPodUID(annotations)
+ 
+ 	entries, err := os.ReadDir(KataDirectVolumesDir)
+ 	if err != nil {
+-		return nil
++		return nil, nil
+ 	}
+ 
+ 	for _, entry := range entries {
+@@ -206,7 +207,21 @@ func GetCSIVolumesForPod(annotations map[string]string) []provider.CloudVolume {
+ 			continue
+ 		}
+ 
+-		if podUID != "" && !strings.Contains(decodedStr, "/pods/"+podUID+"/") {
++		// The remote hypervisor may send only Pod name and namespace. Resolve
++		// its UID once, before selecting any CSI volume from this shared tree.
++		if podUID == "" {
++			if lookupPodUID == nil {
++				return nil, fmt.Errorf("Pod UID is required to select CSI volumes")
++			}
++			podUID, err = lookupPodUID()
++			if err != nil {
++				return nil, fmt.Errorf("look up Pod UID for CSI volumes: %w", err)
++			}
++			if podUID == "" {
++				return nil, fmt.Errorf("Pod UID lookup returned an empty UID")
++			}
++		}
++		if !strings.Contains(decodedStr, "/pods/"+podUID+"/") {
+ 			continue
+ 		}
+ 
+@@ -239,5 +254,5 @@ func GetCSIVolumesForPod(annotations map[string]string) []provider.CloudVolume {
+ 		})
+ 	}
+ 
+-	return volumes
++	return volumes, nil
+ }
+diff --git a/src/cloud-api-adaptor/pkg/util/cloud_csi_test.go b/src/cloud-api-adaptor/pkg/util/cloud_csi_test.go
+index b7e0617a..4718662e 100644
+--- a/src/cloud-api-adaptor/pkg/util/cloud_csi_test.go
++++ b/src/cloud-api-adaptor/pkg/util/cloud_csi_test.go
+@@ -3,6 +3,7 @@ package util
+ import (
+ 	b64 "encoding/base64"
+ 	"encoding/json"
++	"errors"
+ 	"fmt"
+ 	"os"
+ 	"path/filepath"
+@@ -39,7 +40,11 @@ func writeMountInfo(t *testing.T, dir, volumePath string, info map[string]interf
+ 
+ func TestGetCSIVolumesForPod_EmptyDirectory(t *testing.T) {
+ 	setupDirectVolumesDir(t)
+-	volumes := GetCSIVolumesForPod(map[string]string{})
++	volumes, err := GetCSIVolumesForPod(map[string]string{}, func() (string, error) {
++		t.Fatal("looked up Pod UID without CSI volumes")
++		return "", nil
++	})
++	require.NoError(t, err)
+ 	assert.Nil(t, volumes)
+ }
+ 
+@@ -48,7 +53,11 @@ func TestGetCSIVolumesForPod_NonExistentDirectory(t *testing.T) {
+ 	KataDirectVolumesDir = "/nonexistent/path"
+ 	defer func() { KataDirectVolumesDir = origDir }()
+ 
+-	volumes := GetCSIVolumesForPod(map[string]string{})
++	volumes, err := GetCSIVolumesForPod(map[string]string{}, func() (string, error) {
++		t.Fatal("looked up Pod UID without CSI volumes")
++		return "", nil
++	})
++	require.NoError(t, err)
+ 	assert.Nil(t, volumes)
+ }
+ 
+@@ -61,7 +70,8 @@ func TestGetCSIVolumesForPod_SingleVolume(t *testing.T) {
+ 		"fstype": "ext4",
+ 	})
+ 
+-	volumes := GetCSIVolumesForPod(map[string]string{})
++	volumes, err := GetCSIVolumesForPod(map[string]string{cri.SandboxUID: "pod-uid-123"}, nil)
++	require.NoError(t, err)
+ 	require.Len(t, volumes, 1)
+ 	assert.Equal(t, "/subscriptions/sub1/resourceGroups/rg1/providers/Microsoft.Compute/disks/csi-vol-pvc-abc", volumes[0].DiskID)
+ }
+@@ -78,7 +88,8 @@ func TestGetCSIVolumesForPod_CloudVolumePathTakesPrecedence(t *testing.T) {
+ 		},
+ 	})
+ 
+-	volumes := GetCSIVolumesForPod(map[string]string{})
++	volumes, err := GetCSIVolumesForPod(map[string]string{cri.SandboxUID: "pod-uid-123"}, nil)
++	require.NoError(t, err)
+ 	require.Len(t, volumes, 1)
+ 	assert.Equal(t, "/subscriptions/sub1/disks/preferred-disk", volumes[0].DiskID)
+ }
+@@ -113,7 +124,8 @@ func TestGetCSIVolumesForPod_PodUIDFiltering(t *testing.T) {
+ 				"/var/lib/kubelet/pods/pod-uid-AAA/volumes/kubernetes.io~csi/pvc-3/mount",
+ 				map[string]interface{}{"device": "disk-C", "fstype": "ext4"})
+ 
+-			volumes := GetCSIVolumesForPod(tt.annotations)
++			volumes, err := GetCSIVolumesForPod(tt.annotations, nil)
++			require.NoError(t, err)
+ 			require.Len(t, volumes, 2)
+ 
+ 			diskIDs := []string{volumes[0].DiskID, volumes[1].DiskID}
+@@ -124,19 +136,20 @@ func TestGetCSIVolumesForPod_PodUIDFiltering(t *testing.T) {
+ 	}
+ }
+ 
+-func TestGetCSIVolumesForPod_EmptyPodUIDReturnsAll(t *testing.T) {
++func TestGetCSIVolumesForPod_MissingUID(t *testing.T) {
+ 	dir := setupDirectVolumesDir(t)
+-
+ 	writeMountInfo(t, dir,
+ 		"/var/lib/kubelet/pods/pod-uid-AAA/volumes/kubernetes.io~csi/pvc-1/mount",
+ 		map[string]interface{}{"device": "disk-A", "fstype": "ext4"})
+-
+-	writeMountInfo(t, dir,
+-		"/var/lib/kubelet/pods/pod-uid-BBB/volumes/kubernetes.io~csi/pvc-2/mount",
+-		map[string]interface{}{"device": "disk-B", "fstype": "ext4"})
+-
+-	volumes := GetCSIVolumesForPod(map[string]string{})
+-	assert.Len(t, volumes, 2)
++	for _, lookup := range []func() (string, error){
++		nil,
++		func() (string, error) { return "", nil },
++		func() (string, error) { return "", errors.New("API unavailable") },
++	} {
++		volumes, err := GetCSIVolumesForPod(map[string]string{}, lookup)
++		require.Error(t, err)
++		require.Empty(t, volumes)
++	}
+ }
+ 
+ func TestGetCSIVolumesForPod_SkipsNonCSIVolumes(t *testing.T) {
+@@ -150,7 +163,8 @@ func TestGetCSIVolumesForPod_SkipsNonCSIVolumes(t *testing.T) {
+ 		"/var/lib/kubelet/pods/pod-uid-123/volumes/kubernetes.io~configmap/config/mount",
+ 		map[string]interface{}{"device": "configmap-device", "fstype": "ext4"})
+ 
+-	volumes := GetCSIVolumesForPod(map[string]string{})
++	volumes, err := GetCSIVolumesForPod(map[string]string{cri.SandboxUID: "pod-uid-123"}, nil)
++	require.NoError(t, err)
+ 	require.Len(t, volumes, 1)
+ 	assert.Equal(t, "csi-disk", volumes[0].DiskID)
+ }
+@@ -162,7 +176,8 @@ func TestGetCSIVolumesForPod_SkipsMissingDiskID(t *testing.T) {
+ 		"/var/lib/kubelet/pods/pod-uid-123/volumes/kubernetes.io~csi/pvc-no-disk/mount",
+ 		map[string]interface{}{"fstype": "ext4"})
+ 
+-	volumes := GetCSIVolumesForPod(map[string]string{})
++	volumes, err := GetCSIVolumesForPod(map[string]string{cri.SandboxUID: "pod-uid-123"}, nil)
++	require.NoError(t, err)
+ 	assert.Empty(t, volumes)
+ }
+ 
+@@ -174,7 +189,8 @@ func TestGetCSIVolumesForPod_SkipsInvalidJSON(t *testing.T) {
+ 	require.NoError(t, os.MkdirAll(volDir, 0o755))
+ 	require.NoError(t, os.WriteFile(filepath.Join(volDir, "mountInfo.json"), []byte("{invalid json"), 0o644))
+ 
+-	volumes := GetCSIVolumesForPod(map[string]string{})
++	volumes, err := GetCSIVolumesForPod(map[string]string{cri.SandboxUID: "pod-uid-123"}, nil)
++	require.NoError(t, err)
+ 	assert.Empty(t, volumes)
+ }
+ 
+@@ -187,7 +203,8 @@ func TestGetCSIVolumesForPod_SkipsNonBase64Directories(t *testing.T) {
+ 		"/var/lib/kubelet/pods/pod-uid-123/volumes/kubernetes.io~csi/pvc-ok/mount",
+ 		map[string]interface{}{"device": "good-disk", "fstype": "ext4"})
+ 
+-	volumes := GetCSIVolumesForPod(map[string]string{})
++	volumes, err := GetCSIVolumesForPod(map[string]string{cri.SandboxUID: "pod-uid-123"}, nil)
++	require.NoError(t, err)
+ 	require.Len(t, volumes, 1)
+ 	assert.Equal(t, "good-disk", volumes[0].DiskID)
+ }
+@@ -199,7 +216,8 @@ func TestGetCSIVolumesForPod_SkipsRegularFiles(t *testing.T) {
+ 	encoded := b64.URLEncoding.EncodeToString([]byte(volPath))
+ 	require.NoError(t, os.WriteFile(filepath.Join(dir, encoded), []byte("not a dir"), 0o644))
+ 
+-	volumes := GetCSIVolumesForPod(map[string]string{})
++	volumes, err := GetCSIVolumesForPod(map[string]string{cri.SandboxUID: "pod-uid-123"}, nil)
++	require.NoError(t, err)
+ 	assert.Empty(t, volumes)
+ }
+ 
+@@ -219,7 +237,8 @@ func TestGetCSIVolumesForPod_MultipleVolumesCanonicalOrder(t *testing.T) {
+ 		})
+ 	}
+ 
+-	volumes := GetCSIVolumesForPod(map[string]string{})
++	volumes, err := GetCSIVolumesForPod(map[string]string{cri.SandboxUID: "pod-uid-123"}, nil)
++	require.NoError(t, err)
+ 	require.Len(t, volumes, 3)
+ 
+ 	for i := 0; i < len(volumes)-1; i++ {
+@@ -235,7 +254,8 @@ func TestGetCSIVolumesForPod_ReturnType(t *testing.T) {
+ 		"/var/lib/kubelet/pods/pod-uid-123/volumes/kubernetes.io~csi/pvc-test/mount",
+ 		map[string]interface{}{"device": "test-disk", "fstype": "ext4"})
+ 
+-	volumes := GetCSIVolumesForPod(map[string]string{})
++	volumes, err := GetCSIVolumesForPod(map[string]string{cri.SandboxUID: "pod-uid-123"}, nil)
++	require.NoError(t, err)
+ 	require.Len(t, volumes, 1)
+ 	assert.IsType(t, provider.CloudVolume{}, volumes[0])
+ }
+-- 
+2.43.7
+

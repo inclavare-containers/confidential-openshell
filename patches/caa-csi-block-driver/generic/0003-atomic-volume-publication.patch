@@ -1,0 +1,858 @@
+From 785b426cf918f26b542f5beaee0ea1b3d08f8757 Mon Sep 17 00:00:00 2001
+From: Weidong Sun <sunweidong@linux.alibaba.com>
+Date: Wed, 4 Nov 2026 15:25:09 +0800
+Subject: [PATCH] node: publish volume metadata atomically and recover after
+ restart
+
+Return cloud device identity in controller responses so NodePublish can
+resume without NodeStage after plugin restart. Keep target ownership and
+mount properties consistent on republish, publish metadata with rename,
+and remove only empty kubelet targets during unpublish.
+
+Accept existing upstream metadata without version, mode or readonly labels.
+Use its cloud-volume-id to verify ownership and the current target's Pod
+identity when replaying older records. Bound reads and preserve existing
+metadata when publication or cleanup fails.
+
+Co-authored-by: Codex <noreply@openai.com>
+---
+ .../templates/csi-driver.yaml                 |   2 +-
+ deploy/csi-driver.yaml                        |   2 +-
+ pkg/driver/controllerserver.go                |   5 +-
+ pkg/driver/directvolume.go                    |  82 ++++-
+ pkg/driver/directvolume_test.go               | 300 ++++++++++++++++++
+ pkg/driver/identity_contract_test.go          |  44 +++
+ pkg/driver/metadata_atomic.go                 |  48 +++
+ pkg/driver/metadata_atomic_test.go            |  49 +++
+ pkg/driver/nodeserver.go                      | 117 +++++--
+ pkg/driver/testdata/direct-volume-v1.json     |   1 +
+ 10 files changed, 611 insertions(+), 39 deletions(-)
+ create mode 100644 pkg/driver/directvolume_test.go
+ create mode 100644 pkg/driver/identity_contract_test.go
+ create mode 100644 pkg/driver/metadata_atomic.go
+ create mode 100644 pkg/driver/metadata_atomic_test.go
+ create mode 100644 pkg/driver/testdata/direct-volume-v1.json
+
+diff --git a/charts/caa-csi-block-driver/templates/csi-driver.yaml b/charts/caa-csi-block-driver/templates/csi-driver.yaml
+index c7ccbd72..1b1c4910 100644
+--- a/charts/caa-csi-block-driver/templates/csi-driver.yaml
++++ b/charts/caa-csi-block-driver/templates/csi-driver.yaml
+@@ -6,6 +6,6 @@ metadata:
+     {{- include "caa-csi.labels" . | nindent 4 }}
+ spec:
+   attachRequired: false
+-  podInfoOnMount: false
++  podInfoOnMount: true
+   volumeLifecycleModes:
+     - Persistent
+diff --git a/deploy/csi-driver.yaml b/deploy/csi-driver.yaml
+index fdbfef20..48ef6c99 100644
+--- a/deploy/csi-driver.yaml
++++ b/deploy/csi-driver.yaml
+@@ -4,6 +4,6 @@ metadata:
+   name: caa-csi-block.csi.confidentialcontainers.io
+ spec:
+   attachRequired: false
+-  podInfoOnMount: false
++  podInfoOnMount: true
+   volumeLifecycleModes:
+     - Persistent
+diff --git a/pkg/driver/controllerserver.go b/pkg/driver/controllerserver.go
+index b2bb250a..843f3fab 100644
+--- a/pkg/driver/controllerserver.go
++++ b/pkg/driver/controllerserver.go
+@@ -123,7 +123,7 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
+ 			return nil, status.Errorf(codes.AlreadyExists, "volume %s capacity %d is outside the requested range", req.GetName(), rec.CapacityBytes)
+ 		}
+ 		csLogger.Printf("CreateVolume: %s already exists, returning existing", req.GetName())
+-		volumeCtx := map[string]string{"cloudProvider": rec.Provider}
++		volumeCtx := map[string]string{"cloudProvider": rec.Provider, "cloud-volume-path": rec.Path}
+ 		for k, v := range rec.Params {
+ 			volumeCtx[k] = v
+ 		}
+@@ -208,7 +208,8 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
+ 	csLogger.Printf("CreateVolume: %s (provider=%s, path=%s)", req.GetName(), volInfo.Provider, volInfo.Path)
+ 
+ 	volumeCtx := map[string]string{
+-		"cloudProvider": volInfo.Provider,
++		"cloudProvider":     volInfo.Provider,
++		"cloud-volume-path": volInfo.Path,
+ 	}
+ 	for k, v := range params {
+ 		volumeCtx[k] = v
+diff --git a/pkg/driver/directvolume.go b/pkg/driver/directvolume.go
+index 4289511b..a9605005 100644
+--- a/pkg/driver/directvolume.go
++++ b/pkg/driver/directvolume.go
+@@ -4,21 +4,33 @@
+ package driver
+ 
+ import (
++	"bytes"
++	"encoding/json"
++	"errors"
+ 	"fmt"
++	"io"
++	"os"
+ 	"sort"
+ 	"strconv"
+ 	"strings"
+ )
+ 
+-// mountInfoJSON carries the upstream fields plus CSI access and group options.
++const (
++	maxDirectVolumeMetadataSize = 64 * 1024
++)
++
++// mountInfoJSON extends the upstream mountInfo fields with the requested
++// access mode and group. Version labels are not required to read older records.
+ type mountInfoJSON struct {
+-	VolumeType string            `json:"volume-type"`
+-	Device     string            `json:"device"`
+-	FsType     string            `json:"fstype"`
+-	ReadOnly   bool              `json:"readonly"`
+-	Options    []string          `json:"options,omitempty"`
+-	FSGroup    string            `json:"fs-group,omitempty"`
+-	Metadata   map[string]string `json:"metadata,omitempty"`
++	VolumeType   string            `json:"volume-type"`
++	Device       string            `json:"device"`
++	FsType       string            `json:"fstype"`
++	ReadOnly     bool              `json:"readonly"`
++	Options      []string          `json:"options,omitempty"`
++	FSGroup      string            `json:"fs-group,omitempty"`
++	PodUID       string            `json:"pod-uid"`
++	VolumeHandle string            `json:"volume-handle"`
++	Metadata     map[string]string `json:"metadata,omitempty"`
+ }
+ 
+ func normalizeFilesystemType(fsType string) (string, error) {
+@@ -120,3 +132,57 @@ func directVolumeMetadataContext(values map[string]string) map[string]string {
+ 	}
+ 	return result
+ }
++
++func readDirectVolumeMetadata(path string) (*mountInfoJSON, error) {
++	file, err := os.Open(path)
++	if err != nil {
++		return nil, err
++	}
++	defer file.Close()
++	data, err := io.ReadAll(io.LimitReader(file, maxDirectVolumeMetadataSize+1))
++	if err != nil {
++		return nil, err
++	}
++	if len(data) > maxDirectVolumeMetadataSize {
++		return nil, fmt.Errorf("direct-volume metadata exceeds %d bytes", maxDirectVolumeMetadataSize)
++	}
++	var metadata mountInfoJSON
++	if err := json.Unmarshal(data, &metadata); err != nil {
++		return nil, err
++	}
++	if metadata.Device == "" {
++		return nil, errors.New("direct-volume record lacks device identity")
++	}
++	if metadata.VolumeHandle == "" {
++		metadata.VolumeHandle = metadata.Metadata["cloud-volume-id"]
++	}
++	// The original writer omitted readonly. Mount flags still express access.
++	for _, option := range metadata.Options {
++		metadata.ReadOnly = metadata.ReadOnly || option == "ro"
++	}
++	return &metadata, nil
++}
++
++func directVolumeMetadataEqual(left, right mountInfoJSON) bool {
++	// Compare mount semantics and ownership, not transport labels or unused
++	// controller parameters from older writer versions.
++	left.VolumeType, right.VolumeType = "", ""
++	left.Metadata = map[string]string{"encrypt-type": left.Metadata["encrypt-type"], "kbs-key-id": left.Metadata["kbs-key-id"]}
++	right.Metadata = map[string]string{"encrypt-type": right.Metadata["encrypt-type"], "kbs-key-id": right.Metadata["kbs-key-id"]}
++	leftJSON, leftErr := json.Marshal(left)
++	rightJSON, rightErr := json.Marshal(right)
++	return leftErr == nil && rightErr == nil && bytes.Equal(leftJSON, rightJSON)
++}
++
++func writeDirectVolumeMetadataAtomic(path string, metadata mountInfoJSON) error {
++	data, err := json.Marshal(metadata)
++	if err != nil {
++		return fmt.Errorf("marshal direct-volume metadata: %w", err)
++	}
++	data = append(data, '\n')
++	if len(data) > maxDirectVolumeMetadataSize {
++		return fmt.Errorf("direct-volume metadata exceeds %d bytes", maxDirectVolumeMetadataSize)
++	}
++
++	return writeMountInfoAtomic(path, data)
++}
+diff --git a/pkg/driver/directvolume_test.go b/pkg/driver/directvolume_test.go
+new file mode 100644
+index 00000000..5269da1d
+--- /dev/null
++++ b/pkg/driver/directvolume_test.go
+@@ -0,0 +1,300 @@
++// (C) Copyright Confidential Containers Contributors
++// SPDX-License-Identifier: Apache-2.0
++
++package driver
++
++import (
++	"errors"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"github.com/container-storage-interface/spec/lib/go/csi"
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/status"
++)
++
++func TestDirectVolumeMetadataExistingFixture(t *testing.T) {
++	metadata, err := readDirectVolumeMetadata(filepath.Join("testdata", "direct-volume-v1.json"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if metadata.Device != "d-workspace123" || !metadata.ReadOnly {
++		t.Fatalf("unexpected metadata: %+v", metadata)
++	}
++	if metadata.FSGroup != "2000" {
++		t.Fatalf("unexpected fsGroup: %q", metadata.FSGroup)
++	}
++	if len(metadata.Options) != 2 || metadata.Options[0] != "noatime" || metadata.Options[1] != "ro" {
++		t.Fatalf("unexpected normalized options: %v", metadata.Options)
++	}
++}
++
++func validDirectVolumeMetadata() mountInfoJSON {
++	return mountInfoJSON{
++		VolumeType:   "directvol",
++		Device:       "cloud-disk-123",
++		FsType:       "ext4",
++		ReadOnly:     true,
++		Options:      []string{"noatime", "ro"},
++		FSGroup:      "2000",
++		PodUID:       "pod-uid-123",
++		VolumeHandle: "pvc-workspace",
++		Metadata: map[string]string{
++			"cloud-provider":    "testcloud",
++			"cloud-volume-path": "cloud-disk-123",
++		},
++	}
++}
++
++func TestWriteDirectVolumeMetadataAtomic(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "direct-volume", mountInfoFileName)
++	metadata := validDirectVolumeMetadata()
++	if err := writeDirectVolumeMetadataAtomic(path, metadata); err != nil {
++		t.Fatal(err)
++	}
++	info, err := os.Stat(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if info.Mode().Perm() != 0o600 {
++		t.Fatalf("metadata permissions = %o, want 600", info.Mode().Perm())
++	}
++	written, err := readDirectVolumeMetadata(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !directVolumeMetadataEqual(*written, metadata) {
++		t.Fatalf("metadata changed during atomic write: %+v", written)
++	}
++	temporary, err := filepath.Glob(filepath.Join(filepath.Dir(path), ".mountInfo.json.*"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(temporary) != 0 {
++		t.Fatalf("temporary metadata files remain: %v", temporary)
++	}
++}
++
++func TestNodePublishAndUnpublishRejectNonKubeletTargets(t *testing.T) {
++	node, _, _ := setupPublishedNode(t)
++	outside := filepath.Join(t.TempDir(), "pods", "pod-uid-123", "volumes", "kubernetes.io~csi", "pvc-workspace", "mount")
++
++	_, err := node.NodePublishVolume(t.Context(), publishRequest(outside, csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER, false))
++	if status.Code(err) != codes.InvalidArgument {
++		t.Fatalf("publish got %v, want InvalidArgument", err)
++	}
++	if err := os.MkdirAll(outside, 0o750); err != nil {
++		t.Fatal(err)
++	}
++	marker := filepath.Join(outside, "must-survive")
++	if err := os.WriteFile(marker, []byte("safe"), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	_, err = node.NodeUnpublishVolume(t.Context(), &csi.NodeUnpublishVolumeRequest{
++		VolumeId: "pvc-workspace", TargetPath: outside,
++	})
++	if status.Code(err) != codes.InvalidArgument {
++		t.Fatalf("unpublish got %v, want InvalidArgument", err)
++	}
++	if _, err := os.Stat(marker); err != nil {
++		t.Fatalf("unpublish touched an out-of-scope path: %v", err)
++	}
++}
++
++func TestNodePublishRequiresPodInfo(t *testing.T) {
++	node, target, _ := setupPublishedNode(t)
++	request := publishRequest(target, csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER, false)
++	delete(request.VolumeContext, "csi.storage.k8s.io/pod.uid")
++
++	_, err := node.NodePublishVolume(t.Context(), request)
++	if status.Code(err) != codes.InvalidArgument {
++		t.Fatalf("got %v, want InvalidArgument", err)
++	}
++}
++
++func TestNodeUnpublishRejectsVolumeHandleMismatch(t *testing.T) {
++	node, target, metadataPath := setupPublishedNode(t)
++	if _, err := node.NodePublishVolume(t.Context(), publishRequest(target,
++		csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER, false)); err != nil {
++		t.Fatal(err)
++	}
++
++	_, err := node.NodeUnpublishVolume(t.Context(), &csi.NodeUnpublishVolumeRequest{
++		VolumeId: "different-volume", TargetPath: target,
++	})
++	if status.Code(err) != codes.FailedPrecondition {
++		t.Fatalf("got %v, want FailedPrecondition", err)
++	}
++	if _, err := os.Stat(metadataPath); err != nil {
++		t.Fatalf("mismatched unpublish removed metadata: %v", err)
++	}
++	if _, err := os.Stat(target); err != nil {
++		t.Fatalf("mismatched unpublish removed target: %v", err)
++	}
++}
++
++func TestNodePublishVolumeRecoversAfterPluginRestart(t *testing.T) {
++	node, target, metadataPath := setupPublishedNode(t)
++	request := publishRequest(target, csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER, false)
++	contextSize := len(request.VolumeContext)
++	if _, err := node.NodePublishVolume(t.Context(), request); err != nil {
++		t.Fatal(err)
++	}
++
++	// Recreate the plugin without NodeStage, then replay the same publish.
++	node = newNodeServer("node-1")
++	if _, err := node.NodePublishVolume(t.Context(), request); err != nil {
++		t.Fatal(err)
++	}
++	metadata, err := readDirectVolumeMetadata(metadataPath)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if metadata.Device != "cloud-disk-123" || node.devices["pvc-workspace"] != "cloud-disk-123" {
++		t.Fatalf("plugin state was not recovered: metadata=%+v devices=%v", metadata, node.devices)
++	}
++	if len(request.VolumeContext) != contextSize || request.VolumeContext["cloud-provider"] != "" {
++		t.Fatal("publish mutated caller volume context")
++	}
++	request.VolumeContext["cloud-volume-path"] = "other-disk"
++	if _, err := newNodeServer("node-1").NodePublishVolume(t.Context(), request); status.Code(err) != codes.AlreadyExists {
++		t.Fatalf("expected conflicting disk replay to fail, got %v", err)
++	}
++}
++
++func TestNodePublishVolumeEnforcesCompatibleRepublish(t *testing.T) {
++	node, target, metadataPath := setupPublishedNode(t)
++	if _, err := node.NodePublishVolume(t.Context(), publishRequest(target, csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER, true)); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := node.NodePublishVolume(t.Context(), publishRequest(target, csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER, true)); err != nil {
++		t.Fatalf("idempotent publish failed: %v", err)
++	}
++	_, err := node.NodePublishVolume(t.Context(), publishRequest(target, csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER, false))
++	if status.Code(err) != codes.AlreadyExists {
++		t.Fatalf("got %v, want AlreadyExists", err)
++	}
++	if _, err := os.Stat(metadataPath); err != nil {
++		t.Fatal(err)
++	}
++	matches, err := filepath.Glob(filepath.Join(filepath.Dir(metadataPath), ".mountInfo.json.*"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(matches) != 0 {
++		t.Fatalf("temporary metadata files remain: %v", matches)
++	}
++}
++
++func TestNodeUnpublishVolumeIsIdempotent(t *testing.T) {
++	node, target, metadataPath := setupPublishedNode(t)
++	if _, err := node.NodePublishVolume(t.Context(), publishRequest(target,
++		csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER, false)); err != nil {
++		t.Fatal(err)
++	}
++	request := &csi.NodeUnpublishVolumeRequest{VolumeId: "pvc-workspace", TargetPath: target}
++	if _, err := node.NodeUnpublishVolume(t.Context(), request); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := node.NodeUnpublishVolume(t.Context(), request); err != nil {
++		t.Fatalf("idempotent unpublish retry failed: %v", err)
++	}
++	if _, err := os.Stat(metadataPath); !errors.Is(err, os.ErrNotExist) {
++		t.Fatalf("metadata remains after unpublish: %v", err)
++	}
++}
++
++func TestReadDirectVolumeMetadataRejectsOversizedDocument(t *testing.T) {
++	path := filepath.Join(t.TempDir(), mountInfoFileName)
++	if err := os.WriteFile(path, make([]byte, maxDirectVolumeMetadataSize+1), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := readDirectVolumeMetadata(path); err == nil || errors.Is(err, os.ErrNotExist) {
++		t.Fatalf("oversized metadata was not rejected: %v", err)
++	}
++}
++
++func TestReadDirectVolumeMetadataOptionalReadOnly(t *testing.T) {
++	base := `{"version":1,"volume-type":"block","volume-mode":"filesystem","device":"cloud-disk-123","fstype":"ext4","pod-uid":"pod-uid-123","volume-handle":"pvc-workspace"`
++	tests := []struct {
++		name     string
++		readonly string
++		want     bool
++		wantErr  string
++	}{
++		{name: "explicit false", readonly: `,"readonly":false}`, want: false},
++		{name: "missing", readonly: `}`, want: false},
++		{name: "null", readonly: `,"readonly":null}`, want: false},
++		{name: "wrong type", readonly: `,"readonly":"false"}`, wantErr: "cannot unmarshal"},
++	}
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			path := filepath.Join(t.TempDir(), mountInfoFileName)
++			if err := os.WriteFile(path, []byte(base+test.readonly), 0o600); err != nil {
++				t.Fatal(err)
++			}
++			metadata, err := readDirectVolumeMetadata(path)
++			if test.wantErr != "" {
++				if err == nil || !strings.Contains(err.Error(), test.wantErr) {
++					t.Fatalf("error = %v, want substring %q", err, test.wantErr)
++				}
++				return
++			}
++			if err != nil {
++				t.Fatal(err)
++			}
++			if metadata.ReadOnly != test.want {
++				t.Fatalf("readonly = %t, want %t", metadata.ReadOnly, test.want)
++			}
++		})
++	}
++}
++
++func TestUnpublishPreservesNonemptyTarget(t *testing.T) {
++	node, target, _ := setupPublishedNode(t)
++	if _, err := node.NodePublishVolume(t.Context(), publishRequest(target, csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER, false)); err != nil {
++		t.Fatal(err)
++	}
++	marker := filepath.Join(target, "must-survive")
++	if err := os.WriteFile(marker, []byte("data"), 0600); err != nil {
++		t.Fatal(err)
++	}
++	_, err := node.NodeUnpublishVolume(t.Context(), &csi.NodeUnpublishVolumeRequest{VolumeId: "pvc-workspace", TargetPath: target})
++	if status.Code(err) != codes.Internal {
++		t.Fatalf("expected cleanup error, got %v", err)
++	}
++	if _, err := os.Stat(marker); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func TestNodePublishAndUnpublishExistingUpstreamMetadata(t *testing.T) {
++	node, target, path := setupPublishedNode(t)
++	request := publishRequest(target, csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER, false)
++	request.VolumeCapability.GetMount().VolumeMountGroup = ""
++	delete(request.VolumeContext, "encrypt-type")
++	delete(request.VolumeContext, "kbs-key-id")
++	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.MkdirAll(target, 0750); err != nil {
++		t.Fatal(err)
++	}
++	// This is the original upstream writer's shape, without a version label,
++	// explicit readonly, Pod UID or volume-handle extension.
++	original := []byte(`{"volume-type":"directvol","device":"cloud-disk-123","fstype":"ext4","metadata":{"cloud-volume-id":"pvc-workspace","cloud-volume-path":"cloud-disk-123"}}`)
++	if err := os.WriteFile(path, original, 0600); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := node.NodePublishVolume(t.Context(), request); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := node.NodeUnpublishVolume(t.Context(), &csi.NodeUnpublishVolumeRequest{VolumeId: "wrong-volume", TargetPath: target}); status.Code(err) != codes.FailedPrecondition {
++		t.Fatalf("legacy ownership check: %v", err)
++	}
++	if _, err := node.NodeUnpublishVolume(t.Context(), &csi.NodeUnpublishVolumeRequest{VolumeId: request.VolumeId, TargetPath: target}); err != nil {
++		t.Fatal(err)
++	}
++}
+diff --git a/pkg/driver/identity_contract_test.go b/pkg/driver/identity_contract_test.go
+new file mode 100644
+index 00000000..879bd1b9
+--- /dev/null
++++ b/pkg/driver/identity_contract_test.go
+@@ -0,0 +1,44 @@
++// (C) Copyright Confidential Containers Contributors
++// SPDX-License-Identifier: Apache-2.0
++
++package driver
++
++import (
++	"os"
++	"path/filepath"
++	"testing"
++
++	_ "github.com/confidential-devhub/caa-csi-block-driver/pkg/provider/libvirt"
++	"github.com/container-storage-interface/spec/lib/go/csi"
++)
++
++func TestControllerReplayKeepsNodeDeviceIdentity(t *testing.T) {
++	dir := t.TempDir()
++	if err := os.MkdirAll(filepath.Join(dir, "pool"), 0700); err != nil {
++		t.Fatal(err)
++	}
++	t.Setenv("CSI_VOLUME_STORE_DIR", filepath.Join(dir, "records"))
++	request := &csi.CreateVolumeRequest{
++		Name:       "pvc-workspace",
++		Parameters: map[string]string{"cloudProvider": "libvirt", "cloudProviderVolumePath": filepath.Join(dir, "pool")},
++		VolumeCapabilities: []*csi.VolumeCapability{{
++			AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{}},
++			AccessMode: &csi.VolumeCapability_AccessMode{Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER},
++		}},
++	}
++	first, err := newControllerServer().CreateVolume(t.Context(), request)
++	if err != nil {
++		t.Fatal(err)
++	}
++	replayed, err := newControllerServer().CreateVolume(t.Context(), request)
++	if err != nil {
++		t.Fatal(err)
++	}
++	path := first.Volume.VolumeContext["cloud-volume-path"]
++	if path == "" || replayed.Volume.VolumeContext["cloud-volume-path"] != path {
++		t.Fatalf("replayed volume lost node device identity: %v", replayed.Volume.VolumeContext)
++	}
++	if _, err := os.Stat(path); err != nil {
++		t.Fatal(err)
++	}
++}
+diff --git a/pkg/driver/metadata_atomic.go b/pkg/driver/metadata_atomic.go
+new file mode 100644
+index 00000000..7fe9801d
+--- /dev/null
++++ b/pkg/driver/metadata_atomic.go
+@@ -0,0 +1,48 @@
++// (C) Copyright Confidential Containers Contributors
++// SPDX-License-Identifier: Apache-2.0
++
++package driver
++
++import (
++	"fmt"
++	"os"
++	"path/filepath"
++)
++
++func writeMountInfoAtomic(path string, data []byte) error {
++	dir := filepath.Dir(path)
++	if err := os.MkdirAll(dir, 0o700); err != nil {
++		return fmt.Errorf("create direct-volume directory: %w", err)
++	}
++	temporary, err := os.CreateTemp(dir, ".mountInfo.json.*")
++	if err != nil {
++		return fmt.Errorf("create direct-volume temporary file: %w", err)
++	}
++	temporaryPath := temporary.Name()
++	defer os.Remove(temporaryPath)
++
++	if _, err := temporary.Write(data); err != nil {
++		temporary.Close()
++		return fmt.Errorf("write direct-volume temporary file: %w", err)
++	}
++	if err := temporary.Sync(); err != nil {
++		temporary.Close()
++		return fmt.Errorf("sync direct-volume temporary file: %w", err)
++	}
++	if err := temporary.Close(); err != nil {
++		return fmt.Errorf("close direct-volume temporary file: %w", err)
++	}
++	if err := os.Rename(temporaryPath, path); err != nil {
++		return fmt.Errorf("publish direct-volume metadata: %w", err)
++	}
++
++	directory, err := os.Open(dir)
++	if err != nil {
++		return fmt.Errorf("open direct-volume directory for sync: %w", err)
++	}
++	defer directory.Close()
++	if err := directory.Sync(); err != nil {
++		return fmt.Errorf("sync direct-volume directory: %w", err)
++	}
++	return nil
++}
+diff --git a/pkg/driver/metadata_atomic_test.go b/pkg/driver/metadata_atomic_test.go
+new file mode 100644
+index 00000000..0849defb
+--- /dev/null
++++ b/pkg/driver/metadata_atomic_test.go
+@@ -0,0 +1,49 @@
++// (C) Copyright Confidential Containers Contributors
++// SPDX-License-Identifier: Apache-2.0
++
++package driver
++
++import (
++	"errors"
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/container-storage-interface/spec/lib/go/csi"
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/status"
++)
++
++func TestAtomicMetadataFailedRenamePreservesTarget(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "mountInfo.json")
++	if err := os.Mkdir(path, 0700); err != nil {
++		t.Fatal(err)
++	}
++	marker := filepath.Join(path, "preserve")
++	if err := os.WriteFile(marker, []byte("original"), 0600); err != nil {
++		t.Fatal(err)
++	}
++	if err := writeMountInfoAtomic(path, []byte(`{"device":"disk"}`)); err == nil {
++		t.Fatal("rename into directory should fail")
++	}
++	data, err := os.ReadFile(marker)
++	if err != nil || string(data) != "original" {
++		t.Fatalf("target changed: %q, %v", data, err)
++	}
++	leftovers, err := filepath.Glob(filepath.Join(filepath.Dir(path), ".mountInfo.json.*"))
++	if err != nil || len(leftovers) != 0 {
++		t.Fatalf("temporary files left: %v, %v", leftovers, err)
++	}
++}
++
++func TestUnpublishReturnsCleanupFailure(t *testing.T) {
++	original := removeAllPath
++	removeAllPath = func(string) error { return errors.New("injected failure") }
++	defer func() { removeAllPath = original }()
++	_, err := newNodeServer("node").NodeUnpublishVolume(t.Context(), &csi.NodeUnpublishVolumeRequest{
++		VolumeId: "volume-1", TargetPath: filepath.Join(getKubeletRootPath(), "pods", "pod-uid", "volumes", "kubernetes.io~csi", "volume-1", "mount"),
++	})
++	if status.Code(err) != codes.Internal {
++		t.Fatalf("got %v", err)
++	}
++}
+diff --git a/pkg/driver/nodeserver.go b/pkg/driver/nodeserver.go
+index d8d566f6..38c6b550 100644
+--- a/pkg/driver/nodeserver.go
++++ b/pkg/driver/nodeserver.go
+@@ -18,17 +18,19 @@ import (
+ 	"syscall"
+ 	"time"
+ 
++	provider "github.com/confidential-devhub/caa-csi-block-driver/pkg/provider"
+ 	"github.com/container-storage-interface/spec/lib/go/csi"
+ 	"google.golang.org/grpc/codes"
+ 	"google.golang.org/grpc/status"
+-
+-	provider "github.com/confidential-devhub/caa-csi-block-driver/pkg/provider"
+ )
+ 
+ var nsLogger = log.New(log.Writer(), "[caa-csi/node] ", log.LstdFlags|log.Lmsgprefix)
+ 
++var removeAllPath = os.RemoveAll
++
+ const (
+ 	defaultKataDirectVolumeRootPath = "/run/kata-containers/shared/direct-volumes"
++	defaultKubeletRootPath          = "/var/lib/kubelet"
+ 	mountInfoFileName               = "mountInfo.json"
+ 	volumeStatsTimeout              = 10 * time.Second
+ )
+@@ -47,6 +49,13 @@ func getKataRuntimePath() string {
+ 	return "kata-runtime"
+ }
+ 
++func getKubeletRootPath() string {
++	if path := strings.TrimSpace(os.Getenv("KUBELET_ROOT_PATH")); path != "" {
++		return filepath.Clean(path)
++	}
++	return defaultKubeletRootPath
++}
++
+ type nodeServer struct {
+ 	csi.UnimplementedNodeServer
+ 	nodeID  string
+@@ -98,7 +107,9 @@ func cleanStaleMountInfoDirs(rootDir string) {
+ 			continue
+ 		}
+ 
+-		var info mountInfoJSON
++		// Cleanup accepts both legacy and versioned metadata. Schema migration
++		// belongs to NodePublishVolume; valid records for live targets stay put.
++		var info map[string]json.RawMessage
+ 		if err := json.Unmarshal(data, &info); err != nil {
+ 			nsLogger.Printf("startup cleanup: removing corrupt mountInfo dir %s: %v", entry.Name(), err)
+ 			if err := os.RemoveAll(dirPath); err != nil {
+@@ -175,11 +186,25 @@ func (ns *nodeServer) NodePublishVolume(_ context.Context, req *csi.NodePublishV
+ 	if req.GetVolumeCapability() == nil {
+ 		return nil, status.Error(codes.InvalidArgument, "Volume capability missing")
+ 	}
++	if !validNodeTarget(targetPath) {
++		return nil, status.Errorf(codes.InvalidArgument, "target path %q is outside the kubelet root or not an absolute clean path", targetPath)
++	}
+ 
++	contextPath := strings.TrimSpace(req.GetVolumeContext()["cloud-volume-path"])
++	// Kubelet may replay NodePublish after a node-plugin restart without
++	// replaying NodeStage first. The controller-provided cloud identity is
++	// sufficient to rebuild direct-volume metadata.
+ 	ns.mu.Lock()
+ 	devicePath := ns.devices[volumeID]
++	if devicePath == "" && contextPath != "" {
++		devicePath = contextPath
++		ns.devices[volumeID] = devicePath
++	}
+ 	ns.mu.Unlock()
+-
++	if devicePath != "" && contextPath != "" && contextPath != devicePath {
++		return nil, status.Errorf(codes.FailedPrecondition,
++			"volume %s context has cloud-volume-path %q, staged path is %q", volumeID, contextPath, devicePath)
++	}
+ 	if devicePath == "" {
+ 		return nil, status.Errorf(codes.FailedPrecondition, "volume %s not staged (no device path)", volumeID)
+ 	}
+@@ -214,37 +239,48 @@ func (ns *nodeServer) NodePublishVolume(_ context.Context, req *csi.NodePublishV
+ 	if err != nil {
+ 		return nil, status.Error(codes.InvalidArgument, err.Error())
+ 	}
++	podUID := strings.TrimSpace(attrib["csi.storage.k8s.io/pod.uid"])
++	if podUID == "" {
++		return nil, status.Error(codes.InvalidArgument, "pod UID missing; enable CSIDriver podInfoOnMount")
++	}
+ 	fsGroup, err := normalizeFSGroup(mount.GetVolumeMountGroup())
+ 	if err != nil {
+ 		return nil, status.Error(codes.InvalidArgument, err.Error())
+ 	}
+ 
+ 	info := mountInfoJSON{
+-		VolumeType: "directvol",
+-		Device:     devicePath,
+-		FsType:     fsType,
+-		ReadOnly:   readOnly,
+-		Options:    options,
+-		FSGroup:    fsGroup,
+-		Metadata:   directVolumeMetadataContext(attrib),
+-	}
+-
+-	data, err := json.Marshal(info)
+-	if err != nil {
+-		return nil, status.Errorf(codes.Internal, "failed to marshal mountInfo: %v", err)
++		VolumeType:   "directvol",
++		Device:       devicePath,
++		FsType:       fsType,
++		ReadOnly:     readOnly,
++		Options:      options,
++		FSGroup:      fsGroup,
++		PodUID:       podUID,
++		VolumeHandle: volumeID,
++		Metadata:     directVolumeMetadataContext(attrib),
+ 	}
+ 
+ 	volumeDir := filepath.Join(getKataDirectVolumeRootPath(), b64.URLEncoding.EncodeToString([]byte(targetPath)))
+-	if err := os.MkdirAll(volumeDir, 0700); err != nil {
+-		return nil, status.Errorf(codes.Internal, "failed to create kata direct volume dir %s: %v", volumeDir, err)
+-	}
+-	if err := os.WriteFile(filepath.Join(volumeDir, mountInfoFileName), data, 0600); err != nil {
+-		return nil, status.Errorf(codes.Internal, "failed to write mountInfo.json: %v", err)
+-	}
+-
++	metadataPath := filepath.Join(volumeDir, mountInfoFileName)
++	ns.mu.Lock()
++	defer ns.mu.Unlock()
+ 	if err := os.MkdirAll(targetPath, 0750); err != nil {
+ 		return nil, status.Errorf(codes.Internal, "failed to create target path %s: %v", targetPath, err)
+ 	}
++	if existing, err := readDirectVolumeMetadata(metadataPath); err == nil {
++		// Older records rely on the target path for Pod identity. Ownership is
++		// still checked through their cloud-volume-id metadata field.
++		if existing.PodUID == "" {
++			existing.PodUID = podUID
++		}
++		if !directVolumeMetadataEqual(*existing, info) {
++			return nil, status.Errorf(codes.AlreadyExists, "target %s is already published with incompatible properties", targetPath)
++		}
++	} else if !os.IsNotExist(err) {
++		return nil, status.Errorf(codes.Internal, "existing mountInfo.json is invalid: %v", err)
++	} else if err := writeDirectVolumeMetadataAtomic(metadataPath, info); err != nil {
++		return nil, status.Errorf(codes.Internal, "failed to publish mountInfo.json: %v", err)
++	}
+ 
+ 	nsLogger.Printf("NodePublishVolume: %s published at %s (device=%s, provider=%s)",
+ 		volumeID, targetPath, devicePath, attrib["cloud-provider"])
+@@ -252,19 +288,46 @@ func (ns *nodeServer) NodePublishVolume(_ context.Context, req *csi.NodePublishV
+ 	return &csi.NodePublishVolumeResponse{}, nil
+ }
+ 
++// Bound filesystem operations to kubelet's configured root without depending
++// on a particular CSI target-path shape.
++func validNodeTarget(target string) bool {
++	if !filepath.IsAbs(target) || filepath.Clean(target) != target {
++		return false
++	}
++	relative, err := filepath.Rel(getKubeletRootPath(), target)
++	return err == nil && relative != "." && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
++}
++
+ func (ns *nodeServer) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
++	if req.GetVolumeId() == "" {
++		return nil, status.Error(codes.InvalidArgument, "Volume ID missing")
++	}
+ 	targetPath := req.GetTargetPath()
+ 	if targetPath == "" {
+ 		return nil, status.Error(codes.InvalidArgument, "Target path missing")
+ 	}
++	if !validNodeTarget(targetPath) {
++		return nil, status.Errorf(codes.InvalidArgument, "target path %q is outside the kubelet root or not an absolute clean path", targetPath)
++	}
+ 
++	ns.mu.Lock()
++	defer ns.mu.Unlock()
+ 	volumeDir := filepath.Join(getKataDirectVolumeRootPath(), b64.URLEncoding.EncodeToString([]byte(targetPath)))
+-	if err := os.RemoveAll(volumeDir); err != nil {
+-		nsLogger.Printf("WARNING: failed to remove kata direct volume dir %s: %v", volumeDir, err)
++	metadataPath := filepath.Join(volumeDir, mountInfoFileName)
++	if metadata, err := readDirectVolumeMetadata(metadataPath); err == nil && metadata != nil {
++		if metadata.VolumeHandle != req.GetVolumeId() {
++			return nil, status.Errorf(codes.FailedPrecondition,
++				"target %s belongs to volume %s, not %s", targetPath, metadata.VolumeHandle, req.GetVolumeId())
++		}
++	} else if err != nil && !os.IsNotExist(err) {
++		return nil, status.Errorf(codes.Internal, "existing mountInfo.json is invalid: %v", err)
++	}
++	if err := removeAllPath(volumeDir); err != nil && !os.IsNotExist(err) {
++		return nil, status.Errorf(codes.Internal, "failed to remove kata direct volume dir %s: %v", volumeDir, err)
+ 	}
+ 
+-	if err := os.RemoveAll(targetPath); err != nil {
+-		nsLogger.Printf("WARNING: failed to remove target path %s: %v", targetPath, err)
++	if err := os.Remove(targetPath); err != nil && !os.IsNotExist(err) {
++		return nil, status.Errorf(codes.Internal, "failed to remove target path %s: %v", targetPath, err)
+ 	}
+ 
+ 	nsLogger.Printf("NodeUnpublishVolume: %s unpublished", req.GetVolumeId())
+diff --git a/pkg/driver/testdata/direct-volume-v1.json b/pkg/driver/testdata/direct-volume-v1.json
+new file mode 100644
+index 00000000..c8c6d412
+--- /dev/null
++++ b/pkg/driver/testdata/direct-volume-v1.json
+@@ -0,0 +1 @@
++{"version":1,"volume-type":"block","volume-mode":"filesystem","device":"d-workspace123","fstype":"ext4","readonly":true,"options":["noatime","ro"],"fs-group":"2000","pod-uid":"pod-uid-123","volume-handle":"pvc-workspace","metadata":{"cloud-provider":"alibabacloud","cloud-volume-path":"d-workspace123"}}
+-- 
+2.43.7
+

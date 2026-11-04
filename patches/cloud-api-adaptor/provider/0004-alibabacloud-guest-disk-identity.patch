@@ -1,21 +1,19 @@
-From 617565cb392a8308186d7141adb9ce7a0601ebe4 Mon Sep 17 00:00:00 2001
+From 797425f8c035b53b93ef8b89a69218803d2a4e29 Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
 Date: Tue, 3 Nov 2026 20:11:27 +0800
-Subject: [PATCH] guest: resolve Alibaba disks by their measured identities
+Subject: [PATCH] alibabacloud: identify attached data disks by serial and WWID
 
-A guest device name is not a stable cloud-disk identity. Resolve Alibaba
-disk IDs through kernel serial and WWID attributes and check their
-backing devices before admitting a whole-disk mount.
+Match Alibaba disk IDs against kernel serial/WWID information and verify
+that the selected device is a whole data disk, not system backing storage.
+Reject ambiguous matches while allowing an already mounted data disk to
+be reused by the guest mount lifecycle. No measured policy is introduced.
 
-Reject ambiguous matches and the root filesystem backing disk. Use
-kernel device numbers and backing links for that check.
-
-Generated-by: OpenAI Codex
+Co-authored-by: Codex <noreply@openai.com>
 ---
  .../forwarder/interceptor/alibaba_device.go   | 175 +++++++++++++++
  .../interceptor/alibaba_device_test.go        | 199 ++++++++++++++++++
- .../pkg/forwarder/interceptor/interceptor.go  |  25 ++-
- 3 files changed, 396 insertions(+), 3 deletions(-)
+ .../pkg/forwarder/interceptor/interceptor.go  |  24 ++-
+ 3 files changed, 395 insertions(+), 3 deletions(-)
  create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/alibaba_device.go
  create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/alibaba_device_test.go
 
@@ -406,18 +404,10 @@ index 00000000..a76665dd
 +	}
 +}
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
-index ce16854f..029520b3 100644
+index 723c2e0e..0c5499be 100644
 --- a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
-@@ -5,6 +5,7 @@ package interceptor
- 
- import (
- 	"context"
-+	"errors"
- 	"fmt"
- 	"log"
- 	"net"
-@@ -400,6 +401,9 @@ func detectCloudProvider() string {
+@@ -282,6 +282,9 @@ func detectCloudProvider() string {
  // (SCSI rescan, udev rules), so the entire detection is retried.
  func findDataDiskDevice(lunIdx int, diskID string) (string, error) {
  	provider := detectCloudProvider()
@@ -427,7 +417,7 @@ index ce16854f..029520b3 100644
  	logger.Printf("Cloud provider detected: %s (LUN %d, diskID %s)", provider, lunIdx, diskID)
  
  	maxAttempts := 15
-@@ -415,10 +419,11 @@ func findDataDiskDevice(lunIdx int, diskID string) (string, error) {
+@@ -297,10 +300,11 @@ func findDataDiskDevice(lunIdx int, diskID string) (string, error) {
  		}
  	}
  
@@ -440,7 +430,7 @@ index ce16854f..029520b3 100644
  	for attempt := 1; attempt <= maxAttempts; attempt++ {
  		if attempt > 1 {
  			logger.Printf("Retry %d/%d for LUN %d...", attempt, maxAttempts, lunIdx)
-@@ -426,6 +431,15 @@ func findDataDiskDevice(lunIdx int, diskID string) (string, error) {
+@@ -308,6 +312,15 @@ func findDataDiskDevice(lunIdx int, diskID string) (string, error) {
  		}
  
  		switch provider {
@@ -456,7 +446,7 @@ index ce16854f..029520b3 100644
  		case "azure":
  			if dev, err := findAzureDataDisk(lunIdx); err == nil {
  				return dev, nil
-@@ -440,12 +454,17 @@ func findDataDiskDevice(lunIdx int, diskID string) (string, error) {
+@@ -322,12 +335,17 @@ func findDataDiskDevice(lunIdx int, diskID string) (string, error) {
  			}
  		}
  

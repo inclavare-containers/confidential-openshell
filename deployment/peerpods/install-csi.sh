@@ -14,10 +14,6 @@ helm template caa-csi-block "$CSI_CHART" \
 helm upgrade --install caa-csi-block "$CSI_CHART" \
   --namespace confidential-containers-system --values "$OPERATOR_DIR/csi-values.yaml" \
   --wait --timeout=20m
-kubectl -n caa-csi-block rollout status deployment/caa-csi-block-controller --timeout=15m
 kubectl -n caa-csi-block rollout status daemonset/caa-csi-block --timeout=15m
-kubectl -n caa-csi-block wait --for=jsonpath='{.status.phase}'=Bound \
-  pvc/caa-csi-block-controller-state --timeout=5m
-kubectl -n caa-csi-block get pvc
 kubectl get storageclass alicloud-disk-essd-peerpod -o yaml
-printf 'CSI ready: controller and node rollouts passed; controller-state PVC is Bound.\n'
+printf 'CSI ready: combined controller/node DaemonSet rollout passed.\n'

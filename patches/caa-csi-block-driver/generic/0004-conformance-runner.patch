@@ -1,24 +1,21 @@
-From 0799c5944403565e734eb45cf1690e71acad8361 Mon Sep 17 00:00:00 2001
+From 3e8f6f086c1da9976d1c973d58898dd765ab45ee Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
-Date: Tue, 3 Nov 2026 11:58:13 +0800
+Date: Wed, 4 Nov 2026 11:31:52 +0800
 Subject: [PATCH] test: share the CSI conformance runner with CI
 
-The local and CI conformance invocations should exercise the same
-supported RPC scope. Move the shared command and skip list into the
-runner and invoke it from the workflow, retaining verbose local
-execution.
+Use the same runner and skip list locally and in CI. Supply the normal PodInfoOnMount field in the test volume context.
 
-Generated-by: OpenAI Codex
+Co-authored-by: Codex <noreply@openai.com>
 ---
- .github/workflows/csi-sanity.yaml | 108 +++---------------------------
+ .github/workflows/csi-sanity.yaml | 106 ++----------------------------
  hack/run-csi-sanity.sh            |  46 +++++++++----
- 2 files changed, 40 insertions(+), 114 deletions(-)
+ 2 files changed, 37 insertions(+), 115 deletions(-)
 
 diff --git a/.github/workflows/csi-sanity.yaml b/.github/workflows/csi-sanity.yaml
-index b8e673ad..2beaa88c 100644
+index b8e673ad..1760c6fe 100644
 --- a/.github/workflows/csi-sanity.yaml
 +++ b/.github/workflows/csi-sanity.yaml
-@@ -17,106 +17,14 @@ jobs:
+@@ -17,106 +17,10 @@ jobs:
          with:
            go-version-file: go.mod
  
@@ -81,12 +78,9 @@ index b8e673ad..2beaa88c 100644
 -          SCRIPT
 -
 -          chmod +x /tmp/csi-test/*.sh
-+      - uses: azure/setup-helm@v4.3.0
-+        with:
-+          version: v3.17.3
- 
+-
 -      - name: Start CSI driver and run csi-sanity tests
-+      - name: Unit, race, vet, and deployment checks
++      - name: Unit, race, and vet checks
          run: |
 -          set -eu
 -
@@ -134,7 +128,7 @@ index b8e673ad..2beaa88c 100644
 +      - name: Build driver and run csi-sanity tests
 +        run: make test-verbose
 diff --git a/hack/run-csi-sanity.sh b/hack/run-csi-sanity.sh
-index 142129c9..05deb636 100755
+index 142129c9..c9cb0a90 100755
 --- a/hack/run-csi-sanity.sh
 +++ b/hack/run-csi-sanity.sh
 @@ -5,13 +5,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -153,7 +147,7 @@ index 142129c9..05deb636 100755
  }
  trap cleanup EXIT
  
-@@ -21,13 +22,13 @@ if [ ! -x "$BINARY" ]; then
+@@ -21,32 +22,48 @@ if [ ! -x "$BINARY" ]; then
      exit 1
  fi
  
@@ -168,12 +162,12 @@ index 142129c9..05deb636 100755
  
 -mkdir -p "$TEST_DIR"/{pool,volstore,kata-vols}
 +export KUBELET_ROOT_PATH="$TEST_DIR/kubelet"
-+export CSI_SANITY_TARGET_PATH=1
 +mkdir -p "$TEST_DIR"/{pool,volstore,kata-vols} "$KUBELET_ROOT_PATH/pods"
  
  cat > "$TEST_DIR/params.yaml" <<EOF
  cloudProvider: libvirt
-@@ -35,18 +36,34 @@ cloudProviderVolumePath: $TEST_DIR/pool
++csi.storage.k8s.io/pod.uid: csi-sanity
+ cloudProviderVolumePath: $TEST_DIR/pool
  EOF
  
  cat > "$TEST_DIR/create-path.sh" <<'SCRIPT'

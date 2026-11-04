@@ -28,12 +28,9 @@ fi
 systemctl stop kbs.service as.service
 # Run the Trustee stop/backup steps on its own host if it is separate.
 docker stop openshell-registry
-kubectl -n caa-csi-block scale deployment/caa-csi-block-controller --replicas=0
-kubectl -n caa-csi-block rollout status deployment/caa-csi-block-controller --timeout=120s
-kubectl -n caa-csi-block wait --for=delete pod \
-  -l app.kubernetes.io/name=caa-csi-block-driver,app.kubernetes.io/component=controller --timeout=120s
-kubectl -n caa-csi-block get pvc/caa-csi-block-controller-state -o yaml > "$BACKUP/csi-state-pvc.yaml"
 kubectl get pv -o yaml > "$BACKUP/pvs.yaml"
+kubectl get storageclass alicloud-disk-essd-peerpod -o yaml > "$BACKUP/workspace-storageclass.yaml"
+kubectl -n caa-csi-block get configmap caa-csi-block-bootstrap-params -o yaml > "$BACKUP/csi-bootstrap.yaml"
 helm -n confidential-containers-system get values peerpods -a > "$BACKUP/peerpods-values.yaml"
 helm -n confidential-containers-system get values caa-csi-block -a > "$BACKUP/csi-values.yaml"
 EXTRA_STATE=()
@@ -57,11 +54,12 @@ as well as its public symlink for systemd's `DynamicUser` state. Store the backu
 on protected storage outside this host. It contains private keys, provider
 credentials, workspace keys, administration credentials and registry content.
 
-The CSI controller-state PVC is separate from this tar archive. With its writer
-stopped, take an ACK storage snapshot/backup of the exact PV identified above;
-record its cloud disk ID and the completed snapshot ID. Do the same for every
-retained workspace ESSD. An application-consistent restore needs the same stopped
-point across Gateway data, driver state, Trustee state, CSI records and workspace
+Wait for outstanding volume create/delete operations to finish before taking the
+inventory. CSI uses node-local records and cloud tag recovery, without a separate
+state PVC. Preserve the cluster ID, bootstrap parameters and PV inventory. Take
+an ACK snapshot/backup of every retained workspace ESSD and record the exact disk
+and completed snapshot IDs. An application-consistent restore needs the same
+stopped point across Gateway data, driver state, Trustee state and workspace
 disks. A disk snapshot alone cannot recreate the workspace key or owner identity.
 
 Keep the complete driver directory: signer, resources, workspace keys/bindings,
@@ -209,12 +207,13 @@ Once no sandbox is retained and no owned role VM/workspace disk remains:
 
 1. Save `ack-state.json`, Helm values and an inventory of every dedicated resource.
    On an attached cluster, this includes only resources added by this deployment.
-   Identify the CSI state disk before removing its PVC.
+   Preserve the CSI bootstrap configuration and workspace disk inventory.
 2. Stop/disable the two OpenShell services. Uninstall `caa-csi-block` and `peerpods`
    from their Helm release namespace `confidential-containers-system`; let their
-   cleanup hooks finish. Delete the now-unused controller-state PVC in
-   `caa-csi-block` only when no records/workspaces are being retained. Verify its
-   PV and backing disk are deleted or explicitly recorded as retained.
+   cleanup hooks finish. Confirm all owned workspace PVs and backing disks are
+   deleted or explicitly recorded as retained. If upgrading from the older split
+   layout, inventory its retained controller-state PVC separately and remove it
+   only after cloud recovery is verified and no old controller is using it.
 3. On an attached cluster, retain the cluster, VPC, node pools, CSI add-ons,
    Terway, RRSA issuer, shared cert-manager/Agent Sandbox installations and worker
    security group. Remove only this deployment's worker labels, Kata runtime

@@ -5,6 +5,13 @@ Use the [deployment runbook](../../docs/deployment.md) for installation and
 [build preparation](../../docs/build.md#peerpod-controller) for controller packaging.
 Keep private values, credentials and runtime state outside the checkout.
 
+Deployment images are pulled anonymously, like public images. Do not configure
+registry usernames/passwords, Pod or ServiceAccount `imagePullSecrets`, or guest
+registry credentials for this profile. The deployment registry already permits
+anonymous pulls. HTTPS server certificate verification and digest-pinned image
+references remain enabled; the registry CA supplies trust without authenticating
+the client.
+
 The PeerPod manager needs the Alibaba Cloud backend. Its official runtime supplies
 the CA bundle; [Dockerfile.controller](Dockerfile.controller) replaces only
 `/manager`. `images.peerpod_ctrl_runtime` in the [runtime lock](../runtime/artifacts.lock.json)

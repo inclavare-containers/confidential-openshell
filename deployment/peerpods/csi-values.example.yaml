@@ -15,10 +15,6 @@ storageClass:
   reclaimPolicy: Delete
   volumeBindingMode: Immediate
   allowVolumeExpansion: false
-controller:
-  state:
-    size: 20Gi
-    storageClassName: ACK_HOST_ESSD_STORAGE_CLASS
 alibabacloud:
   region: REGION
   zoneId: ZONE
@@ -28,4 +24,3 @@ alibabacloud:
     enabled: true
     roleArn: CSI_RAM_ROLE_ARN
     oidcProviderArn: ACK_OIDC_PROVIDER_ARN
-    tokenFile: /var/run/secrets/ack.alibabacloud.com/rrsa-tokens/token

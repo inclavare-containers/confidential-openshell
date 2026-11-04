@@ -308,9 +308,11 @@ Repeat after kata-deploy upgrades or selecting new workers.
 ./cos cluster csi
 ```
 
-Installs the release chart and checks rollouts and a Bound controller-state PVC.
-Controller state uses host ACK ESSD storage; guest workspaces use the separate
-PeerPod class. Stop/Start retains a workspace; final deletion removes its owned disk.
+Installs the release chart and checks the combined controller/node DaemonSet.
+CSI keeps its upstream node-local records and recovers completed volumes through
+cloud tags and bootstrap configuration. It does not require a state PVC or a host
+StorageClass. Guest workspaces use the PeerPod class. Stop/Start retains a
+workspace; final deletion removes its owned disk.
 
 ## 9. Install and connect to OpenShell
 

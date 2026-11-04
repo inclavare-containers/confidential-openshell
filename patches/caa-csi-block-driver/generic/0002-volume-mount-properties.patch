@@ -1,0 +1,428 @@
+From 7f7c131fcf0aff3a937580e76b5785de146076a4 Mon Sep 17 00:00:00 2001
+From: Weidong Sun <sunweidong@linux.alibaba.com>
+Date: Wed, 4 Nov 2026 15:25:08 +0800
+Subject: [PATCH] node: preserve CSI filesystem mount properties
+
+Forward filesystem type, readonly access, mount flags and fsGroup through
+upstream mountInfo fields. Advertise VOLUME_MOUNT_GROUP so kubelet passes
+the requested group. Copy volume context before adding consumed cloud
+identity fields; retain key references without copying provider credentials.
+
+This feature applies to ordinary volumes and requires no versioned schema
+or confidential workspace policy.
+
+Co-authored-by: Codex <noreply@openai.com>
+---
+ pkg/driver/directvolume.go          | 122 +++++++++++++++++++++++++
+ pkg/driver/mount_properties_test.go | 136 ++++++++++++++++++++++++++++
+ pkg/driver/nodeserver.go            |  59 ++++++++----
+ pkg/driver/nodeserver_test.go       |  19 ++++
+ 4 files changed, 320 insertions(+), 16 deletions(-)
+ create mode 100644 pkg/driver/directvolume.go
+ create mode 100644 pkg/driver/mount_properties_test.go
+
+diff --git a/pkg/driver/directvolume.go b/pkg/driver/directvolume.go
+new file mode 100644
+index 00000000..4289511b
+--- /dev/null
++++ b/pkg/driver/directvolume.go
+@@ -0,0 +1,122 @@
++// (C) Copyright Confidential Containers Contributors
++// SPDX-License-Identifier: Apache-2.0
++
++package driver
++
++import (
++	"fmt"
++	"sort"
++	"strconv"
++	"strings"
++)
++
++// mountInfoJSON carries the upstream fields plus CSI access and group options.
++type mountInfoJSON struct {
++	VolumeType string            `json:"volume-type"`
++	Device     string            `json:"device"`
++	FsType     string            `json:"fstype"`
++	ReadOnly   bool              `json:"readonly"`
++	Options    []string          `json:"options,omitempty"`
++	FSGroup    string            `json:"fs-group,omitempty"`
++	Metadata   map[string]string `json:"metadata,omitempty"`
++}
++
++func normalizeFilesystemType(fsType string) (string, error) {
++	fsType = strings.ToLower(strings.TrimSpace(fsType))
++	if fsType == "" {
++		fsType = "ext4"
++	}
++	switch fsType {
++	case "ext4", "ext3", "xfs":
++		return fsType, nil
++	default:
++		return "", fmt.Errorf("filesystem type %q is not supported", fsType)
++	}
++}
++
++func normalizeFSGroup(fsGroup string) (string, error) {
++	fsGroup = strings.TrimSpace(fsGroup)
++	if fsGroup == "" {
++		return "", nil
++	}
++	value, err := strconv.ParseUint(fsGroup, 10, 32)
++	if err != nil || strconv.FormatUint(value, 10) != fsGroup {
++		return "", fmt.Errorf("invalid volume mount group %q", fsGroup)
++	}
++	return fsGroup, nil
++}
++
++func normalizeMountOptions(flags []string, readOnly bool) ([]string, bool, error) {
++	allowed := map[string]bool{
++		"async": true, "atime": true, "defaults": true, "diratime": true,
++		"dev": true, "dirsync": true, "discard": true, "exec": true,
++		"lazytime": true, "noatime": true, "nodev": true, "nodiratime": true,
++		"noexec": true, "nosuid": true,
++		"relatime": true, "ro": true, "rw": true, "strictatime": true,
++		"suid": true, "sync": true,
++	}
++	conflictGroup := map[string]string{
++		"ro": "access", "rw": "access",
++		"sync": "io", "async": "io",
++		"atime": "atime", "noatime": "atime", "relatime": "atime", "strictatime": "atime",
++		"diratime": "diratime", "nodiratime": "diratime",
++		"exec": "exec", "noexec": "exec",
++		"dev": "dev", "nodev": "dev",
++		"suid": "suid", "nosuid": "suid",
++	}
++	seen := make(map[string]struct{}, len(flags)+1)
++	selected := make(map[string]string)
++	options := make([]string, 0, len(flags)+1)
++	for _, raw := range flags {
++		option := strings.TrimSpace(strings.ToLower(raw))
++		if option == "" {
++			continue
++		}
++		if strings.ContainsAny(option, " ,\t\r\n") || !allowed[option] {
++			return nil, false, fmt.Errorf("mount option %q is not allowed", raw)
++		}
++		if group := conflictGroup[option]; group != "" {
++			if previous := selected[group]; previous != "" && previous != option {
++				return nil, false, fmt.Errorf("mount options %q and %q conflict", previous, option)
++			}
++			selected[group] = option
++		}
++		if option == "ro" {
++			readOnly = true
++		}
++		if _, ok := seen[option]; ok {
++			continue
++		}
++		seen[option] = struct{}{}
++		options = append(options, option)
++	}
++	if readOnly {
++		if _, ok := seen["rw"]; ok {
++			return nil, false, fmt.Errorf("readonly volume conflicts with mount option %q", "rw")
++		}
++		if _, ok := seen["ro"]; !ok {
++			options = append(options, "ro")
++		}
++	}
++	sort.Strings(options)
++	return options, readOnly, nil
++}
++
++// directVolumeMetadataContext is the only provider metadata exposed across
++// the host/guest boundary. Controller parameters remain in the durable record
++// for idempotency and provider reconstruction, but are not copied wholesale
++// into mountInfo.json.
++func directVolumeMetadataContext(values map[string]string) map[string]string {
++	result := make(map[string]string, 4)
++	for _, key := range []string{
++		"cloud-provider", "cloud-volume-path", "cloud-volume-id",
++		// Preserve the existing upstream CDH contract. These are key
++		// references, never key material.
++		"encrypt-type", "kbs-key-id",
++	} {
++		if value := strings.TrimSpace(values[key]); value != "" {
++			result[key] = value
++		}
++	}
++	return result
++}
+diff --git a/pkg/driver/mount_properties_test.go b/pkg/driver/mount_properties_test.go
+new file mode 100644
+index 00000000..b4882750
+--- /dev/null
++++ b/pkg/driver/mount_properties_test.go
+@@ -0,0 +1,136 @@
++// (C) Copyright Confidential Containers Contributors
++// SPDX-License-Identifier: Apache-2.0
++
++package driver
++
++import (
++	b64 "encoding/base64"
++	"encoding/json"
++	"github.com/container-storage-interface/spec/lib/go/csi"
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/status"
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++func readPublishedMountInfo(path string) (*mountInfoJSON, error) {
++	data, err := os.ReadFile(path)
++	if err != nil {
++		return nil, err
++	}
++	var metadata mountInfoJSON
++	if err := json.Unmarshal(data, &metadata); err != nil {
++		return nil, err
++	}
++	return &metadata, nil
++}
++func publishRequest(target string, mode csi.VolumeCapability_AccessMode_Mode, readonly bool, flags ...string) *csi.NodePublishVolumeRequest {
++	return &csi.NodePublishVolumeRequest{
++		VolumeId:   "pvc-workspace",
++		TargetPath: target,
++		Readonly:   readonly,
++		VolumeContext: map[string]string{
++			"cloudProvider":              "testcloud",
++			"cloud-volume-path":          "cloud-disk-123",
++			"csi.storage.k8s.io/pod.uid": "pod-uid-123",
++			"cloudAccessKeySecret":       "must-not-leak",
++			"cloudSecurityToken":         "must-not-leak",
++			"custom-workload-context":    "must-not-cross-boundary",
++			"encrypt-type":               "luks2",
++			"kbs-key-id":                 "default/luks-key/workspace",
++		},
++		VolumeCapability: &csi.VolumeCapability{
++			AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{
++				FsType:           "ext4",
++				MountFlags:       flags,
++				VolumeMountGroup: "2000",
++			}},
++			AccessMode: &csi.VolumeCapability_AccessMode{Mode: mode},
++		},
++	}
++}
++
++func setupPublishedNode(t *testing.T) (*nodeServer, string, string) {
++	t.Helper()
++	root := t.TempDir()
++	t.Setenv("KATA_DIRECT_VOLUME_ROOT_PATH", root)
++	kubeletRoot := t.TempDir()
++	t.Setenv("KUBELET_ROOT_PATH", kubeletRoot)
++	target := filepath.Join(kubeletRoot, "pods", "pod-uid-123", "volumes", "kubernetes.io~csi", "pvc-workspace", "mount")
++	node := newNodeServer("node-1")
++	node.devices["pvc-workspace"] = "cloud-disk-123"
++	metadataPath := filepath.Join(root, b64.URLEncoding.EncodeToString([]byte(target)), mountInfoFileName)
++	return node, target, metadataPath
++}
++
++func TestNodePublishVolumeRejectsConflictingMountOptions(t *testing.T) {
++	for _, flags := range [][]string{
++		{"ro", "rw"}, {"sync", "async"}, {"atime", "noatime"},
++		{"diratime", "nodiratime"}, {"exec", "noexec"},
++		{"dev", "nodev"}, {"suid", "nosuid"},
++	} {
++		node, target, _ := setupPublishedNode(t)
++		_, err := node.NodePublishVolume(t.Context(), publishRequest(target, csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER, false, flags...))
++		if status.Code(err) != codes.InvalidArgument {
++			t.Fatalf("flags %v got %v, want InvalidArgument", flags, err)
++		}
++	}
++}
++
++func TestNodePublishVolumeReadOnlyContract(t *testing.T) {
++	tests := []struct {
++		name     string
++		mode     csi.VolumeCapability_AccessMode_Mode
++		readonly bool
++		flags    []string
++	}{
++		{name: "explicit readonly", mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER, readonly: true},
++		{name: "reader-only access mode", mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_READER_ONLY},
++		{name: "multi-node reader-only access mode", mode: csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY},
++		{name: "ro mount flag", mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER, flags: []string{"noatime", "ro"}},
++	}
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			node, target, metadataPath := setupPublishedNode(t)
++			if _, err := node.NodePublishVolume(t.Context(), publishRequest(target, test.mode, test.readonly, test.flags...)); err != nil {
++				t.Fatal(err)
++			}
++			metadata, err := readPublishedMountInfo(metadataPath)
++			if err != nil {
++				t.Fatal(err)
++			}
++			if !metadata.ReadOnly || metadata.FSGroup != "2000" {
++				t.Fatalf("unexpected metadata: %#v", metadata)
++			}
++			if !containsOption(metadata.Options, "ro") || containsOption(metadata.Options, "rw") {
++				t.Fatalf("readonly options not normalized: %v", metadata.Options)
++			}
++			if _, ok := metadata.Metadata["cloudAccessKeySecret"]; ok {
++				t.Fatal("access key secret leaked into direct-volume metadata")
++			}
++			if _, ok := metadata.Metadata["cloudSecurityToken"]; ok {
++				t.Fatal("security token leaked into direct-volume metadata")
++			}
++			if _, ok := metadata.Metadata["custom-workload-context"]; ok {
++				t.Fatal("unconsumed volume context crossed into direct-volume metadata")
++			}
++			if metadata.Metadata["cloud-provider"] != "testcloud" ||
++				metadata.Metadata["cloud-volume-path"] != "cloud-disk-123" ||
++				metadata.Metadata["encrypt-type"] != "luks2" ||
++				metadata.Metadata["kbs-key-id"] != "default/luks-key/workspace" ||
++				len(metadata.Metadata) != 5 {
++				t.Fatalf("unexpected direct-volume metadata projection: %v", metadata.Metadata)
++			}
++		})
++	}
++}
++
++func containsOption(options []string, wanted string) bool {
++	for _, option := range options {
++		if option == wanted {
++			return true
++		}
++	}
++	return false
++}
+diff --git a/pkg/driver/nodeserver.go b/pkg/driver/nodeserver.go
+index 0cb45e43..d8d566f6 100644
+--- a/pkg/driver/nodeserver.go
++++ b/pkg/driver/nodeserver.go
+@@ -47,14 +47,6 @@ func getKataRuntimePath() string {
+ 	return "kata-runtime"
+ }
+ 
+-type mountInfoJSON struct {
+-	VolumeType string            `json:"volume-type"`
+-	Device     string            `json:"device"`
+-	FsType     string            `json:"fstype"`
+-	Metadata   map[string]string `json:"metadata,omitempty"`
+-	Options    []string          `json:"options,omitempty"`
+-}
+-
+ type nodeServer struct {
+ 	csi.UnimplementedNodeServer
+ 	nodeID  string
+@@ -192,21 +184,49 @@ func (ns *nodeServer) NodePublishVolume(_ context.Context, req *csi.NodePublishV
+ 		return nil, status.Errorf(codes.FailedPrecondition, "volume %s not staged (no device path)", volumeID)
+ 	}
+ 
+-	attrib := req.GetVolumeContext()
+-	if attrib == nil {
+-		attrib = make(map[string]string)
++	attrib := make(map[string]string, len(req.GetVolumeContext())+1)
++	for key, value := range req.GetVolumeContext() {
++		attrib[key] = value
+ 	}
+-
++	attrib["cloud-volume-path"] = devicePath
+ 	attrib["cloud-volume-id"] = volumeID
+-	if attrib["cloud-volume-path"] == "" {
+-		attrib["cloud-volume-path"] = devicePath
++	providerName := strings.TrimSpace(attrib["cloud-provider"])
++	if providerName == "" {
++		providerName = strings.TrimSpace(attrib["cloudProvider"])
++	}
++	if providerName != "" {
++		attrib["cloud-provider"] = providerName
++	}
++
++	mount := req.GetVolumeCapability().GetMount()
++	if mount == nil {
++		return nil, status.Error(codes.InvalidArgument, "raw block volumes are not supported")
++	}
++	mode := req.GetVolumeCapability().GetAccessMode().GetMode()
++	readerOnly := mode == csi.VolumeCapability_AccessMode_SINGLE_NODE_READER_ONLY ||
++		mode == csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY
++	readOnly := req.GetReadonly() || readerOnly
++	options, readOnly, err := normalizeMountOptions(mount.GetMountFlags(), readOnly)
++	if err != nil {
++		return nil, status.Errorf(codes.InvalidArgument, "invalid mount flags: %v", err)
++	}
++	fsType, err := normalizeFilesystemType(mount.GetFsType())
++	if err != nil {
++		return nil, status.Error(codes.InvalidArgument, err.Error())
++	}
++	fsGroup, err := normalizeFSGroup(mount.GetVolumeMountGroup())
++	if err != nil {
++		return nil, status.Error(codes.InvalidArgument, err.Error())
+ 	}
+ 
+ 	info := mountInfoJSON{
+ 		VolumeType: "directvol",
+ 		Device:     devicePath,
+-		FsType:     "ext4",
+-		Metadata:   attrib,
++		FsType:     fsType,
++		ReadOnly:   readOnly,
++		Options:    options,
++		FSGroup:    fsGroup,
++		Metadata:   directVolumeMetadataContext(attrib),
+ 	}
+ 
+ 	data, err := json.Marshal(info)
+@@ -471,6 +491,13 @@ func (ns *nodeServer) NodeGetCapabilities(_ context.Context, _ *csi.NodeGetCapab
+ 					},
+ 				},
+ 			},
++			{
++				Type: &csi.NodeServiceCapability_Rpc{
++					Rpc: &csi.NodeServiceCapability_RPC{
++						Type: csi.NodeServiceCapability_RPC_VOLUME_MOUNT_GROUP,
++					},
++				},
++			},
+ 		},
+ 	}, nil
+ }
+diff --git a/pkg/driver/nodeserver_test.go b/pkg/driver/nodeserver_test.go
+index d45afd46..ab4f7b2e 100644
+--- a/pkg/driver/nodeserver_test.go
++++ b/pkg/driver/nodeserver_test.go
+@@ -4,6 +4,7 @@
+ package driver
+ 
+ import (
++	"context"
+ 	b64 "encoding/base64"
+ 	"encoding/json"
+ 	"os"
+@@ -13,6 +14,8 @@ import (
+ 	"github.com/container-storage-interface/spec/lib/go/csi"
+ )
+ 
++// The startup cleanup also sees records written by older CSI versions.
++
+ func TestParseKataVolumeStats(t *testing.T) {
+ 	t.Parallel()
+ 
+@@ -159,3 +162,19 @@ func TestCleanStaleMountInfoDirs_NonexistentRoot(t *testing.T) {
+ 
+ 	cleanStaleMountInfoDirs("/nonexistent/path/" + t.Name())
+ }
++
++func TestNodeGetCapabilitiesAdvertisesVolumeMountGroup(t *testing.T) {
++	t.Parallel()
++
++	response, err := (&nodeServer{}).NodeGetCapabilities(context.Background(), &csi.NodeGetCapabilitiesRequest{})
++	if err != nil {
++		t.Fatalf("NodeGetCapabilities failed: %v", err)
++	}
++
++	for _, capability := range response.GetCapabilities() {
++		if capability.GetRpc().GetType() == csi.NodeServiceCapability_RPC_VOLUME_MOUNT_GROUP {
++			return
++		}
++	}
++	t.Fatal("VOLUME_MOUNT_GROUP capability is not advertised")
++}
+-- 
+2.43.7
+

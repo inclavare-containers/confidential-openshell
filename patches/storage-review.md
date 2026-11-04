@@ -1,80 +1,95 @@
-# Patch classification and review
+# Patch review ledger
 
-The migration branch uses the exact bases in
-[sources.lock.json](../deployment/build/sources.lock.json). Selection and validation
-are tracked in [the CoCo migration record](../docs/coco-migration.md). The saved
-main branch remains on the previously accepted release-based stack.
+This ledger describes the rebuilt queues, not a list of pending edits. Bases and
+result trees are in [sources.lock.json](../deployment/build/sources.lock.json).
+Each row names the behavior covered by one patch. Tests follow that behavior;
+shared prerequisites are explicit rather than copied into later patches.
 
-## Scope and submission rules
+## CAA common changes
 
-- `generic/` fixes or improves existing upstream behavior. These changes do not
-  require the confidential-volume wire format or measured workspace policy.
-- `provider/` supplies ordinary Alibaba disk/instance integration. These changes
-  are useful for plain retained data disks as well as encrypted workspaces.
-  New provider support is described as a feature, not an existing-upstream bug.
-- `confidential-volume/` contains the paired metadata contract, measured disk/key
-  authorization, initialization policy and sealed resources. This workstream
-  waits for upstream storage design discussion.
+These patches apply before Alibaba data-disk support and measured guest policy.
+The common prefix is compiled and tested independently of those overlays.
 
-A patch can have an implementation dependency without belonging to the same
-workstream. The ordered `series` records build dependencies. Generic/provider
-patches should be proposed separately; the confidential-volume contract is not
-included merely to make a generic fix apply. New standalone upstream submissions
-must reproduce their issue against the target upstream revision.
-
-The CAA PeerPod controller is selected from the same upstream repository. Its
-queue references the generic deletion fix and provider retention guard, without
-copying attachment, metadata, or guest policy code.
-
-## CAA queue
-
-| Patch | Scope | Review and validation decision |
+| Patch | Concrete purpose and evidence | Dependency / targeted check |
 | --- | --- | --- |
-| [generic/0001 image selection](cloud-api-adaptor/generic/0001-alibabacloud-image-overrides.patch) | Existing provider bug | Preserve the submitted #3437 patch verbatim. Two disk-size cases cover the two image assignment branches using one existing request recorder. |
-| [generic/0002 on-link routes](cloud-api-adaptor/generic/0002-preserve-onlink-routes.patch) | Existing networking bug | Preserve the submitted #3435 patch verbatim. Extend the upstream worker/guest route tests. |
-| [generic/0003 deletion absence](cloud-api-adaptor/generic/0003-alibabacloud-confirm-delete-absence.patch) | Existing instance cleanup | Accept only exact typed absence after a deletion error. Keep the shared result/error table; no disk enumeration is introduced. |
-| [generic/0004 userdata](cloud-api-adaptor/generic/0004-alibabacloud-bounded-userdata.patch) | Transport enhancement | Host compression and guest bounded decompression travel together. Keep separate boundary tests and one byte-preservation check. |
-| [generic/0005 credentials and diagnostics](cloud-api-adaptor/generic/0005-image-pull-credentials-and-diagnostics.patch) | Optional credential forwarding and reduced diagnostics | Preserve default behavior; test both forwarding modes and reuse existing TLS propagation tests. |
-| [provider/0001 create retries](cloud-api-adaptor/provider/0001-alibabacloud-idempotent-create.patch) | Ordinary instance creation | Extracted from retained-disk attachment. Stable native ECS token, deterministic tags and checked response shape. Reuses the image patch's request recorder; the test-fixture dependency should be considered when submitting before #3437 merges. |
-| [generic/0006 fsGroup](cloud-api-adaptor/generic/0006-recursive-fsgroup.patch) | Existing storage permissions | Extracted from encrypted mounting. Preserve owners, apply group access to retained contents and setgid to directories, skip symlinks and readonly requests, and propagate errors. Tests exercise real file permissions and inheritance. |
-| [confidential-volume/0001 metadata](cloud-api-adaptor/confidential-volume/0001-immutable-metadata-contract.patch) | Paired CSI/CAA v1 contract | Immutable sandbox resolution and strict host/guest inputs. Use upstream Pod UID parsing before a lazy API lookup. Requires the matching CSI writer; generic readonly/immutability ideas must be extracted without forcing this schema upstream. |
-| [provider/0002 retention guard](cloud-api-adaptor/provider/0002-alibabacloud-retained-delete-guard.patch) | Ordinary retained-disk safety | Shared by adapter and controller. Keep full inventory, retention/security-lock checks, retry-time rechecks and finalizer coverage. Multi-attach restrictions describe this provider profile, not a universal cloud API rule. |
-| [provider/0003 ESSD attachment](cloud-api-adaptor/provider/0003-alibabacloud-retained-essd.patch) | New Alibaba data-disk support | Attachment/release reconciliation and bounded cleanup. Retain ambiguous-result, cancellation, timeout, rebinding and concurrent deletion tests; duplicate guard cases have been removed. Depends on the retention and creation helpers. |
-| [provider/0004 guest identity](cloud-api-adaptor/provider/0004-alibabacloud-guest-disk-identity.patch) | New Alibaba device discovery | Match serial/WWID; reject ambiguous, partitioned, consumed and system devices. Host ID validation cannot replace guest device verification. |
-| [confidential-volume/0002 workspace mounts](cloud-api-adaptor/confidential-volume/0002-measured-workspace-mounts.patch) | Measured persistent encryption | CDH opens existing encrypted devices; initialization is explicitly authorized by measured policy. Encrypted host annotations without measured workspace policy are rejected. Reuse upstream CDH protobuf types; no restoration of the reverted permissive CAA path. Keep ownership/rollback and readonly checks. |
-| [confidential-volume/0003 sealed admission](cloud-api-adaptor/confidential-volume/0003-sealed-mount-admission.patch) | Measured sealed resources | Check descriptors before unsealing and container dispatch. Retain transaction-level rollback tests distinct from resource cleanup tests. The custom AA extension RPC, event encoder and their dedicated tests are removed; upstream AA now owns binding. |
+| [G01 image selection](cloud-api-adaptor/generic/0001-alibabacloud-image-overrides.patch) | Honor the per-instance image in both system-disk branches; existing PR #3437 code diff unchanged. | Upstream request recorder, two image branches. |
+| [G02 on-link routes](cloud-api-adaptor/generic/0002-preserve-onlink-routes.patch) | Preserve link-scope routes across worker/guest conversion; existing PR #3435 code diff unchanged. | Existing worker and guest route tests. |
+| [G03 fsGroup access](cloud-api-adaptor/generic/0003-volume-group-access.patch) | Fix Go setgid usage and apply group access to retained contents without changing owners or following symlinks. Real file/process comparison reproduces wrong inherited group and inaccessible retained files before the change. | Existing guest mount path; real ownership/inheritance and readonly tests. G07 supplies the ordinary CSI property path. Prioritized for upstream. |
+| [G04 exact delete absence](cloud-api-adaptor/generic/0004-alibabacloud-confirm-delete-absence.patch) | After a deletion error, accept only typed absence of that exact instance; other errors remain errors. | No disk feature; API result/error table. |
+| [G05 userdata transport](cloud-api-adaptor/generic/0005-alibabacloud-bounded-userdata.patch) | Compress oversized userdata and bound guest decompression. Host and guest agree on the 1 MiB decoded limit, preventing a host-accepted payload from being rejected only after VM creation. | Host encode and guest decode boundary tests; unrelated cloud-config test removed. |
+| [G06 Pod disk selection](cloud-api-adaptor/generic/0006-resolve-csi-pod-identity.patch) | Resolve missing Pod UID before filtering direct volumes. The selected Kata request lacks that UID; an unmodified upstream reproducer selected both Pods' disks instead of only the requested Pod's. | Existing UID parser; lazy API lookup and two-Pod fixture. No new metadata schema. |
+| [G07 mount properties](cloud-api-adaptor/generic/0007-volume-mount-properties.patch) | Carry and apply readonly, mount options and fsGroup through the existing CSI→proxy→guest path. Old records without readonly remain readable. | G03/G06; CSI mount-property producer. Typed transport and filesystem/bind option tests. |
+| [G08 attachment mapping](cloud-api-adaptor/generic/0008-reuse-sandbox-volume-plan.patch) | Read direct-volume records once and reuse their disk/LUN mapping for containers. Bound those reads; preserve legacy cloud-volume-path and optional Pod UID. Unrelated CSI mounts follow upstream forwarding. | G06/G07; changed/deleted metadata, container subsets, legacy records and property propagation. Mutation tests, not a claimed wrong-disk production incident. |
+| [G09 deletion completion](cloud-api-adaptor/generic/0009-alibabacloud-delete-completion.patch) | Reconcile accepted/ambiguous instance deletion until exact absence, with bounded cancellation and documented transition retries. | G04 only; independently tested without retained disks. |
+| [G10 guest mount lifecycle](cloud-api-adaptor/generic/0010-guest-volume-lifecycle.patch) | Track acquired versus reused ordinary mounts; roll back on preparation/agent failure and retain failed cleanup for retry. Use the existing containerd mount implementation and verify reused mounts. | G07/G08; ordinary rollback, reuse, filesystem identity, optional loop-device tests. No key, CDH or measured policy. |
+| [G11 dialer test fixture](cloud-api-adaptor/generic/0011-proxy-dialer-test-fixture.patch) | Synchronize the existing listener-reopen test and close the correct handles. | Test-only repair; isolated from volume mapping, checked under the race detector. |
 
-## CSI queue
+## CAA provider changes
 
-| Patch | Scope | Review and validation decision |
+These are ordinary Alibaba data-disk capabilities, useful without encryption.
+
+| Patch | Concrete purpose | Dependency / targeted check |
 | --- | --- | --- |
-| [generic/0001 capacity](caa-csi-block-driver/generic/0001-recovered-capacity.patch) | Existing CreateVolume bug | Validate cached and recovered actual capacity against the requested range. One table covers the two distinct paths and prevents persisting an incompatible result. |
-| [provider/0001 Alibaba](caa-csi-block-driver/provider/0001-alibabacloud-essd.patch) | New ordinary provider | Reuse provider interfaces, tag recovery and SDK credential caching. No encryption key handling or second volume journal. |
-| [confidential-volume/0001 metadata](caa-csi-block-driver/confidential-volume/0001-versioned-metadata.patch) | Paired v1 wire contract | Atomic publication, ownership and readonly/fsGroup metadata. Restart/replay coverage is consolidated. The atomic-write and restart fixes can be separately proposed against the old upstream format. |
-| [generic/0002 deployment](caa-csi-block-driver/generic/0002-controller-node-deployment.patch) | Existing CSI deployment enhancement | Separate controller credentials/state from node publication. Helm generates the raw manifests. Alibaba values depend on the provider feature; neither deployment mode requires measured workspace policy. |
-| [generic/0003 conformance](caa-csi-block-driver/generic/0003-conformance-runner.patch) | Existing test infrastructure | One runner and skip list for local/CI; cleanup is confined to its own temporary directory. The explicit test path adapter follows the node metadata contract. |
-| [generic/0004 image bases](caa-csi-block-driver/generic/0004-build-runtime-bases.patch) | Build maintenance | Digest-pinned bases; verify actual builds rather than adding a Dockerfile text test. |
+| [P01 deletion guard](cloud-api-adaptor/provider/0001-alibabacloud-retained-delete-guard.patch) | Inspect retention attributes and security locks before every instance deletion attempt. Share the guard with the controller. | G04/G09; incomplete/unsafe inventory and finalizer retry tests. |
+| [P02 retained release](cloud-api-adaptor/provider/0002-alibabacloud-retained-release.patch) | Wait for retained disks to be released after instance deletion, accepting absence or rebinding to another instance. | P01 inventory; timeout, cancellation and rebound tests. |
+| [P03 retained attachment](cloud-api-adaptor/provider/0003-alibabacloud-retained-attachment.patch) | Validate and attach supported retained ESSD disks, reconciling ambiguous attach responses. | P01 disk parser; fake SDK request/state tests. No instance-create token. |
+| [P04 guest disk identity](cloud-api-adaptor/provider/0004-alibabacloud-guest-disk-identity.patch) | Resolve Alibaba disk IDs using kernel serial/WWID; reject ambiguous, partitioned and system-backing devices. Permit mounted data disks for reuse. | G10; kernel fixture tests. This establishes device identity, not measured authorization. |
 
-Kata's [no-new-privileges patch](kata-containers/0001-fix-runtime-preserve-exec-no-new-privileges.patch)
-and the OpenShell pins are unchanged. The existing Kata conversion test remains
-sufficient for that field-forwarding fix.
+## CAA confidential guest overlays
 
-## Remaining intentional overlap
+| Patch | Concrete purpose | Dependency / targeted check |
+| --- | --- | --- |
+| [C01 measured workspace](cloud-api-adaptor/confidential-volume/0001-measured-workspace.patch) | Authorize disk/key/filesystem and optional initialization from measured policy. Use upstream CDH to open LUKS devices; enforce mapper parameters/readonly and extend ordinary ownership tracking to mapper resources. | G10/P04; policy, initialization, mapper and cleanup-order tests. Host annotations cannot choose the key. |
+| [C02 sealed admission](cloud-api-adaptor/confidential-volume/0002-sealed-admission.patch) | Verify manifest-named descriptors, unseal through CDH and expose only private verified outputs before agent dispatch. | C01 CDH client, G10 rollback; descriptor tampering, confined symlinks, FIFO, cleanup and sealed-rejection tests. Ordinary volume rollback remains in G10. |
 
-- CSI writer, host resolver and guest each validate their own trust boundary.
-  A shared golden fixture connects the schemas without introducing another
-  cross-repository library.
-- CAA captures disk IDs for post-delete waiting and rechecks current inventory
-  before every deletion attempt. Returning the checked inventory from the
-  mutation helper could remove the first double read, but deleting a read alone
-  loses recovery information or retry-time protection.
-- Acquired/borrowed resource flags and cleanup retries represent different
-  lifecycle states. They are retained, with one successful-cleanup test and
-  separate reuse/failure-order cases.
-- Required metadata and measured policy remain explicit. Successful use of
-  `SecureMount` does not prove authenticated LUKS headers, ciphertext integrity
-  or rollback protection; those are separate storage-design capabilities.
+CAA's ordinary mounts do not automatically invoke Kata `Storage` ownership.
+The selected Kata sealed-file path logs unseal errors and continues; it cannot
+replace mandatory descriptor admission. CDH's selected filesystem path ignores
+mount flags, so C01 requests an opened device and enforces access modes locally.
+These are specific API/behavior differences, not a reason to fold generic fixes
+into the confidential overlays. Sealed admission stays after volume rewriting so
+later rewriting cannot replace a verified source.
 
-Validation does not use a target test-to-code line ratio. The migration reuses
-upstream test fixtures and removes obsolete extension/host-path tests rather
-than replacing upstream APIs with parallel implementations.
+## CSI changes
+
+CSI has no confidential-volume patch. Its metadata contains ordinary mount and
+ownership information, never workspace plaintext keys.
+
+| Patch | Concrete purpose | Targeted check |
+| --- | --- | --- |
+| [G01 capacity](caa-csi-block-driver/generic/0001-recovered-capacity.patch) | Validate actual cached/recovered capacity against CreateVolume's requested range. | Shared table for both paths. |
+| [G02 mount properties](caa-csi-block-driver/generic/0002-volume-mount-properties.patch) | Publish readonly/options/fsGroup and advertise delegated group handling. | Existing NodePublish fixtures, including ro options. |
+| [G03 atomic publication](caa-csi-block-driver/generic/0003-atomic-volume-publication.patch) | Publish complete metadata atomically; preserve restart identity and verify volume ownership on reuse/unpublish. | Legacy republish, wrong-volume unpublish and atomic/restart tests. Version/mode labels are not required. |
+| [G04 conformance runner](caa-csi-block-driver/generic/0004-conformance-runner.patch) | Share the upstream CSI sanity invocation between local runs and CI. | Existing runner with normal PodInfoOnMount context; no production test-path switch. |
+| [G05 build bases](caa-csi-block-driver/generic/0005-build-runtime-bases.patch) | Pin compatible build/runtime images. | Source/build configuration checks; no Dockerfile-text test. |
+| [P01 Alibaba ESSD](caa-csi-block-driver/provider/0001-alibabacloud-essd.patch) | Add the provider through upstream interfaces, cloud recovery and SDK credential caching, with combined-DaemonSet configuration. | Provider tests; no controller state PVC, service split or operation journal. |
+
+## Removed and retained boundaries
+
+- Removed the image-pull Secret opt-out, its test hook and deployment flag, plus
+  the bundled debug-copy/log-suppression changes. Registry pulls are anonymous;
+  HTTPS certificate verification and image digest pinning remain.
+- Removed the complete CAA instance-create idempotency patch, including its
+  extra SandboxId tag, validation/error changes and dedicated test. It was an
+  optional retry enhancement without a reproduced current deployment blocker.
+- Removed mandatory transport-version/mode/readonly labels. CAA and CSI retain
+  compatibility with original upstream mount records and the old fixture.
+- Removed Kata's historical PR prose, captured evidence and contribution scripts.
+  Only its patch, series and checksum remain. The upstream change is merged.
+- OpenShell/Kata bases are unchanged. Existing CAA #3435/#3437 code diffs are
+  unchanged; only local attribution metadata is normalized.
+
+## Validation and next review
+
+Validation for this cleanup is deliberately local and targeted: clean patch
+replay/checksums/tree equality, each extracted stage's package tests, independent
+common-prefix tests, final CAA host/guest race tests and binary compilation, CSI
+package tests, controller finalizer tests and Kata's existing conversion test.
+The maintained documentation and deployment-value generator are also checked.
+No new ACK/TDX deployment, cloud fault experiment or full end-to-end run is claimed.
+Those checks follow review convergence.
+
+The repository's three iterative cleanup commits are consolidated after the
+unchanged CoCo migration commits. Top-level commits use the original scoped
+subject/body convention. Patch attribution follows the
+[community-specific conventions](README.md) and stays inside patch messages.

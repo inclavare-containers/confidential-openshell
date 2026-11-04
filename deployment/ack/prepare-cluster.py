@@ -169,9 +169,6 @@ def main():
     eni = json.loads(network['data']['eni_conf'])
     require(str(eni.get('disable_network_policy', False)).lower() == 'false',
             'Terway NetworkPolicy is disabled. See deployment/ack/README.md.')
-    classes = json.loads(kubectl(env, 'get', 'storageclass', '-o', 'json'))
-    require(any(c['metadata']['name'] == config['csi_storage_class'] for c in classes['items']),
-            f'Host StorageClass {config["csi_storage_class"]} is missing. Enable the ACK csi-plugin and csi-provisioner storage add-ons before attachment.')
     cloud.save(zone_id=nodes['items'][0]['metadata']['labels']['topology.kubernetes.io/zone'])
     print(kubectl(env, 'get', 'nodes', '-o', 'wide'), end='')
     print(f'ACK ready: {cluster} ({config["ack_api_access"]} API). Kubeconfig is valid for up to 3 days; repeat to renew it.')

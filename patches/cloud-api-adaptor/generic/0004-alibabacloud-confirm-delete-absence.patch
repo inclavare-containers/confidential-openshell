@@ -1,4 +1,4 @@
-From cbb75737ec0210339be84250e6720a5cd747f4b4 Mon Sep 17 00:00:00 2001
+From 7494d6e4db29e87bf0cc9d8ea98984e80b528d65 Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
 Date: Tue, 3 Nov 2026 19:30:00 +0800
 Subject: [PATCH] alibabacloud: confirm instance absence after deletion errors
@@ -11,7 +11,7 @@ other errors and handle non-SDK errors without a type-assertion panic.
 This change applies to the existing instance deletion path and requires
 no data-disk support or additional DescribeDisks permission.
 
-Generated-by: OpenAI Codex
+Co-authored-by: Codex <noreply@openai.com>
 ---
  .../alibabacloud/instance_delete.go           | 35 ++++++++
  src/cloud-providers/alibabacloud/provider.go  | 25 ++----

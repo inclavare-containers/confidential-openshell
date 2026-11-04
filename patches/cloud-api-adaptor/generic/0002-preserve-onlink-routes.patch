@@ -12,8 +12,9 @@ setup. Extend the existing worker and guest network tests to verify
 flag preservation and installation of a route with an off-subnet gateway.
 
 Fixes: #3434
-Generated-by: OpenAI Codex
 Signed-off-by: Weidong Sun <sunweidong@linux.alibaba.com>
+
+Co-authored-by: Codex <noreply@openai.com>
 ---
  .../pkg/podnetwork/podnetwork_test.go         | 29 ++++++++++++++++++-
  .../pkg/podnetwork/podnode.go                 |  1 +

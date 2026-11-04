@@ -1,0 +1,439 @@
+From 11d52f641ef37c205366c51991a61d6827ba03fa Mon Sep 17 00:00:00 2001
+From: Weidong Sun <sunweidong@linux.alibaba.com>
+Date: Wed, 4 Nov 2026 15:29:29 +0800
+Subject: [PATCH] alibabacloud: reconcile retained disk release after instance
+ deletion
+
+Keep the first guarded inventory through instance deletion and wait for
+those disks to be released, disappear, or rebind to another instance.
+Do not finish cleanup while a retained disk still belongs to the old VM.
+
+Co-authored-by: Codex <noreply@openai.com>
+---
+ .../alibabacloud/delete_instance_test.go      | 197 ++++++++++++++++--
+ .../alibabacloud/instance_cleanup.go          |  22 +-
+ src/cloud-providers/alibabacloud/provider.go  |   8 +-
+ .../alibabacloud/retained_release.go          |  80 +++++++
+ 4 files changed, 284 insertions(+), 23 deletions(-)
+ create mode 100644 src/cloud-providers/alibabacloud/retained_release.go
+
+diff --git a/src/cloud-providers/alibabacloud/delete_instance_test.go b/src/cloud-providers/alibabacloud/delete_instance_test.go
+index 358bb7ec..d815541e 100644
+--- a/src/cloud-providers/alibabacloud/delete_instance_test.go
++++ b/src/cloud-providers/alibabacloud/delete_instance_test.go
+@@ -5,27 +5,54 @@ package alibabacloud
+ 
+ import (
+ 	"context"
++	"encoding/json"
+ 	"errors"
+-	ecs "github.com/alibabacloud-go/ecs-20140526/v4/client"
+-	"github.com/alibabacloud-go/tea/tea"
+ 	"strings"
+ 	"sync"
+ 	"testing"
+ 	"time"
++
++	ecs "github.com/alibabacloud-go/ecs-20140526/v4/client"
++	"github.com/alibabacloud-go/tea/tea"
+ )
+ 
+ type fakeDeleteOutcome struct {
+ 	err     error
+ 	applied bool
+ }
++
++type fakeCleanupDisk struct {
++	status             string
++	instanceID         string
++	diskType           string
++	multiAttach        string
++	portable           bool
++	deleteWithInstance *bool
++}
++
+ type fakeCleanupECSClient struct {
+ 	*ecs.Client
+-	mu             sync.Mutex
+-	instanceID     string
+-	instanceExists bool
+-	deleteOutcomes []fakeDeleteOutcome
+-	deleteCalls    int
+-	deleteForce    []bool
++
++	mu                    sync.Mutex
++	instanceID            string
++	instanceExists        bool
++	disks                 map[string]*fakeCleanupDisk
++	deleteOutcomes        []fakeDeleteOutcome
++	deleteCalls           int
++	deleteForce           []bool
++	describeAttachedCalls int
++	releaseAfter          int
++	diskPollsAfterDelete  int
++	operationLocks        []string
++	rebindAfter           int
++	rebindInstanceID      string
++}
++
++func retainedFakeDisk(instanceID string) *fakeCleanupDisk {
++	return &fakeCleanupDisk{
++		status: "In_use", instanceID: instanceID, diskType: "data",
++		multiAttach: "Disabled", portable: true, deleteWithInstance: tea.Bool(false),
++	}
+ }
+ 
+ func (f *fakeCleanupECSClient) DeleteInstance(request *ecs.DeleteInstanceRequest) (*ecs.DeleteInstanceResponse, error) {
+@@ -43,6 +70,14 @@ func (f *fakeCleanupECSClient) DeleteInstance(request *ecs.DeleteInstanceRequest
+ 	}
+ 	if outcome.applied {
+ 		f.instanceExists = false
++		for _, disk := range f.disks {
++			if disk.instanceID == f.instanceID {
++				disk.status = "Detaching"
++			}
++		}
++		if f.releaseAfter == 0 {
++			f.releaseDisksLocked()
++		}
+ 	}
+ 	return &ecs.DeleteInstanceResponse{Body: &ecs.DeleteInstanceResponseBody{}}, outcome.err
+ }
+@@ -53,10 +88,85 @@ func (f *fakeCleanupECSClient) DescribeInstanceAttribute(request *ecs.DescribeIn
+ 	if tea.StringValue(request.InstanceId) != f.instanceID || !f.instanceExists {
+ 		return nil, fakeSDKError(404, "InvalidInstanceId.NotFound")
+ 	}
+-	return &ecs.DescribeInstanceAttributeResponse{Body: &ecs.DescribeInstanceAttributeResponseBody{Status: tea.String("Running")}}, nil
++	locks := make([]*ecs.DescribeInstanceAttributeResponseBodyOperationLocksLockReason, 0, len(f.operationLocks))
++	for _, reason := range f.operationLocks {
++		locks = append(locks, &ecs.DescribeInstanceAttributeResponseBodyOperationLocksLockReason{
++			LockReason: tea.String(reason),
++		})
++	}
++	return &ecs.DescribeInstanceAttributeResponse{Body: &ecs.DescribeInstanceAttributeResponseBody{
++		Status:         tea.String("Running"),
++		OperationLocks: &ecs.DescribeInstanceAttributeResponseBodyOperationLocks{LockReason: locks},
++	}}, nil
+ }
+-func (f *fakeCleanupECSClient) DescribeDisks(*ecs.DescribeDisksRequest) (*ecs.DescribeDisksResponse, error) {
+-	return &ecs.DescribeDisksResponse{Body: &ecs.DescribeDisksResponseBody{Disks: &ecs.DescribeDisksResponseBodyDisks{}}}, nil
++
++func (f *fakeCleanupECSClient) DescribeDisks(request *ecs.DescribeDisksRequest) (*ecs.DescribeDisksResponse, error) {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++
++	var diskIDs []string
++	if instanceID := tea.StringValue(request.InstanceId); instanceID != "" {
++		f.describeAttachedCalls++
++		for diskID, disk := range f.disks {
++			if disk.instanceID == instanceID {
++				diskIDs = append(diskIDs, diskID)
++			}
++		}
++	} else if err := json.Unmarshal([]byte(tea.StringValue(request.DiskIds)), &diskIDs); err != nil {
++		return nil, err
++	}
++
++	if !f.instanceExists && tea.StringValue(request.DiskIds) != "" {
++		f.diskPollsAfterDelete++
++		if f.rebindAfter > 0 && f.diskPollsAfterDelete >= f.rebindAfter {
++			f.rebindDisksLocked()
++		} else if f.releaseAfter > 0 && f.diskPollsAfterDelete >= f.releaseAfter {
++			f.releaseDisksLocked()
++		}
++	}
++
++	items := make([]*ecs.DescribeDisksResponseBodyDisksDisk, 0, len(diskIDs))
++	for _, diskID := range diskIDs {
++		disk := f.disks[diskID]
++		if disk == nil {
++			continue
++		}
++		items = append(items, &ecs.DescribeDisksResponseBodyDisksDisk{
++			DiskId: tea.String(diskID), Status: tea.String(disk.status),
++			InstanceId: tea.String(disk.instanceID), Type: tea.String(disk.diskType),
++			MultiAttach: diskString(disk.multiAttach), Portable: tea.Bool(disk.portable),
++			DeleteWithInstance: disk.deleteWithInstance,
++		})
++	}
++	total := int32(len(items))
++	return &ecs.DescribeDisksResponse{Body: &ecs.DescribeDisksResponseBody{
++		TotalCount: &total, Disks: &ecs.DescribeDisksResponseBodyDisks{Disk: items},
++	}}, nil
++}
++
++func diskString(value string) *string {
++	if value == "" {
++		return nil
++	}
++	return tea.String(value)
++}
++
++func (f *fakeCleanupECSClient) releaseDisksLocked() {
++	for _, disk := range f.disks {
++		if disk.instanceID == f.instanceID {
++			disk.status = "Available"
++			disk.instanceID = ""
++		}
++	}
++}
++
++func (f *fakeCleanupECSClient) rebindDisksLocked() {
++	for _, disk := range f.disks {
++		if disk.instanceID == f.instanceID {
++			disk.status = "In_use"
++			disk.instanceID = f.rebindInstanceID
++		}
++	}
+ }
+ 
+ func fakeSDKError(status int, code string) error {
+@@ -164,7 +274,8 @@ func TestDeleteInstanceHonorsCancellation(t *testing.T) {
+ func TestDeleteInstanceIsIdempotentUnderConcurrentCalls(t *testing.T) {
+ 	useFastCleanupTimings(t)
+ 	client := &fakeCleanupECSClient{
+-		instanceID: "i-peerpod", instanceExists: true,
++		instanceID: "i-peerpod", instanceExists: true, releaseAfter: 2,
++		disks: map[string]*fakeCleanupDisk{"d-workspace": retainedFakeDisk("i-peerpod")},
+ 	}
+ 	p := newCleanupTestProvider(client)
+ 
+@@ -188,3 +299,65 @@ func TestDeleteInstanceIsIdempotentUnderConcurrentCalls(t *testing.T) {
+ 	}
+ 
+ }
++
++func TestDeleteInstanceForceDeletesBeforeWaitingForRetainedDisk(t *testing.T) {
++	useFastCleanupTimings(t)
++	client := &fakeCleanupECSClient{
++		instanceID: "i-peerpod", instanceExists: true, releaseAfter: 3,
++		disks: map[string]*fakeCleanupDisk{"d-workspace": retainedFakeDisk("i-peerpod")},
++	}
++	p := newCleanupTestProvider(client)
++
++	if err := p.DeleteInstance(context.Background(), "i-peerpod"); err != nil {
++		t.Fatalf("DeleteInstance() error = %v", err)
++	}
++	client.mu.Lock()
++	defer client.mu.Unlock()
++	if client.deleteCalls != 1 || len(client.deleteForce) != 1 || !client.deleteForce[0] {
++		t.Fatalf("DeleteInstance calls=%d Force=%v", client.deleteCalls, client.deleteForce)
++	}
++	if client.describeAttachedCalls != 1 {
++		t.Fatalf("attached-disk inventory calls=%d, want one per delete attempt", client.describeAttachedCalls)
++	}
++	if client.diskPollsAfterDelete < 3 {
++		t.Fatalf("retained disk polls after delete = %d, want at least 3", client.diskPollsAfterDelete)
++	}
++	if disk := client.disks["d-workspace"]; disk.status != "Available" || disk.instanceID != "" {
++		t.Fatalf("retained disk final state = %+v", disk)
++	}
++}
++
++func TestDeleteInstanceTreatsDiskReboundDuringWaitAsComplete(t *testing.T) {
++	useFastCleanupTimings(t)
++	client := &fakeCleanupECSClient{
++		instanceID: "i-peerpod", instanceExists: true, releaseAfter: -1,
++		rebindAfter: 2, rebindInstanceID: "i-replacement",
++		disks: map[string]*fakeCleanupDisk{"d-workspace": retainedFakeDisk("i-peerpod")},
++	}
++	p := newCleanupTestProvider(client)
++	if err := p.DeleteInstance(context.Background(), "i-peerpod"); err != nil {
++		t.Fatalf("DeleteInstance() error = %v", err)
++	}
++	client.mu.Lock()
++	disk := *client.disks["d-workspace"]
++	client.mu.Unlock()
++	if disk.status != "In_use" || disk.instanceID != "i-replacement" {
++		t.Fatalf("rebound disk state = %+v", disk)
++	}
++
++}
++
++func TestDeleteInstanceReportsDiskWaitTimeout(t *testing.T) {
++	useFastCleanupTimings(t)
++	instanceCleanupTimeout = 20 * time.Millisecond
++	client := &fakeCleanupECSClient{
++		instanceID: "i-peerpod", instanceExists: true, releaseAfter: -1,
++		disks: map[string]*fakeCleanupDisk{"d-workspace": retainedFakeDisk("i-peerpod")},
++	}
++	p := newCleanupTestProvider(client)
++
++	err := p.DeleteInstance(context.Background(), "i-peerpod")
++	if !errors.Is(err, context.DeadlineExceeded) {
++		t.Fatalf("DeleteInstance() error = %v, want cleanup deadline", err)
++	}
++}
+diff --git a/src/cloud-providers/alibabacloud/instance_cleanup.go b/src/cloud-providers/alibabacloud/instance_cleanup.go
+index 7e5705d2..97500fdb 100644
+--- a/src/cloud-providers/alibabacloud/instance_cleanup.go
++++ b/src/cloud-providers/alibabacloud/instance_cleanup.go
+@@ -19,27 +19,31 @@ var (
+ 	instanceCleanupPollInterval = 2 * time.Second
+ )
+ 
+-func (p *alibabaCloudProvider) forceDeleteInstance(ctx context.Context, instanceID string) error {
++func (p *alibabaCloudProvider) forceDeleteInstance(ctx context.Context, instanceID string) ([]string, error) {
++	var diskIDs []string
+ 	deleteAccepted := false
+ 	for {
+ 		if err := ctx.Err(); err != nil {
+-			return fmt.Errorf("reconcile deletion of instance %s: %w", instanceID, err)
++			return nil, fmt.Errorf("reconcile deletion of instance %s: %w", instanceID, err)
+ 		}
+ 
+ 		if !deleteAccepted {
+-			_, absent, err := p.deleteInstanceWithRetentionGuard(ctx, instanceID)
++			disks, absent, err := p.deleteInstanceWithRetentionGuard(ctx, instanceID)
++			if diskIDs == nil {
++				diskIDs = disks
++			}
+ 			if absent {
+-				return nil
++				return diskIDs, nil
+ 			}
+ 			switch {
+ 			case err == nil:
+ 				deleteAccepted = true
+ 			case isAlibabaInstanceNotFoundError(err):
+-				return nil
++				return diskIDs, nil
+ 			case isRetryableAlibabaInstanceDeleteError(err):
+ 				logger.Printf("DeleteInstance outcome for %s is retryable or unknown: %v", instanceID, err)
+ 			default:
+-				return fmt.Errorf("delete Alibaba Cloud instance %s: %w", instanceID, err)
++				return nil, fmt.Errorf("delete Alibaba Cloud instance %s: %w", instanceID, err)
+ 			}
+ 		}
+ 
+@@ -49,15 +53,15 @@ func (p *alibabaCloudProvider) forceDeleteInstance(ctx context.Context, instance
+ 		switch {
+ 		case err == nil:
+ 		case isAlibabaInstanceNotFoundError(err):
+-			return nil
++			return diskIDs, nil
+ 		case isAmbiguousAlibabaCloudError(err) || isIncorrectAlibabaInstanceStatusError(err):
+ 			logger.Printf("DescribeInstanceAttribute outcome for deleting instance %s is retryable: %v", instanceID, err)
+ 		default:
+-			return fmt.Errorf("describe deleting Alibaba Cloud instance %s: %w", instanceID, err)
++			return nil, fmt.Errorf("describe deleting Alibaba Cloud instance %s: %w", instanceID, err)
+ 		}
+ 
+ 		if err := waitForAlibabaCleanupPoll(ctx); err != nil {
+-			return fmt.Errorf("reconcile deletion of instance %s: %w", instanceID, err)
++			return nil, fmt.Errorf("reconcile deletion of instance %s: %w", instanceID, err)
+ 		}
+ 	}
+ }
+diff --git a/src/cloud-providers/alibabacloud/provider.go b/src/cloud-providers/alibabacloud/provider.go
+index d39edef4..8a9fbef6 100644
+--- a/src/cloud-providers/alibabacloud/provider.go
++++ b/src/cloud-providers/alibabacloud/provider.go
+@@ -411,12 +411,16 @@ func (p *alibabaCloudProvider) DeleteInstance(ctx context.Context, instanceID st
+ 	cleanupCtx, cancel := context.WithTimeout(ctx, instanceCleanupTimeout)
+ 	defer cancel()
+ 
+-	err := p.forceDeleteInstance(cleanupCtx, instanceID)
++	diskIDs, err := p.forceDeleteInstance(cleanupCtx, instanceID)
+ 	if err != nil {
+ 		return err
+ 	}
+ 
+-	logger.Printf("Deleted instance %s", instanceID)
++	if err := p.waitForRetainedDataDisks(cleanupCtx, instanceID, diskIDs); err != nil {
++		return fmt.Errorf("wait for retained data disks from instance %s: %w", instanceID, err)
++	}
++
++	logger.Printf("Deleted instance %s and reconciled cleanup for %d retained data disk(s)", instanceID, len(diskIDs))
+ 
+ 	p.eipsMu.Lock()
+ 	eipID := p.eips[instanceID]
+diff --git a/src/cloud-providers/alibabacloud/retained_release.go b/src/cloud-providers/alibabacloud/retained_release.go
+new file mode 100644
+index 00000000..1bb82a6c
+--- /dev/null
++++ b/src/cloud-providers/alibabacloud/retained_release.go
+@@ -0,0 +1,80 @@
++// (C) Copyright Confidential Containers Contributors
++// SPDX-License-Identifier: Apache-2.0
++
++package alibabacloud
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	ecs "github.com/alibabacloud-go/ecs-20140526/v4/client"
++	"github.com/alibabacloud-go/tea/tea"
++)
++
++func describeAlibabaDataDisks(ctx context.Context, client ecsClient, region string, diskIDs []string) ([]alibabaDataDisk, error) {
++	if len(diskIDs) == 0 {
++		return nil, nil
++	}
++	if err := ctx.Err(); err != nil {
++		return nil, err
++	}
++	encodedIDs, err := json.Marshal(diskIDs)
++	if err != nil {
++		return nil, err
++	}
++	response, err := client.DescribeDisks(&ecs.DescribeDisksRequest{
++		RegionId: tea.String(region), DiskIds: tea.String(string(encodedIDs)),
++		DiskType: tea.String("data"), PageSize: tea.Int32(100),
++	})
++	if err != nil {
++		return nil, fmt.Errorf("describe data disks: %w", err)
++	}
++	return parseAlibabaDataDisksResponse(response)
++}
++
++func (p *alibabaCloudProvider) waitForRetainedDataDisks(ctx context.Context, instanceID string, diskIDs []string) error {
++	for len(diskIDs) > 0 {
++		disks, err := describeAlibabaDataDisks(ctx, p.ecsClient, p.serviceConfig.Region, diskIDs)
++		if err != nil {
++			return err
++		}
++		requested := make(map[string]struct{}, len(diskIDs))
++		for _, diskID := range diskIDs {
++			requested[diskID] = struct{}{}
++		}
++		byID := make(map[string]alibabaDataDisk, len(disks))
++		for _, disk := range disks {
++			if _, found := requested[disk.id]; !found {
++				return fmt.Errorf("DescribeDisks returned unrequested data disk %s", disk.id)
++			}
++			byID[disk.id] = disk
++		}
++		remaining := make([]string, 0, len(diskIDs))
++		for _, diskID := range diskIDs {
++			disk, found := byID[diskID]
++			if !found {
++				logger.Printf("Retained data disk %s no longer exists; cleanup for instance %s is complete for that disk", diskID, instanceID)
++				continue
++			}
++			available, relevant, err := classifyRetainedAlibabaDataDisk(instanceID, disk)
++			if err != nil {
++				return err
++			}
++			if !relevant {
++				logger.Printf("Retained data disk %s is now attached to instance %s; cleanup for instance %s is complete for that disk", diskID, disk.instanceID, instanceID)
++				continue
++			}
++			if !available {
++				remaining = append(remaining, diskID)
++			}
++		}
++		if len(remaining) == 0 {
++			return nil
++		}
++		diskIDs = remaining
++		if err := waitForAlibabaCleanupPoll(ctx); err != nil {
++			return err
++		}
++	}
++	return nil
++}
+-- 
+2.43.7
+

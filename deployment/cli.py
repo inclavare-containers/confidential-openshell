@@ -54,7 +54,7 @@ STEPS = {
     'cluster values': ('Generate private PeerPods and CSI values', 'deployment/peerpods/configure-values.py', [], 'cluster peerpods'),
     'cluster peerpods': ('Install Kata and PeerPods and wait for rollouts', 'deployment/peerpods/install-peerpods.sh', [], 'workers configure'),
     'workers configure': ('Configure and verify the active worker Kata profiles', 'deployment/peerpods/configure-workers.py', [], 'cluster csi'),
-    'cluster csi': ('Install CSI and verify controller storage', 'deployment/peerpods/install-csi.sh', [], 'gateway install'),
+    'cluster csi': ('Install CSI and verify the DaemonSet rollout', 'deployment/peerpods/install-csi.sh', [], 'gateway install'),
     'gateway install': ('Install native OpenShell, identity, RBAC and driver configuration', 'deployment/openshell/install.sh', [], 'gateway start'),
     'gateway start': ('Start and check the confidential driver and Gateway', 'deployment/openshell/start-services.sh', [], 'gateway login'),
     'gateway login': ('Register and check the native operator CLI identity', 'deployment/openshell/login.sh', [], None),

@@ -1,32 +1,58 @@
-From 498611008daef22e2af6a61007ba4873ac1ba889 Mon Sep 17 00:00:00 2001
+From 46954be616008dcdd1c9d03775a7435904673de5 Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
-Date: Tue, 3 Nov 2026 20:11:26 +0800
-Subject: [PATCH] alibabacloud: protect retained disks before instance deletion
+Date: Wed, 4 Nov 2026 15:29:24 +0800
+Subject: [PATCH] alibabacloud: guard deletion of retained data disks
 
-Read the complete attached-disk inventory before each deletion attempt and
-reject unsafe retention settings or security operation locks. Apply the
-same profile in the adaptor and independent PeerPod controller so either
-cleanup path preserves persistent data disks.
+Validate retention attributes and instance locks before each deletion
+attempt. Share this provider guard with the independent PeerPod controller,
+including finalizer failure and retry coverage.
 
-This profile supports retained-volume deployments. It builds on the
-independent deletion-absence fix without changing its error semantics.
-
-Generated-by: OpenAI Codex
+Co-authored-by: Codex <noreply@openai.com>
 ---
- src/cloud-providers/alibabacloud/provider.go  |   3 +-
- .../alibabacloud/retained_delete.go           | 179 ++++++++++++++++++
- .../alibabacloud/retained_delete_test.go      | 111 +++++++++++
+ .../alibabacloud/delete_instance_test.go      |   4 +
+ .../alibabacloud/instance_cleanup.go          |   2 +-
+ src/cloud-providers/alibabacloud/provider.go  |   1 +
+ .../alibabacloud/retained_delete.go           | 180 ++++++++++++++++++
+ .../alibabacloud/retained_delete_test.go      | 115 +++++++++++
  .../controllers/finalizer_test.go             |  64 +++++++
- 4 files changed, 356 insertions(+), 1 deletion(-)
+ 6 files changed, 365 insertions(+), 1 deletion(-)
  create mode 100644 src/cloud-providers/alibabacloud/retained_delete.go
  create mode 100644 src/cloud-providers/alibabacloud/retained_delete_test.go
  create mode 100644 src/peerpod-ctrl/controllers/finalizer_test.go
 
+diff --git a/src/cloud-providers/alibabacloud/delete_instance_test.go b/src/cloud-providers/alibabacloud/delete_instance_test.go
+index 7f8c5f87..358bb7ec 100644
+--- a/src/cloud-providers/alibabacloud/delete_instance_test.go
++++ b/src/cloud-providers/alibabacloud/delete_instance_test.go
+@@ -55,6 +55,10 @@ func (f *fakeCleanupECSClient) DescribeInstanceAttribute(request *ecs.DescribeIn
+ 	}
+ 	return &ecs.DescribeInstanceAttributeResponse{Body: &ecs.DescribeInstanceAttributeResponseBody{Status: tea.String("Running")}}, nil
+ }
++func (f *fakeCleanupECSClient) DescribeDisks(*ecs.DescribeDisksRequest) (*ecs.DescribeDisksResponse, error) {
++	return &ecs.DescribeDisksResponse{Body: &ecs.DescribeDisksResponseBody{Disks: &ecs.DescribeDisksResponseBodyDisks{}}}, nil
++}
++
+ func fakeSDKError(status int, code string) error {
+ 	return &tea.SDKError{StatusCode: tea.Int(status), Code: tea.String(code)}
+ }
+diff --git a/src/cloud-providers/alibabacloud/instance_cleanup.go b/src/cloud-providers/alibabacloud/instance_cleanup.go
+index a3e85b8c..7e5705d2 100644
+--- a/src/cloud-providers/alibabacloud/instance_cleanup.go
++++ b/src/cloud-providers/alibabacloud/instance_cleanup.go
+@@ -27,7 +27,7 @@ func (p *alibabaCloudProvider) forceDeleteInstance(ctx context.Context, instance
+ 		}
+ 
+ 		if !deleteAccepted {
+-			absent, err := p.deleteInstanceAndConfirmAbsence(instanceID)
++			_, absent, err := p.deleteInstanceWithRetentionGuard(ctx, instanceID)
+ 			if absent {
+ 				return nil
+ 			}
 diff --git a/src/cloud-providers/alibabacloud/provider.go b/src/cloud-providers/alibabacloud/provider.go
-index 51925ac4..c24d0a49 100644
+index 1f9fbe8d..d39edef4 100644
 --- a/src/cloud-providers/alibabacloud/provider.go
 +++ b/src/cloud-providers/alibabacloud/provider.go
-@@ -69,6 +69,7 @@ func encodeUserData(data string) (string, error) {
+@@ -70,6 +70,7 @@ func encodeUserData(data string) (string, error) {
  
  // Make ecsClient a mockable interface
  type ecsClient interface {
@@ -34,21 +60,12 @@ index 51925ac4..c24d0a49 100644
  	RunInstances(
  		params *ecs.RunInstancesRequest) (*ecs.RunInstancesResponse, error)
  	DeleteInstance(
-@@ -423,7 +424,7 @@ func (p *alibabaCloudProvider) DeleteInstance(ctx context.Context, instanceID st
- 	}
- 	logger.Printf("Deleting instance (%s)", instanceID)
- 	err := p.waitUntilTimeout(time.Duration(time.Second*30), func() (bool, error) {
--		_, err := p.deleteInstanceAndConfirmAbsence(instanceID)
-+		_, err := p.deleteInstanceWithRetentionGuard(ctx, instanceID)
- 		if err != nil {
- 			var sdkError *tea.SDKError
- 			if errors.As(err, &sdkError) && sdkError != nil && tea.StringValue(sdkError.Code) == "IncorrectInstanceStatus" {
 diff --git a/src/cloud-providers/alibabacloud/retained_delete.go b/src/cloud-providers/alibabacloud/retained_delete.go
 new file mode 100644
-index 00000000..b9d5d7e2
+index 00000000..eabde4be
 --- /dev/null
 +++ b/src/cloud-providers/alibabacloud/retained_delete.go
-@@ -0,0 +1,179 @@
+@@ -0,0 +1,180 @@
 +// (C) Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -215,25 +232,26 @@ index 00000000..b9d5d7e2
 +// deleteInstanceWithRetentionGuard is the only mutation boundary used by
 +// both deletion loops. Recheck current disk/lock state on every retry.
 +// The bool result confirms exact absence; nil error alone means accepted.
-+func (p *alibabaCloudProvider) deleteInstanceWithRetentionGuard(ctx context.Context, instanceID string) (bool, error) {
++func (p *alibabaCloudProvider) deleteInstanceWithRetentionGuard(ctx context.Context, instanceID string) ([]string, bool, error) {
 +	disks, err := p.retainedDataDisksForInstanceDelete(ctx, instanceID)
 +	if err != nil {
-+		return false, fmt.Errorf("validate retained disks: %w", err)
++		return nil, false, fmt.Errorf("validate retained disks: %w", err)
 +	}
 +	if len(disks) != 0 {
 +		absent, err := p.validateInstanceRetainedDiskSafety(ctx, instanceID)
 +		if err != nil || absent {
-+			return absent, err
++			return disks, absent, err
 +		}
 +	}
-+	return p.deleteInstanceAndConfirmAbsence(instanceID)
++	absent, err := p.deleteInstanceAndConfirmAbsence(instanceID)
++	return disks, absent, err
 +}
 diff --git a/src/cloud-providers/alibabacloud/retained_delete_test.go b/src/cloud-providers/alibabacloud/retained_delete_test.go
 new file mode 100644
-index 00000000..2588ff7a
+index 00000000..9567a573
 --- /dev/null
 +++ b/src/cloud-providers/alibabacloud/retained_delete_test.go
-@@ -0,0 +1,111 @@
+@@ -0,0 +1,115 @@
 +// (C) Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -300,6 +318,10 @@ index 00000000..2588ff7a
 +		mutate                func(*retentionClient)
 +	}{
 +		{name: "retained disk is released safely"},
++		{name: "multi-attach rejected", wantError: "multi-attach", mutate: func(c *retentionClient) { c.disks.Body.Disks.Disk[0].MultiAttach = tea.String("Enabled") }},
++		{name: "non-data disk rejected", wantError: "detachable data disk", mutate: func(c *retentionClient) { c.disks.Body.Disks.Disk[0].Type = tea.String("system") }},
++		{name: "non-portable disk rejected", wantError: "detachable data disk", mutate: func(c *retentionClient) { c.disks.Body.Disks.Disk[0].Portable = tea.Bool(false) }},
++		{name: "available but bound disk rejected", wantError: "unexpectedly bound", mutate: func(c *retentionClient) { c.disks.Body.Disks.Disk[0].Status = tea.String("Available") }},
 +		{name: "security lock blocks delete", lock: "security", wantError: "security-locked"},
 +		{name: "unknown lock fails closed with retained disk", lock: "new-lock", wantError: "unrecognized operation lock"},
 +		{name: "known financial lock does not imply data loss", lock: "financial"},

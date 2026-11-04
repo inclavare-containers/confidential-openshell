@@ -1,2 +1,3 @@
-../cloud-api-adaptor/generic/0003-alibabacloud-confirm-delete-absence.patch
-../cloud-api-adaptor/provider/0002-alibabacloud-retained-delete-guard.patch
+../cloud-api-adaptor/generic/0004-alibabacloud-confirm-delete-absence.patch
+../cloud-api-adaptor/generic/0009-alibabacloud-delete-completion.patch
+../cloud-api-adaptor/provider/0001-alibabacloud-retained-delete-guard.patch

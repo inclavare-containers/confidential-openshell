@@ -56,14 +56,13 @@ def main():
     csi = yaml.safe_load((ROOT / 'deployment/peerpods/csi-values.example.yaml').read_text())
     csi['image']['repository'], csi['image']['tag'] = split('caa-csi-block-driver')
     csi['sidecarImages'].update(provisioner=image('csi_provisioner'), nodeDriverRegistrar=image('csi_node_registrar'))
-    csi['controller']['state']['storageClassName'] = cloud.config['csi_storage_class']
     csi['alibabacloud'].update(region=cloud.region, zoneId=state['zone_id'], clusterId=state['cluster_id'])
     csi['alibabacloud']['rrsa'].update(roleArn=state['ram_roles']['csi'], oidcProviderArn=state['rrsa']['oidc_arn'])
     for path, values in zip(paths, (peer, csi)):
         write(path, yaml.safe_dump(values, sort_keys=False))
         print(f'Generated {path}; review before installing.')
     print(f'Using cluster {state["cluster_id"]}, guest image {state["podvm_image_id"]}, PodVM vSwitch {state["podvm_vswitch_id"]}.')
-    print(f'Runtime images use published digests; controller-state StorageClass: {cloud.config["csi_storage_class"]}.')
+    print('Runtime images use published digests; CSI uses the combined DaemonSet and cloud volume recovery.')
 
 
 if __name__ == '__main__':

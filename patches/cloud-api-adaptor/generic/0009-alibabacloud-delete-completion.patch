@@ -1,0 +1,358 @@
+From f0fdc20c6004eb4c6fb2be4d006fba80037e47f4 Mon Sep 17 00:00:00 2001
+From: Weidong Sun <sunweidong@linux.alibaba.com>
+Date: Wed, 4 Nov 2026 15:29:21 +0800
+Subject: [PATCH] alibabacloud: wait for instance deletion to complete
+
+Reconcile accepted and ambiguous deletion outcomes against the exact
+instance ID. Bound polling by the caller context, retry documented
+transitions, and preserve definitive API failures.
+
+Co-authored-by: Codex <noreply@openai.com>
+---
+ .../alibabacloud/delete_instance_test.go      | 186 ++++++++++++++++++
+ .../alibabacloud/instance_cleanup.go          | 106 ++++++++++
+ src/cloud-providers/alibabacloud/provider.go  |  19 +-
+ 3 files changed, 298 insertions(+), 13 deletions(-)
+ create mode 100644 src/cloud-providers/alibabacloud/delete_instance_test.go
+ create mode 100644 src/cloud-providers/alibabacloud/instance_cleanup.go
+
+diff --git a/src/cloud-providers/alibabacloud/delete_instance_test.go b/src/cloud-providers/alibabacloud/delete_instance_test.go
+new file mode 100644
+index 00000000..7f8c5f87
+--- /dev/null
++++ b/src/cloud-providers/alibabacloud/delete_instance_test.go
+@@ -0,0 +1,186 @@
++// (C) Copyright Confidential Containers Contributors
++// SPDX-License-Identifier: Apache-2.0
++
++package alibabacloud
++
++import (
++	"context"
++	"errors"
++	ecs "github.com/alibabacloud-go/ecs-20140526/v4/client"
++	"github.com/alibabacloud-go/tea/tea"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++)
++
++type fakeDeleteOutcome struct {
++	err     error
++	applied bool
++}
++type fakeCleanupECSClient struct {
++	*ecs.Client
++	mu             sync.Mutex
++	instanceID     string
++	instanceExists bool
++	deleteOutcomes []fakeDeleteOutcome
++	deleteCalls    int
++	deleteForce    []bool
++}
++
++func (f *fakeCleanupECSClient) DeleteInstance(request *ecs.DeleteInstanceRequest) (*ecs.DeleteInstanceResponse, error) {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	f.deleteForce = append(f.deleteForce, tea.BoolValue(request.Force))
++	index := f.deleteCalls
++	f.deleteCalls++
++	if tea.StringValue(request.InstanceId) != f.instanceID || !f.instanceExists {
++		return nil, fakeSDKError(404, "InvalidInstanceId.NotFound")
++	}
++	outcome := fakeDeleteOutcome{applied: true}
++	if index < len(f.deleteOutcomes) {
++		outcome = f.deleteOutcomes[index]
++	}
++	if outcome.applied {
++		f.instanceExists = false
++	}
++	return &ecs.DeleteInstanceResponse{Body: &ecs.DeleteInstanceResponseBody{}}, outcome.err
++}
++
++func (f *fakeCleanupECSClient) DescribeInstanceAttribute(request *ecs.DescribeInstanceAttributeRequest) (*ecs.DescribeInstanceAttributeResponse, error) {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	if tea.StringValue(request.InstanceId) != f.instanceID || !f.instanceExists {
++		return nil, fakeSDKError(404, "InvalidInstanceId.NotFound")
++	}
++	return &ecs.DescribeInstanceAttributeResponse{Body: &ecs.DescribeInstanceAttributeResponseBody{Status: tea.String("Running")}}, nil
++}
++func fakeSDKError(status int, code string) error {
++	return &tea.SDKError{StatusCode: tea.Int(status), Code: tea.String(code)}
++}
++
++func newCleanupTestProvider(client *fakeCleanupECSClient) *alibabaCloudProvider {
++	return &alibabaCloudProvider{ecsClient: client, serviceConfig: &Config{Region: "cn-hangzhou"}}
++}
++
++func useFastCleanupTimings(t *testing.T) {
++	t.Helper()
++	oldTimeout, oldPoll := instanceCleanupTimeout, instanceCleanupPollInterval
++	instanceCleanupTimeout = 250 * time.Millisecond
++	instanceCleanupPollInterval = time.Millisecond
++	t.Cleanup(func() {
++		instanceCleanupTimeout = oldTimeout
++		instanceCleanupPollInterval = oldPoll
++	})
++}
++
++func TestDeleteInstanceReconcilesAmbiguousOutcomes(t *testing.T) {
++	useFastCleanupTimings(t)
++	t.Run("unknown success", func(t *testing.T) {
++		client := &fakeCleanupECSClient{
++			instanceID: "i-peerpod", instanceExists: true,
++
++			deleteOutcomes: []fakeDeleteOutcome{{err: context.DeadlineExceeded, applied: true}},
++		}
++		p := newCleanupTestProvider(client)
++		if err := p.DeleteInstance(context.Background(), "i-peerpod"); err != nil {
++			t.Fatalf("DeleteInstance() error = %v", err)
++		}
++		if client.deleteCalls != 1 {
++			t.Fatalf("DeleteInstance calls = %d, want reconciliation without duplicate mutation", client.deleteCalls)
++		}
++	})
++
++	t.Run("retry after unknown failure", func(t *testing.T) {
++		client := &fakeCleanupECSClient{
++			instanceID: "i-peerpod", instanceExists: true,
++
++			deleteOutcomes: []fakeDeleteOutcome{{err: context.DeadlineExceeded}, {applied: true}},
++		}
++		p := newCleanupTestProvider(client)
++		if err := p.DeleteInstance(context.Background(), "i-peerpod"); err != nil {
++			t.Fatalf("DeleteInstance() error = %v", err)
++		}
++		if client.deleteCalls != 2 {
++			t.Fatalf("DeleteInstance calls = %d, want retry", client.deleteCalls)
++		}
++	})
++}
++
++func TestDeleteInstanceRejectsDefinitiveAPIError(t *testing.T) {
++	useFastCleanupTimings(t)
++	client := &fakeCleanupECSClient{
++		instanceID: "i-peerpod", instanceExists: true,
++
++		deleteOutcomes: []fakeDeleteOutcome{{err: fakeSDKError(403, "Forbidden")}},
++	}
++	p := newCleanupTestProvider(client)
++	err := p.DeleteInstance(context.Background(), "i-peerpod")
++	if err == nil || !strings.Contains(err.Error(), "Forbidden") {
++		t.Fatalf("DeleteInstance() error = %v", err)
++	}
++}
++
++func TestDeleteInstanceRetriesDocumentedTransitionErrors(t *testing.T) {
++	useFastCleanupTimings(t)
++	for _, code := range []string{"IncorrectInstanceStatus.Initializing", "DependencyViolation.SLBConfiguring"} {
++		t.Run(code, func(t *testing.T) {
++			client := &fakeCleanupECSClient{
++				instanceID: "i-peerpod", instanceExists: true,
++
++				deleteOutcomes: []fakeDeleteOutcome{{err: fakeSDKError(403, code)}, {applied: true}},
++			}
++			p := newCleanupTestProvider(client)
++			if err := p.DeleteInstance(context.Background(), "i-peerpod"); err != nil {
++				t.Fatalf("DeleteInstance() error = %v", err)
++			}
++			if client.deleteCalls != 2 {
++				t.Fatalf("DeleteInstance calls = %d, want transition retry", client.deleteCalls)
++			}
++		})
++	}
++}
++
++func TestDeleteInstanceHonorsCancellation(t *testing.T) {
++	useFastCleanupTimings(t)
++	client := &fakeCleanupECSClient{
++		instanceID: "i-peerpod", instanceExists: true,
++	}
++	p := newCleanupTestProvider(client)
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	if err := p.DeleteInstance(ctx, "i-peerpod"); !errors.Is(err, context.Canceled) {
++		t.Fatalf("DeleteInstance() error with canceled parent = %v", err)
++	}
++	if client.deleteCalls != 0 {
++		t.Fatal("canceled call deleted instance")
++	}
++}
++
++func TestDeleteInstanceIsIdempotentUnderConcurrentCalls(t *testing.T) {
++	useFastCleanupTimings(t)
++	client := &fakeCleanupECSClient{
++		instanceID: "i-peerpod", instanceExists: true,
++	}
++	p := newCleanupTestProvider(client)
++
++	var wg sync.WaitGroup
++	errorsByCall := make([]error, 2)
++	for index := range errorsByCall {
++		wg.Add(1)
++		go func(index int) {
++			defer wg.Done()
++			errorsByCall[index] = p.DeleteInstance(context.Background(), "i-peerpod")
++		}(index)
++	}
++	wg.Wait()
++	for index, err := range errorsByCall {
++		if err != nil {
++			t.Fatalf("DeleteInstance call %d error = %v", index, err)
++		}
++	}
++	if err := p.DeleteInstance(context.Background(), "i-peerpod"); err != nil {
++		t.Fatalf("repeated DeleteInstance() error = %v", err)
++	}
++
++}
+diff --git a/src/cloud-providers/alibabacloud/instance_cleanup.go b/src/cloud-providers/alibabacloud/instance_cleanup.go
+new file mode 100644
+index 00000000..a3e85b8c
+--- /dev/null
++++ b/src/cloud-providers/alibabacloud/instance_cleanup.go
+@@ -0,0 +1,106 @@
++// (C) Copyright Confidential Containers Contributors
++// SPDX-License-Identifier: Apache-2.0
++
++package alibabacloud
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	ecs "github.com/alibabacloud-go/ecs-20140526/v4/client"
++	"github.com/alibabacloud-go/tea/tea"
++	"net"
++	"strings"
++	"time"
++)
++
++var (
++	instanceCleanupTimeout      = 10 * time.Minute
++	instanceCleanupPollInterval = 2 * time.Second
++)
++
++func (p *alibabaCloudProvider) forceDeleteInstance(ctx context.Context, instanceID string) error {
++	deleteAccepted := false
++	for {
++		if err := ctx.Err(); err != nil {
++			return fmt.Errorf("reconcile deletion of instance %s: %w", instanceID, err)
++		}
++
++		if !deleteAccepted {
++			absent, err := p.deleteInstanceAndConfirmAbsence(instanceID)
++			if absent {
++				return nil
++			}
++			switch {
++			case err == nil:
++				deleteAccepted = true
++			case isAlibabaInstanceNotFoundError(err):
++				return nil
++			case isRetryableAlibabaInstanceDeleteError(err):
++				logger.Printf("DeleteInstance outcome for %s is retryable or unknown: %v", instanceID, err)
++			default:
++				return fmt.Errorf("delete Alibaba Cloud instance %s: %w", instanceID, err)
++			}
++		}
++
++		_, err := p.ecsClient.DescribeInstanceAttribute(&ecs.DescribeInstanceAttributeRequest{
++			InstanceId: tea.String(instanceID),
++		})
++		switch {
++		case err == nil:
++		case isAlibabaInstanceNotFoundError(err):
++			return nil
++		case isAmbiguousAlibabaCloudError(err) || isIncorrectAlibabaInstanceStatusError(err):
++			logger.Printf("DescribeInstanceAttribute outcome for deleting instance %s is retryable: %v", instanceID, err)
++		default:
++			return fmt.Errorf("describe deleting Alibaba Cloud instance %s: %w", instanceID, err)
++		}
++
++		if err := waitForAlibabaCleanupPoll(ctx); err != nil {
++			return fmt.Errorf("reconcile deletion of instance %s: %w", instanceID, err)
++		}
++	}
++}
++
++func isIncorrectAlibabaInstanceStatusError(err error) bool {
++	var sdkErr *tea.SDKError
++	if !errors.As(err, &sdkErr) {
++		return false
++	}
++	code := tea.StringValue(sdkErr.Code)
++	return code == "IncorrectInstanceStatus" || strings.HasPrefix(code, "IncorrectInstanceStatus.")
++}
++
++func isRetryableAlibabaInstanceDeleteError(err error) bool {
++	if isIncorrectAlibabaInstanceStatusError(err) || isAmbiguousAlibabaCloudError(err) {
++		return true
++	}
++	var sdkErr *tea.SDKError
++	if !errors.As(err, &sdkErr) {
++		return false
++	}
++	// Alibaba documents this dependency as an in-progress SLB transition. Do
++	// not retry other DependencyViolation errors that require operator action.
++	return tea.StringValue(sdkErr.Code) == "DependencyViolation.SLBConfiguring"
++}
++
++func waitForAlibabaCleanupPoll(ctx context.Context) error {
++	timer := time.NewTimer(instanceCleanupPollInterval)
++	defer timer.Stop()
++	select {
++	case <-ctx.Done():
++		return ctx.Err()
++	case <-timer.C:
++		return nil
++	}
++}
++
++func isAmbiguousAlibabaCloudError(err error) bool {
++	var sdkErr *tea.SDKError
++	if errors.As(err, &sdkErr) && sdkErr.StatusCode != nil {
++		status := *sdkErr.StatusCode
++		return status == 408 || status == 429 || status >= 500
++	}
++	var netErr net.Error
++	return errors.As(err, &netErr) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)
++}
+diff --git a/src/cloud-providers/alibabacloud/provider.go b/src/cloud-providers/alibabacloud/provider.go
+index 8134204d..1f9fbe8d 100644
+--- a/src/cloud-providers/alibabacloud/provider.go
++++ b/src/cloud-providers/alibabacloud/provider.go
+@@ -407,22 +407,15 @@ func (p *alibabaCloudProvider) DeleteInstance(ctx context.Context, instanceID st
+ 		return errors.New("refusing to delete an Alibaba Cloud instance without an ID")
+ 	}
+ 	logger.Printf("Deleting instance (%s)", instanceID)
+-	err := p.waitUntilTimeout(time.Duration(time.Second*30), func() (bool, error) {
+-		_, err := p.deleteInstanceAndConfirmAbsence(instanceID)
+-		if err != nil {
+-			var sdkError *tea.SDKError
+-			if errors.As(err, &sdkError) && sdkError != nil && tea.StringValue(sdkError.Code) == "IncorrectInstanceStatus" {
+-				return false, nil
+-			}
+-			return false, err
+-		}
+-		return true, nil
+-	})
++	cleanupCtx, cancel := context.WithTimeout(ctx, instanceCleanupTimeout)
++	defer cancel()
++
++	err := p.forceDeleteInstance(cleanupCtx, instanceID)
+ 	if err != nil {
+-		return fmt.Errorf("failed to delete an instance %s: %w", instanceID, err)
++		return err
+ 	}
+ 
+-	logger.Printf("Deleted an instance %s", instanceID)
++	logger.Printf("Deleted instance %s", instanceID)
+ 
+ 	p.eipsMu.Lock()
+ 	eipID := p.eips[instanceID]
+-- 
+2.43.7
+
