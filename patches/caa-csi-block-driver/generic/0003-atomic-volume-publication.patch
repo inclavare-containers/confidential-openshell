@@ -15,15 +15,15 @@ fails, allowing an unpublish retry to finish.
 Co-authored-by: Codex <noreply@openai.com>
 ---
  pkg/driver/controllerserver.go            |   2 +
- pkg/driver/directvolume.go                |  91 ++++++-
- pkg/driver/directvolume_test.go           | 290 ++++++++++++++++++++++
- pkg/driver/identity_contract_test.go      |  44 ++++
- pkg/driver/metadata_atomic.go             |  48 ++++
- pkg/driver/metadata_atomic_test.go        |  49 ++++
+ pkg/driver/directvolume.go                |  91 ++++++++-
+ pkg/driver/directvolume_test.go           | 307 ++++++++++++++++++++++++++++++
+ pkg/driver/identity_contract_test.go      |  44 +++++
+ pkg/driver/metadata_atomic.go             |  48 +++++
+ pkg/driver/metadata_atomic_test.go        |  49 +++++
  pkg/driver/mount_properties_test.go       |  15 +-
- pkg/driver/nodeserver.go                  |  88 +++++--
+ pkg/driver/nodeserver.go                  |  89 ++++++---
  pkg/driver/testdata/direct-volume-v1.json |   1 +
- 9 files changed, 584 insertions(+), 44 deletions(-)
+ 9 files changed, 602 insertions(+), 44 deletions(-)
  create mode 100644 pkg/driver/directvolume_test.go
  create mode 100644 pkg/driver/identity_contract_test.go
  create mode 100644 pkg/driver/metadata_atomic.go
@@ -164,10 +164,10 @@ index 2bece324..c8a039c7 100644
 +}
 diff --git a/pkg/driver/directvolume_test.go b/pkg/driver/directvolume_test.go
 new file mode 100644
-index 00000000..1d534b2e
+index 00000000..753f3acb
 --- /dev/null
 +++ b/pkg/driver/directvolume_test.go
-@@ -0,0 +1,290 @@
+@@ -0,0 +1,307 @@
 +// (C) Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -458,6 +458,23 @@ index 00000000..1d534b2e
 +		t.Fatalf("unpublish: %v", err)
 +	}
 +}
++
++func TestNodePublishCorrectRetryAfterRejectedRecovery(t *testing.T) {
++	node, target, _ := setupPublishedNode(t)
++	request := publishRequest(target, csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER, false)
++	if _, err := node.NodePublishVolume(t.Context(), request); err != nil {
++		t.Fatal(err)
++	}
++	node.devices = map[string]string{} // node-plugin restart
++	wrong := publishRequest(target, csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER, false)
++	wrong.VolumeContext["cloud-volume-path"] = "wrong-disk"
++	if _, err := node.NodePublishVolume(t.Context(), wrong); status.Code(err) != codes.AlreadyExists {
++		t.Fatalf("wrong recovery: %v", err)
++	}
++	if _, err := node.NodePublishVolume(t.Context(), request); err != nil {
++		t.Fatalf("correct retry: %v", err)
++	}
++}
 diff --git a/pkg/driver/identity_contract_test.go b/pkg/driver/identity_contract_test.go
 new file mode 100644
 index 00000000..8fd9a7e1
@@ -651,7 +668,7 @@ index ca3c939c..fa21fb70 100644
  	node.devices["pvc-workspace"] = "cloud-disk-123"
  	metadataPath := filepath.Join(root, b64.URLEncoding.EncodeToString([]byte(target)), mountInfoFileName)
 diff --git a/pkg/driver/nodeserver.go b/pkg/driver/nodeserver.go
-index 37a6cca4..087b9603 100644
+index 37a6cca4..41fd1905 100644
 --- a/pkg/driver/nodeserver.go
 +++ b/pkg/driver/nodeserver.go
 @@ -18,15 +18,16 @@ import (
@@ -683,7 +700,7 @@ index 37a6cca4..087b9603 100644
  		if err := json.Unmarshal(data, &info); err != nil {
  			nsLogger.Printf("startup cleanup: removing corrupt mountInfo dir %s: %v", entry.Name(), err)
  			if err := os.RemoveAll(dirPath); err != nil {
-@@ -175,11 +177,25 @@ func (ns *nodeServer) NodePublishVolume(_ context.Context, req *csi.NodePublishV
+@@ -175,11 +177,24 @@ func (ns *nodeServer) NodePublishVolume(_ context.Context, req *csi.NodePublishV
  	if req.GetVolumeCapability() == nil {
  		return nil, status.Error(codes.InvalidArgument, "Volume capability missing")
  	}
@@ -699,7 +716,6 @@ index 37a6cca4..087b9603 100644
  	devicePath := ns.devices[volumeID]
 +	if devicePath == "" && contextPath != "" {
 +		devicePath = contextPath
-+		ns.devices[volumeID] = devicePath
 +	}
  	ns.mu.Unlock()
 -
@@ -710,7 +726,7 @@ index 37a6cca4..087b9603 100644
  	if devicePath == "" {
  		return nil, status.Errorf(codes.FailedPrecondition, "volume %s not staged (no device path)", volumeID)
  	}
-@@ -220,31 +236,32 @@ func (ns *nodeServer) NodePublishVolume(_ context.Context, req *csi.NodePublishV
+@@ -220,31 +235,34 @@ func (ns *nodeServer) NodePublishVolume(_ context.Context, req *csi.NodePublishV
  	}
  
  	info := mountInfoJSON{
@@ -759,10 +775,12 @@ index 37a6cca4..087b9603 100644
 +	} else if err := writeDirectVolumeMetadataAtomic(metadataPath, info); err != nil {
 +		return nil, status.Errorf(codes.Internal, "failed to publish mountInfo.json: %v", err)
 +	}
++
++	ns.devices[volumeID] = devicePath
  
  	nsLogger.Printf("NodePublishVolume: %s published at %s (device=%s, provider=%s)",
  		volumeID, targetPath, devicePath, attrib["cloud-provider"])
-@@ -253,18 +270,35 @@ func (ns *nodeServer) NodePublishVolume(_ context.Context, req *csi.NodePublishV
+@@ -253,18 +271,35 @@ func (ns *nodeServer) NodePublishVolume(_ context.Context, req *csi.NodePublishV
  }
  
  func (ns *nodeServer) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
@@ -809,6 +827,3 @@ index 00000000..c8c6d412
 +++ b/pkg/driver/testdata/direct-volume-v1.json
 @@ -0,0 +1 @@
 +{"version":1,"volume-type":"block","volume-mode":"filesystem","device":"d-workspace123","fstype":"ext4","readonly":true,"options":["noatime","ro"],"fs-group":"2000","pod-uid":"pod-uid-123","volume-handle":"pvc-workspace","metadata":{"cloud-provider":"alibabacloud","cloud-volume-path":"d-workspace123"}}
--- 
-2.43.7
-

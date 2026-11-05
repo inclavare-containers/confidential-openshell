@@ -9,23 +9,23 @@ Keep the upstream combined DaemonSet and node-local store; add Alibaba-only RRSA
 
 Co-authored-by: Codex <noreply@openai.com>
 ---
- README.md                                     |   1 +
- .../templates/_helpers.tpl                    |   3 +
- .../templates/bootstrap-params.yaml           |   4 +
- .../templates/daemonset.yaml                  |  30 ++
- .../templates/storageclass.yaml               |   7 +-
- charts/caa-csi-block-driver/values.yaml       |  14 +-
- cmd/main.go                                   |   1 +
- deploy/bootstrap-params-alibabacloud.yaml     |  15 +
- deploy/daemonset-alibabacloud.yaml            | 168 +++++++++++
- deploy/storageclass-alibabacloud.yaml         |  19 ++
- docs/alibabacloud.md                          |  28 ++
- go.mod                                        |  15 +
- go.sum                                        | 238 +++++++++++++++
- pkg/provider/alibabacloud/credentials_test.go |  80 +++++
- pkg/provider/alibabacloud/provider.go         | 280 ++++++++++++++++++
- pkg/provider/alibabacloud/provider_test.go    | 142 +++++++++
- 16 files changed, 1043 insertions(+), 2 deletions(-)
+ README.md                                          |   1 +
+ charts/caa-csi-block-driver/templates/_helpers.tpl |   3 +
+ .../templates/bootstrap-params.yaml                |   4 +
+ .../caa-csi-block-driver/templates/daemonset.yaml  |  30 +++
+ .../templates/storageclass.yaml                    |   7 +-
+ charts/caa-csi-block-driver/values.yaml            |  14 +-
+ cmd/main.go                                        |   1 +
+ deploy/bootstrap-params-alibabacloud.yaml          |  15 ++
+ deploy/daemonset-alibabacloud.yaml                 | 168 ++++++++++++
+ deploy/storageclass-alibabacloud.yaml              |  19 ++
+ docs/alibabacloud.md                               |  28 ++
+ go.mod                                             |  15 ++
+ go.sum                                             | 238 +++++++++++++++++
+ pkg/provider/alibabacloud/credentials_test.go      |  89 +++++++
+ pkg/provider/alibabacloud/provider.go              | 293 +++++++++++++++++++++
+ pkg/provider/alibabacloud/provider_test.go         | 185 +++++++++++++
+ 16 files changed, 1108 insertions(+), 2 deletions(-)
  create mode 100644 deploy/bootstrap-params-alibabacloud.yaml
  create mode 100644 deploy/daemonset-alibabacloud.yaml
  create mode 100644 deploy/storageclass-alibabacloud.yaml
@@ -812,10 +812,10 @@ index cc2887e5..12aac17a 100644
 +honnef.co/go/tools v0.0.0-20190523083050-ea95bdfd59fc/go.mod h1:rf3lG4BRIbNafJWhAfAdb/ePZxsR/4RtNHQocxwk9r4=
 diff --git a/pkg/provider/alibabacloud/credentials_test.go b/pkg/provider/alibabacloud/credentials_test.go
 new file mode 100644
-index 00000000..2e5b4eaa
+index 00000000..7a4a29ea
 --- /dev/null
 +++ b/pkg/provider/alibabacloud/credentials_test.go
-@@ -0,0 +1,80 @@
+@@ -0,0 +1,89 @@
 +// (C) Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -831,31 +831,30 @@ index 00000000..2e5b4eaa
 +	"net/http/httptest"
 +	"os"
 +	"path/filepath"
++	"sync"
 +	"sync/atomic"
 +	"testing"
 +	"time"
 +)
 +
 +func TestSDKCredentialCacheSurvivesProviderRecreation(t *testing.T) {
-+	var stsCalls, ecsCalls atomic.Int64
++	var stsCalls atomic.Int64
 +	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 +		_ = r.ParseForm()
 +		w.Header().Set("Content-Type", "application/json")
 +		if r.FormValue("Action") == "AssumeRoleWithOIDC" {
-+			stsCalls.Add(1)
++			call := stsCalls.Add(1)
++			expiration := time.Now().Add(time.Hour)
++			if call == 1 {
++				expiration = time.Now().Add(time.Minute)
++			}
 +			_ = json.NewEncoder(w).Encode(map[string]any{"Credentials": map[string]string{
 +				"AccessKeyId": "fixture-id", "AccessKeySecret": "fixture-secret", "SecurityToken": "fixture-token",
-+				"Expiration": time.Now().Add(time.Hour).UTC().Format("2006-01-02T15:04:05Z"),
++				"Expiration": expiration.UTC().Format("2006-01-02T15:04:05Z"),
 +			}})
 +			return
 +		}
-+		if r.Header.Get("x-acs-action") != "DescribeDisks" {
-+			t.Errorf("unexpected local operation: %s", r.Header.Get("x-acs-action"))
-+			w.WriteHeader(http.StatusBadRequest)
-+			return
-+		}
-+		ecsCalls.Add(1)
-+		_, _ = w.Write([]byte(`{"TotalCount":0,"Disks":{"Disk":[]}}`))
++		t.Errorf("unexpected operation: %s", r.FormValue("Action"))
 +	}))
 +	defer server.Close()
 +	roots := x509.NewCertPool()
@@ -883,25 +882,35 @@ index 00000000..2e5b4eaa
 +	t.Setenv("ALIBABA_CLOUD_OIDC_TOKEN_FILE", token)
 +	t.Setenv("ALIBABA_CLOUD_OIDC_PROVIDER_ARN", "fixture-provider")
 +	t.Setenv("ALIBABA_CLOUD_ROLE_ARN", "fixture-role")
-+	for range 3 {
++	read := func() {
 +		p, err := NewAlibabaCloudProvider(map[string]string{"region": "cn-beijing", "clusterId": "fixture"})
 +		if err != nil {
-+			t.Fatal(err)
++			t.Error(err)
++			return
 +		}
-+		if _, err := p.VolumeExists(context.Background(), "pvc-fixture"); err != nil {
-+			t.Fatal(err)
++		if _, err := p.sdk.Credential.GetCredential(); err != nil {
++			t.Error(err)
 +		}
 +	}
-+	if stsCalls.Load() != 1 || ecsCalls.Load() != 3 {
-+		t.Fatalf("credential cache not reused: STS=%d ECS=%d", stsCalls.Load(), ecsCalls.Load())
++	read() // Cache a credential already within the SDK refresh window.
++	var group sync.WaitGroup
++	start := make(chan struct{})
++	for range 20 {
++		group.Add(1)
++		go func() { defer group.Done(); <-start; read() }()
++	}
++	close(start)
++	group.Wait()
++	if stsCalls.Load() != 2 {
++		t.Fatalf("expected one initial fetch and one refresh, got %d", stsCalls.Load())
 +	}
 +}
 diff --git a/pkg/provider/alibabacloud/provider.go b/pkg/provider/alibabacloud/provider.go
 new file mode 100644
-index 00000000..d4248c4e
+index 00000000..3b12f655
 --- /dev/null
 +++ b/pkg/provider/alibabacloud/provider.go
-@@ -0,0 +1,280 @@
+@@ -0,0 +1,293 @@
 +// (C) Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -913,7 +922,6 @@ index 00000000..d4248c4e
 +	"encoding/json"
 +	"errors"
 +	"fmt"
-+	"net/http"
 +	"sync"
 +	"time"
 +
@@ -922,6 +930,7 @@ index 00000000..d4248c4e
 +	"github.com/alibabacloud-go/tea/dara"
 +	"github.com/alibabacloud-go/tea/tea"
 +	"github.com/aliyun/credentials-go/credentials"
++	"github.com/aliyun/credentials-go/credentials/providers"
 +
 +	"github.com/confidential-devhub/caa-csi-block-driver/pkg/provider"
 +)
@@ -946,8 +955,21 @@ index 00000000..d4248c4e
 +// CSI constructs a provider for each RPC. Credential identity is fixed by the
 +// controller process environment; retain the SDK object so its normal refresh
 +// cache survives those provider instances. Product/region settings stay local.
-+var defaultCredential = sync.OnceValues(func() (credentials.Credential, error) {
-+	return credentials.NewCredential(nil)
++type serializedCredentials struct {
++	providers.CredentialsProvider
++	mu sync.Mutex
++}
++
++func (p *serializedCredentials) GetCredentials() (*providers.Credentials, error) {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	return p.CredentialsProvider.GetCredentials()
++}
++
++var defaultCredential = sync.OnceValue(func() credentials.Credential {
++	return credentials.FromCredentialsProvider("default", &serializedCredentials{
++		CredentialsProvider: providers.NewDefaultCredentialsProvider(),
++	})
 +})
 +
 +func init() {
@@ -963,34 +985,17 @@ index 00000000..d4248c4e
 +	if params["clusterId"] == "" {
 +		return nil, errors.New("clusterId is required")
 +	}
-+	credential, err := defaultCredential()
-+	if err != nil {
-+		return nil, err
-+	}
 +	return &AlibabaCloudProvider{
 +		config: Config{Region: params["region"], Zone: params["zoneId"], ClusterID: params["clusterId"]},
 +		sdk: openapi.Config{
-+			RegionId: tea.String(params["region"]), Credential: credential,
++			RegionId: tea.String(params["region"]), Credential: defaultCredential(),
 +			ReadTimeout: tea.Int(30000), ConnectTimeout: tea.Int(10000),
 +		},
 +	}, nil
 +}
 +
-+// Generated ECS methods have no context parameter. Bind the HTTP request to
-+// the CSI context without changing the shared SDK configuration.
-+type contextHTTPClient struct{ ctx context.Context }
-+
-+func (c contextHTTPClient) Call(req *http.Request, _ *http.Transport) (*http.Response, error) {
-+	client := http.Client{Timeout: 30 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-+	return client.Do(req.Clone(c.ctx))
-+}
-+
-+func (p *AlibabaCloudProvider) client(ctx context.Context) (*ecs.Client, error) {
-+	if err := ctx.Err(); err != nil {
-+		return nil, err
-+	}
++func (p *AlibabaCloudProvider) client() (*ecs.Client, error) {
 +	config := p.sdk
-+	config.HttpClient = contextHTTPClient{ctx}
 +	return ecs.NewClient(&config)
 +}
 +
@@ -1003,7 +1008,10 @@ index 00000000..d4248c4e
 +	}
 +	// Recover a previous successful create using the same cloud tags as upstream providers.
 +	if disk != nil {
-+		return volumeInfo(disk), nil
++		if diskReady(disk) {
++			return volumeInfo(disk), nil
++		}
++		return p.waitForDisk(ctx, tea.StringValue(disk.DiskId))
 +	}
 +	if p.config.Zone == "" {
 +		return nil, errors.New("zoneId is required to create volumes")
@@ -1012,11 +1020,11 @@ index 00000000..d4248c4e
 +	if err != nil {
 +		return nil, err
 +	}
-+	client, err := p.client(ctx)
++	client, err := p.client()
 +	if err != nil {
 +		return nil, err
 +	}
-+	response, err := client.CreateDiskWithOptions(&ecs.CreateDiskRequest{
++	response, err := client.CreateDiskWithContext(ctx, &ecs.CreateDiskRequest{
 +		RegionId: tea.String(p.config.Region), ZoneId: tea.String(p.config.Zone),
 +		ClientToken:  tea.String(fmt.Sprintf("%x", sha256.Sum256([]byte(p.config.ClusterID+"\x00"+volumeID)))),
 +		DiskCategory: tea.String("cloud_essd"), PerformanceLevel: tea.String("PL0"), Size: tea.Int32(size),
@@ -1035,14 +1043,25 @@ index 00000000..d4248c4e
 +	if response == nil || response.Body == nil || tea.StringValue(response.Body.DiskId) == "" {
 +		return nil, errors.New("CreateDisk returned no disk ID")
 +	}
-+	ids, _ := json.Marshal([]string{tea.StringValue(response.Body.DiskId)})
++	return p.waitForDisk(ctx, tea.StringValue(response.Body.DiskId))
++}
++
++func diskReady(disk *ecs.DescribeDisksResponseBodyDisksDisk) bool {
++	return tea.StringValue(disk.Status) == "Available" || tea.StringValue(disk.Status) == "In_use"
++}
++
++func (p *AlibabaCloudProvider) waitForDisk(ctx context.Context, id string) (*provider.VolumeInfo, error) {
++	ids, _ := json.Marshal([]string{id})
 +	for {
 +		disks, err := p.describeDisks(ctx, &ecs.DescribeDisksRequest{DiskIds: tea.String(string(ids))})
 +		if err != nil {
 +			return nil, err
 +		}
-+		if len(disks) == 1 && (tea.StringValue(disks[0].Status) == "Available" || tea.StringValue(disks[0].Status) == "In_use") {
++		if len(disks) == 1 && diskReady(disks[0]) {
 +			return volumeInfo(disks[0]), nil
++		}
++		if len(disks) == 1 && tea.StringValue(disks[0].Status) == "Deleting" {
++			return nil, fmt.Errorf("disk %s is being deleted", id)
 +		}
 +		select {
 +		case <-ctx.Done():
@@ -1060,11 +1079,11 @@ index 00000000..d4248c4e
 +	if tea.StringValue(disk.InstanceId) != "" || tea.StringValue(disk.Status) == "In_use" {
 +		return fmt.Errorf("disk %s is attached", tea.StringValue(disk.DiskId))
 +	}
-+	client, err := p.client(ctx)
++	client, err := p.client()
 +	if err != nil {
 +		return err
 +	}
-+	_, err = client.DeleteDiskWithOptions(&ecs.DeleteDiskRequest{DiskId: disk.DiskId}, &dara.RuntimeOptions{Autoretry: tea.Bool(false)})
++	_, err = client.DeleteDiskWithContext(ctx, &ecs.DeleteDiskRequest{DiskId: disk.DiskId}, &dara.RuntimeOptions{Autoretry: tea.Bool(false)})
 +	if ctx.Err() != nil {
 +		return ctx.Err()
 +	}
@@ -1122,6 +1141,9 @@ index 00000000..d4248c4e
 +	}
 +	volumes := make([]*provider.VolumeInfo, 0, len(disks))
 +	for _, disk := range disks {
++		if !diskReady(disk) {
++			continue
++		}
 +		if info := volumeInfo(disk); info.VolumeID != "" {
 +			volumes = append(volumes, info)
 +		}
@@ -1130,7 +1152,7 @@ index 00000000..d4248c4e
 +}
 +
 +func (p *AlibabaCloudProvider) describeDisks(ctx context.Context, req *ecs.DescribeDisksRequest) ([]*ecs.DescribeDisksResponseBodyDisksDisk, error) {
-+	client, err := p.client(ctx)
++	client, err := p.client()
 +	if err != nil {
 +		return nil, err
 +	}
@@ -1141,7 +1163,7 @@ index 00000000..d4248c4e
 +	var disks []*ecs.DescribeDisksResponseBodyDisksDisk
 +	for page := int32(1); ; page++ {
 +		req.PageNumber = tea.Int32(page)
-+		response, err := client.DescribeDisksWithOptions(req, &dara.RuntimeOptions{Autoretry: tea.Bool(false)})
++		response, err := client.DescribeDisksWithContext(ctx, req, &dara.RuntimeOptions{Autoretry: tea.Bool(false)})
 +		if ctx.Err() != nil {
 +			return nil, ctx.Err()
 +		}
@@ -1184,10 +1206,10 @@ index 00000000..d4248c4e
 +}
 diff --git a/pkg/provider/alibabacloud/provider_test.go b/pkg/provider/alibabacloud/provider_test.go
 new file mode 100644
-index 00000000..403f45b9
+index 00000000..b9eb83c0
 --- /dev/null
 +++ b/pkg/provider/alibabacloud/provider_test.go
-@@ -0,0 +1,142 @@
+@@ -0,0 +1,185 @@
 +// (C) Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -1225,6 +1247,9 @@ index 00000000..403f45b9
 +}
 +
 +func TestVolumeLifecycle(t *testing.T) {
++	for _, key := range []string{"HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"} {
++		t.Setenv(key, "")
++	}
 +	exists, creates, denyLookup := false, 0, false
 +	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 +		_ = r.ParseForm()
@@ -1304,6 +1329,9 @@ index 00000000..403f45b9
 +}
 +
 +func TestCreateDiskRetryReusesTokenWithoutCrossClusterCollision(t *testing.T) {
++	for _, key := range []string{"HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"} {
++		t.Setenv(key, "")
++	}
 +	var tokens []string
 +	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 +		_ = r.ParseForm()
@@ -1330,6 +1358,40 @@ index 00000000..403f45b9
 +		t.Fatalf("retry/cluster/volume token scope is incorrect: %v", tokens)
 +	}
 +}
--- 
-2.43.7
-
++
++func TestExistingDiskWaitsAndRecoverySkipsDeleting(t *testing.T) {
++	for _, key := range []string{"HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"} {
++		t.Setenv(key, "")
++	}
++	lookups := 0
++	state := "Creating"
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		_ = r.ParseForm()
++		if r.Header.Get("x-acs-action") != "DescribeDisks" {
++			t.Errorf("unexpected create/retry: %s", r.Header.Get("x-acs-action"))
++		}
++		lookups++
++		if state == "Creating" && lookups > 1 {
++			state = "Available"
++		}
++		w.Header().Set("Content-Type", "application/json")
++		_ = json.NewEncoder(w).Encode(map[string]any{"TotalCount": 1, "Disks": map[string]any{"Disk": []map[string]any{{"DiskId": "d-test", "Status": state, "Size": 1, "Tags": map[string]any{"Tag": []map[string]string{{"TagKey": volumeTagKey, "TagValue": "pvc-test"}}}}}}})
++	}))
++	defer server.Close()
++	p := &AlibabaCloudProvider{config: Config{Region: "cn-beijing", ClusterID: "fixture"}, sdk: openapi.Config{
++		Endpoint: tea.String(strings.TrimPrefix(server.URL, "http://")), Protocol: tea.String("http"), AccessKeyId: tea.String("fake"), AccessKeySecret: tea.String("fake"),
++	}}
++	if _, err := p.CreateVolume(context.Background(), "pvc-test", gib); err != nil {
++		t.Fatal(err)
++	}
++	if lookups != 2 {
++		t.Fatalf("returned before the existing disk was ready: %d reads", lookups)
++	}
++	state = "Deleting"
++	if _, err := p.CreateVolume(context.Background(), "pvc-test", gib); err == nil {
++		t.Fatal("returned deleting disk")
++	}
++	if volumes, err := p.ListManagedVolumes(context.Background()); err != nil || len(volumes) != 0 {
++		t.Fatalf("recovered deleting disk: %v %v", volumes, err)
++	}
++}
