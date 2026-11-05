@@ -2,6 +2,11 @@
 CLOUD_VOLUMES_KEY = "io.confidentialcontainers.org.cloud_volumes"
 WORKSPACE_MOUNTS = __WORKSPACE_MOUNTS__
 
+workspace_mount_destination(destination) if {
+    some container
+    destination in WORKSPACE_MOUNTS[container]
+}
+
 workspace_cloud_volume(encoded, destination) := volumes[name] if {
     volumes := json.unmarshal(encoded)
     some name
@@ -31,5 +36,5 @@ check_mount(p_mount, i_mount, bundle_id, sandbox_id) if {
     some name, volume in volumes
     volume == workspace_cloud_volume(encoded, p_mount.destination)
     volume.readonly == ("ro" in p_mount.options)
-    i_mount.source == concat("", ["/run/cloud-volumes/", name])
+    i_mount.source == concat("", ["/run/cloud-volumes/", volume.disk_id])
 }

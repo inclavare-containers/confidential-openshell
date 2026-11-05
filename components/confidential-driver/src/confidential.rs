@@ -187,6 +187,10 @@ impl GuestInitdata {
             let config = toml::Value::try_from(serde_json::json!({
                 "version": "0.1.0", "key_uri": uri, "allow_initialize": allow_workspace_initialize,
                 "encryption_type": "luks2", "filesystem_type": "ext4", "disk_ids": disk_ids,
+                "mounts": if generated_policy.is_some() {
+                    store.workspace_mounts(sandbox_id, namespace, sandbox_resource_uid)
+                        .map_err(|error| format!("read measured workspace mounts: {error}"))?
+                } else { json!({}) },
             }))
             .map_err(|error| format!("serialize measured workspace configuration: {error}"))?;
             data.insert(
@@ -346,6 +350,18 @@ mod tests {
                 Some("d-workspace"),
             )
             .unwrap();
+        store.record_launch(&crate::launch::LaunchIntent {
+            sandbox_id: "sandbox-1".into(), namespace: "sandbox".into(), sandbox_cr_uid: "cr-uid-1".into(),
+            sandbox_name: "test".into(), main_process_spec: "test".into(), log_level: "info".into(),
+            agent_uid: 1000, agent_gid: 1000, volume_claim_templates: serde_json::Value::Null,
+            workload: serde_json::from_value(serde_json::json!({"apiVersion":"v1", "kind":"Pod",
+                "spec":{"containers":[{"name":"agent", "image":"approved",
+                    "volumeMounts":[{"name":"workspace", "mountPath":"/sandbox"}]}],
+                    "initContainers":[{"name":"workspace-init", "image":"approved",
+                    "volumeMounts":[{"name":"workspace", "mountPath":"/mnt/openshell-workspace"}]}],
+                    "securityContext":{"fsGroup":1000},
+                    "volumes":[{"name":"workspace", "persistentVolumeClaim":{"claimName":"workspace-pvc"}}]}})).unwrap(),
+        }).unwrap();
         let workspace_uri = store
             .plan_workspace_key("sandbox", "cr-uid-1")
             .expect("plan key")

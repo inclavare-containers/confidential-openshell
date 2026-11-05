@@ -5,7 +5,7 @@
   },
   "cloud-api-adaptor": {
     "base": "9ca88115b6daa43f023a8a3b61ee48190707b6e1",
-    "result_tree": "208958a6ae29b0702e5014614e9fa8380552babe"
+    "result_tree": "b10fd9ec7414e194858ec41f6bf5d43866615535"
   },
   "caa-csi-block-driver": {
     "base": "aa4e40abeab760240569979680bc985c86783ce8",

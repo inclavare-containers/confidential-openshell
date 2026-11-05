@@ -3,9 +3,11 @@ From: Weidong Sun <sunweidong@linux.alibaba.com>
 Date: Wed, 4 Nov 2026 15:24:44 +0800
 Subject: [PATCH] guest: authorize encrypted workspaces through measured policy
 
-Authorize disk identity, key, filesystem and initialization from measured
-initdata. Use CDH to open the encrypted device and verify the mapping and
-mount access before forwarding the container request.
+Authorize disk identity, key, filesystem, initialization and per-container
+mount properties from measured initdata before device operations. Required
+mounts cannot disappear with host annotations. Use the disk ID for the guest
+mount and CDH mapper so host aliases cannot reopen the same filesystem.
+Verify the mapping and mount access before forwarding the container request.
 
 Track and release acquired encrypted-workspace resources on preparation,
 agent and sandbox cleanup paths. Keep ordinary cloud volumes on their
@@ -15,6 +17,26 @@ encrypted-volume profile is enabled.
 
 Co-authored-by: Codex <noreply@openai.com>
 ---
+ .../cmd/agent-protocol-forwarder/main.go           |  26 +-
+ .../cmd/agent-protocol-forwarder/main_test.go      |  19 +
+ .../pkg/forwarder/interceptor/cdh_client.go        |  59 +++
+ .../pkg/forwarder/interceptor/interceptor.go       | 269 +++++++----
+ .../pkg/forwarder/interceptor/interceptor_test.go  |   9 +
+ .../pkg/forwarder/interceptor/workspace.go         | 286 ++++++++++++
+ .../pkg/forwarder/interceptor/workspace_mount.go   | 509 +++++++++++++++++++++
+ .../workspace_mount_integration_test.go            |  67 +++
+ .../forwarder/interceptor/workspace_mount_test.go  | 210 +++++++++
+ .../pkg/forwarder/interceptor/workspace_test.go    | 122 +++++
+ .../interceptor/workspace_transaction_test.go      | 114 +++++
+ 11 files changed, 1601 insertions(+), 89 deletions(-)
+ create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/cdh_client.go
+ create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace.go
+ create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace_mount.go
+ create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace_mount_integration_test.go
+ create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace_mount_test.go
+ create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace_test.go
+ create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace_transaction_test.go
+
 diff --git a/src/cloud-api-adaptor/cmd/agent-protocol-forwarder/main.go b/src/cloud-api-adaptor/cmd/agent-protocol-forwarder/main.go
 index 189a3595..e36fccec 100644
 --- a/src/cloud-api-adaptor/cmd/agent-protocol-forwarder/main.go
@@ -176,7 +198,7 @@ index 00000000..a87c24fd
 +	return nil
 +}
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
-index 565ba101..6810fbb4 100644
+index 565ba101..edb069e0 100644
 --- a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
 @@ -5,7 +5,9 @@ package interceptor
@@ -261,7 +283,7 @@ index 565ba101..6810fbb4 100644
  	logger.Printf("CreateContainer: containerID:%s", req.ContainerId)
  
  	// Specify the network namespace path in the container spec
-@@ -123,87 +139,108 @@ func (i *interceptor) CreateContainer(ctx context.Context, req *pb.CreateContain
+@@ -123,87 +139,109 @@ func (i *interceptor) CreateContainer(ctx context.Context, req *pb.CreateContain
  		logger.Printf("    %s: %q", ns.Type, ns.Path)
  	}
  
@@ -272,14 +294,14 @@ index 565ba101..6810fbb4 100644
 -		if err != nil {
 -			return nil, fmt.Errorf("corrupt cloud_volumes annotation (pod would start without volumes): %w", err)
 -		}
-+	var preparedVolumes []*preparedWorkspaceVolume
- 
+-
 -		volNames := make([]string, 0, len(cloudVolumes))
 -		for k := range cloudVolumes {
 -			volNames = append(volNames, k)
 -		}
 -		sort.Strings(volNames)
--
++	var preparedVolumes []*preparedWorkspaceVolume
+ 
 -		for _, volName := range volNames {
 -			volInfo := cloudVolumes[volName]
 -			mountPoint := volInfo.MountPoint
@@ -289,7 +311,8 @@ index 565ba101..6810fbb4 100644
 -			lunStr := volInfo.LUN
 -			if mountPoint == "" || lunStr == "" {
 -				return nil, fmt.Errorf("cloud volume %s missing required mount_point or lun field", volName)
-+	if cvJSON, ok := req.OCI.Annotations[util.CloudVolumesAnnotationKey]; ok && cvJSON != "" {
++	cvJSON := req.OCI.Annotations[util.CloudVolumesAnnotationKey]
++	if i.requireEncryptedVolumes || cvJSON != "" {
 +		if i.requireEncryptedVolumes {
 +			// Serialize acquisition with sandbox cleanup and other container retries.
 +			i.workspaceMu.Lock()
@@ -436,7 +459,7 @@ index 565ba101..6810fbb4 100644
  		}
  	}
  
-@@ -230,19 +267,13 @@ func (i *interceptor) CreateContainer(ctx context.Context, req *pb.CreateContain
+@@ -230,19 +268,13 @@ func (i *interceptor) CreateContainer(ctx context.Context, req *pb.CreateContain
  		}
  	}
  
@@ -457,7 +480,7 @@ index 565ba101..6810fbb4 100644
  func normalizeBindMountOptions(options []string, readOnly bool) []string {
  	result := make([]string, 0, len(options)+1)
  	seen := make(map[string]struct{}, len(options)+1)
-@@ -266,6 +297,10 @@ func normalizeBindMountOptions(options []string, readOnly bool) []string {
+@@ -266,6 +298,10 @@ func normalizeBindMountOptions(options []string, readOnly bool) []string {
  	return result
  }
  
@@ -468,7 +491,7 @@ index 565ba101..6810fbb4 100644
  func waitForDeviceMounted(ctx context.Context, path string) error {
  
  	ctx, cancel := context.WithTimeout(ctx, volumeCheckTimeout)
-@@ -357,12 +392,24 @@ func (i *interceptor) DestroySandbox(ctx context.Context, req *pb.DestroySandbox
+@@ -357,12 +393,24 @@ func (i *interceptor) DestroySandbox(ctx context.Context, req *pb.DestroySandbox
  
  	logger.Printf("DestroySandbox")
  
@@ -494,7 +517,7 @@ index 565ba101..6810fbb4 100644
  	}
  
  	return res, err
-@@ -823,3 +870,62 @@ func formatAndMount(device, mountPoint, fsType string, readOnly bool, options []
+@@ -823,3 +871,62 @@ func formatAndMount(device, mountPoint, fsType string, readOnly bool, options []
  	logger.Printf("Mounted %s at %s (type=%s)", device, mountPoint, fsType)
  	return nil
  }
@@ -576,10 +599,10 @@ index 44b1bd4c..3c0c652d 100644
 +}
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace.go
 new file mode 100644
-index 00000000..4555250e
+index 00000000..8fcda5df
 --- /dev/null
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace.go
-@@ -0,0 +1,249 @@
+@@ -0,0 +1,286 @@
 +// (C) Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -594,6 +617,7 @@ index 00000000..4555250e
 +	"net/url"
 +	"os"
 +	"os/exec"
++	"slices"
 +	"strings"
 +	"syscall"
 +	"time"
@@ -611,13 +635,22 @@ index 00000000..4555250e
 +
 +// The disk list comes from the operator's workspace journal, measured as exact
 +// initdata bytes. Host-provided annotations cannot authorize another disk/key.
++type workspaceMount struct {
++	MountPoint string   `toml:"mount_point"`
++	DiskID     string   `toml:"disk_id"`
++	ReadOnly   bool     `toml:"readonly"`
++	FSGroup    string   `toml:"fs_group"`
++	Options    []string `toml:"options"`
++}
++
 +type workspacePolicy struct {
-+	Version         string   `toml:"version"`
-+	KeyURI          string   `toml:"key_uri"`
-+	DiskIDs         []string `toml:"disk_ids"`
-+	AllowInitialize bool     `toml:"allow_initialize"`
-+	EncryptionType  string   `toml:"encryption_type"`
-+	FilesystemType  string   `toml:"filesystem_type"`
++	Mounts          map[string][]workspaceMount `toml:"mounts"`
++	Version         string                      `toml:"version"`
++	KeyURI          string                      `toml:"key_uri"`
++	DiskIDs         []string                    `toml:"disk_ids"`
++	AllowInitialize bool                        `toml:"allow_initialize"`
++	EncryptionType  string                      `toml:"encryption_type"`
++	FilesystemType  string                      `toml:"filesystem_type"`
 +}
 +
 +func loadWorkspacePolicy(path string) (workspacePolicy, error) {
@@ -643,6 +676,9 @@ index 00000000..4555250e
 +	}
 +	if err := validateKBSResourceURI(policy.KeyURI); err != nil {
 +		return policy, err
++	}
++	if len(policy.Mounts) == 0 {
++		return policy, errors.New("workspace policy requires container mounts")
 +	}
 +	if len(policy.DiskIDs) == 0 {
 +		return policy, errors.New("workspace policy requires a nonempty disk_ids list")
@@ -684,6 +720,30 @@ index 00000000..4555250e
 +	}
 +	if volume.FSType != p.FilesystemType {
 +		return errors.New("filesystem differs from measured workspace policy")
++	}
++	return nil
++}
++
++// Validate the entire container's measured mounts before opening any device.
++func (p workspacePolicy) authorizeMounts(container string, volumes map[string]util.CloudVolumeAnnotation) error {
++	expected := p.Mounts[container]
++	if len(volumes) != len(expected) {
++		return fmt.Errorf("container %s requires %d workspace mounts, got %d", container, len(expected), len(volumes))
++	}
++	remaining := make(map[string]workspaceMount, len(expected))
++	for _, mount := range expected {
++		remaining[mount.MountPoint] = mount
++	}
++	for _, volume := range volumes {
++		if err := p.authorize(volume); err != nil {
++			return err
++		}
++		mount, ok := remaining[volume.MountPoint]
++		if !ok || mount.DiskID != volume.DiskID || mount.ReadOnly != volume.ReadOnly ||
++			mount.FSGroup != volume.FSGroup || !slices.Equal(mount.Options, volume.Options) {
++			return fmt.Errorf("workspace mount %s differs from measured policy", volume.MountPoint)
++		}
++		delete(remaining, volume.MountPoint)
 +	}
 +	return nil
 +}
@@ -831,10 +891,10 @@ index 00000000..4555250e
 +}
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace_mount.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace_mount.go
 new file mode 100644
-index 00000000..c28846d0
+index 00000000..15211efd
 --- /dev/null
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace_mount.go
-@@ -0,0 +1,508 @@
+@@ -0,0 +1,509 @@
 +// (C) Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -969,20 +1029,30 @@ index 00000000..c28846d0
 +}
 +
 +func (i *interceptor) prepareWorkspaceVolumes(ctx context.Context, req *pb.CreateContainerRequest, encoded string) ([]*preparedWorkspaceVolume, error) {
++	if i.workspace == nil {
++		policy, err := loadWorkspacePolicy(workspaceInitdataPath)
++		if err != nil {
++			return nil, fmt.Errorf("encrypted volumes are required: %w", err)
++		}
++		i.workspace = &policy
++	}
++	if encoded == "" {
++		encoded = "{}"
++	}
 +	volumes, err := util.DecodeCloudVolumeAnnotations(encoded)
 +	if err != nil {
-+		return nil, fmt.Errorf("corrupt cloud_volumes annotation (pod would start without volumes): %w", err)
++		return nil, fmt.Errorf("corrupt cloud_volumes annotation: %w", err)
 +	}
-+	var workspace *workspacePolicy
-+	if len(volumes) != 0 {
-+		if i.workspace == nil {
-+			policy, err := loadWorkspacePolicy(workspaceInitdataPath)
-+			if err != nil {
-+				return nil, fmt.Errorf("encrypted volumes are required: %w", err)
-+			}
-+			i.workspace = &policy
++	workspace := i.workspace
++	if err := workspace.authorizeMounts(req.OCI.Annotations["io.kubernetes.cri.container-name"], volumes); err != nil {
++		return nil, err
++	}
++	// Resolve every mount before any persistent device operation. DiskID is the
++	// guest mount identity; host-supplied aliases cannot open a second mapper.
++	for name, volume := range volumes {
++		if err := rewriteWorkspaceMount(req, name, volume, filepath.Join(cloudVolumeMountBase, volume.DiskID)); err != nil {
++			return nil, err
 +		}
-+		workspace = i.workspace
 +	}
 +
 +	names := make([]string, 0, len(volumes))
@@ -992,14 +1062,11 @@ index 00000000..c28846d0
 +	sort.Strings(names)
 +	prepared := make([]*preparedWorkspaceVolume, 0, len(names))
 +	for _, name := range names {
-+		volume, err := prepareWorkspaceVolume(ctx, name, volumes[name], workspace)
++		volume, err := prepareWorkspaceVolume(ctx, volumes[name].DiskID, volumes[name], workspace)
 +		if volume != nil {
 +			prepared = append(prepared, volume)
 +		}
 +		if err != nil {
-+			return prepared, err
-+		}
-+		if err := rewriteWorkspaceMount(req, name, volumes[name], volume.sourcePath); err != nil {
 +			return prepared, err
 +		}
 +	}
@@ -1008,12 +1075,6 @@ index 00000000..c28846d0
 +
 +func prepareWorkspaceVolume(ctx context.Context, name string, volume util.CloudVolumeAnnotation, workspace *workspacePolicy) (*preparedWorkspaceVolume, error) {
 +	lun, _ := strconv.Atoi(volume.LUN) // validated by DecodeCloudVolumeAnnotations
-+	if workspace == nil {
-+		return nil, errors.New("encrypted workspace requires measured policy")
-+	}
-+	if err := workspace.authorize(volume); err != nil {
-+		return nil, fmt.Errorf("workspace volume %s: %w", name, err)
-+	}
 +	device, err := findDataDiskDevice(lun, volume.DiskID)
 +	if err != nil {
 +		return nil, fmt.Errorf("cloud volume %s device discovery: %w", name, err)
@@ -1418,10 +1479,10 @@ index 00000000..2ca3957d
 +}
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace_mount_test.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace_mount_test.go
 new file mode 100644
-index 00000000..93408403
+index 00000000..b5125bb8
 --- /dev/null
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace_mount_test.go
-@@ -0,0 +1,209 @@
+@@ -0,0 +1,210 @@
 +// (C) Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -1519,6 +1580,7 @@ index 00000000..93408403
 +
 +func TestEncryptedVolumeRequiredNeverFallsBackToRawDisk(t *testing.T) {
 +	policy := testWorkspacePolicy()
++	policy.Mounts = map[string][]workspaceMount{"": {{MountPoint: "/data", DiskID: "d-abc123"}}}
 +	i := &interceptor{requireEncryptedVolumes: true, workspace: &policy}
 +	req := &pb.CreateContainerRequest{OCI: &pb.Spec{Mounts: []*pb.Mount{{Destination: "/data"}}}}
 +	_, err := i.prepareWorkspaceVolumes(context.Background(), req,
@@ -1633,10 +1695,10 @@ index 00000000..93408403
 +}
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace_test.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace_test.go
 new file mode 100644
-index 00000000..61a6d00e
+index 00000000..6e23dcd8
 --- /dev/null
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace_test.go
-@@ -0,0 +1,120 @@
+@@ -0,0 +1,122 @@
 +// (C) Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -1663,6 +1725,8 @@ index 00000000..61a6d00e
 +allow_initialize = true
 +encryption_type = "luks2"
 +filesystem_type = "ext4"
++[mounts]
++agent = [{mount_point="/data",disk_id="d-abc123",readonly=false,fs_group="",options=[]}]
 +`
 +
 +func testWorkspacePolicy() workspacePolicy {
@@ -1759,10 +1823,10 @@ index 00000000..61a6d00e
 +}
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace_transaction_test.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace_transaction_test.go
 new file mode 100644
-index 00000000..77b72a64
+index 00000000..88b0f786
 --- /dev/null
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace_transaction_test.go
-@@ -0,0 +1,79 @@
+@@ -0,0 +1,114 @@
 +// (C) Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -1770,6 +1834,7 @@ index 00000000..77b72a64
 +
 +import (
 +	"context"
++	"encoding/json"
 +	"errors"
 +	"os"
 +	"path/filepath"
@@ -1842,5 +1907,37 @@ index 00000000..77b72a64
 +	require.Equal(t, []string{"/run/cloud-volumes/existing"}, i.cloudMountPaths)
 +	require.Empty(t, i.workspaceVolumes)
 +}
--- 
-2.43.7
++
++func TestRequiredWorkspaceCannotBeRemovedOrChangedBeforePreparation(t *testing.T) {
++	policy := testWorkspacePolicy()
++	policy.Mounts = map[string][]workspaceMount{"agent": {{MountPoint: "/sandbox", DiskID: "d-abc123", FSGroup: "1000"}}}
++	valid := util.CloudVolumeAnnotation{MountPoint: "/sandbox", DiskID: "d-abc123", LUN: "0", FSType: "ext4", FSGroup: "1000"}
++	for _, tc := range []struct{ name, encoded string }{
++		{"missing annotation", ""}, {"empty object", "{}"},
++		{"readonly changed", `{"vol-0":{"mount_point":"/sandbox","disk_id":"d-abc123","lun":"0","fs_type":"ext4","fs_group":"1000","readonly":true}}`},
++		{"group changed", `{"vol-0":{"mount_point":"/sandbox","disk_id":"d-abc123","lun":"0","fs_type":"ext4","fs_group":"0"}}`},
++		{"filesystem options changed", `{"vol-0":{"mount_point":"/sandbox","disk_id":"d-abc123","lun":"0","fs_type":"ext4","fs_group":"1000","options":["suid"]}}`},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			i := &interceptor{requireEncryptedVolumes: true, workspace: &policy, Redirector: &mockRedirector{}}
++			req := &pb.CreateContainerRequest{OCI: &pb.Spec{Linux: &pb.Linux{}, Annotations: map[string]string{"io.kubernetes.cri.container-name": "agent", util.CloudVolumesAnnotationKey: tc.encoded}, Mounts: []*pb.Mount{{Destination: "/sandbox", Source: t.TempDir(), Type: "bind"}}}}
++			_, err := i.createContainer(context.Background(), req, i.prepareWorkspaceVolumes)
++			require.ErrorContains(t, err, "workspace")
++			require.Empty(t, i.workspaceVolumes)
++		})
++	}
++	encoded, _ := json.Marshal(map[string]util.CloudVolumeAnnotation{"alias-one": valid, "alias-two": valid})
++	require.Error(t, policy.authorizeMounts("agent", mustDecodeVolumes(t, string(encoded))))
++	// Bootstrap init has no workspace and must still reach the native agent.
++	i := &interceptor{requireEncryptedVolumes: true, workspace: &policy, Redirector: &mockRedirector{}}
++	req := &pb.CreateContainerRequest{OCI: &pb.Spec{Linux: &pb.Linux{}, Annotations: map[string]string{"io.kubernetes.cri.container-name": "openshell-sandbox-bootstrap"}}}
++	_, err := i.createContainer(context.Background(), req, i.prepareWorkspaceVolumes)
++	require.NoError(t, err)
++}
++
++func mustDecodeVolumes(t *testing.T, encoded string) map[string]util.CloudVolumeAnnotation {
++	t.Helper()
++	volumes, err := util.DecodeCloudVolumeAnnotations(encoded)
++	require.NoError(t, err)
++	return volumes
++}

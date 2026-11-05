@@ -69,9 +69,9 @@ func TestWorkspaceCloudMountSubstitution(t *testing.T) {
 		data   string
 		allow  bool
 	}{
-		{"expected guest mount", "/run/cloud-volumes/vol-0", encoded, true},
+		{"expected guest mount", "/run/cloud-volumes/d-123ABC", encoded, true},
 		{"unexpected source", "/etc", encoded, false},
-		{"readonly mismatch", "/run/cloud-volumes/vol-0", `{"vol-0":{"mount_point":"/sandbox","fs_type":"ext4","lun":"0","disk_id":"d-123ABC","readonly":true,"fs_group":"1000"}}`, false},
+		{"readonly mismatch", "/run/cloud-volumes/d-123ABC", `{"vol-0":{"mount_point":"/sandbox","fs_type":"ext4","lun":"0","disk_id":"d-123ABC","readonly":true,"fs_group":"1000"}}`, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			iMount := map[string]any{"destination": "/sandbox", "source": tc.source, "type_": "bind", "options": []string{"rbind", "rprivate", "rw"}}
@@ -122,7 +122,7 @@ func TestWorkspaceInitCloudVolumeBinding(t *testing.T) {
 			},
 			guest: map[string]any{
 				"destination": "/mnt/openshell-workspace",
-				"source":      "/run/cloud-volumes/vol-0",
+				"source":      "/run/cloud-volumes/d-123ABC",
 				"type_":       "bind",
 				"options":     []string{"rbind", "rprivate", "rw"},
 			},
@@ -138,7 +138,7 @@ func TestWorkspaceInitCloudVolumeBinding(t *testing.T) {
 		{"wrong policy destination", func(b *binding) { b.policy["destination"] = "/sandbox" }, false},
 		{"wrong policy options", func(b *binding) { b.policy["options"] = []string{"rbind", "rw"} }, false},
 		{"wrong guest destination", func(b *binding) { b.guest["destination"] = "/sandbox" }, false},
-		{"wrong guest source", func(b *binding) { b.guest["source"] = "/run/cloud-volumes/vol-1" }, false},
+		{"wrong guest source", func(b *binding) { b.guest["source"] = "/run/cloud-volumes/d-other" }, false},
 		{"wrong guest options", func(b *binding) { b.guest["options"] = []string{"rbind", "rw"} }, false},
 		{"wrong fsGroup", func(b *binding) { b.volume["fs_group"] = "0" }, false},
 		{"extra disk", func(b *binding) { b.extra = true }, true},

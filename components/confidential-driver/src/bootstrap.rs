@@ -977,6 +977,65 @@ impl BootstrapStore {
         })
     }
 
+    /// Bind guest mounts to the launch retained on T and its resolved PVCs.
+    pub(super) fn workspace_mounts(
+        &self,
+        sandbox_id: &str,
+        namespace: &str,
+        uid: &str,
+    ) -> Result<serde_json::Value> {
+        let launch = self.load_launch(sandbox_id, namespace, uid)?;
+        let journal: WorkspaceVolumeJournal = self.with_lock(|| {
+            Ok(serde_json::from_slice(&read_private(
+                &self.workspace_journal(&workspace_hash(namespace, uid)),
+            )?)?)
+        })?;
+        let spec = launch
+            .workload
+            .spec
+            .as_ref()
+            .expect("trusted workload spec");
+        let group = spec
+            .security_context
+            .as_ref()
+            .and_then(|s| s.fs_group)
+            .map(|g| g.to_string())
+            .unwrap_or_default();
+        let claims: std::collections::BTreeMap<_, _> = spec
+            .volumes
+            .iter()
+            .flatten()
+            .filter_map(|v| v.persistent_volume_claim.as_ref().map(|p| (&v.name, p)))
+            .collect();
+        let mut mounts = serde_json::Map::new();
+        for container in spec
+            .containers
+            .iter()
+            .chain(spec.init_containers.iter().flatten())
+        {
+            let mut entries = Vec::new();
+            for mount in container.volume_mounts.iter().flatten() {
+                let Some(claim) = claims.get(&mount.name) else {
+                    continue;
+                };
+                let disk = journal
+                    .volumes
+                    .iter()
+                    .find(|v| v.pvc_name == claim.claim_name)
+                    .and_then(|v| v.cloud_disk_id.as_ref())
+                    .ok_or(StoreError::Invalid("workspace PVC has no bound disk"))?;
+                let readonly = mount.read_only.unwrap_or(false) || claim.read_only.unwrap_or(false);
+                entries.push(serde_json::json!({
+                    "mount_point": mount.mount_path, "disk_id": disk,
+                    "readonly": readonly, "fs_group": group,
+                    "options": if readonly { vec!["ro"] } else { Vec::<&str>::new() },
+                }));
+            }
+            mounts.insert(container.name.clone(), serde_json::Value::Array(entries));
+        }
+        Ok(serde_json::Value::Object(mounts))
+    }
+
     /// Preserve one 32-byte key across workload attempts and generations.
     /// The previous serving path is withdrawn before a new measured workload
     /// binding becomes active. The key itself remains in private host state.

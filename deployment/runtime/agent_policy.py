@@ -305,6 +305,10 @@ def generate(pod: dict, *, role: str, tools_dir: pathlib.Path,
         rules = rules.replace(insertion, insertion + "    openshell_guest_pull(p_oci, i_storages)\n")
         rules += "\n" + GUEST_PULL_EXTENSION.read_text()
         if role == "workload":
+            # Workspace mounts cannot also match Kata's ordinary shared-bind rules.
+            rules = rules.replace("check_mount(p_mount, i_mount, bundle_id, sandbox_id) if {",
+                                  "check_mount(p_mount, i_mount, bundle_id, sandbox_id) if {\n"
+                                  "    not workspace_mount_destination(p_mount.destination)")
             fs_group = pod["spec"].get("securityContext", {}).get("fsGroup", "")
             pvc_names = {v["name"] for v in pod["spec"].get("volumes", []) if "persistentVolumeClaim" in v}
             mounts = {c["name"]: [m["mountPath"] for m in c.get("volumeMounts", []) if m["name"] in pvc_names]
