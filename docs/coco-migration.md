@@ -63,7 +63,7 @@ remain in the patch queues.
 
 ## Validated build
 
-The tested release is `ab6d488b865f55e94378c65ce07fea01445a9c06`. Its handoff
+The migration-tested release was `ab6d488b865f55e94378c65ce07fea01445a9c06`. Its handoff
 `SHA256SUMS` file has SHA-256
 `8f7a1c5370bb32905dcb785294a3473ae92921f8c71775175c017adc0ebfd252`.
 The complete release archive and validation evidence were copied back and
@@ -73,7 +73,7 @@ Passed: upstream artifact provenance, exact patch replay/tree locks,
 generic-only CAA tests, provider race tests, the complete project offline suite,
 official AS/KBS policy execution, native component builds, guest verity and
 measurement derivation, and clean release packaging. The offline suite includes
-driver/observer, adapter/guest, controller finalizer, CSI conformance, policy,
+driver/observer, adapter/guest, controller finalizer, CSI Go tests, policy,
 build-contract and rendered-chart checks.
 
 The guest receipt remains at `9de7ff00`. The subsequent build-only commit changed
@@ -131,6 +131,19 @@ native create, exec, upload/download, Stop/Start/Delete, workspace and sealed
 environment operations; external coding-provider calls were not rerun. Full
 recovery onto a replacement host/cluster, LUKS-header authentication, ciphertext
 integrity and rollback protection were not claimed or tested.
+
+## Subsequent validation on 2026-11-05
+
+The later full build and live acceptance covered commit
+`54c256df403a80688486ff8e5c2d0a0471ca5fcd`, tree
+`a03053ffd8dd3488839431e6b4950c55249f381a`. Its release archive SHA-256 is
+`3ed8d42a5ea26a2c2e0229c70cd32838b8d3f4dcfe410d89da74da2e2c8c4b5b`;
+the handoff SHA-256 is
+`c9303973bced58e2896399d5c320b438d3937af76f13ce4ebaf77a75d354ecc8`.
+Private evidence is retained locally in
+`.local/full-validation-20261105/validation.json`. That deployment was retired.
+Later workspace-authorization, lifecycle and CSI fixes have separate local
+regression coverage; the earlier cloud result does not validate those revisions.
 
 ## Retirement
 

@@ -1,6 +1,6 @@
 # Deploy
 
-Deploy native OpenShell 0.1.6 with CoCo 0.22, Trustee, ACK and Intel TDX.
+Deploy native OpenShell 0.1.6 with pinned CoCo components, Trustee, ACK and Intel TDX.
 Complete [build](build.md), including release installation, first. Run the commands
 below as root from `/opt/confidential-openshell` on the **trusted service host**.
 It hosts Gateway, driver and the private registry; Trustee can run here or on a
@@ -90,9 +90,10 @@ Set `OPENSHELL_KATA_OCI_VERSION` in the driver environment to match another
 runtime. Worker configuration reads containerd's effective CRI configuration;
 schema 3 input and migrated schema 4 are both compatible.
 
-Workers need ECS Cloud Assistant. The default host StorageClass is
-`alicloud-disk-essd` from ACK's CSI add-ons. Public API access must already be
-enabled unless you pass `--private-api` and have private routing.
+Workers need ECS Cloud Assistant. Deployment creates the peer-pod StorageClass
+`alicloud-disk-essd-peerpod`; no host `alicloud-disk-essd` StorageClass is required.
+Public API access must already be enabled unless you pass `--private-api` and
+have private routing.
 `--cluster-id` can provide an ID directly.
 
 Continue with step 4. The common steps add deployment-specific PodVM resources,

@@ -42,8 +42,8 @@ def main():
     selected = choose(current, cloud.state.get('created_cluster'), args.nodes, cloud.state.get('worker_nodes'))
     previous = (set(cloud.state.get('worker_nodes', [])) - set(selected)) & {n['metadata']['name'] for n in current}
     if previous:
-        run(['kubectl', 'label', 'node', *sorted(previous), 'node.kubernetes.io/worker-', '--overwrite'])
-    run(['kubectl', 'label', 'node', *selected, 'node.kubernetes.io/worker=', '--overwrite'])
+        run(['kubectl', 'label', 'node', *sorted(previous), 'confidential.openshell.ai/worker-', '--overwrite'])
+    run(['kubectl', 'label', 'node', *selected, 'confidential.openshell.ai/worker=', '--overwrite'])
     cloud.save(worker_nodes=selected)
     print('Deployment workers selected: ' + ', '.join(selected), flush=True)
     print('Registry and Kata configuration steps will use these workers through ECS Cloud Assistant; no worker SSH alias is needed.', flush=True)

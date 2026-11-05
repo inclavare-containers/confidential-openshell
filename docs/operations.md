@@ -158,10 +158,11 @@ fi
 ```
 
 `gateway install` preserves `gateway.toml`. Review template changes against the
-private file. If `driver.env` differs, inspect the generated `.part` file and the
-new published digests, back up the old file, then explicitly install the reviewed
-file with `root:openshell-gateway`, mode `0640`, before repeating the step. Do not
-regenerate TLS identities, driver keys, resource records or workspace keys.
+private file. Driver configuration generates `driver.env.part` and installs it as
+`driver.env` automatically with `root:openshell-gateway`, mode `0640`. Back up the
+previous environment before the upgrade and review the installed configuration
+and published digests before starting Gateway. Do not regenerate TLS identities,
+driver keys, resource records or workspace keys.
 The conditional reports step installs the selected observer binary and unit when
 reports were already enabled; restarting an old binary alone does not update it.
 Start one retained sandbox and complete

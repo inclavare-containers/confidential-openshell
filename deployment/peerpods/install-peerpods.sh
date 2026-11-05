@@ -6,7 +6,7 @@ need helm kubectl jq
 [[ -s "$OPERATOR_DIR/peerpods-values.yaml" ]] || die 'Create peerpods-values.yaml first.'
 ! rg -q REPLACE_WITH "$OPERATOR_DIR/peerpods-values.yaml" || die 'Complete all PeerPods values first.'
 selected=$(jq -er '.worker_nodes | select(length > 0) | length' "$OPERATOR_DIR/ack-state.json")
-labelled=$(kubectl get nodes -l node.kubernetes.io/worker -o json | jq '.items | length')
+labelled=$(kubectl get nodes -l confidential.openshell.ai/worker -o json | jq '.items | length')
 [[ $labelled == "$selected" ]] || die 'Worker labels differ from the saved selection. Run ./cos workers select and review existing worker labels.'
 bash deployment/peerpods/prepare-chart.sh
 helm template peerpods .local/charts/peerpods \
