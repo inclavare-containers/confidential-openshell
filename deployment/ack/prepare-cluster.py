@@ -140,7 +140,10 @@ def main():
     env = {**os.environ, 'KUBECONFIG': str(path)}
     switch = cloud.api('vpc', 'DescribeVSwitchAttributes', RegionId=cloud.region,
                        VSwitchId=config['worker_vswitch_id'])
-    network = json.loads(kubectl(env, '-n', 'kube-system', 'get', 'configmap', 'eni-config', '-o', 'json'))
+    network = json.loads(cloud.wait(
+        'Terway network configuration',
+        lambda: kubectl(env, '-n', 'kube-system', 'get', 'configmap', 'eni-config',
+                       '--ignore-not-found', '-o', 'json'), bool))
     eni = json.loads(network['data']['eni_conf'])
     require(str(eni.get('disable_network_policy', False)).lower() == 'false',
             'Terway NetworkPolicy is disabled. See deployment/ack/README.md.')

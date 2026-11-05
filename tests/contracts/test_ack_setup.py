@@ -392,6 +392,25 @@ class Setup(CloudFixture, unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, 'NetworkPolicy is disabled'):
             self.prepare()
 
+    def test_cluster_waits_for_terway_config_after_control_plane_is_running(self):
+        attempts = []
+
+        def delayed_config(args, **kwargs):
+            if 'configmap' in args:
+                attempts.append(args)
+                if len(attempts) == 1:
+                    if '--ignore-not-found' not in args:
+                        raise subprocess.CalledProcessError(
+                            1, args, stderr='Error from server (NotFound): configmaps "eni-config" not found')
+                    return subprocess.CompletedProcess(args, 0, '', '')
+            return self.kubectl(args, **kwargs)
+
+        with patch.object(cloud.time, 'sleep') as sleep:
+            self.prepare(runner=delayed_config)
+        self.assertEqual(len(attempts), 2)
+        sleep.assert_called_once_with(15)
+        self.assertFalse(any(op.startswith('Create') for op, _ in self.calls))
+
     def test_network_retries_reuse_podvm_group_and_only_allow_worker_guest_traffic(self):
         self.prepare()
         with patch.object(sys, 'argv', ['prepare-network.py']):

@@ -9,7 +9,7 @@ systemctl enable --now as.service
 systemctl enable --now kbs.service
 systemctl is-active --quiet as.service kbs.service
 code=$(curl --noproxy '*' --cacert "$KBS_CA" \
-  --retry 10 --retry-connrefused --retry-delay 1 --retry-max-time 30 \
+  --retry 30 --retry-connrefused --retry-delay 1 --retry-max-time 30 \
   --connect-timeout 5 --max-time 10 -sS -o /dev/null -w '%{http_code}' \
   "${KBS_URL}/kbs/v0/resource/default/bootstrap/anonymous-check")
 [[ $code == 401 || $code == 403 ]] || die "KBS anonymous denial check failed: HTTP $code (expected 401 or 403)."
