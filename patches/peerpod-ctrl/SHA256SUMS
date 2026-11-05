@@ -1,3 +1,1 @@
-c55483ea8f85053369723c5ec68bba36d7262e36fa66e25e80734a0a51cd5812  ../cloud-api-adaptor/generic/0004-alibabacloud-confirm-delete-absence.patch
-fe8af97948c0f81e8e4df764bbc5b6b89d10a36f618cc16ea07341808827e6cb  ../cloud-api-adaptor/generic/0009-alibabacloud-delete-completion.patch
-87ef6e41d9eb13eb9d91098c86dfb569307e4d0b309b6010f3032c7c60156388  ../cloud-api-adaptor/provider/0001-alibabacloud-retained-delete-guard.patch
+d08782ac246618830c8464ccfdd6ccec05af8f458d6a7216a82f489ccd28b822  ../cloud-api-adaptor/generic/0004-alibabacloud-confirm-delete-absence.patch

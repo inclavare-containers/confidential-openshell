@@ -15,7 +15,6 @@ GOCACHE="$CONTROLLER_BUILD/go-cache" make -C "$CONTROLLER_SOURCE/src/peerpod-ctr
   build BUILTIN_CLOUD_PROVIDERS=alibabacloud
 (cd "$CONTROLLER_SOURCE/src/peerpod-ctrl" && go mod verify)
 install -m 0755 "$CONTROLLER_SOURCE/src/peerpod-ctrl/bin/manager" "$CONTROLLER_BUILD/context/manager"
-cp "$ROOT/deployment/peerpods/Dockerfile.controller" "$CONTROLLER_BUILD/context/Dockerfile"
 go version -m "$CONTROLLER_BUILD/context/manager"
 sha256sum "$CONTROLLER_BUILD/context/manager"
 python3 - "$CONTROLLER_BUILD" <<'PY'

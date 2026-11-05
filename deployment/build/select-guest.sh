@@ -6,7 +6,6 @@ Record the selected image and checksum-verified references in .local/guest-selec
 source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 need jq sha256sum
 mode=${1:?"$usage"}; region=${2:?"$usage"}
-bash deployment/build/check-region.sh "$region"
 image_id=; qcow=; receipt=
 mkdir -p artifacts/guest .local
 case "$mode" in

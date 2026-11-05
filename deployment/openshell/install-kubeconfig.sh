@@ -59,5 +59,3 @@ runuser -u openshell-gateway -- env \
   --config /etc/openshell-confidential/gateway.toml \
   --compute-driver confidential \
   --compute-driver-socket /run/openshell-confidential/driver.sock config preflight
-kubectl apply -f deployment/openshell/network-fence.example.yaml
-kubectl -n openshell get networkpolicy confidential-ingress-default-deny -o yaml

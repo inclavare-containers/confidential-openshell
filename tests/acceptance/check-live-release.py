@@ -39,7 +39,7 @@ def verify_ear(token, public_key):
     if claims.get('iat', time.time() + 60) > time.time() + 30 or claims.get('exp', 0) <= time.time() + 5:
         raise ValueError('expired or future EAR')
     cpu = claims['submods']['cpu0']
-    if cpu.get('ear.status') != 'affirming' or cpu.get('ear.appraisal-policy-id') != 'default':
+    if cpu.get('ear.status') != 'affirming' or cpu.get('ear.appraisal-policy-id') != 'openshell-tdx':
         raise ValueError('non-affirming appraisal')
     vector = cpu.get('ear.trustworthiness-vector', {})
     if any(vector.get(key) != value for key, value in {'hardware': 2, 'configuration': 2, 'executables': 3, 'file-system': 2}.items()):

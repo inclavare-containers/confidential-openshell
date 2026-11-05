@@ -4,6 +4,7 @@ Append the checked host-shim replacement to the private kata-deploy image. Set H
 source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 require_root
 service_addresses
+[[ -z $REGISTRY_CA ]] || export SSL_CERT_FILE="$REGISTRY_CA"
 KATA_DEPLOY_UPSTREAM=$(jq -er .images.kata_deploy deployment/runtime/artifacts.lock.json)
 KATA_DEPLOY_DIGEST=${KATA_DEPLOY_UPSTREAM##*@}
 KATA_DEPLOY_MIRROR="${REGISTRY_ADDR}/openshell/mirror/kata_deploy:4.2.0"
@@ -15,7 +16,7 @@ KATA_SHIM_SHA256=$(cut -d ' ' -f1 "$OPERATOR_DIR/shim.sha256")
 if ! crane digest "$KATA_DEPLOY_BASE" >/dev/null 2>&1; then
   crane copy --platform linux/amd64 "$KATA_DEPLOY_UPSTREAM" "$KATA_DEPLOY_MIRROR"
 fi
-test "$(SSL_CERT_FILE="$REGISTRY_CA" crane digest "$KATA_DEPLOY_BASE")" = "$KATA_DEPLOY_DIGEST"
+test "$(crane digest "$KATA_DEPLOY_BASE")" = "$KATA_DEPLOY_DIGEST"
 docker pull "$KATA_DEPLOY_BASE"
 KATA_CONTAINER=$(docker create "$KATA_DEPLOY_BASE")
 docker cp "$KATA_CONTAINER:/opt/kata-artifacts/tarballs/kata-static-shim-v2-go.tar.zst" "$OVERLAY_DIR/original.tar.zst"
@@ -41,16 +42,16 @@ install -m 0644 "$OVERLAY_DIR/kata-static-shim-v2-go.tar.zst" \
 tar -cf "$OVERLAY_DIR/kata-deploy-overlay.layer.tar" -C "$OVERLAY_DIR/layer" \
   opt/kata-artifacts/tarballs/kata-static-shim-v2-go.tar.zst
 KATA_DEPLOY_PRIVATE="${REGISTRY_ADDR}/openshell/kata-deploy-shim-nnp:4.2.0"
-SSL_CERT_FILE="$REGISTRY_CA" crane append --platform linux/amd64 \
+crane append --platform linux/amd64 \
   -b "$KATA_DEPLOY_BASE" -f "$OVERLAY_DIR/kata-deploy-overlay.layer.tar" \
   -t "$KATA_DEPLOY_PRIVATE"
-SSL_CERT_FILE="$REGISTRY_CA" crane digest "$KATA_DEPLOY_PRIVATE"
-SSL_CERT_FILE="$REGISTRY_CA" crane manifest "$KATA_DEPLOY_BASE" \
+crane digest "$KATA_DEPLOY_PRIVATE"
+crane manifest "$KATA_DEPLOY_BASE" \
   | jq -r '.layers[].digest' > "$OVERLAY_DIR/base-layers"
-SSL_CERT_FILE="$REGISTRY_CA" crane manifest "$KATA_DEPLOY_PRIVATE" \
+crane manifest "$KATA_DEPLOY_PRIVATE" \
   | jq -r '.layers[].digest' > "$OVERLAY_DIR/patched-layers"
 test "$(wc -l < "$OVERLAY_DIR/patched-layers")" -eq "$(( $(wc -l < "$OVERLAY_DIR/base-layers") + 1 ))"
 sed '$d' "$OVERLAY_DIR/patched-layers" | cmp - "$OVERLAY_DIR/base-layers"
 
-printf '%s@%s\n' "${KATA_DEPLOY_PRIVATE%:*}" "$(SSL_CERT_FILE="$REGISTRY_CA" crane digest "$KATA_DEPLOY_PRIVATE")" > "$OPERATOR_DIR/kata-deploy-image.txt"
+printf '%s@%s\n' "${KATA_DEPLOY_PRIVATE%:*}" "$(crane digest "$KATA_DEPLOY_PRIVATE")" > "$OPERATOR_DIR/kata-deploy-image.txt"
 cat "$OPERATOR_DIR/kata-deploy-image.txt"

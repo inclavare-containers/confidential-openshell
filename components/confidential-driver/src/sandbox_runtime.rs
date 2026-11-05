@@ -29,7 +29,6 @@ pub fn supervisor_pod(
     client_tls: SupervisorClientTls<'_>,
     main_process_spec: &str,
     log_level: &str,
-    sa_token_ttl_secs: i64,
     https_proxy: Option<&str>,
     no_proxy: Option<&str>,
     proxy_auth_secret: Option<(&str, &str)>,
@@ -56,7 +55,7 @@ pub fn supervisor_pod(
         client_tls,
         main_process_spec,
         log_level,
-        sa_token_ttl_secs,
+        crate::config::MIN_SA_TOKEN_TTL_SECS,
         https_proxy,
         no_proxy,
         proxy_auth_secret,
@@ -69,12 +68,25 @@ pub fn supervisor_pod(
     )?;
     let spec = pod.spec.as_mut().expect("native supervisor Pod has a spec");
     spec.enable_service_links = Some(false);
+    spec.volumes
+        .as_mut()
+        .expect("native supervisor volumes")
+        .retain(|v| v.name != "sa-token");
+    for container in &mut spec.containers {
+        if let Some(mounts) = &mut container.volume_mounts {
+            mounts.retain(|mount| mount.name != "sa-token");
+        }
+        if let Some(env) = &mut container.env {
+            env.retain(|entry| entry.name != "OPENSHELL_K8S_SA_TOKEN_FILE");
+        }
+    }
+
     let security = spec
         .security_context
         .as_mut()
         .expect("native Pod security context");
-    security.supplemental_groups = Some(Vec::new());
-    security.supplemental_groups_policy = Some("Strict".to_string());
+    // Explicit image groups keep containerd and genpolicy aligned for guest pull.
+    security.supplemental_groups = Some(vec![0]);
     // Kata Memory EmptyDir uses guest tmpfs, keeping sockets, TLS state and logs
     // off host-backed volumes. Kata 4.2 does not forward its sizeLimit.
     for volume in spec.volumes.as_mut().expect("native supervisor volumes") {
@@ -94,7 +106,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn supervisor_pod_keeps_confidential_groups_environment_and_state_private() {
+    fn supervisor_pod_sets_guest_pull_groups_and_keeps_state_private() {
         let pod = supervisor_pod(
             "sandbox",
             &SandboxRuntimeNames::new("pair"),
@@ -111,7 +123,6 @@ mod tests {
             SupervisorClientTls::Bootstrap,
             "{}",
             "info",
-            600,
             None,
             None,
             None,
@@ -125,6 +136,21 @@ mod tests {
         .expect("render supervisor Pod");
         let spec = pod.spec.as_ref().expect("supervisor spec");
         assert_eq!(spec.enable_service_links, Some(false));
+        assert!(
+            spec.volumes
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|v| v.projected.is_none())
+        );
+        assert!(
+            spec.containers[0]
+                .env
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|entry| entry.name != "OPENSHELL_K8S_SA_TOKEN_FILE")
+        );
         for name in ["run", "logs"] {
             let empty_dir = spec
                 .volumes
@@ -138,15 +164,14 @@ mod tests {
             assert!(empty_dir.size_limit.is_none());
         }
         let security = spec.security_context.as_ref().unwrap();
-        assert_eq!(security.supplemental_groups.as_deref(), Some([].as_slice()));
         assert_eq!(
-            security.supplemental_groups_policy.as_deref(),
-            Some("Strict")
+            security.supplemental_groups.as_deref(),
+            Some([0].as_slice())
         );
-        let encoded = serde_json::to_value(&pod).unwrap();
-        assert_eq!(
-            encoded.pointer("/spec/securityContext/supplementalGroupsPolicy"),
-            Some(&serde_json::json!("Strict"))
-        );
+        assert_eq!(security.supplemental_groups_policy, None);
+        assert_eq!(security.fs_group, Some(1000));
+        let identity = spec.containers[0].security_context.as_ref().unwrap();
+        assert_eq!(identity.run_as_user, Some(1000));
+        assert_eq!(identity.run_as_group, Some(1000));
     }
 }

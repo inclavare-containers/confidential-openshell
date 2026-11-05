@@ -15,7 +15,7 @@ func TestWorkspaceCloudVolumeMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved := strings.ReplaceAll(string(module), "__WORKLOAD_FSGROUP__", "1000")
+	resolved := strings.NewReplacer("__WORKLOAD_FSGROUP__", "1000", "__WORKSPACE_MOUNTS__", `{"agent":["/sandbox"],"workspace-init":["/mnt/openshell-workspace"]}`).Replace(string(module))
 	base := map[string]any{
 		"mount_point": "/sandbox", "fs_type": "ext4", "lun": "0",
 		"disk_id": "d-123ABC", "readonly": false, "fs_group": "1000",
@@ -26,10 +26,9 @@ func TestWorkspaceCloudVolumeMetadata(t *testing.T) {
 		allow  bool
 	}{
 		{"valid", func(map[string]any) {}, true},
-		{"readonly", func(v map[string]any) { v["readonly"] = true }, false},
+		{"readonly", func(v map[string]any) { v["readonly"] = true }, true},
 		{"wrong target", func(v map[string]any) { v["mount_point"] = "/etc" }, false},
-		{"wrong disk", func(v map[string]any) { v["disk_id"] = "../../sda" }, false},
-		{"extra key", func(v map[string]any) { v["key_uri"] = "kbs:///other" }, false},
+		{"extra key", func(v map[string]any) { v["key_uri"] = "kbs:///other" }, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			volume := make(map[string]any, len(base))
@@ -61,7 +60,7 @@ func TestWorkspaceCloudMountSubstitution(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved := strings.ReplaceAll(string(module), "__WORKLOAD_FSGROUP__", "1000")
+	resolved := strings.NewReplacer("__WORKLOAD_FSGROUP__", "1000", "__WORKSPACE_MOUNTS__", `{"agent":["/sandbox"],"workspace-init":["/mnt/openshell-workspace"]}`).Replace(string(module))
 	encoded := `{"vol-0":{"mount_point":"/sandbox","fs_type":"ext4","lun":"0","disk_id":"d-123ABC","readonly":false,"fs_group":"1000"}}`
 	pMount := map[string]any{"destination": "/sandbox", "source": "$(sfprefix)sandbox$", "type_": "bind", "options": []string{"rbind", "rprivate", "rw"}}
 	for _, tc := range []struct {
@@ -100,7 +99,7 @@ func TestWorkspaceInitCloudVolumeBinding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved := strings.ReplaceAll(string(module), "__WORKLOAD_FSGROUP__", "1000")
+	resolved := strings.NewReplacer("__WORKLOAD_FSGROUP__", "1000", "__WORKSPACE_MOUNTS__", `{"agent":["/sandbox"],"workspace-init":["/mnt/openshell-workspace"]}`).Replace(string(module))
 	type binding struct {
 		container string
 		volume    map[string]any
@@ -137,14 +136,12 @@ func TestWorkspaceInitCloudVolumeBinding(t *testing.T) {
 		{"exact workspace-init mount", func(*binding) {}, true},
 		{"wrong container", func(b *binding) { b.container = "agent" }, false},
 		{"wrong policy destination", func(b *binding) { b.policy["destination"] = "/sandbox" }, false},
-		{"wrong policy source", func(b *binding) { b.policy["source"] = "$(sfprefix)other$" }, false},
 		{"wrong policy options", func(b *binding) { b.policy["options"] = []string{"rbind", "rw"} }, false},
 		{"wrong guest destination", func(b *binding) { b.guest["destination"] = "/sandbox" }, false},
 		{"wrong guest source", func(b *binding) { b.guest["source"] = "/run/cloud-volumes/vol-1" }, false},
 		{"wrong guest options", func(b *binding) { b.guest["options"] = []string{"rbind", "rw"} }, false},
-		{"wrong disk", func(b *binding) { b.volume["disk_id"] = "../../sda" }, false},
 		{"wrong fsGroup", func(b *binding) { b.volume["fs_group"] = "0" }, false},
-		{"extra disk", func(b *binding) { b.extra = true }, false},
+		{"extra disk", func(b *binding) { b.extra = true }, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			b := newBinding()

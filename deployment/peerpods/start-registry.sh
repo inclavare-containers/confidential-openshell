@@ -4,14 +4,18 @@ Start the TLS registry using its configured certificate and key.'
 source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 require_root
 service_addresses
-install -d -m 0755 "/etc/docker/certs.d/${REGISTRY_ADDR}"
-install -m 0644 "$REGISTRY_CA" "/etc/docker/certs.d/${REGISTRY_ADDR}/ca.crt"
-if command -v update-ca-trust >/dev/null; then
-  install -m 0644 "$REGISTRY_CA" /etc/pki/ca-trust/source/anchors/openshell-registry.crt
-  update-ca-trust
-else
-  install -m 0644 "$REGISTRY_CA" /usr/local/share/ca-certificates/openshell-registry.crt
-  update-ca-certificates
+tls_args=()
+if [[ -n $REGISTRY_CA ]]; then
+    tls_args=(--cacert "$REGISTRY_CA")
+    install -d -m 0755 "/etc/docker/certs.d/${REGISTRY_ADDR}"
+    install -m 0644 "$REGISTRY_CA" "/etc/docker/certs.d/${REGISTRY_ADDR}/ca.crt"
+    if command -v update-ca-trust >/dev/null; then
+      install -m 0644 "$REGISTRY_CA" /etc/pki/ca-trust/source/anchors/openshell-registry.crt
+      update-ca-trust
+    else
+      install -m 0644 "$REGISTRY_CA" /usr/local/share/ca-certificates/openshell-registry.crt
+      update-ca-certificates
+    fi
 fi
 install -d -m 0700 /var/lib/openshell-confidential/registry
 registry_image=$(jq -er .images.registry deployment/runtime/artifacts.lock.json)
@@ -35,7 +39,7 @@ else
   "$registry_image"
 fi
 for attempt in $(seq 1 30); do
-  if curl --noproxy '*' --cacert "$REGISTRY_CA" -fsS "https://${REGISTRY_ADDR}/v2/"; then
+  if curl --noproxy '*' "${tls_args[@]}" -fsS "https://${REGISTRY_ADDR}/v2/"; then
     printf '\nRegistry ready: https://%s\n' "$REGISTRY_ADDR"
     exit 0
   fi

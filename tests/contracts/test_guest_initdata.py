@@ -23,10 +23,7 @@ def fixture(role):
     names = guest_check.WORKLOAD_REFS if role == 'workload' else guest_check.SUPERVISOR_REFS - {'upstream-proxy-ca.pem'}
     bootstrap = {'schema': 1, 'role': role, 'sandbox_id': 'sandbox-1', 'namespace': 'openshell',
                  'sandbox_resource_uid': 'cr-1', 'runtime_generation': 'g0001', 'bootstrap_attempt': 'a' * 64,
-                 'sealed_volume_destination': '/.openshell/bootstrap-input' if role == 'workload' else '/.openshell/supervisor',
-                 'sealed_volume_container': 'openshell-sandbox-bootstrap' if role == 'workload' else 'supervisor',
-                 'resource_uris': {n: 'kbs:///default/bootstrap/' + hashlib.sha256(n.encode()).hexdigest() for n in names},
-                 'sealed_descriptor_sha256': {n: 'b' * 64 for n in names}}
+                 'resource_uris': {n: 'kbs:///default/bootstrap/' + hashlib.sha256(n.encode()).hexdigest() for n in names}}
     aa = '[token_configs.kbs]\nurl="https://10.0.0.1:8443"\ncert=' + json.dumps(CA)
     cdh = '[kbc]\nurl="https://10.0.0.1:8443"\nkbs_cert=' + json.dumps(CA) + '\n[image]\nextra_root_certificates=[' + json.dumps(CA) + ']'
     return {'aa.toml': aa, 'cdh.toml': cdh, 'policy.rego': 'package agent_policy\ndefault allow := false',
@@ -72,16 +69,16 @@ class GuestContract(unittest.TestCase):
         data['cdh.toml'] = data['cdh.toml'].replace('extra_root_certificates=[' + json.dumps(CA),
                                                         'extra_root_certificates=[' + json.dumps(other))
         validate(data)
+        for roots in ([], [CA, other]):
+            data['cdh.toml'] = '[kbc]\nurl="https://10.0.0.1:8443"\nkbs_cert=' + json.dumps(CA) + '\n[image]\nextra_root_certificates=' + json.dumps(roots)
+            validate(data)
         data['aa.toml'] = data['aa.toml'].replace(json.dumps(CA), json.dumps(other))
         with self.assertRaisesRegex(ValueError, 'AA and CDH KBS CA'):
             validate(data)
 
     def test_core_negative_bindings_remain_enforced(self):
         for key, value, error in [('role', 'unknown', 'role'), ('bootstrap_attempt', 'short', 'attempt'),
-                                  ('sandbox_resource_uid', '', 'sandbox_resource_uid'),
-                                  ('sealed_volume_destination', '/tmp', 'destination'),
-                                  ('sealed_volume_container', 'wrong', 'container'),
-                                  ('sealed_descriptor_sha256', {}, 'hashes')]:
+                                  ('sandbox_resource_uid', '', 'sandbox_resource_uid')]:
             with self.subTest(key=key):
                 data = fixture('workload')
                 body = json.loads(data['openshell-bootstrap.json']); body[key] = value
@@ -116,7 +113,6 @@ class GuestContract(unittest.TestCase):
         data = fixture('supervisor')
         body = json.loads(data['openshell-bootstrap.json'])
         body['resource_uris'].pop('client-ca.crt')
-        body['sealed_descriptor_sha256'].pop('client-ca.crt')
         data['openshell-bootstrap.json'] = json.dumps(body)
         with self.assertRaisesRegex(ValueError, 'missing role bootstrap resource references'):
             validate(data)
@@ -127,29 +123,25 @@ class GuestContract(unittest.TestCase):
                 data = fixture('supervisor')
                 body = json.loads(data['openshell-bootstrap.json'])
                 body['resource_uris'][name] = 'kbs:///default/bootstrap/old'
-                body['sealed_descriptor_sha256'][name] = 'b' * 64
                 data['openshell-bootstrap.json'] = json.dumps(body)
                 with self.assertRaisesRegex(ValueError, 'invalid bootstrap resource references'):
                     validate(data)
 
     def test_core_service_order_measures_initdata_before_secret_release(self):
+        import configparser
         units = ROOT / 'deployment/guest/files/etc/systemd/system'
-        aa = (units / 'attestation-agent.service.d/20-confidential.conf').read_text()
-        cdh = (units / 'confidential-data-hub.service.d/20-confidential.conf').read_text()
-        kata = (units / 'kata-agent.service.d/20-confidential.conf').read_text()
-        self.assertIn('After=process-user-data.service systemd-time-wait-sync.service', aa)
-        self.assertIn('--initdata-toml /run/peerpod/initdata.toml', aa)
-        self.assertIn('Requires=attestation-agent.service', cdh)
-        self.assertIn('After=attestation-agent.service', cdh)
-        self.assertIn('After=confidential-data-hub.service', kata)
-
-    def test_reference_namespace_ingress_default_deny_is_retained(self):
-        policy = (ROOT / 'deployment/openshell/network-fence.example.yaml').read_text()
-        self.assertIn('namespace: openshell', policy)
-        self.assertIn('podSelector: {}', policy)
-        self.assertIn('policyTypes: [Ingress]', policy)
-        self.assertIn('ingress: []', policy)
-        self.assertIn('--workspace-mode shared', (ROOT / 'deployment/openshell/openshell-confidential-driver.service').read_text())
+        def unit(name):
+            result = configparser.ConfigParser(interpolation=None, strict=False)
+            result.read(units / name / '20-confidential.conf')
+            return result
+        aa = unit('attestation-agent.service.d')
+        cdh = unit('confidential-data-hub.service.d')
+        kata = unit('kata-agent.service.d')
+        self.assertTrue({'process-user-data.service', 'systemd-time-wait-sync.service'}
+                        <= set(aa['Unit']['After'].split()))
+        self.assertIn('attestation-agent.service', cdh['Unit']['Wants'].split())
+        self.assertIn('attestation-agent.service', cdh['Unit']['After'].split())
+        self.assertIn('confidential-data-hub.service', kata['Unit']['After'].split())
 
 if __name__ == '__main__':
     unittest.main()

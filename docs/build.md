@@ -132,9 +132,9 @@ deployment or real TDX attestation.
 ./cos build guest --region cn-beijing
 ```
 
-The public profile supports **cn-beijing, Zone I, ecs.g9i.xlarge**. Other regions
-are rejected before the guest build or selection; the broader cloud placement
-table is not a tested deployment profile. This step builds the
+The validated deployment uses **cn-beijing, Zone I, ecs.g9i.xlarge**.
+Region and zone are configurable; ECS validates the actual TDX launch parameters.
+This step builds the
 upstream Ubuntu UKI/verity image, verifies it, records its measurements and selects
 that exact build for the release. It prints the QCOW2, reference JSON and receipt
 paths; there is no receipt path to copy into another command.

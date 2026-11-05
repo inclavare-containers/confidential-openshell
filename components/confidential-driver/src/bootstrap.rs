@@ -263,12 +263,6 @@ impl BootstrapStore {
     ) -> Result<Self> {
         let mut store = Self::open(repository_dir, signing_key_path)?;
         store.trustee_config = trustee_config;
-        if !fs::symlink_metadata(renderer_script.as_ref())?
-            .file_type()
-            .is_file()
-        {
-            return Err(StoreError::UnsafePath);
-        }
         store.policy = Some((
             renderer_script.as_ref().to_path_buf(),
             kbs_policy_output.as_ref().to_path_buf(),
@@ -976,17 +970,7 @@ impl BootstrapStore {
                 let Some(disk_id) = volume.cloud_disk_id else {
                     return Ok(Vec::new());
                 };
-                if !disk_id.starts_with("d-")
-                    || disk_id.len() <= 2
-                    || disk_id.len() > 128
-                    || !disk_id
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-                {
-                    return Err(StoreError::Invalid(
-                        "workspace cloud disk ID must be an Alibaba disk ID",
-                    ));
-                }
+                validate_volume_id(&disk_id)?;
                 disks.insert(disk_id);
             }
             Ok(disks.into_iter().collect())
@@ -1246,35 +1230,6 @@ impl BootstrapStore {
         })
     }
 
-    /// Sign a native CDH vault reference before the measured initdata digest
-    /// exists. It contains only a deterministic URI and publishes no raw
-    /// bytes. `publish_file` later returns this exact descriptor.
-    pub(super) fn seal_planned_file(
-        &self,
-        role: BootstrapRole,
-        generation: &str,
-        sandbox_id: &str,
-        attempt_id: &str,
-        key: &str,
-    ) -> Result<String> {
-        let planned = self.plan_file(role, generation, sandbox_id, attempt_id, key)?;
-        let identity = identity_hash(role, generation, sandbox_id, attempt_id);
-        let id = file_hash(&identity, key);
-        let input = descriptor_input(&planned.resource_uri)?;
-        self.with_lock(|| {
-            if self.has_pending_delete_for_sandbox(sandbox_id)? {
-                return Err(StoreError::Revoked);
-            }
-            if self.tombstone(&identity).exists()
-                || self.revoking(&identity).exists()
-                || self.quarantine(&id).exists()
-            {
-                return Err(StoreError::Revoked);
-            }
-            self.load_or_sign_descriptor(&id, &input)
-        })
-    }
-
     fn load_or_sign_descriptor(&self, id: &str, input: &str) -> Result<String> {
         let descriptor_path = self.descriptor(id);
         let pair = self.load_or_create_signer()?;
@@ -1307,6 +1262,7 @@ impl BootstrapStore {
     /// Remove every file for an identity. Resource rename is the serving cut
     /// before a tombstone is committed. Interrupted revocations are detected
     /// through quarantine files; a later retry finishes the operation.
+    #[cfg(test)]
     pub(super) fn revoke_attempt(
         &self,
         role: BootstrapRole,
@@ -2524,11 +2480,11 @@ pathlib.Path(args[args.index('--output') + 1]).write_text('package policy\ndefau
             .record_workspace_volume("ns", "uid", "first", Some("pv-a"), Some("d-z"))
             .unwrap();
         store
-            .record_workspace_volume("ns", "uid", "second", Some("pv-b"), Some("d-a"))
+            .record_workspace_volume("ns", "uid", "second", Some("pv-b"), Some("disk-a"))
             .unwrap();
         assert_eq!(
             store.workspace_disk_ids("ns", "uid").unwrap(),
-            ["d-a", "d-z"]
+            ["d-z", "disk-a"]
         );
         assert!(
             store
@@ -2869,15 +2825,6 @@ pathlib.Path(args[args.index('--output') + 1]).write_text('package policy\ndefau
                 )
                 .is_ok()
         );
-        let presealed = store
-            .seal_planned_file(
-                BootstrapRole::Workload,
-                GENERATION,
-                "sandbox-1",
-                ATTEMPT,
-                "auth.json",
-            )
-            .unwrap();
         assert!(
             !store
                 .resource(planned.resource_uri.rsplit('/').next().unwrap())
@@ -2896,7 +2843,6 @@ pathlib.Path(args[args.index('--output') + 1]).write_text('package policy\ndefau
             )
             .unwrap();
         assert_eq!(planned.resource_uri, secret.resource_uri);
-        assert_eq!(presealed, secret.sealed_descriptor);
         assert_eq!(
             read_regular(&store.resource(secret.resource_uri.rsplit('/').next().unwrap())).unwrap(),
             raw

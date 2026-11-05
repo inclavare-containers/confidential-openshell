@@ -19,3 +19,15 @@ Gateway database to change this display.
 Follow the [sequential deployment runbook](../../docs/deployment.md) for
 installation and checks. Edit private operator copies outside
 the checkout; keep credentials and runtime state out of this directory.
+
+When upgrading from the namespace-wide ingress policy, stop existing sandboxes
+and the driver, then remove only the previous managed fences before restarting:
+
+```sh
+kubectl -n openshell delete networkpolicy confidential-ingress-default-deny --ignore-not-found
+kubectl -n openshell delete networkpolicy -l openshell.ai/managed-by=openshell,openshell.ai/component=sandbox-supervisor-egress
+```
+
+The driver recreates supervisor egress policies with upstream behavior on the
+next sandbox start. Workload and control-connection policies remain managed
+by the driver.

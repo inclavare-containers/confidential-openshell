@@ -46,11 +46,9 @@ struct Args {
     #[arg(long, env = "OPENSHELL_KATA_POLICY_TOOLS_DIR")]
     kata_policy_tools_dir: PathBuf,
 
-    #[arg(long, env = "OPENSHELL_KATA_POLICY_REGISTRY")]
-    kata_policy_registry: String,
-
+    /// Optional additional registry CA; system roots remain enabled.
     #[arg(long, env = "OPENSHELL_KATA_POLICY_REGISTRY_CA")]
-    kata_policy_registry_ca: PathBuf,
+    kata_policy_registry_ca: Option<PathBuf>,
 
     /// Immutable pause image used by Kata policy generation.
     #[arg(long, env = "OPENSHELL_KATA_POLICY_PAUSE_IMAGE")]
@@ -235,13 +233,6 @@ struct Args {
     #[arg(long, env = "OPENSHELL_ENABLE_USER_NAMESPACES")]
     enable_user_namespaces: bool,
 
-    /// Lifetime (seconds) of the projected `ServiceAccount` token
-    /// kubelet writes into each sandbox pod for the `IssueSandboxToken`
-    /// bootstrap exchange. Kubelet enforces a minimum of 600s; the
-    /// gateway clamps values outside `[600, 86400]`. Default 3600.
-    #[arg(long, env = "OPENSHELL_K8S_SA_TOKEN_TTL_SECS", default_value_t = 3600)]
-    sa_token_ttl_secs: i64,
-
     #[arg(long, env = "OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET")]
     provider_spiffe_workload_api_socket_path: Option<String>,
 
@@ -364,12 +355,12 @@ async fn main() -> Result<()> {
             default_runtime_class_name: args.confidential_runtime_class,
             allowed_pod_annotations: args.allowed_pod_annotations,
             allowed_pod_labels: args.allowed_pod_labels,
-            sa_token_ttl_secs: args.sa_token_ttl_secs,
             provider_spiffe_workload_api_socket_path: args
                 .provider_spiffe_workload_api_socket_path
                 .unwrap_or_default(),
             sandbox_uid: args.sandbox_uid,
             sandbox_gid: args.sandbox_gid,
+            ..Default::default()
         },
         shutdown_rx,
         ConfidentialDriverSettings {
@@ -378,8 +369,10 @@ async fn main() -> Result<()> {
             client_tls_ca: args.confidential_client_tls_ca,
             policy_generator: args.kata_policy_generator,
             policy_tools_dir: args.kata_policy_tools_dir,
-            policy_registry: args.kata_policy_registry,
-            policy_registry_ca: args.kata_policy_registry_ca,
+            policy_registry_ca: args
+                .kata_policy_registry_ca
+                .or_else(|| std::env::var_os("REGISTRY_CA").map(PathBuf::from))
+                .filter(|path| !path.as_os_str().is_empty()),
             policy_pause_image: args.kata_policy_pause_image,
             bootstrap_store_dir: args.bootstrap_store_dir,
             bootstrap_signing_key: args.bootstrap_signing_key,
@@ -443,10 +436,6 @@ mod tests {
             "/tmp/agent_policy.py",
             "--kata-policy-tools-dir",
             "/tmp/kata-policy",
-            "--kata-policy-registry",
-            "registry.internal:5000",
-            "--kata-policy-registry-ca",
-            "/tmp/registry-ca.pem",
             "--kata-policy-pause-image",
             "registry.internal/pause@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "--bootstrap-store-dir",
@@ -472,5 +461,6 @@ mod tests {
         );
         assert_eq!(args.gateway_name.as_deref(), Some("kubernetes-dev"));
         assert_eq!(args.bootstrap_timeout_seconds, 300);
+        assert!(args.kata_policy_registry_ca.is_none());
     }
 }

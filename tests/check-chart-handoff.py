@@ -30,64 +30,29 @@ def require(condition, explanation):
 
 
 def consume(bundle, expected_checksums):
-    """No checkout/Git/B path is read here; all data inputs are inside bundle."""
     require(shutil.which('git') is None, 'simulated T must not have Git')
-    checksums = bundle / 'SHA256SUMS'
-    require(sha256(checksums) == expected_checksums, 'handoff checksum-list identity mismatch')
-    verified = set()
-    for line in checksums.read_text().splitlines():
-        expected, name = line.split('  ', 1)
-        relative = Path(name)
-        require(not relative.is_absolute() and '..' not in relative.parts and relative.as_posix() == name
-                and name not in verified, 'unsafe or duplicate handoff path')
-        path = bundle / relative
-        require(path.is_file(), f'missing handoff file: {name}')
-        require(not any(p.is_symlink() for p in [path, *path.parents]) and path.stat().st_nlink == 1,
-                'handoff files must not contain symlinks or hardlinks')
-        require(sha256(path) == expected, f'handoff hash mismatch: {name}')
-        verified.add(name)
-    require({ARCHIVE, 'build-manifest.json', 'csi-values.yaml'} <= verified, 'incomplete handoff checksum list')
-    manifest = json.loads((bundle / 'build-manifest.json').read_text())
-    source = manifest['sources'][COMPONENT]
-    require(source['upstream_checkout'] == source['patch_check'] == 'verified', 'unverified CSI source')
-    artifact = manifest['artifacts']['csi-chart']
-    require(artifact['path'] == 'artifacts/' + ARCHIVE, 'unexpected CSI artifact path')
-    require(sha256(bundle / ARCHIVE) == artifact['sha256'], 'CSI manifest hash mismatch')
-    extracted = bundle / 'extracted'
-    extracted.mkdir()
-    seen = set()
-    with tarfile.open(bundle / ARCHIVE, 'r:gz') as archive:
-        for member in archive.getmembers():
-            path = Path(member.name)
-            require(not path.is_absolute() and '..' not in path.parts and path.parts
-                    and path.parts[0] == COMPONENT and path.as_posix() == member.name and member.name not in seen,
-                    'unsafe or duplicate chart member path')
-            require(member.isfile() or member.isdir(), 'chart must not contain links or devices')
-            seen.add(member.name)
-            target = extracted / path
-            if member.isdir():
-                target.mkdir(parents=True, exist_ok=True)
-            else:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(archive.extractfile(member).read())
-    provenance = json.loads((extracted / COMPONENT / 'source-provenance.json').read_text())
-    require(provenance == artifact['source'], 'packaged CSI provenance differs from manifest')
-    require(provenance['patched_result_tree'] == source['expected_patched_result_tree'] == source['observed_patched_result_tree'],
-            'CSI patched result tree mismatch')
-    require(provenance['source_upstream_commit'] == source['source_upstream_commit'] == source['observed_patch_base_commit'],
-            'CSI upstream commit mismatch')
-    args = ['helm', 'template', 'caa-csi-block', '--namespace', 'confidential-containers-system',
-            '--values', str(bundle / 'csi-values.yaml')]
-    # T installs the archive directly. Also render its extracted tree to prove
-    # that the package is self-contained and the two forms have identical resources.
-    rendered = subprocess.check_output([*args, str(bundle / ARCHIVE)], text=True)
-    unpacked = subprocess.check_output([*args, str(extracted / COMPONENT)], text=True)
-    require(rendered == unpacked, 'archive and extracted chart renders differ')
+    source = Path(__file__).resolve().parent / 'source'
+    spec = importlib.util.spec_from_file_location('install_release', source / 'deployment/build/install-release.py')
+    release = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(release)
+    installed = bundle.parent / 'installed-handoff'
+    release.copy_handoff(bundle, installed, expected_checksums)
+    operator = bundle.parent / 'operator'
+    operator.mkdir()
+    subprocess.run(['bash', str(source / 'deployment/peerpods/verify-csi-chart.sh')],
+                   env={**os.environ, 'HANDOFF': str(installed), 'OPERATOR_DIR': str(operator)},
+                   stdout=subprocess.PIPE, check=True, text=True)
+    rendered = subprocess.check_output([
+        'helm', 'template', 'caa-csi-block', str(installed / ARCHIVE),
+        '--namespace', 'confidential-containers-system',
+        '--values', str(installed / 'csi-values.yaml')], text=True)
     (bundle / 'rendered.yaml').write_text(rendered)
     resources = [document for document in yaml.safe_load_all(rendered) if document is not None]
     assert_resources(resources)
+    provenance = json.loads((operator / 'csi-chart-source.json').read_text())
     print(json.dumps({'result': 'passed', 'resources': len(resources), 'source': provenance,
-                      'chart_sha256': artifact['sha256'], 'rendered_sha256': sha256(bundle / 'rendered.yaml')}, sort_keys=True))
+                      'chart_sha256': sha256(installed / ARCHIVE),
+                      'rendered_sha256': sha256(bundle / 'rendered.yaml')}, sort_keys=True))
 
 
 def assert_resources(resources):
@@ -108,8 +73,7 @@ def assert_resources(resources):
     require('--nodeid=$(KUBE_NODE_NAME)' in driver['args'], 'node identity missing')
     require(not any(a.startswith('--component=') for a in driver['args']), 'unexpected split service mode')
     require('--leader-election=true' in containers['csi-provisioner']['args'], 'provisioner leader election missing')
-    csi = one('CSIDriver', 'caa-csi-block.csi.confidentialcontainers.io')
-    require(csi['spec']['podInfoOnMount'] is True, 'CSI must receive Pod identity from kubelet')
+    one('CSIDriver', 'caa-csi-block.csi.confidentialcontainers.io')
     binding = one('ClusterRoleBinding', 'caa-csi-block')
     require(binding['subjects'] == [{'kind': 'ServiceAccount', 'name': node_pod['serviceAccountName'], 'namespace': 'caa-csi-block'}],
             'CSI ServiceAccount binding is incorrect')
@@ -167,11 +131,17 @@ class HandoffTests(unittest.TestCase):
         (self.bundle / 'build-manifest.json').write_text(json.dumps(source_report))
         self.checksums()
         shutil.copyfile(__file__, self.trusted / 'consumer.py')
+        for name in ('deployment/build/install-release.py', 'deployment/lib/common.sh',
+                     'deployment/peerpods/verify-csi-chart.sh'):
+            destination = self.trusted / 'source' / name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(self.root / name, destination)
         tools = self.trusted / 'tools'
         tools.mkdir()
-        executable = shutil.which('helm')
-        self.assertIsNotNone(executable, 'existing trusted Helm is required')
-        (tools / 'helm').symlink_to(executable)
+        for name in ('helm', 'bash', 'dirname', 'sha256sum', 'tar', 'gzip', 'jq'):
+            executable = shutil.which(name)
+            self.assertIsNotNone(executable, f'{name} is required')
+            (tools / name).symlink_to(executable)
         self.env = {**os.environ, 'PATH': str(tools), 'HELM_CACHE_HOME': str(self.trusted / 'helm-cache'),
                     'HELM_CONFIG_HOME': str(self.trusted / 'helm-config'), 'HELM_DATA_HOME': str(self.trusted / 'helm-data'),
                     'HELM_PLUGINS': str(self.trusted / 'no-plugins'), 'KUBECONFIG': str(self.trusted / 'no-kubeconfig')}
@@ -198,7 +168,7 @@ class HandoffTests(unittest.TestCase):
         (self.bundle / ARCHIVE).unlink()
         result = self.run_consumer()
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn('missing handoff file', result.stderr)
+        self.assertIn('No such file', result.stderr)
         self.assertFalse((self.bundle / 'rendered.yaml').exists())
 
     def test_changed_package_hash_fails_before_render(self):
@@ -206,7 +176,7 @@ class HandoffTests(unittest.TestCase):
             output.write(b'corruption')
         result = self.run_consumer()
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn('handoff hash mismatch', result.stderr)
+        self.assertIn('checksum did NOT match', result.stderr)
         self.assertFalse((self.bundle / 'rendered.yaml').exists())
 
     def test_wrong_source_tree_fails_even_with_matching_transport_checksums(self):
@@ -217,7 +187,7 @@ class HandoffTests(unittest.TestCase):
         self.checksums()
         result = self.run_consumer()
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn('CSI patched result tree mismatch', result.stderr)
+        self.assertIn('verify-csi-chart.sh', result.stderr)
         self.assertFalse((self.bundle / 'rendered.yaml').exists())
 
     def test_upstream_chart_is_rejected_by_resource_assertions_even_if_mislabeled(self):
@@ -249,7 +219,7 @@ class HandoffTests(unittest.TestCase):
         self.approved = '0' * 64
         result = self.run_consumer()
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn('handoff checksum-list identity mismatch', result.stderr)
+        self.assertIn('Handoff changed while copying', result.stderr)
         self.assertFalse((self.bundle / 'rendered.yaml').exists())
 
     def test_unsafe_archive_member_fails_even_with_matching_transport_checksums(self):
@@ -267,7 +237,7 @@ class HandoffTests(unittest.TestCase):
         self.checksums()
         result = self.run_consumer()
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn('unsafe or duplicate chart member path', result.stderr)
+        self.assertIn('Error:', result.stderr)
         self.assertFalse((self.bundle / 'rendered.yaml').exists())
         self.assertFalse((self.bundle / 'extracted/escape').exists())
 

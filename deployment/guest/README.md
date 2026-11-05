@@ -9,7 +9,7 @@ OCI artifacts and binary hashes.
 The only compiled guest integrations are CAA's APF and process-user-data from
 the verified patch tree. The image reuses upstream systemd units; small drop-ins
 validate measured initdata, pass its exact TOML to native AA startup binding,
-and gate CDH/Kata/APF startup. Ubuntu `python3` supports the validator and
+and order CDH/Kata/APF startup. AA/CDH retain upstream automatic restart. Ubuntu `python3` supports the validator and
 workspace initializer; `systemd-timesyncd` with Alibaba NTP corrects the ECS RTC
 before KBS authentication. AA/CDH daemon sources are unchanged. The upstream
 container-facing REST path is disabled because this profile uses native ttRPC.
@@ -80,7 +80,8 @@ identity. A fresh disk must be an unused, partition-free whole disk, entirely
 zero-filled and explicitly authorized for initialization on the first sandbox creation.
 Restart sets `allow_initialize=false`, so a substituted blank disk is rejected. The small initializer
 receives exactly 32 CDH-released key bytes on stdin and calls Ubuntu's standard
-cryptsetup to create an embedded LUKS2 header plus ext4, then closes it. Existing
+cryptsetup to create an embedded LUKS2 header, formats the measured filesystem
+(default ext4), then closes it. Existing
 LUKS disks are never initialized or repaired. Upstream CDH SecureMount opens
 `sourceType=encrypted,targetType=device`; APF verifies the active kernel mapping uses
 LUKS2, AES-XTS with a 512-bit key and 4096-byte sectors before mounting, including reused

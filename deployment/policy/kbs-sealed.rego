@@ -10,7 +10,7 @@ approved_initdata_events := {}
 default allow := false
 
 approved_tdx(appraisal) if {
-	appraisal["ear.appraisal-policy-id"] == "default"
+	appraisal["ear.appraisal-policy-id"] == "openshell-tdx"
 	appraisal["ear.status"] == "affirming"
 	vector := appraisal["ear.trustworthiness-vector"]
 	vector.hardware == 2

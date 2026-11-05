@@ -73,13 +73,20 @@ class Addresses(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             ca = Path(temp) / 'ca.pem'
             ca.write_text('-----BEGIN CERTIFICATE-----\nYQ==\n-----END CERTIFICATE-----\n')
-            result = subprocess.run(['python3', str(ROOT / 'deployment/guest/render-guest-initdata.py'),
-                                     '--kbs-url', 'https://203.0.113.10:8443', '--kbs-ca', str(ca), '--registry-ca', str(ca)], capture_output=True, text=True, check=True)
-            data = tomllib.loads(result.stdout)['data']
-            aa, cdh = tomllib.loads(data['aa.toml']), tomllib.loads(data['cdh.toml'])
-            self.assertEqual(aa['token_configs']['kbs']['url'], 'https://203.0.113.10:8443')
-            self.assertEqual(cdh['kbc']['url'], aa['token_configs']['kbs']['url'])
-            self.assertEqual(cdh['kbc']['kbs_cert'].strip(), ca.read_text().strip())
+            for extra_roots in ([], [str(ca)], [str(ca), str(ca)]):
+                registry_args = [part for path in extra_roots for part in ('--registry-ca', path)]
+                result = subprocess.run(['python3', str(ROOT / 'deployment/guest/render-guest-initdata.py'),
+                                         '--kbs-url', 'https://203.0.113.10:8443', '--kbs-ca', str(ca),
+                                         *registry_args], capture_output=True, text=True, check=True)
+                data = tomllib.loads(result.stdout)['data']
+                aa, cdh = tomllib.loads(data['aa.toml']), tomllib.loads(data['cdh.toml'])
+                self.assertEqual(aa['token_configs']['kbs']['url'], 'https://203.0.113.10:8443')
+                self.assertEqual(cdh['kbc']['url'], aa['token_configs']['kbs']['url'])
+                self.assertEqual(cdh['kbc']['kbs_cert'].strip(), ca.read_text().strip())
+                self.assertEqual(cdh['image']['extra_root_certificates'], [ca.read_text().strip()] * len(extra_roots))
+                kbs_config = tomllib.loads((ROOT / 'deployment/trustee/kbs-config.example.toml').read_text())
+                selector = aa['token_configs']['kbs']['attestation_policy_selector']
+                self.assertEqual(kbs_config['attestation_service']['policy_id_map'][selector], ['openshell-tdx'])
 
     def test_tls_authenticates_advertised_ip_without_binding_that_address(self):
         with tempfile.TemporaryDirectory() as temp:

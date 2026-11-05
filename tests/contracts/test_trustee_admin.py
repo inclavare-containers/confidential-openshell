@@ -16,6 +16,7 @@ B = 'resource/default/bootstrap/' + 'b' * 64
 
 class Peer:
     endpoint = 'https://trustee.example:8443'
+    as_policy_id = 'openshell-tdx'
 
     def __init__(self):
         self.resources = {'resource/unrelated/project/key': b'untouched'}
@@ -60,6 +61,15 @@ class Publication(unittest.TestCase):
         self.peer.calls.clear()
         self.sync({A: b'secret'})
         self.assertEqual(self.peer.calls, [])
+
+    def test_named_policy_is_published_when_migrating_an_existing_journal(self):
+        self.sync({A: b'secret'})
+        state = json.loads(self.journal.read_text())
+        state.pop('as_policy_id')
+        self.journal.write_text(json.dumps(state))
+        self.peer.calls.clear()
+        self.sync({A: b'secret'})
+        self.assertEqual(self.peer.calls, [('AS', b'approved measurements')])
 
     def test_lost_post_response_survives_restart_and_is_deleted_on_rollback(self):
         self.peer.lose_post_response = True

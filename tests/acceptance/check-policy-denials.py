@@ -59,7 +59,7 @@ def signed_token(issuer, issuer_jwk, tee_pubkey, digest, tcb="OutOfDate", attrib
     claims = {
         "exp": int(time.time()) + 120, "nbf": int(time.time()) - 10,
         "submods": {"cpu0": {
-            "ear.appraisal-policy-id": "default", "ear.status": "affirming",
+            "ear.appraisal-policy-id": "openshell-tdx", "ear.status": "affirming",
             "ear.trustworthiness-vector": {
                 "hardware": 2, "configuration": 2, "executables": 3, "file-system": 2,
             },

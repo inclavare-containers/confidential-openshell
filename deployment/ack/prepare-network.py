@@ -4,7 +4,6 @@ import argparse
 import ipaddress
 
 from cloud import Cloud, require
-from network import require_tdx_zone
 
 
 def inherit_worker_snat(cloud, vpc):
@@ -64,7 +63,6 @@ def main():
     cloud = Cloud()
     detail = cloud.cluster()
     vpc, zone = cloud.state['vpc_id'], cloud.state['zone_id']
-    require_tdx_zone(cloud.region, cloud.config['podvm_instance_type'], zone)
     worker_group = detail['security_group_id']
     info = cloud.api('ecs', 'DescribeSecurityGroupAttribute', RegionId=cloud.region, SecurityGroupId=worker_group)
     require(info['VpcId'] == vpc, 'Worker security group must be in the ACK VPC.')

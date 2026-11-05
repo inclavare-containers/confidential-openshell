@@ -1,28 +1,27 @@
-From 797425f8c035b53b93ef8b89a69218803d2a4e29 Mon Sep 17 00:00:00 2001
+From b74933d9a14fc294fecbdfe4aba4dcd1ccfa2b73 Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
 Date: Tue, 3 Nov 2026 20:11:27 +0800
-Subject: [PATCH] alibabacloud: identify attached data disks by serial and WWID
+Subject: [PATCH] alibabacloud: locate guest disks by cloud disk ID
 
-Match Alibaba disk IDs against kernel serial/WWID information and verify
-that the selected device is a whole data disk, not system backing storage.
-Reject ambiguous matches while allowing an already mounted data disk to
-be reused by the guest mount lifecycle. No measured policy is introduced.
+Match Alibaba disk IDs against kernel serial/WWID information for virtio
+and NVMe devices. Require a unique match and retain the existing guest
+device-discovery retries without falling back to device ordering.
 
 Co-authored-by: Codex <noreply@openai.com>
 ---
- .../forwarder/interceptor/alibaba_device.go   | 175 +++++++++++++++
- .../interceptor/alibaba_device_test.go        | 199 ++++++++++++++++++
+ .../forwarder/interceptor/alibaba_device.go   |  68 ++++++++
+ .../interceptor/alibaba_device_test.go        | 145 ++++++++++++++++++
  .../pkg/forwarder/interceptor/interceptor.go  |  24 ++-
- 3 files changed, 395 insertions(+), 3 deletions(-)
+ 3 files changed, 234 insertions(+), 3 deletions(-)
  create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/alibaba_device.go
  create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/alibaba_device_test.go
 
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/alibaba_device.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/alibaba_device.go
 new file mode 100644
-index 00000000..413fd32c
+index 00000000..7a9a3bd4
 --- /dev/null
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/alibaba_device.go
-@@ -0,0 +1,175 @@
+@@ -0,0 +1,68 @@
 +// (C) Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -35,22 +34,18 @@ index 00000000..413fd32c
 +	"path/filepath"
 +	"regexp"
 +	"strings"
-+
-+	"github.com/moby/sys/mountinfo"
 +)
 +
 +var (
-+	alibabaDiskIDPattern      = regexp.MustCompile(`^d-[A-Za-z0-9]+$`)
-+	unsupportedBlockNameStart = regexp.MustCompile(`^(loop|dm-|md|ram|zram|sr|fd)`)
-+	errAlibabaDiskIDInvalid   = errors.New("invalid Alibaba Cloud disk identity")
-+	errAlibabaDiskNotFound    = errors.New("Alibaba Cloud disk is not visible")
-+	errAlibabaDiskAmbiguous   = errors.New("Alibaba Cloud disk identity is ambiguous")
++	alibabaDiskIDPattern    = regexp.MustCompile(`^d-[A-Za-z0-9]+$`)
++	errAlibabaDiskIDInvalid = errors.New("invalid Alibaba Cloud disk identity")
++	errAlibabaDiskNotFound  = errors.New("Alibaba Cloud disk is not visible")
++	errAlibabaDiskAmbiguous = errors.New("Alibaba Cloud disk identity is ambiguous")
 +)
 +
 +type alibabaDeviceLocator struct {
 +	sysBlockRoot string
 +	deviceRoot   string
-+	isSystemDisk func(string) bool
 +}
 +
 +func isAlibabaDiskIdentity(diskID string) bool {
@@ -58,13 +53,11 @@ index 00000000..413fd32c
 +}
 +
 +func findAlibabaDataDisk(diskID string) (string, error) {
-+	return (alibabaDeviceLocator{
-+		sysBlockRoot: "/sys/block", deviceRoot: "/dev", isSystemDisk: isAlibabaSystemDisk,
-+	}).find(diskID)
++	return (alibabaDeviceLocator{sysBlockRoot: "/sys/block", deviceRoot: "/dev"}).find(diskID)
 +}
 +
-+// Use the same kernel identities as the measured workspace initializer.
-+// Virtio serials omit d-; NVMe serials include it. Never select by device order.
++// Match the cloud disk ID to its kernel identity, with or without the d- prefix.
++// /sys/block enumerates whole devices; selecting a filesystem is a separate step.
 +func (l alibabaDeviceLocator) find(diskID string) (string, error) {
 +	if !alibabaDiskIDPattern.MatchString(diskID) {
 +		return "", fmt.Errorf("%w: %q", errAlibabaDiskIDInvalid, diskID)
@@ -76,12 +69,8 @@ index 00000000..413fd32c
 +	wanted := strings.ToLower(strings.TrimPrefix(diskID, "d-"))
 +	matched := ""
 +	for _, entry := range entries {
-+		name := entry.Name()
-+		if !l.safeWholeDisk(name) {
-+			continue
-+		}
 +		for _, field := range []string{"device/serial", "serial", "device/wwid", "wwid"} {
-+			data, err := os.ReadFile(filepath.Join(l.sysBlockRoot, name, field))
++			data, err := os.ReadFile(filepath.Join(l.sysBlockRoot, entry.Name(), field))
 +			if err != nil {
 +				continue
 +			}
@@ -92,7 +81,7 @@ index 00000000..413fd32c
 +			if matched != "" {
 +				return "", fmt.Errorf("%w: %s", errAlibabaDiskAmbiguous, diskID)
 +			}
-+			matched = filepath.Join(l.deviceRoot, name)
++			matched = filepath.Join(l.deviceRoot, entry.Name())
 +			break
 +		}
 +	}
@@ -101,109 +90,12 @@ index 00000000..413fd32c
 +	}
 +	return matched, nil
 +}
-+
-+func (l alibabaDeviceLocator) safeWholeDisk(name string) bool {
-+	if name == "" || filepath.Base(name) != name || unsupportedBlockNameStart.MatchString(name) {
-+		return false
-+	}
-+	if _, err := os.Stat(filepath.Join(l.sysBlockRoot, name)); err != nil {
-+		return false
-+	}
-+	if _, err := os.Stat(filepath.Join(l.sysBlockRoot, name, "partition")); err == nil {
-+		return false
-+	}
-+	if hasPartitionsIn(l.sysBlockRoot, name) {
-+		return false
-+	}
-+	return l.isSystemDisk == nil || !l.isSystemDisk(name)
-+}
-+
-+func hasPartitionsIn(sysBlockRoot, name string) bool {
-+	entries, err := os.ReadDir(filepath.Join(sysBlockRoot, name))
-+	if err != nil {
-+		return false
-+	}
-+	for _, entry := range entries {
-+		if strings.HasPrefix(entry.Name(), name) {
-+			if _, err := os.Stat(filepath.Join(sysBlockRoot, name, entry.Name(), "partition")); err == nil {
-+				return true
-+			}
-+		}
-+	}
-+	return false
-+}
-+
-+func isAlibabaSystemDisk(devName string) bool {
-+	criticalMounts := map[string]struct{}{`/`: {}, `/boot`: {}, `/boot/efi`: {}, `/usr`: {}, `/var`: {}}
-+	mounts, err := mountinfo.GetMounts(func(mount *mountinfo.Info) (skip, stop bool) {
-+		_, critical := criticalMounts[mount.Mountpoint]
-+		return !critical, false
-+	})
-+	if err != nil {
-+		return true
-+	}
-+	for _, mount := range mounts {
-+		// Resolve kernel device numbers; source strings can be /dev/root or
-+		// UUID aliases. Major zero denotes a non-block-backed filesystem.
-+		if mount.Major == 0 {
-+			continue
-+		}
-+		devicePath, err := filepath.EvalSymlinks(fmt.Sprintf("/sys/dev/block/%d:%d", mount.Major, mount.Minor))
-+		if err != nil {
-+			return true
-+		}
-+		if blockDeviceGraphContains("/sys/class/block", filepath.Base(devicePath), devName) {
-+			return true
-+		}
-+	}
-+	return false
-+}
-+
-+// blockDeviceGraphContains follows the kernel block graph instead of assuming
-+// that a critical filesystem is mounted directly from a whole disk. This
-+// follows backing devices (slaves) and partition parents. Holder links point
-+// toward consumers, not backing devices, and must not establish ownership.
-+func blockDeviceGraphContains(classBlockRoot, start, target string) bool {
-+	seen := make(map[string]struct{})
-+	var visit func(string) bool
-+	visit = func(name string) bool {
-+		name = filepath.Base(filepath.Clean(name))
-+		if name == "" || name == "." {
-+			return false
-+		}
-+		if name == target {
-+			return true
-+		}
-+		if _, exists := seen[name]; exists {
-+			return false
-+		}
-+		seen[name] = struct{}{}
-+
-+		devicePath := filepath.Join(classBlockRoot, name)
-+		if _, err := os.Stat(filepath.Join(devicePath, "partition")); err == nil {
-+			if resolved, err := filepath.EvalSymlinks(devicePath); err == nil {
-+				parent := filepath.Base(filepath.Dir(resolved))
-+				if parent != name && visit(parent) {
-+					return true
-+				}
-+			}
-+		}
-+		entries, _ := os.ReadDir(filepath.Join(devicePath, "slaves"))
-+		for _, entry := range entries {
-+			if visit(entry.Name()) {
-+				return true
-+			}
-+		}
-+		return false
-+	}
-+	return visit(start)
-+}
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/alibaba_device_test.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/alibaba_device_test.go
 new file mode 100644
-index 00000000..a76665dd
+index 00000000..313105fb
 --- /dev/null
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/alibaba_device_test.go
-@@ -0,0 +1,199 @@
+@@ -0,0 +1,145 @@
 +// (C) Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -249,7 +141,6 @@ index 00000000..a76665dd
 +	return alibabaDeviceLocator{
 +		sysBlockRoot: sysBlock,
 +		deviceRoot:   deviceRoot,
-+		isSystemDisk: func(string) bool { return false },
 +	}, sysBlock, deviceRoot
 +}
 +
@@ -278,32 +169,6 @@ index 00000000..a76665dd
 +	}
 +	if device != filepath.Join(deviceRoot, "vdb") {
 +		t.Fatalf("got device %q", device)
-+	}
-+}
-+
-+func TestFindAlibabaDataDiskRejectsUnsafeDevices(t *testing.T) {
-+	locator, sysBlock, deviceRoot := newTestAlibabaLocator(t)
-+	addTestBlockDevice(t, sysBlock, deviceRoot, "loop0", map[string]string{"device/serial": "workspace123"})
-+	addTestBlockDevice(t, sysBlock, deviceRoot, "vda", map[string]string{"device/serial": "workspace123"})
-+	if err := os.MkdirAll(filepath.Join(sysBlock, "vda", "vda1"), 0o755); err != nil {
-+		t.Fatal(err)
-+	}
-+	if err := os.WriteFile(filepath.Join(sysBlock, "vda", "vda1", "partition"), []byte("1\n"), 0o644); err != nil {
-+		t.Fatal(err)
-+	}
-+
-+	if _, err := locator.find("d-workspace123"); !errors.Is(err, errAlibabaDiskNotFound) {
-+		t.Fatal("expected virtual and partitioned devices to be rejected")
-+	}
-+}
-+
-+func TestFindAlibabaDataDiskRejectsSystemDisk(t *testing.T) {
-+	locator, sysBlock, deviceRoot := newTestAlibabaLocator(t)
-+	addTestBlockDevice(t, sysBlock, deviceRoot, "vda", map[string]string{"device/serial": "workspace123"})
-+	locator.isSystemDisk = func(name string) bool { return name == "vda" }
-+
-+	if _, err := locator.find("d-workspace123"); !errors.Is(err, errAlibabaDiskNotFound) {
-+		t.Fatalf("expected system disk to be rejected, got %v", err)
 +	}
 +}
 +
@@ -357,57 +222,30 @@ index 00000000..a76665dd
 +	}
 +}
 +
-+func TestBlockDeviceGraphContainsLVMRootBackingDisk(t *testing.T) {
-+	root := t.TempDir()
-+	classBlock := filepath.Join(root, "sys", "class", "block")
-+	devices := filepath.Join(root, "sys", "devices", "pci", "block", "vda")
-+	requireMkdir := func(path string) {
-+		t.Helper()
-+		if err := os.MkdirAll(path, 0o755); err != nil {
-+			t.Fatal(err)
-+		}
-+	}
-+	requireMkdir(filepath.Join(classBlock, "dm-0", "slaves"))
-+	requireMkdir(filepath.Join(devices, "vda2"))
-+	requireMkdir(filepath.Join(classBlock, "vda"))
-+	if err := os.WriteFile(filepath.Join(devices, "vda2", "partition"), []byte("2\n"), 0o644); err != nil {
-+		t.Fatal(err)
-+	}
-+	if err := os.Symlink(filepath.Join(devices, "vda2"), filepath.Join(classBlock, "vda2")); err != nil {
-+		t.Fatal(err)
-+	}
-+	if err := os.Symlink(filepath.Join(classBlock, "vda2"), filepath.Join(classBlock, "dm-0", "slaves", "vda2")); err != nil {
-+		t.Fatal(err)
-+	}
-+
-+	if !blockDeviceGraphContains(classBlock, "dm-0", "vda") {
-+		t.Fatal("dm/LVM root did not resolve to its whole-disk backing device")
-+	}
-+	if blockDeviceGraphContains(classBlock, "dm-0", "vdb") {
-+		t.Fatal("unrelated data disk was classified as a system-disk backing device")
++func TestFindAlibabaDataDiskWithPartitions(t *testing.T) {
++	locator, sysBlock, deviceRoot := newTestAlibabaLocator(t)
++	addTestBlockDevice(t, sysBlock, deviceRoot, "vdb", map[string]string{
++		"device/serial": "workspace123", "vdb1/partition": "1",
++	})
++	device, err := locator.find("d-workspace123")
++	if err != nil || device != filepath.Join(deviceRoot, "vdb") {
++		t.Fatalf("whole-disk lookup: device=%q err=%v", device, err)
 +	}
 +}
 +
-+func TestBlockDeviceGraphDoesNotTreatHolderAsBackingDevice(t *testing.T) {
-+	classBlock := filepath.Join(t.TempDir(), "sys", "class", "block")
-+	if err := os.MkdirAll(filepath.Join(classBlock, "vda", "holders"), 0o755); err != nil {
-+		t.Fatal(err)
-+	}
-+	if err := os.MkdirAll(filepath.Join(classBlock, "dm-0"), 0o755); err != nil {
-+		t.Fatal(err)
-+	}
-+	if err := os.Symlink(filepath.Join(classBlock, "dm-0"), filepath.Join(classBlock, "vda", "holders", "dm-0")); err != nil {
-+		t.Fatal(err)
-+	}
-+	if blockDeviceGraphContains(classBlock, "vda", "dm-0") {
-+		t.Fatal("consumer was mistaken for a backing device")
++func TestFindAlibabaDataDiskNVMeSerialWithoutPrefix(t *testing.T) {
++	locator, sysBlock, deviceRoot := newTestAlibabaLocator(t)
++	addTestBlockDevice(t, sysBlock, deviceRoot, "nvme1n1", map[string]string{"device/serial": "workspace123"})
++	device, err := locator.find("d-workspace123")
++	if err != nil || device != filepath.Join(deviceRoot, "nvme1n1") {
++		t.Fatalf("NVMe lookup: device=%q err=%v", device, err)
 +	}
 +}
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
-index 723c2e0e..0c5499be 100644
+index d47fd4e9..4d0fbbcd 100644
 --- a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
-@@ -282,6 +282,9 @@ func detectCloudProvider() string {
+@@ -400,6 +400,9 @@ func detectCloudProvider() string {
  // (SCSI rescan, udev rules), so the entire detection is retried.
  func findDataDiskDevice(lunIdx int, diskID string) (string, error) {
  	provider := detectCloudProvider()
@@ -417,7 +255,7 @@ index 723c2e0e..0c5499be 100644
  	logger.Printf("Cloud provider detected: %s (LUN %d, diskID %s)", provider, lunIdx, diskID)
  
  	maxAttempts := 15
-@@ -297,10 +300,11 @@ func findDataDiskDevice(lunIdx int, diskID string) (string, error) {
+@@ -415,10 +418,11 @@ func findDataDiskDevice(lunIdx int, diskID string) (string, error) {
  		}
  	}
  
@@ -430,7 +268,7 @@ index 723c2e0e..0c5499be 100644
  	for attempt := 1; attempt <= maxAttempts; attempt++ {
  		if attempt > 1 {
  			logger.Printf("Retry %d/%d for LUN %d...", attempt, maxAttempts, lunIdx)
-@@ -308,6 +312,15 @@ func findDataDiskDevice(lunIdx int, diskID string) (string, error) {
+@@ -426,6 +430,15 @@ func findDataDiskDevice(lunIdx int, diskID string) (string, error) {
  		}
  
  		switch provider {
@@ -446,7 +284,7 @@ index 723c2e0e..0c5499be 100644
  		case "azure":
  			if dev, err := findAzureDataDisk(lunIdx); err == nil {
  				return dev, nil
-@@ -322,12 +335,17 @@ func findDataDiskDevice(lunIdx int, diskID string) (string, error) {
+@@ -440,12 +453,17 @@ func findDataDiskDevice(lunIdx int, diskID string) (string, error) {
  			}
  		}
  

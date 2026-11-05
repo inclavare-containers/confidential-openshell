@@ -34,10 +34,9 @@ mod lifecycle_reconciliation {
             watch_client: client,
             sandbox_api_version: Arc::new(OnceCell::new()),
             lifecycle_gates: Arc::default(),
-            config: KubernetesComputeConfig::default(),
+            config: KubernetesComputeConfig { default_runtime_class_name: "kata-remote".into(), ..Default::default() },
             operator_allowlist: None,
-            confidential: None,
-            shared_supervisor: None,
+            confidential: test_confidential_profile(),
         };
         (driver, steps, Arc::default())
     }
@@ -51,11 +50,13 @@ mod lifecycle_reconciliation {
                 "labels": {LABEL_SANDBOX_ID: "sandbox-1", LABEL_SANDBOX_WORKSPACE: "team-a"},
                 "annotations": {
                     crate::resource_admission::CONFIG_USED: "false",
-                    crate::resource_admission::IDENTITIES: "{}",
+                    crate::resource_admission::IDENTITIES: r#"{"RuntimeClass//kata-remote":"runtime-uid"}"#,
                     ANNOTATION_SANDBOX_RUNTIME_READINESS: "unavailable"
                 }
             },
             "spec": {"podTemplate": {"spec": {
+                "runtimeClassName": "kata-remote",
+                "containers": [{"name": "agent", "image": format!("registry.test/agent@sha256:{}", "a".repeat(64))}],
                 "automountServiceAccountToken": false,
                 "volumes": [{"name": SANDBOX_BOOTSTRAP_VOLUME_NAME,
                     "secret": {"secretName": "os-sandbox-sandbox-1-gen2"}}]
@@ -119,7 +120,7 @@ mod lifecycle_reconciliation {
                 http::StatusCode::OK,
                 serde_json::json!({
                     "apiVersion": format!("{SANDBOX_GROUP}/{version}"),
-                    "kind": "SandboxList", "items": [object]
+                    "kind": "SandboxList", "items": if object.is_array() { object } else { serde_json::json!([object]) }
                 }),
             ),
         )
@@ -174,6 +175,7 @@ mod lifecycle_reconciliation {
             )
         };
         vec![
+            runtime_class_test_step(),
             workload(),
             supervisor(),
             workload(),
@@ -249,11 +251,20 @@ mod lifecycle_reconciliation {
     #[tokio::test]
     async fn reconciliation_skips_a_busy_restart_and_retries_after_release() {
         let version = SANDBOX_VERSION_V1BETA1;
+        let mut other = snapshot(version, None);
+        other["metadata"]["name"] = serde_json::json!("other-cr");
+        other["metadata"]["labels"][LABEL_SANDBOX_ID] = serde_json::json!("sandbox-2");
+        let items = serde_json::json!([snapshot(version, None), other]);
         let mut steps = vec![
-            listed(version, snapshot(version, None)),
-            listed(version, snapshot(version, None)),
+            listed(version, items.clone()),
+            listed(version, items.clone()),
             refreshed(version, restarted_snapshot(version)),
         ];
+        for _ in 0..2 {
+            steps.push((http::Method::GET,
+                "/apis/agents.x-k8s.io/v1beta1/namespaces/openshell/sandboxes/other-cr",
+                kube_test_not_found("sandboxes", "other-cr")));
+        }
         steps.extend(preparing_dependencies());
         let (driver, steps, _) = read_only_driver(steps);
         driver.sandbox_api_version.set(version).unwrap();
@@ -265,7 +276,8 @@ mod lifecycle_reconciliation {
             .await;
         // Restart may already have created its Pod while the CR is still
         // stopped. Reconciliation must skip even reading that companion.
-        driver.reconcile_sandbox_runtime_resources().await;
+        tokio::time::timeout(Duration::from_secs(1), driver.reconcile_sandbox_runtime_resources())
+            .await.expect("busy sandbox must not block the other sandbox");
         drop(guard);
         driver.reconcile_sandbox_runtime_resources().await;
         assert!(steps.lock().unwrap().is_empty());

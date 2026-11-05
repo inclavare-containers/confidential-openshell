@@ -1,4 +1,4 @@
-From 7494d6e4db29e87bf0cc9d8ea98984e80b528d65 Mon Sep 17 00:00:00 2001
+From 2f595d905f7540dfb78d0be6fcb5bf586a04f9bf Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
 Date: Tue, 3 Nov 2026 19:30:00 +0800
 Subject: [PATCH] alibabacloud: confirm instance absence after deletion errors
@@ -11,12 +11,15 @@ other errors and handle non-SDK errors without a type-assertion panic.
 This change applies to the existing instance deletion path and requires
 no data-disk support or additional DescribeDisks permission.
 
+Retry IncorrectInstanceStatus.Initializing during failed-create rollback, just
+as the existing IncorrectInstanceStatus case is retried.
+
 Co-authored-by: Codex <noreply@openai.com>
 ---
- .../alibabacloud/instance_delete.go           | 35 ++++++++
- src/cloud-providers/alibabacloud/provider.go  | 25 ++----
- .../alibabacloud/provider_delete_test.go      | 84 +++++++++++++++++++
- 3 files changed, 127 insertions(+), 17 deletions(-)
+ .../alibabacloud/instance_delete.go           |  35 ++++++
+ src/cloud-providers/alibabacloud/provider.go  |  26 ++--
+ .../alibabacloud/provider_delete_test.go      | 114 ++++++++++++++++++
+ 3 files changed, 158 insertions(+), 17 deletions(-)
  create mode 100644 src/cloud-providers/alibabacloud/instance_delete.go
  create mode 100644 src/cloud-providers/alibabacloud/provider_delete_test.go
 
@@ -62,10 +65,10 @@ index 00000000..7c1e2de8
 +	return false, fmt.Errorf("delete instance %s: %w", instanceID, err)
 +}
 diff --git a/src/cloud-providers/alibabacloud/provider.go b/src/cloud-providers/alibabacloud/provider.go
-index 26312855..411a9d41 100644
+index 26312855..e120b983 100644
 --- a/src/cloud-providers/alibabacloud/provider.go
 +++ b/src/cloud-providers/alibabacloud/provider.go
-@@ -369,32 +369,23 @@ func (p *alibabaCloudProvider) CreateInstance(ctx context.Context, podName, sand
+@@ -369,32 +369,24 @@ func (p *alibabaCloudProvider) CreateInstance(ctx context.Context, podName, sand
  }
  
  func (p *alibabaCloudProvider) DeleteInstance(ctx context.Context, instanceID string) error {
@@ -84,7 +87,8 @@ index 26312855..411a9d41 100644
 -			if *err.(*tea.SDKError).Code == "IncorrectInstanceStatus" {
 -				logger.Printf("instance %s is not in the correct state to be deleted, retrying", instanceID)
 +			var sdkError *tea.SDKError
-+			if errors.As(err, &sdkError) && sdkError != nil && tea.StringValue(sdkError.Code) == "IncorrectInstanceStatus" {
++			if errors.As(err, &sdkError) && sdkError != nil &&
++				(tea.StringValue(sdkError.Code) == "IncorrectInstanceStatus" || tea.StringValue(sdkError.Code) == "IncorrectInstanceStatus.Initializing") {
  				return false, nil
  			}
 -
@@ -108,16 +112,17 @@ index 26312855..411a9d41 100644
  	logger.Printf("Deleted an instance %s", instanceID)
 diff --git a/src/cloud-providers/alibabacloud/provider_delete_test.go b/src/cloud-providers/alibabacloud/provider_delete_test.go
 new file mode 100644
-index 00000000..bd767198
+index 00000000..056ee7cf
 --- /dev/null
 +++ b/src/cloud-providers/alibabacloud/provider_delete_test.go
-@@ -0,0 +1,84 @@
+@@ -0,0 +1,114 @@
 +// (C) Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
 +package alibabacloud
 +
 +import (
++	"context"
 +	"errors"
 +	"fmt"
 +	"testing"
@@ -129,6 +134,7 @@ index 00000000..bd767198
 +type fakeDeleteECSClient struct {
 +	*ecs.Client
 +	deleteError       error
++	deleteHook        func(int) error
 +	attributeError    error
 +	attributeResponse *ecs.DescribeInstanceAttributeResponse
 +	deleteRequests    []*ecs.DeleteInstanceRequest
@@ -137,6 +143,9 @@ index 00000000..bd767198
 +
 +func (f *fakeDeleteECSClient) DeleteInstance(request *ecs.DeleteInstanceRequest) (*ecs.DeleteInstanceResponse, error) {
 +	f.deleteRequests = append(f.deleteRequests, request)
++	if f.deleteHook != nil {
++		return nil, f.deleteHook(len(f.deleteRequests))
++	}
 +	return &ecs.DeleteInstanceResponse{Body: &ecs.DeleteInstanceResponseBody{}}, f.deleteError
 +}
 +
@@ -192,6 +201,31 @@ index 00000000..bd767198
 +			}
 +			if test.wantReadCalls == 1 && tea.StringValue(client.attributeRequests[0].InstanceId) != "i-target" {
 +				t.Fatal("absence read must target the same exact instance on the same client")
++			}
++		})
++	}
++}
++
++func TestDeleteInstanceRetriesInitialization(t *testing.T) {
++	for _, code := range []string{"IncorrectInstanceStatus", "IncorrectInstanceStatus.Initializing"} {
++		t.Run(code, func(t *testing.T) {
++			client := &fakeDeleteECSClient{deleteHook: func(call int) error {
++				if call == 1 {
++					return &tea.SDKError{Code: tea.String(code)}
++				}
++				return nil
++			}}
++			p := &alibabaCloudProvider{ecsClient: client}
++			if err := p.DeleteInstance(context.Background(), "i-starting"); err != nil {
++				t.Fatal(err)
++			}
++			if len(client.deleteRequests) != 2 {
++				t.Fatalf("delete calls = %d", len(client.deleteRequests))
++			}
++			for _, request := range client.deleteRequests {
++				if tea.StringValue(request.InstanceId) != "i-starting" {
++					t.Fatal("retry changed instance")
++				}
 +			}
 +		})
 +	}

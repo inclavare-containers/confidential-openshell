@@ -7,7 +7,7 @@ from pathlib import Path
 import subprocess
 
 from cloud import Cloud, OPERATOR, require, run, write
-from network import create_network, require_tdx_zone
+from network import create_network
 
 
 def kubectl(env, *args):
@@ -64,23 +64,6 @@ def nodepool_request(config, security_group, key):
     }
 
 
-SUPPORTED_CONTAINERD = json.loads(Path(__file__).with_name('ack.example.json').read_text())['containerd_version']
-
-
-def validate_nodes(nodes):
-    require(nodes['items'], 'ACK has no workers. Wait for node-pool creation, then repeat this step.')
-    require(len({n['metadata']['labels']['topology.kubernetes.io/zone'] for n in nodes['items']}) == 1,
-            'This deployment profile requires a single worker zone.')
-    for node in nodes['items']:
-        status = node['status']
-        require(status.get('features', {}).get('supplementalGroupsPolicy') is True and
-                status['nodeInfo']['operatingSystem'] == 'linux' and status['nodeInfo']['architecture'] == 'amd64' and
-                'Ubuntu 24.04' in status['nodeInfo'].get('osImage', '') and
-                status['nodeInfo']['containerRuntimeVersion'] == 'containerd://' + SUPPORTED_CONTAINERD and
-                any(c['type'] == 'Ready' and c['status'] == 'True' for c in status['conditions']),
-                f"Worker {node['metadata']['name']} must be Ready Ubuntu 24.04/amd64 and use containerd {SUPPORTED_CONTAINERD} with supplementalGroupsPolicy (OCI 1.3.0 profile).")
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--create', action='store_true', help='Create a paid ACK Pro cluster and workers if cluster_id is empty.')
@@ -88,10 +71,6 @@ def main():
     args = parser.parse_args()
     cloud = Cloud()
     config = cloud.config
-    require(config['containerd_version'] == SUPPORTED_CONTAINERD,
-            f'This OCI 1.3.0 deployment profile requires containerd {SUPPORTED_CONTAINERD}.')
-    if config.get('zone_id'):
-        require_tdx_zone(cloud.region, config['podvm_instance_type'], config['zone_id'])
     cluster = cloud.state.get('cluster_id') or config.get('cluster_id')
     require(cluster or args.create, 'Set cluster_id in ack.json, or use --create to create a new paid cluster.')
     if not cluster:
@@ -159,17 +138,13 @@ def main():
     path = OPERATOR / 'administrator-kubeconfig'
     write(path, kubeconfig['config'])
     env = {**os.environ, 'KUBECONFIG': str(path)}
-    nodes = cloud.wait('Ready ACK workers', lambda: json.loads(kubectl(env, 'get', 'nodes', '-o', 'json')),
-               lambda d: bool(d['items']) and all(any(c['type'] == 'Ready' and c['status'] == 'True'
-               for c in n['status'].get('conditions', [])) for n in d['items']))
-    validate_nodes(nodes)
-    require_tdx_zone(cloud.region, config['podvm_instance_type'],
-                     nodes['items'][0]['metadata']['labels']['topology.kubernetes.io/zone'])
+    switch = cloud.api('vpc', 'DescribeVSwitchAttributes', RegionId=cloud.region,
+                       VSwitchId=config['worker_vswitch_id'])
     network = json.loads(kubectl(env, '-n', 'kube-system', 'get', 'configmap', 'eni-config', '-o', 'json'))
     eni = json.loads(network['data']['eni_conf'])
     require(str(eni.get('disable_network_policy', False)).lower() == 'false',
             'Terway NetworkPolicy is disabled. See deployment/ack/README.md.')
-    cloud.save(zone_id=nodes['items'][0]['metadata']['labels']['topology.kubernetes.io/zone'])
+    cloud.save(zone_id=config.get('zone_id') or switch['ZoneId'])
     print(kubectl(env, 'get', 'nodes', '-o', 'wide'), end='')
     print(f'ACK ready: {cluster} ({config["ack_api_access"]} API). Kubeconfig is valid for up to 3 days; repeat to renew it.')
     print(f'VPC: {cloud.state["vpc_id"]}; worker vSwitch: {config["worker_vswitch_id"]}; worker security group: {cloud.state["worker_security_group_id"]}.')

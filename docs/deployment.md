@@ -57,16 +57,16 @@ OSS bucket is required.
 ```
 
 Creates a **paid ACK Pro cluster and pay-as-you-go worker**. It checks ECS inventory
-within the documented TDX zones, creates a dedicated VPC and worker/Pod vSwitches, and configures
+for the configured instance types, creates a dedicated VPC and worker/Pod vSwitches, and configures
 public API access, Terway NetworkPolicy, RRSA, storage add-ons, worker egress and
 Ubuntu 24.04/containerd. The default is one worker.
 
-Success prints cluster/VPC/vSwitch/security-group IDs and Ready nodes. These IDs
+Success prints cluster/VPC/vSwitch/security-group IDs and the current node state. These IDs
 are saved automatically; rerunning resumes the same deployment.
 
 The default VPC CIDR is `10.64.0.0/16`. Pass a different private CIDR with
 `--vpc-cidr` if planned network connections would overlap. Optional `--zone`
-chooses a supported zone with available inventory; `--name` chooses a resource-name prefix.
+selects a zone; `--name` chooses a resource-name prefix.
 The default Beijing `ecs.g9i.xlarge` profile uses **Zone I**; ordinary ECS availability
 in other zones does not imply TDX support.
 `--private-api` requires routed private access from this host to ACK.
@@ -81,21 +81,19 @@ Skip step 3. This command lists existing clusters and asks which to use:
 ./cos cluster attach
 ```
 
-Obtains an administrator kubeconfig and checks the region, API access, RRSA,
-Ready Ubuntu 24.04/amd64 workers with **containerd 2.3.4**,
-`supplementalGroupsPolicy` and Terway
-NetworkPolicy. It retains the existing cluster, VPC, node pools and worker OS.
-The measured policy requires the tested OCI 1.3.0 contract and containerd's CRI
-runtime/images plugins. Schema 3 input is supported; this runtime may migrate its
-effective configuration to schema 4. Other runtime versions require a separately
-validated profile.
-Missing prerequisites fail with an explanation; it does not upgrade the cluster
-or silently enable its features.
+Obtains an administrator kubeconfig and checks region, API access, RRSA and
+Terway NetworkPolicy. It retains the existing cluster, VPC, node pools and worker
+OS. Select the workers to configure in the later `workers select` step.
 
-The supported profile uses one worker zone, Ubuntu 24.04 workers with ECS Cloud
-Assistant running, and host StorageClass `alicloud-disk-essd` from ACK's CSI
-add-ons. Public API access must already be enabled unless you pass `--private-api`
-and have private routing. `--cluster-id` can provide an ID directly.
+The validated example uses Ubuntu 24.04, containerd 2.3.4 and OCI 1.3.0.
+Set `OPENSHELL_KATA_OCI_VERSION` in the driver environment to match another
+runtime. Worker configuration reads containerd's effective CRI configuration;
+schema 3 input and migrated schema 4 are both compatible.
+
+Workers need ECS Cloud Assistant. The default host StorageClass is
+`alicloud-disk-essd` from ACK's CSI add-ons. Public API access must already be
+enabled unless you pass `--private-api` and have private routing.
+`--cluster-id` can provide an ID directly.
 
 Continue with step 4. The common steps add deployment-specific PodVM resources,
 identities and workloads while retaining the existing cluster network.
@@ -189,8 +187,11 @@ is checked in step 10.
 Skip the three local Trustee commands above. On the Trustee server, configure an
 admin public key and the endpoint ACLs shown in
 [the KBS configuration](../deployment/trustee/kbs-config.example.toml). Use a dedicated
-KBS resource policy and AS `default_cpu` policy for this deployment. The driver
-manages these policies as a whole, so it must be their only writer.
+KBS resource policy and named AS `openshell-tdx_cpu` policy for this deployment. The driver
+manages these policies as a whole, so it must be their only writer. Configure
+the KBS `openshell-tdx` selector as shown in the example; AS adds `_cpu` to the
+selected policy-set name for CPU evidence. Existing deployments
+must install this selector before using the new guest initdata.
 
 On the driver host, connect with your endpoint, public TLS CA and private management key:
 
@@ -216,7 +217,12 @@ PoC Trustee certificate. These optional settings are saved with the deployment:
 ```
 
 KBS and registry may have different CAs. The default PoC can continue sharing
-certificate material. Registry addresses can also be selected with `--registry-addr`.
+certificate material. For an existing public registry with a system-trusted
+certificate, use `--registry-addr REGISTRY --registry-ca ''` and skip
+`registry start`. Authenticate the publishing client as required by that registry;
+guests can pull from public repositories anonymously. Runtime images may come
+from different registries. Extra registry roots are optional and preserve any
+roots already configured in the base CDH initdata.
 
 ## 7. Prepare bootstrap and publish images
 
@@ -293,14 +299,14 @@ DaemonSets and controller/webhook deployments.
 ./cos workers configure
 ```
 
-Finds the active Kata profile, merges required guest-pull, shared-filesystem and
-timeout settings, sets the private pause image and verifies the installed shim.
+Verifies the installed shim and the guest-pull, shared-filesystem, timeout and
+pause-image settings installed by kata-deploy.
 Sets the kubelet request timeout to the same 600 seconds: guest image pulls run
 inside container creation and otherwise inherit kubelet's shorter default deadline.
 Uses [ACK's custom kubelet arguments file](https://help.aliyun.com/en/ack/ack-managed-and-ack-dedicated/user-guide/customize-the-kubelet-configurations-of-a-node-pool), preserves other arguments and backs up
-changed files. Restarts containerd/kubelet when needed, waits for the node,
+changed files. Restarts kubelet when needed, waits for the node,
 reads back the effective kubelet setting and verifies a CRI pull. Marks `kata-remote` attachable.
-Repeat after kata-deploy upgrades or selecting new workers.
+Run for newly selected workers; kata-deploy maintains the runtime settings across upgrades.
 
 ### Workspace CSI
 

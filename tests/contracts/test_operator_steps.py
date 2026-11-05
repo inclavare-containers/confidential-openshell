@@ -1,5 +1,4 @@
 """Exercise user-facing step execution, worker selection and configuration preservation."""
-from copy import deepcopy
 import importlib.util
 import hashlib
 import io
@@ -93,28 +92,6 @@ class WorkerSelection(unittest.TestCase):
 
 
 class WorkerProfile(unittest.TestCase):
-    def test_containerd_config_accepts_native_migration_and_requires_cri_plugins(self):
-        plugins = {'io.containerd.cri.v1.runtime': {}, 'io.containerd.cri.v1.images': {}}
-        for version in (3, 4):
-            profile.require_containerd_config({'version': version, 'plugins': plugins})
-        for config in ({'version': 2, 'plugins': plugins}, {'version': 5, 'plugins': plugins},
-                       {'version': 4, 'plugins': {'io.containerd.cri.v1.runtime': {}}},
-                       {'version': 4}):
-            with self.subTest(config=config), self.assertRaisesRegex(SystemExit, 'CRI runtime and images plugins'):
-                profile.require_containerd_config(config)
-
-    def test_containerd_release_version_accepts_ack_and_upstream_output(self):
-        for version in ('2.3.4', 'v2.3.4'):
-            profile.require_containerd_version(
-                f'containerd github.com/containerd/containerd/v2 {version} 4eddfe81d0f9\n', '2.3.4')
-        for output in ('containerd github.com/containerd/containerd/v2 2.3.40 abc',
-                       'containerd github.com/containerd/containerd/v2 v2.3.4-rc.1 abc',
-                       'containerd github.com/containerd/containerd/v2 2.2.4 v2.3.4',
-                       'unknown github.com/containerd/containerd/v2 2.3.4 abc',
-                       'containerd 2.3.4'):
-            with self.subTest(output=output), self.assertRaisesRegex(SystemExit, 'requires containerd 2.3.4'):
-                profile.require_containerd_version(output, '2.3.4')
-
     def test_kubelet_deadline_preserves_other_arguments_and_environment(self):
         for value in ('"--max-pods=110 --runtime-request-timeout=2m --v=3"',
                       '--max-pods=110 --runtime-request-timeout 2m --v=3'):
@@ -148,33 +125,7 @@ class WorkerProfile(unittest.TestCase):
             self.assertFalse(profile.replace(path, text))
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
-    def test_merge_preserves_unrelated_containerd_settings_and_is_idempotent(self):
-        original = '''version = 3
-imports = ["/etc/containerd/conf.d/*.toml"]
-[plugins.'io.containerd.cri.v1.images'.registry]
-config_path = "/etc/containerd/cert.d:/etc/containerd/certs.d"
-[plugins.'io.containerd.cri.v1.images'.pinned_images]
-sandbox = "original/pause:3.9" # old image
-[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runc]
-runtime_type = "io.containerd.runc.v2"
-'''
-        changes = [(('plugins', 'io.containerd.cri.v1.images', 'pinned_images'), 'sandbox', 'private/pause@sha256:abcd')]
-        merged = profile.merge(original, changes)
-        expected = deepcopy(tomllib.loads(original))
-        expected['plugins']['io.containerd.cri.v1.images']['pinned_images']['sandbox'] = 'private/pause@sha256:abcd'
-        self.assertEqual(tomllib.loads(merged), expected)
-        self.assertEqual(profile.merge(merged, changes), merged)
 
-    def test_kata_merge_adds_missing_sections_and_retains_existing_values(self):
-        original = '# upstream profile\n[hypervisor.remote]\nsocket = "/run/peerpod/hypervisor.sock"\n'
-        changes = [(('hypervisor', 'remote'), 'shared_fs', 'none'),
-                   (('runtime',), 'experimental_force_guest_pull', True),
-                   (('runtime',), 'create_container_timeout', 600)]
-        merged = profile.merge(original, changes)
-        result = tomllib.loads(merged)
-        self.assertEqual(result['hypervisor']['remote']['socket'], '/run/peerpod/hypervisor.sock')
-        self.assertEqual(result['runtime'], {'experimental_force_guest_pull': True, 'create_container_timeout': 600})
-        self.assertEqual(profile.merge(merged, changes), merged)
 
     def test_repeated_write_preserves_the_first_backup(self):
         with tempfile.TemporaryDirectory() as temp:

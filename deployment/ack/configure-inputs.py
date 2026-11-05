@@ -8,7 +8,7 @@ import re
 import secrets
 
 from cloud import Client, OPERATOR, ROOT, read, require, write
-from network import network_config, require_tdx_zone, select_zone
+from network import network_config, select_zone
 
 
 def free_cidrs(vpc_cidr, switches, count):
@@ -42,7 +42,6 @@ def discover(client, args):
     require(cluster['region_id'] == client.region, 'ACK and the selected PodVM image must use the same region.')
     worker_switch = cluster['vswitch_ids'][0]
     switch = client.api('vpc', 'DescribeVSwitchAttributes', RegionId=client.region, VSwitchId=worker_switch)
-    require_tdx_zone(client.region, config['podvm_instance_type'], switch['ZoneId'])
     vpc_id = switch['VpcId']
     require(vpc_id == cluster['vpc_id'], 'Worker vSwitch must be in the selected ACK VPC.')
     for selected in (args.pod_vswitch_id, args.podvm_vswitch_id):
@@ -60,7 +59,7 @@ def discover(client, args):
         page += 1
     needed = int(not args.podvm_vswitch_id)
     cidrs = iter(free_cidrs(vpc['CidrBlock'], switches, needed) if needed else [])
-    config.update(name=args.name, cluster_id=args.cluster_id,
+    config.update(name=args.name, cluster_id=args.cluster_id, zone_id=switch['ZoneId'],
                   ack_api_access=args.ack_api_access, oss_endpoint_network=args.oss_endpoint_network,
                   worker_vswitch_id=worker_switch,
                   pod_vswitch_id=args.pod_vswitch_id, podvm_vswitch_id=args.podvm_vswitch_id)

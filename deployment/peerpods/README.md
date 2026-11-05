@@ -13,8 +13,7 @@ references remain enabled; the registry CA supplies trust without authenticating
 the client.
 
 The PeerPod manager needs the Alibaba Cloud backend. Its official runtime supplies
-the CA bundle; [Dockerfile.controller](Dockerfile.controller) replaces only
-`/manager`. `images.peerpod_ctrl_runtime` in the [runtime lock](../runtime/artifacts.lock.json)
+the CA bundle; the build overlays only `/manager` using `crane append`. `images.peerpod_ctrl_runtime` in the [runtime lock](../runtime/artifacts.lock.json)
 is the base image; `build.peerpod_ctrl` supplies the local repository and tag. Set
 `resourceCtrl.image` to the digest published in your trusted registry. Fresh
 builds must record their own binary/archive/image hashes.

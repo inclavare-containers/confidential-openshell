@@ -21,8 +21,6 @@ BLKROGET = 0x125e
 
 
 def require_zero_device(fd, size):
-    if size < 64 * 1024 * 1024:
-        raise ValueError('workspace disk is too small')
     os.lseek(fd, 0, os.SEEK_SET)
     remaining = size
     zeros = bytes(8 * 1024 * 1024)
@@ -38,7 +36,7 @@ def validate_policy(policy, disk_id, fs_type, key_uri):
     if (policy.get('version') != '0.1.0' or
             policy.get('allow_initialize') is not True or
             policy.get('encryption_type') != 'luks2' or
-            policy.get('filesystem_type') != fs_type or fs_type != 'ext4' or
+            policy.get('filesystem_type') != fs_type or
             policy.get('key_uri') != key_uri or
             not re.fullmatch(r'kbs:///default/workspace/[a-zA-Z0-9._~-]+', key_uri) or
             not isinstance(ids, list) or not ids or
@@ -65,9 +63,9 @@ def require_disk_identity(name, disk_id):
 
 def run(*args, key=None, allowed=(0,)):
     result = subprocess.run(args, input=key, stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL, check=False)
+                            stderr=subprocess.PIPE, check=False)
     if result.returncode not in allowed:
-        raise RuntimeError('workspace disk command failed')
+        raise RuntimeError(f'{args[0]} exited {result.returncode}: {result.stderr.decode(errors="replace").strip()}')
     return result.returncode
 
 
@@ -83,7 +81,6 @@ def main():
     try:
         if len(key) != 32:
             raise ValueError('workspace initializer requires exactly 32 key bytes')
-        run('/usr/local/libexec/openshell-guest/check-initdata')
         validate_policy(tomllib.loads((PARENT / 'workspace.toml').read_text()),
                         disk_id, fs_type, key_uri)
         lock_fd = os.open(PARENT / ('workspace-init-' + disk_id + '.lock'),
@@ -119,7 +116,7 @@ def main():
             '--key-file', '-', device, key=key)
         run('cryptsetup', 'luksOpen', '--key-file', '-', device, mapper, key=key)
         try:
-            run('mkfs.ext4', '-q', '/dev/mapper/' + mapper)
+            run('mkfs', '-t', fs_type, '/dev/mapper/' + mapper)
         finally:
             run('cryptsetup', 'luksClose', mapper)
     finally:

@@ -26,7 +26,7 @@ class LiveEvidence(unittest.TestCase):
         key = ec.generate_private_key(ec.SECP256R1())
         digest = 'a' * 96
         claims = {'iat': int(time.time()), 'exp': int(time.time()) + 300, 'submods': {'cpu0': {
-            'ear.status': 'affirming', 'ear.appraisal-policy-id': 'default',
+            'ear.status': 'affirming', 'ear.appraisal-policy-id': 'openshell-tdx',
             'ear.trustworthiness-vector': {'hardware': 2, 'configuration': 2, 'executables': 3, 'file-system': 2},
             'ear.veraison.annotated-evidence': {'runtime_data_claims': {'tee-pubkey': {}}, 'tdx': {
                 'uefi_event_logs': [{'type_name': 'EV_EVENT_TAG', 'details': {'unicode_name': 'AAEL',

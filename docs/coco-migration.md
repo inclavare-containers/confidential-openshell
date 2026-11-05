@@ -1,11 +1,12 @@
 # CoCo migration validation record
 
-Status: migration and live acceptance passed on 2026-11-03. The dedicated test
-infrastructure has been retired.
+Migration and live acceptance passed on 2026-11-03 for the release identified
+below. These results apply to that release; later revisions need separate live
+validation. The dedicated test infrastructure has been retired.
 
 ## Preserved baseline
 
-`main` remains at `dd1460e512e48e80c834688bbdfe447b873589f1`. Its runtime code
+The baseline is `dd1460e512e48e80c834688bbdfe447b873589f1`. Its runtime code
 matches the live-accepted `a550a3ae72e812fed0456adeef2cffdacbd547a4`; subsequent
 commits changed documentation and a commented image example. The 2026-11-03
 acceptance covered real TDX/verified EARs, own/cross-role key release, unexpired
@@ -13,10 +14,6 @@ Stop/Delete denial, persistent workspace restart, raw-disk plaintext checks,
 native cleanup, and actual OpenCode/Codex/Claude tasks. This is evidence for the
 documented deployment profile, not a claim of authenticated LUKS headers or full
 disaster-recovery testing.
-
-The subsequent patch classification/cleanup is saved as `89173caf` on
-`codex/coco-migration-20261103`, followed by the migration work. Its complete
-offline suite passed before migration.
 
 ## Selected inputs
 
@@ -29,7 +26,7 @@ and guest-components/Trustee 0.22.0.
 | CAA | `9ca88115b6daa43f023a8a3b61ee48190707b6e1` | 2026-11-03 completed upstream checks and image builds; includes native AA initdata startup integration. |
 | guest-components | `de1142e1dfb9d56ece0bd758c6efda7fb52c56bd` | 2026-10-30 completed CI and published TDX/amd64 artifacts; includes InitData fallback while preceding the newer RTMR ioctl and eventlog-switch changes. |
 | Trustee | `ade2f25782d69d16efa9aeaf6d58c5a48bd5bc56` | 2026-11-02 completed component CI and published staged images; includes standard InitData event verification. |
-| CSI | `aa4e40abeab760240569979680bc985c86783ce8` | Latest upstream remains the existing 2026-10-27 base. |
+| CSI | `aa4e40abeab760240569979680bc985c86783ce8` | Existing 2026-10-27 base retained. |
 | Kata / OpenShell | Existing 4.2.0 / 0.1.6 pins | No runtime, source-base or image upgrades. |
 
 Exact artifact digests and extracted binary hashes are in the existing locks.
@@ -55,14 +52,14 @@ separate design capabilities.
 replace the custom initdata-extension bridge. AA consumes exact decoded TOML at
 startup. Policies and report readers consume the standard domain
 `github.com/confidential-containers`, operation `InitData`, and JSON digest
-`sha384:<hex>`. Per-resource authorization and measured workspace/sealed-descriptor
-checks remain in place.
+`sha384:<hex>`. Per-resource authorization and measured workspace checks remain
+in place.
 
-The [patch ledger](../patches/storage-review.md) separates generic fixes, ordinary
-provider capabilities and confidential-volume policy. Both pending CAA PRs
+The [patch queues](../patches/README.md) separate generic fixes, ordinary
+provider capabilities and confidential-volume policy. The code diffs submitted in CAA PRs
 [#3435](https://github.com/confidential-containers/cloud-api-adaptor/pull/3435) and
 [#3437](https://github.com/confidential-containers/cloud-api-adaptor/pull/3437)
-remain verbatim patches.
+remain in the patch queues.
 
 ## Validated build
 

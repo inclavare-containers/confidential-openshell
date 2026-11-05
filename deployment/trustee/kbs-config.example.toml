@@ -12,6 +12,9 @@ insecure_header_jwk = false
 type = "coco_as_grpc"
 as_addr = "http://127.0.0.1:50004"
 
+[attestation_service.policy_id_map]
+openshell-tdx = ["openshell-tdx"]
+
 [admin]
 authorization_mode = "AuthenticatedAuthorization"
 

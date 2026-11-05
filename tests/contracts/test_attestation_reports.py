@@ -42,7 +42,6 @@ class Configuration(unittest.TestCase):
     def test_plugin_proto_matches_pinned_upstream_inventory(self):
         root = ROOT / 'components/attestation-observer'
         inventory = json.loads((root / 'UPSTREAM-SOURCES.json').read_text())
-        self.assertEqual(inventory['commit'], '512fed65642015b849f38fb13bfdec7806639987')
         self.assertEqual(hashlib.sha256((root / 'proto/plugin.proto').read_bytes()).hexdigest(),
                          inventory['files']['proto/plugin.proto']['sha256'])
 

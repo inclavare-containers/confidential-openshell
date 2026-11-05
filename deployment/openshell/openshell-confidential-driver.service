@@ -17,8 +17,6 @@ ExecStart=/usr/local/bin/openshell-driver-confidential-kubernetes \
   --confidential-client-tls-ca /var/lib/openshell-confidential/tls/ca.crt \
   --kata-policy-generator /opt/confidential-openshell/deployment/runtime/agent_policy.py \
   --kata-policy-tools-dir /opt/openshell/kata-policy \
-  --kata-policy-registry ${REGISTRY_ADDR} \
-  --kata-policy-registry-ca ${REGISTRY_CA} \
   --kata-policy-pause-image ${PAUSE_IMAGE} \
   --bootstrap-store-dir /var/lib/openshell-confidential/driver/resources \
   --bootstrap-signing-key /var/lib/openshell-confidential/driver/signer.key \

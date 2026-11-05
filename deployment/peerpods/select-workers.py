@@ -7,16 +7,14 @@ from cloud import Cloud, require, run
 
 
 def eligible(node):
-    info = node['status']['nodeInfo']
     labels = node['metadata'].get('labels', {})
-    return (info['operatingSystem'] == 'linux' and info['architecture'] == 'amd64' and
-            not any(key in labels for key in ('node-role.kubernetes.io/control-plane', 'node-role.kubernetes.io/master')) and
+    return (not any(key in labels for key in ('node-role.kubernetes.io/control-plane', 'node-role.kubernetes.io/master')) and
             any(c['type'] == 'Ready' and c['status'] == 'True' for c in node['status'].get('conditions', [])))
 
 
 def choose(current, created, requested, saved, prompt=input):
     candidates = [n['metadata']['name'] for n in current if eligible(n)]
-    require(candidates, 'No Ready Linux/amd64 workers are available.')
+    require(candidates, 'No Ready workers are available.')
     if requested:
         result = requested
     elif created or len(candidates) == 1:
@@ -31,7 +29,7 @@ def choose(current, created, requested, saved, prompt=input):
                 'Enter numbers from the worker list, or pass --nodes followed by their names.')
         result = [candidates[int(x) - 1] for x in answer]
     require(result and len(set(result)) == len(result) and all(x in candidates for x in result),
-            'Selected nodes must be distinct Ready Linux/amd64 workers. Repeat with --nodes to select current workers.')
+            'Selected nodes must be distinct Ready workers. Repeat with --nodes to select current workers.')
     return result
 
 

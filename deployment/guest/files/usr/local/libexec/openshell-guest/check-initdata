@@ -3,20 +3,16 @@
 import base64
 import gzip
 import hashlib
-import io
 import json
 import os
 from pathlib import Path
 import re
-import stat
 import ssl
 import sys
 import tomllib
 from urllib.parse import urlsplit
 
 PARENT = Path("/run/peerpod")
-MAX_ENCODED = 2 * 1024 * 1024
-MAX_TOML = 1024 * 1024
 REQUIRED = ("aa.toml", "cdh.toml", "policy.rego", "openshell-bootstrap.json")
 WORKLOAD_REFS = {"boundary.json", "tls.crt", "tls.key"}
 SUPERVISOR_REFS = {
@@ -25,24 +21,12 @@ SUPERVISOR_REFS = {
 }
 
 
-def regular(path):
-    info = path.lstat()
-    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-        raise ValueError(f"invalid initdata file: {path}")
-    return path.read_bytes()
-
-
 def main():
-    encoded = regular(PARENT / "initdata")
-    if not 0 < len(encoded) <= MAX_ENCODED:
-        raise ValueError("initdata size is invalid")
+    encoded = (PARENT / "initdata").read_bytes()
     # cloud-init's YAML block scalar appends a transport newline. Never trim
     # the decoded TOML: AA measures its exact bytes, including trailing lines.
     packed = base64.b64decode(encoded.rstrip(b"\r\n"), validate=True)
-    with gzip.GzipFile(fileobj=io.BytesIO(packed)) as gz:
-        raw = gz.read(MAX_TOML + 1)
-    if not 0 < len(raw) <= MAX_TOML:
-        raise ValueError("decoded initdata size is invalid")
+    raw = gzip.decompress(packed)
     body = tomllib.loads(raw.decode("utf-8"))
     if body.get("version") != "0.1.0" or body.get("algorithm") != "sha384":
         raise ValueError("initdata version or digest algorithm is invalid")
@@ -53,9 +37,9 @@ def main():
         if not isinstance(data.get(name), str) or not data[name].strip():
             raise ValueError(f"missing required initdata entry: {name}")
     measured_digest = hashlib.sha384(raw).hexdigest().encode("ascii")
-    if regular(PARENT / "initdata.digest").strip() != measured_digest:
+    if (PARENT / "initdata.digest").read_bytes().strip() != measured_digest:
         raise ValueError("CAA initdata digest differs from exact TOML bytes")
-    if regular(PARENT / "initdata.toml") != raw:
+    if (PARENT / "initdata.toml").read_bytes() != raw:
         raise ValueError("AA initdata.toml differs from exact TOML bytes")
     for name in REQUIRED:
         path = PARENT / name
@@ -63,26 +47,17 @@ def main():
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
             with os.fdopen(fd, "wb") as out:
                 out.write(data[name].encode("utf-8"))
-        if regular(path) != data[name].encode("utf-8"):
+        if (path).read_bytes() != data[name].encode("utf-8"):
             raise ValueError(f"materialized {name} differs from initdata")
     aa = tomllib.loads(data["aa.toml"])
     cdh = tomllib.loads(data["cdh.toml"])
     aa_kbs = aa.get("token_configs", {}).get("kbs", {})
     cdh_kbc = cdh.get("kbc", {})
-    image = cdh.get("image", {})
     aa_ca = aa_kbs.get("cert")
     cdh_ca = cdh_kbc.get("kbs_cert")
-    image_cas = image.get("extra_root_certificates")
-    if (not isinstance(aa_ca, str) or not isinstance(cdh_ca, str) or
-        not isinstance(image_cas, list) or len(image_cas) != 1 or
-        not isinstance(image_cas[0], str) or
-        not aa_ca.strip() or aa_ca.strip() != cdh_ca.strip()):
-        raise ValueError("measured AA and CDH KBS CA must match; registry CA is independent")
-    try:
-        ssl.PEM_cert_to_DER_cert(aa_ca.strip())
-        ssl.PEM_cert_to_DER_cert(image_cas[0].strip())
-    except ValueError as error:
-        raise ValueError("measured registry CA is not a PEM certificate") from error
+    if not isinstance(aa_ca, str) or not isinstance(cdh_ca, str) or not aa_ca.strip() or aa_ca.strip() != cdh_ca.strip():
+        raise ValueError("measured AA and CDH KBS CA must match")
+    ssl.PEM_cert_to_DER_cert(aa_ca.strip())
     aa_url = aa_kbs.get("url")
     cdh_url = cdh_kbc.get("url")
     if not isinstance(aa_url, str) or aa_url != cdh_url or not aa_url.startswith("https://"):
@@ -90,18 +65,6 @@ def main():
     bootstrap = json.loads(data["openshell-bootstrap.json"])
     if bootstrap.get("schema") != 1 or bootstrap.get("role") not in ("supervisor", "workload"):
         raise ValueError("invalid bootstrap schema or role")
-    expected_secret_destination = (
-        "/.openshell/bootstrap-input" if bootstrap["role"] == "workload"
-        else "/.openshell/supervisor"
-    )
-    if bootstrap.get("sealed_volume_destination") != expected_secret_destination:
-        raise ValueError("measured bootstrap Secret mount destination is invalid")
-    expected_secret_container = (
-        "openshell-sandbox-bootstrap" if bootstrap["role"] == "workload"
-        else "supervisor"
-    )
-    if bootstrap.get("sealed_volume_container") != expected_secret_container:
-        raise ValueError("measured bootstrap Secret container is invalid")
     for key in ("sandbox_id", "namespace", "sandbox_resource_uid", "runtime_generation"):
         if not isinstance(bootstrap.get(key), str) or not bootstrap[key]:
             raise ValueError(f"invalid bootstrap {key}")
@@ -126,12 +89,6 @@ def main():
     required_refs = WORKLOAD_REFS if bootstrap["role"] == "workload" else SUPERVISOR_REFS - {"upstream-proxy-ca.pem"}
     if not required_refs.issubset(refs):
         raise ValueError("missing role bootstrap resource references")
-    sealed_hashes = bootstrap.get("sealed_descriptor_sha256")
-    volume_refs = refs.keys() & (WORKLOAD_REFS if bootstrap["role"] == "workload" else SUPERVISOR_REFS)
-    if (not isinstance(sealed_hashes, dict) or sealed_hashes.keys() != volume_refs or
-        not all(isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest)
-                for digest in sealed_hashes.values())):
-        raise ValueError("measured sealed descriptor hashes must cover every bootstrap volume file")
     persistent = "workspace-key" in refs
     if bootstrap["role"] == "workload":
         policy_text = data.get("workspace.toml")
@@ -143,7 +100,6 @@ def main():
                 not isinstance(policy.get("key_uri"), str) or
                 policy["key_uri"] != refs["workspace-key"] or
                 policy.get("encryption_type") != "luks2" or
-                policy.get("filesystem_type") != "ext4" or
                 not isinstance(policy.get("allow_initialize"), bool) or
                 not isinstance(policy.get("disk_ids"), list) or not policy["disk_ids"] or
                 not all(isinstance(disk, str) and re.fullmatch(r"d-[a-z0-9]+", disk)
@@ -155,7 +111,7 @@ def main():
                 fd = os.open(workspace_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
                 with os.fdopen(fd, "wb") as out:
                     out.write(policy_text.encode("utf-8"))
-            if regular(workspace_path) != policy_text.encode("utf-8"):
+            if (workspace_path).read_bytes() != policy_text.encode("utf-8"):
                 raise ValueError("materialized workspace.toml differs from initdata")
             os.chmod(workspace_path, 0o400)
     else:
@@ -166,7 +122,7 @@ def main():
         fd = os.open(env, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
         with os.fdopen(fd, "w", encoding="ascii") as out:
             out.write("ENCRYPTED_VOLUMES_REQUIRED=" + ("true" if persistent else "false") + "\n")
-    elif regular(env) != ("ENCRYPTED_VOLUMES_REQUIRED=" + ("true" if persistent else "false") + "\n").encode():
+    elif (env).read_bytes() != ("ENCRYPTED_VOLUMES_REQUIRED=" + ("true" if persistent else "false") + "\n").encode():
         raise ValueError("workspace role configuration changed")
     for name in (*REQUIRED, "initdata", "initdata.digest"):
         os.chmod(PARENT / name, 0o400)

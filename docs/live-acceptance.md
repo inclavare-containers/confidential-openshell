@@ -109,8 +109,10 @@ Record the actual workspace disk and both role instance IDs before stopping.
 The PV's `spec.csi.volumeHandle` is a CSI logical handle, not necessarily an ECS
 `d-*` ID. The paired node metadata gives the cloud disk ID: on the selected node's
 CSI pod in `caa-csi-block`, inspect `/run/kata-containers/shared/direct-volumes/*/mountInfo.json`.
-Match `pod-uid` to the workload Pod UID and `volume-handle` to the PV; record its
-`device`, `fs-group` and explicit `readonly`. Match each PeerPod owner Pod UID to
+Decode each direct-volume directory's URL-safe Base64 name to its kubelet target
+path and match that path to the workload Pod UID and PVC. Match `volume-handle`
+(or legacy `metadata.cloud-volume-id`) to the PV; record `device`, `fs-group`
+and `readonly`. Match each PeerPod owner Pod UID to
 its ECS `spec.instanceID`, and verify exact IDs through `DescribeInstances`.
 Save only this sandbox's records, not an account-wide credential dump.
 

@@ -21,13 +21,13 @@ def worker_command(registry, ca, image, kbs_url, kbs_ca):
     hosts = (ROOT / 'deployment/peerpods/registry-hosts.example.toml').read_text()
     hosts = hosts.replace('PRIVATE_REGISTRY', registry)
     target = '/etc/containerd/certs.d/' + registry
-    return '\n'.join([
-        '#!/bin/bash', 'set -euo pipefail',
-        'command -v crictl >/dev/null',
+    trust = [
         f'install -d -m 0755 {shlex.quote(target)}',
         f"printf '%s' {shlex.quote(base64.b64encode(ca).decode())} | base64 -d > {shlex.quote(target + '/ca.crt')}",
         f"printf '%s' {shlex.quote(base64.b64encode(hosts.encode()).decode())} | base64 -d > {shlex.quote(target + '/hosts.toml')}",
         f'chmod 0644 {shlex.quote(target + "/ca.crt")} {shlex.quote(target + "/hosts.toml")}',
+    ] if ca else []
+    return '\n'.join(['#!/bin/bash', 'set -euo pipefail', 'command -v crictl >/dev/null', *trust,
         'install -d -m 0755 /etc/openshell-confidential',
         f"printf '%s' {shlex.quote(base64.b64encode(kbs_ca).decode())} | base64 -d > /etc/openshell-confidential/kbs-ca.pem",
         'chmod 0644 /etc/openshell-confidential/kbs-ca.pem',
@@ -49,9 +49,8 @@ def main():
     require(os.environ.get('HOST_IP'), 'Set the trusted service address first: ./cos deploy configure.')
     address = ipaddress.IPv4Address(os.environ['HOST_IP'])
     registry = os.environ.get('REGISTRY_ADDR', str(address) + ':5000')
-    ca = Path(os.environ.get('REGISTRY_CA', '/etc/trustee/tls/ca.pem')).read_bytes()
-    require(b'-----BEGIN CERTIFICATE-----' in ca and b'PRIVATE KEY' not in ca,
-            'Use the public registry CA certificate, without private keys.')
+    ca_path = os.environ.get('REGISTRY_CA', '/etc/trustee/tls/ca.pem')
+    ca = Path(ca_path).read_bytes() if ca_path else b''
     trustee = json.loads(TRUSTEE_CLIENT.read_text())
     kbs_ca = Path(trustee['ca_cert']).read_bytes()
     require(b'-----BEGIN CERTIFICATE-----' in kbs_ca and b'PRIVATE KEY' not in kbs_ca,
@@ -59,8 +58,8 @@ def main():
     record = OPERATOR / 'pause-image.txt'
     require(record.is_file(), 'Run bash deployment/peerpods/publish-images.sh first.')
     image = record.read_text().strip()
-    require(image.startswith(registry + '/') and re.fullmatch(r'[^\s@]+@sha256:[0-9a-f]{64}', image),
-            'pause-image.txt must contain the published private registry image digest.')
+    require(re.fullmatch(r'[^\s@]+@sha256:[0-9a-f]{64}', image),
+            'pause-image.txt must contain the published image digest.')
     command = worker_command(registry, ca, image, trustee['kbs_url'], kbs_ca)
     for node, instance in selected(cloud):
         execute(cloud, instance, command, 'Registry trust and CRI pull', timeout=120)

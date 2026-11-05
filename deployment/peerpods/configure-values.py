@@ -53,6 +53,9 @@ def main():
     peer['webhook']['image']['repository'], peer['webhook']['image']['tag'] = split('peerpod_webhook')
     peer['kata-deploy']['image']['reference'] = image('kata-deploy')
     peer['kata-deploy']['kubectlImage'] = {'reference': image('kata_kubectl'), 'tag': ''}
+    peer['kata-deploy']['containerd']['userDropIn'] = (
+        '[plugins."io.containerd.cri.v1.images".pinned_images]\n'
+        f'sandbox = "{image("pause")}"\n')
     csi = yaml.safe_load((ROOT / 'deployment/peerpods/csi-values.example.yaml').read_text())
     csi['image']['repository'], csi['image']['tag'] = split('caa-csi-block-driver')
     csi['sidecarImages'].update(provisioner=image('csi_provisioner'), nodeDriverRegistrar=image('csi_node_registrar'))

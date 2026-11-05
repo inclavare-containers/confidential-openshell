@@ -1,0 +1,354 @@
+From fa29fef3034746a1275d3a91641828f82e5481d5 Mon Sep 17 00:00:00 2001
+From: Weidong Sun <sunweidong@linux.alibaba.com>
+Date: Wed, 4 Nov 2026 15:29:33 +0800
+Subject: [PATCH] alibabacloud: attach existing data disks to the PodVM
+
+Attach the requested disks as retained data disks after the new PodVM
+reaches Running, then wait for each accepted attachment to complete.
+Let ECS validate disk compatibility and report API failures to the
+existing cleanup path without an additional AttachDisk retry loop.
+
+Co-authored-by: Codex <noreply@openai.com>
+---
+ src/cloud-providers/alibabacloud/provider.go     |   6 +
+ src/cloud-providers/alibabacloud/volumes.go      | 120 ++++++++++++++++
+ src/cloud-providers/alibabacloud/volumes_test.go | 172 +++++++++++++++++++++++
+ 3 files changed, 298 insertions(+)
+
+diff --git a/src/cloud-providers/alibabacloud/provider.go b/src/cloud-providers/alibabacloud/provider.go
+index 6fb42f5d..bf78449f 100644
+--- a/src/cloud-providers/alibabacloud/provider.go
++++ b/src/cloud-providers/alibabacloud/provider.go
+@@ -70,6 +70,7 @@ func encodeUserData(data string) (string, error) {
+ 
+ // Make ecsClient a mockable interface
+ type ecsClient interface {
++	DescribeDisks(request *ecs.DescribeDisksRequest) (*ecs.DescribeDisksResponse, error)
+ 	RunInstances(
+ 		params *ecs.RunInstancesRequest) (*ecs.RunInstancesResponse, error)
+ 	DeleteInstance(
+@@ -80,6 +81,7 @@ type ecsClient interface {
+ 	// Describe InstanceAttribute
+ 	DescribeInstanceAttribute(
+ 		params *ecs.DescribeInstanceAttributeRequest) (*ecs.DescribeInstanceAttributeResponse, error)
++	AttachDisk(params *ecs.AttachDiskRequest) (*ecs.AttachDiskResponse, error)
+ 	// Create NIC
+ 	CreateNetworkInterface(
+ 		params *ecs.CreateNetworkInterfaceRequest) (*ecs.CreateNetworkInterfaceResponse, error)
+@@ -353,6 +355,10 @@ func (p *alibabaCloudProvider) CreateInstance(ctx context.Context, podName, sand
+ 	}
+ 	logger.Printf("Instance %s is ready.", instanceID)
+ 
++	if err := p.attachDataDisks(ctx, instanceID, spec.Volumes); err != nil {
++		return instance, fmt.Errorf("attaching Alibaba Cloud data disks: %w", err)
++	}
++
+ 	ips, err := p.getIPs(*result.Body.InstanceIdSets.InstanceIdSet[0], p.ecsClient)
+ 	if err != nil {
+ 		logger.Printf("failed to get IPs for the instance : %v ", err)
+diff --git a/src/cloud-providers/alibabacloud/volumes.go b/src/cloud-providers/alibabacloud/volumes.go
+new file mode 100644
+index 00000000..9f21d94e
+--- /dev/null
++++ b/src/cloud-providers/alibabacloud/volumes.go
+@@ -0,0 +1,120 @@
++// (C) Copyright Confidential Containers Contributors
++// SPDX-License-Identifier: Apache-2.0
++
++package alibabacloud
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"time"
++
++	ecs "github.com/alibabacloud-go/ecs-20140526/v4/client"
++	"github.com/alibabacloud-go/tea/tea"
++
++	provider "github.com/confidential-containers/cloud-api-adaptor/src/cloud-providers"
++)
++
++const (
++	instanceAttachableTimeout = 5 * time.Minute
++	dataDiskStateTimeout      = time.Minute
++	dataDiskPollInterval      = 2 * time.Second
++)
++
++func (p *alibabaCloudProvider) attachDataDisks(ctx context.Context, instanceID string, volumes []provider.CloudVolume) error {
++	if len(volumes) == 0 {
++		return nil
++	}
++	if err := p.waitForAttachableInstance(ctx, instanceID); err != nil {
++		return err
++	}
++
++	attached := make(map[string]bool)
++	for _, volume := range volumes {
++		if attached[volume.DiskID] {
++			continue
++		}
++		if err := ctx.Err(); err != nil {
++			return err
++		}
++		request := &ecs.AttachDiskRequest{
++			InstanceId:         tea.String(instanceID),
++			DiskId:             tea.String(volume.DiskID),
++			DeleteWithInstance: tea.Bool(false),
++			Bootable:           tea.Bool(false),
++		}
++		if _, err := p.ecsClient.AttachDisk(request); err != nil {
++			return fmt.Errorf("attach disk %s: %w", volume.DiskID, err)
++		}
++		if err := p.waitForDataDiskAttached(ctx, instanceID, volume.DiskID); err != nil {
++			return fmt.Errorf("wait for disk %s to attach: %w", volume.DiskID, err)
++		}
++		attached[volume.DiskID] = true
++		logger.Printf("Attached data disk %s to instance %s", volume.DiskID, instanceID)
++	}
++	return nil
++}
++
++// RunInstances can become queryable before it is ready for AttachDisk.
++func (p *alibabaCloudProvider) waitForAttachableInstance(ctx context.Context, instanceID string) error {
++	ctx, cancel := context.WithTimeout(ctx, instanceAttachableTimeout)
++	defer cancel()
++	for {
++		if err := ctx.Err(); err != nil {
++			return err
++		}
++		response, err := p.ecsClient.DescribeInstanceAttribute(&ecs.DescribeInstanceAttributeRequest{InstanceId: tea.String(instanceID)})
++		if err != nil {
++			return fmt.Errorf("describe instance %s: %w", instanceID, err)
++		}
++		if response == nil || response.Body == nil {
++			return fmt.Errorf("describe instance %s returned an incomplete response", instanceID)
++		}
++		if tea.StringValue(response.Body.Status) == "Running" {
++			return nil
++		}
++		if err := waitForDataDiskPoll(ctx); err != nil {
++			return fmt.Errorf("waiting for instance %s to become attachable: %w", instanceID, err)
++		}
++	}
++}
++
++func (p *alibabaCloudProvider) waitForDataDiskAttached(ctx context.Context, instanceID, diskID string) error {
++	ctx, cancel := context.WithTimeout(ctx, dataDiskStateTimeout)
++	defer cancel()
++	encodedIDs, _ := json.Marshal([]string{diskID})
++	for {
++		if err := ctx.Err(); err != nil {
++			return err
++		}
++		response, err := p.ecsClient.DescribeDisks(&ecs.DescribeDisksRequest{
++			RegionId: tea.String(p.serviceConfig.Region), DiskIds: tea.String(string(encodedIDs)),
++		})
++		if err != nil {
++			return err
++		}
++		if response == nil || response.Body == nil || response.Body.Disks == nil {
++			return fmt.Errorf("describe disk %s returned an incomplete response", diskID)
++		}
++		for _, disk := range response.Body.Disks.Disk {
++			if disk != nil && tea.StringValue(disk.DiskId) == diskID &&
++				tea.StringValue(disk.Status) == "In_use" && tea.StringValue(disk.InstanceId) == instanceID {
++				return nil
++			}
++		}
++		if err := waitForDataDiskPoll(ctx); err != nil {
++			return err
++		}
++	}
++}
++
++func waitForDataDiskPoll(ctx context.Context) error {
++	timer := time.NewTimer(dataDiskPollInterval)
++	defer timer.Stop()
++	select {
++	case <-ctx.Done():
++		return ctx.Err()
++	case <-timer.C:
++		return nil
++	}
++}
+diff --git a/src/cloud-providers/alibabacloud/volumes_test.go b/src/cloud-providers/alibabacloud/volumes_test.go
+new file mode 100644
+index 00000000..b0404e5a
+--- /dev/null
++++ b/src/cloud-providers/alibabacloud/volumes_test.go
+@@ -0,0 +1,172 @@
++// (C) Copyright Confidential Containers Contributors
++// SPDX-License-Identifier: Apache-2.0
++
++package alibabacloud
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"testing"
++
++	ecs "github.com/alibabacloud-go/ecs-20140526/v4/client"
++	"github.com/alibabacloud-go/tea/tea"
++
++	provider "github.com/confidential-containers/cloud-api-adaptor/src/cloud-providers"
++)
++
++type fakeVolumeECSClient struct {
++	*ecs.Client
++	t               *testing.T
++	instanceStatus  string
++	instanceQueries int
++	attachRequests  []*ecs.AttachDiskRequest
++	attached        map[string]string
++	attachError     error
++	instanceHook    func()
++	diskHook        func(*ecs.DescribeDisksResponseBodyDisksDisk)
++	diskQueries     int
++}
++
++func newFakeVolumeProvider(t *testing.T, state string) (*alibabaCloudProvider, *fakeVolumeECSClient) {
++	client := &fakeVolumeECSClient{t: t, instanceStatus: state, attached: make(map[string]string)}
++	return &alibabaCloudProvider{ecsClient: client, serviceConfig: &Config{Region: "cn-hangzhou"}}, client
++}
++
++func (f *fakeVolumeECSClient) DescribeInstanceAttribute(*ecs.DescribeInstanceAttributeRequest) (*ecs.DescribeInstanceAttributeResponse, error) {
++	f.instanceQueries++
++	if f.instanceHook != nil {
++		f.instanceHook()
++	}
++	return &ecs.DescribeInstanceAttributeResponse{Body: &ecs.DescribeInstanceAttributeResponseBody{
++		Status: tea.String(f.instanceStatus),
++	}}, nil
++}
++
++func (f *fakeVolumeECSClient) AttachDisk(request *ecs.AttachDiskRequest) (*ecs.AttachDiskResponse, error) {
++	if f.instanceStatus != "Running" {
++		f.t.Fatalf("attempted attachment while instance was %s", f.instanceStatus)
++	}
++	if request.DeleteWithInstance == nil || tea.BoolValue(request.DeleteWithInstance) ||
++		request.Bootable == nil || tea.BoolValue(request.Bootable) {
++		f.t.Fatal("attachment must request a retained data disk")
++	}
++	f.attachRequests = append(f.attachRequests, request)
++	if f.attachError != nil {
++		return nil, f.attachError
++	}
++	f.attached[tea.StringValue(request.DiskId)] = tea.StringValue(request.InstanceId)
++	return &ecs.AttachDiskResponse{}, nil
++}
++
++func (f *fakeVolumeECSClient) DescribeDisks(request *ecs.DescribeDisksRequest) (*ecs.DescribeDisksResponse, error) {
++	var ids []string
++	if err := json.Unmarshal([]byte(tea.StringValue(request.DiskIds)), &ids); err != nil || len(ids) != 1 {
++		f.t.Fatalf("expected a query for one attached disk: %v, %v", ids, err)
++	}
++	instanceID, found := f.attached[ids[0]]
++	if !found {
++		f.t.Fatal("unexpected disk query before AttachDisk")
++	}
++	f.diskQueries++
++	// No zone, portability, multi-attach or retention attributes are needed to
++	// observe attachment completion; the cloud API validates the request.
++	disk := &ecs.DescribeDisksResponseBodyDisksDisk{
++		DiskId: tea.String(ids[0]), InstanceId: tea.String(instanceID), Status: tea.String("In_use"),
++	}
++	if f.diskHook != nil {
++		f.diskHook(disk)
++	}
++	return &ecs.DescribeDisksResponse{Body: &ecs.DescribeDisksResponseBody{
++		Disks: &ecs.DescribeDisksResponseBodyDisks{Disk: []*ecs.DescribeDisksResponseBodyDisksDisk{disk}},
++	}}, nil
++}
++
++func TestAttachAlibabaDataDisks(t *testing.T) {
++	p, client := newFakeVolumeProvider(t, "Running")
++	volumes := make([]provider.CloudVolume, 17)
++	for n := range volumes {
++		volumes[n].DiskID = fmt.Sprintf("d-%d", n)
++	}
++	volumes = append(volumes, volumes[0]) // multiple mounts need one attachment
++	if err := p.attachDataDisks(context.Background(), "i-peerpod", volumes); err != nil {
++		t.Fatal(err)
++	}
++	if len(client.attachRequests) != 17 || client.diskQueries != 17 {
++		t.Fatalf("attach calls=%d, disk queries=%d", len(client.attachRequests), client.diskQueries)
++	}
++	for n, req := range client.attachRequests {
++		if tea.StringValue(req.DiskId) != volumes[n].DiskID || tea.StringValue(req.InstanceId) != "i-peerpod" {
++			t.Fatalf("unexpected attachment request %v", req)
++		}
++	}
++}
++
++func TestAttachAlibabaDataDisksWaitsForReadyStates(t *testing.T) {
++	p, client := newFakeVolumeProvider(t, "Stopped")
++	client.instanceHook = func() {
++		if client.instanceQueries == 2 {
++			client.instanceStatus = "Starting"
++		} else if client.instanceQueries == 3 {
++			client.instanceStatus = "Running"
++		}
++	}
++	client.diskHook = func(disk *ecs.DescribeDisksResponseBodyDisksDisk) {
++		if client.diskQueries == 1 {
++			disk.Status = tea.String("Attaching")
++		}
++	}
++	if err := p.attachDataDisks(context.Background(), "i-peerpod", []provider.CloudVolume{{DiskID: "d-one"}}); err != nil {
++		t.Fatal(err)
++	}
++	if client.instanceQueries != 3 || client.diskQueries != 2 {
++		t.Fatalf("instance queries=%d, disk queries=%d", client.instanceQueries, client.diskQueries)
++	}
++}
++
++func TestAttachAlibabaDataDisksReturnsAPIErrors(t *testing.T) {
++	for _, failure := range []error{errors.New("disk is in another zone"), context.DeadlineExceeded, &tea.SDKError{Code: tea.String("IncorrectInstanceStatus")}} {
++		p, client := newFakeVolumeProvider(t, "Running")
++		client.attachError = failure
++		err := p.attachDataDisks(context.Background(), "i-peerpod", []provider.CloudVolume{{DiskID: "d-one"}})
++		if !errors.Is(err, failure) || len(client.attachRequests) != 1 || client.diskQueries != 0 {
++			t.Fatalf("error=%v, attachment calls=%d, disk queries=%d", err, len(client.attachRequests), client.diskQueries)
++		}
++	}
++}
++
++func TestAttachAlibabaDataDisksHonorsCancellation(t *testing.T) {
++	for _, stage := range []string{"before attach", "after attach"} {
++		t.Run(stage, func(t *testing.T) {
++			p, client := newFakeVolumeProvider(t, "Running")
++			ctx, cancel := context.WithCancel(context.Background())
++			defer cancel()
++			if stage == "before attach" {
++				client.instanceStatus = "Starting"
++				client.instanceHook = cancel
++			} else {
++				client.diskHook = func(disk *ecs.DescribeDisksResponseBodyDisksDisk) {
++					disk.InstanceId = tea.String("i-other")
++					cancel()
++				}
++			}
++			if err := p.attachDataDisks(ctx, "i-peerpod", []provider.CloudVolume{{DiskID: "d-one"}}); !errors.Is(err, context.Canceled) {
++				t.Fatalf("expected cancellation, got %v", err)
++			}
++			if stage == "before attach" && len(client.attachRequests) != 0 {
++				t.Fatal("attached despite cancellation")
++			}
++		})
++	}
++}
++
++func TestAttachAlibabaDataDisksWithoutVolumes(t *testing.T) {
++	p, client := newFakeVolumeProvider(t, "Starting")
++	if err := p.attachDataDisks(context.Background(), "i-peerpod", nil); err != nil {
++		t.Fatal(err)
++	}
++	if client.instanceQueries != 0 || len(client.attachRequests) != 0 || client.diskQueries != 0 {
++		t.Fatal("volume-free instance should not enter attachment flow")
++	}
++}
+-- 
+2.43.7

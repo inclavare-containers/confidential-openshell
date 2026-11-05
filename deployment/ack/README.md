@@ -6,14 +6,15 @@ copy generated resource IDs into configuration templates.
 
 ## New cluster
 
-`./cos cluster create` selects a documented TDX zone with ECS inventory, saves inputs and creates a
+`./cos cluster create` selects a configured zone or one with ECS inventory, saves inputs and creates a
 dedicated VPC, worker/Pod vSwitches, ACK Pro and an Ubuntu node pool. ACK enables
 RRSA, Terway NetworkPolicy, storage add-ons and worker SNAT.
 `./cos cloud network` creates the PodVM vSwitch/security group and inherits egress.
 
-Zone selection intersects the published [TDX region/family support](https://help.aliyun.com/zh/ecs/user-guide/build-a-tdx-confidential-computing-environment)
-with official ECS [DescribeAvailableResource](https://help.aliyun.com/en/ecs/developer-reference/api-ecs-2014-05-26-describeavailableresource)
-inventory. The default Beijing `ecs.g9i.xlarge` profile selects Zone I.
+Automatic zone selection uses ECS
+[DescribeAvailableResource](https://help.aliyun.com/en/ecs/developer-reference/api-ecs-2014-05-26-describeavailableresource)
+inventory and prefers the configured zone when available. The Beijing example
+uses Zone I. Pass `--zone` to select another zone.
 `./cos cloud image` then checks the actual TDX launch parameters with
 [RunInstances DryRun](https://help.aliyun.com/zh/ecs/developer-reference/api-ecs-2014-05-26-runinstances)
 without creating a VM. Ordinary ECS inventory alone cannot establish TDX availability.
@@ -23,7 +24,7 @@ idempotency tokens and availability waits before dependent operations.
 
 ## Existing cluster
 
-`./cos cluster attach` lists/selects ACK and checks the supported profile.
+`./cos cluster attach` lists/selects ACK and obtains its network configuration.
 It keeps existing VPC, worker vSwitches and node pools, obtains a temporary
 administrator kubeconfig and reports missing requirements without changing
 cluster features. Common deployment steps add PodVM resources and identities.
@@ -49,7 +50,7 @@ create/attach command to renew kubeconfig. The trusted host needs no ECS identit
 The new VPC defaults to `10.64.0.0/16`, with three distinct `/24` ranges for workers,
 Kubernetes Pods and PodVMs. `--vpc-cidr` changes this plan. The Service CIDR is
 outside the VPC. Review planned network connections for overlap before creation.
-This profile uses one worker zone.
+The example places PodVMs in one configured zone.
 
 ## Image storage and runtime identities
 
@@ -68,6 +69,5 @@ disable it before deletion. State identifies generated resources. Shared import
 roles and existing-cluster resources are retained resources.
 
 Follow [operations](../../docs/operations.md#retire-owned-resources) for the ordered
-cleanup of dedicated resources and exact-ID readback. The public profile supports
-Beijing Zone I with ecs.g9i.xlarge and containerd 2.3.4; the broader placement
-table does not imply that other deployment profiles have been verified.
+cleanup of dedicated resources and exact-ID readback. Beijing Zone I with
+ecs.g9i.xlarge and containerd 2.3.4 is the validated configuration.

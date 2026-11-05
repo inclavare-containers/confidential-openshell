@@ -42,7 +42,7 @@ PYCLIENT
     export KBS_URL="${KBS_URL:-https://${HOST_IP}:8443}"
     export KBS_CA="${KBS_CA:-/etc/trustee/tls/ca.pem}"
     export REGISTRY_ADDR="${REGISTRY_ADDR:-${HOST_IP}:5000}"
-    export REGISTRY_CA="${REGISTRY_CA:-/etc/trustee/tls/ca.pem}"
+    export REGISTRY_CA="${REGISTRY_CA-/etc/trustee/tls/ca.pem}"
     export REGISTRY_TLS_CERT="${REGISTRY_TLS_CERT:-/etc/trustee/tls/server-chain.pem}"
     export REGISTRY_TLS_KEY="${REGISTRY_TLS_KEY:-/etc/trustee/tls/server.key}"
 }

@@ -14,15 +14,24 @@ export XDG_CONFIG_HOME=/var/lib/openshell-confidential/cli-config
 export OPENSHELL_LOCAL_TLS_DIR=/var/lib/openshell-confidential/tls
 export OPENSHELL_GATEWAY=confidential-local
 export OPENSHELL_WORKSPACE=default
-export OPENSHELL_SANDBOX_POLICY=/opt/confidential-openshell/deployment/harness/policy.yaml
+export OPENSHELL_SANDBOX_POLICY=/opt/confidential-openshell/deployment/harness/community-policy.yaml
 export OPENSHELL_PROVISION_TIMEOUT=900
 export OPENSHELL_LIFECYCLE_TIMEOUT=900
 openshell whoami
 CONFIG_DIR=/var/lib/openshell-confidential/operator/harness
 ```
 
-The deployment selects the Community image and policy; no image build or
-`--from` is needed here. Use sandbox names of at most 19 characters.
+The deployment selects the Community image; no image build or `--from` is
+needed here. Use sandbox names of at most 19 characters.
+
+The policy is the pinned Community image's default, with only the three obsolete
+`tls: terminate` fields removed as required by the
+[upstream format migration](https://github.com/NVIDIA/OpenShell/blob/ac7f615cd12d5cc49cb16eb1f5f10ffeb1e90f47/docs/upgrade/0-1-0.mdx).
+All upstream destinations, binaries and permissions are preserved. This explicit
+copy is needed because the policy embedded in the pinned image still has the old
+syntax; OpenShell rejects it if selected automatically. The selected inference
+provider adds its endpoint access. This is separate from the Kata policy that
+validates container creation inside the guest.
 
 ## Configure inference once
 
@@ -47,8 +56,7 @@ On **T**, create a shell, upload the OpenCode config and connect:
 
 ```bash
 SANDBOX=opencode-demo
-openshell sandbox create --name "$SANDBOX" --provider bailian-openai --tty --detach \
-  --env OPENCODE_DISABLE_MODELS_FETCH=true
+openshell sandbox create --name "$SANDBOX" --provider bailian-openai --tty --detach
 openshell sandbox upload "$SANDBOX" "$CONFIG_DIR/opencode.json" /sandbox/opencode.json --no-git-ignore
 openshell sandbox connect "$SANDBOX"
 ```
@@ -76,13 +84,16 @@ openshell sandbox connect "$SANDBOX"
 In the **sandbox shell**:
 
 ```bash
-codex
+codex --sandbox danger-full-access
 ```
 
 The Community user's home is `/sandbox`, so Codex reads its native
 `~/.codex/config.toml`. The selected endpoint/model must support Responses, including tool calls and
-follow-up tool results. Keep Codex's normal approval prompts; nested namespace
-sandboxing can be unavailable inside the outer OpenShell sandbox.
+follow-up tool results. OpenShell supplies the filesystem, process and network
+isolation, so this command disables Codex's additional inner sandbox. It follows
+the [upstream Codex harness](https://github.com/NVIDIA/OpenShell/blob/ac7f615cd12d5cc49cb16eb1f5f10ffeb1e90f47/scripts/agents/runtime/harnesses/codex/exec.sh#L84),
+while retaining the interactive CLI's normal approval configuration. Use this
+command inside the connected OpenShell sandbox.
 
 ## Claude Code
 

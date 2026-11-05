@@ -1,9 +1,0 @@
-#!/usr/bin/env bash
-set -euo pipefail
-/usr/local/libexec/openshell-guest/check-initdata
-for _ in {1..30}; do
-    [[ -S /run/confidential-containers/cdh.sock ]] && exit 0
-    sleep 1
-done
-echo 'CDH socket unavailable' >&2
-exit 1

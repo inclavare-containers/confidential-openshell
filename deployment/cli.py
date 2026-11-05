@@ -118,7 +118,7 @@ def environment():
         env['ALIBABA_CLOUD_PROFILE'] = saved['profile']
     for key, name in [('registry_addr', 'REGISTRY_ADDR'), ('registry_ca', 'REGISTRY_CA'),
                       ('registry_cert', 'REGISTRY_TLS_CERT'), ('registry_key', 'REGISTRY_TLS_KEY')]:
-        if saved.get(key):
+        if key in saved:
             env[name] = saved[key]
     env['OPERATOR_DIR'] = str(OPERATOR)
     env.setdefault('HANDOFF', str(HANDOFF))

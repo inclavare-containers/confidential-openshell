@@ -11,7 +11,7 @@ use crate::bootstrap::{BootstrapRole, BootstrapStore};
 use base64::Engine as _;
 use flate2::{Compression, GzBuilder};
 use serde_json::json;
-use sha2::{Digest, Sha256, Sha384};
+use sha2::{Digest, Sha384};
 
 pub const INITDATA_ANNOTATION: &str = "io.katacontainers.config.hypervisor.cc_init_data";
 pub const BOOTSTRAP_FILENAME: &str = "openshell-bootstrap.json";
@@ -68,8 +68,8 @@ impl GuestInitdata {
                 ca_path.display()
             )
         })?;
-        if ca.len() > 1024 * 1024 || !ca.contains("-----BEGIN CERTIFICATE-----") {
-            return Err("trusted guest registry CA must be a bounded PEM certificate".to_string());
+        if !ca.contains("-----BEGIN CERTIFICATE-----") {
+            return Err("trusted guest registry CA must be a PEM certificate".to_string());
         }
         let data = self
             .base
@@ -91,10 +91,17 @@ impl GuestInitdata {
         let image_table = image
             .as_table_mut()
             .ok_or_else(|| "cdh.toml [image] must be a table".to_string())?;
-        image_table.insert(
-            "extra_root_certificates".to_string(),
-            toml::Value::Array(vec![toml::Value::String(ca)]),
-        );
+        let roots = image_table
+            .entry("extra_root_certificates")
+            .or_insert_with(|| toml::Value::Array(Vec::new()))
+            .as_array_mut()
+            .ok_or_else(|| "cdh.toml image.extra_root_certificates must be an array".to_string())?;
+        if !roots
+            .iter()
+            .any(|root| root.as_str().map(str::trim) == Some(ca.trim()))
+        {
+            roots.push(toml::Value::String(ca));
+        }
         data.insert(
             "cdh.toml".to_string(),
             toml::Value::String(
@@ -120,19 +127,11 @@ impl GuestInitdata {
         generated_policy: Option<&str>,
     ) -> Result<RenderedInitdata, String> {
         let mut resources = BTreeMap::new();
-        let mut sealed_descriptor_sha256 = BTreeMap::new();
         for key in keys {
             let planned = store
                 .plan_file(role, generation, sandbox_id, attempt, key)
                 .map_err(|error| format!("plan confidential bootstrap resource: {error}"))?;
             resources.insert((*key).to_owned(), planned.resource_uri);
-            let descriptor = store
-                .seal_planned_file(role, generation, sandbox_id, attempt, key)
-                .map_err(|error| format!("sign confidential bootstrap descriptor: {error}"))?;
-            sealed_descriptor_sha256.insert(
-                (*key).to_owned(),
-                format!("{:x}", Sha256::digest(descriptor.as_bytes())),
-            );
         }
         if let Some(uri) = workspace_key_uri {
             if role != BootstrapRole::Workload {
@@ -149,19 +148,10 @@ impl GuestInitdata {
             "runtime_generation": generation,
             "bootstrap_attempt": attempt,
             "resource_uris": resources,
-            "sealed_descriptor_sha256": sealed_descriptor_sha256,
-            "sealed_volume_destination": match role {
-                BootstrapRole::Workload => "/.openshell/bootstrap-input",
-                BootstrapRole::Supervisor => "/.openshell/supervisor",
-            },
-            "sealed_volume_container": match role {
-                BootstrapRole::Workload => "openshell-sandbox-bootstrap",
-                BootstrapRole::Supervisor => "supervisor",
-            },
         });
         let mut document = self.base.clone();
         if let Some(policy) = generated_policy {
-            if !policy.starts_with("package agent_policy") || policy.len() > 2 * 1024 * 1024 {
+            if !policy.starts_with("package agent_policy") {
                 return Err("generated Kata agent policy is invalid".to_string());
             }
             document["data"]
@@ -230,6 +220,7 @@ impl GuestInitdata {
             .map_err(|error| format!("finish guest initdata annotation: {error}"))?;
         let annotation = base64::engine::general_purpose::STANDARD.encode(compressed);
         Ok(RenderedInitdata {
+            #[cfg(test)]
             raw,
             digest,
             annotation,
@@ -238,9 +229,8 @@ impl GuestInitdata {
 }
 
 pub struct RenderedInitdata {
-    /// Canonical bytes measured by Kata, CAA, AAEL, and KBS. Retained for
-    /// contract verification even though Kubernetes receives `annotation`.
-    #[allow(dead_code)]
+    /// Canonical bytes retained for contract verification in tests.
+    #[cfg(test)]
     pub raw: String,
     pub digest: String,
     /// Kata annotation transport: base64(gzip(raw)); never used for the AAEL digest.
@@ -277,7 +267,7 @@ mod tests {
         data.insert(
             "cdh.toml".to_string(),
             toml::Value::String(format!(
-                "[kbc]\nname = 'cc_kbc'\nurl = 'https://10.0.0.1:8443'\nkbs_cert = '''{ca}'''\n"
+                "[kbc]\nname = 'cc_kbc'\nurl = 'https://10.0.0.1:8443'\nkbs_cert = '''{ca}'''\n[image]\nextra_root_certificates = ['''{ca}''']\n"
             )),
         );
         data.insert(
@@ -322,7 +312,21 @@ mod tests {
             toml::from_str(independent.base["data"]["cdh.toml"].as_str().unwrap()).unwrap();
         assert_eq!(cdh["kbc"]["kbs_cert"].as_str().unwrap().trim(), ca.trim());
         assert_eq!(
+            cdh["image"]["extra_root_certificates"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
             cdh["image"]["extra_root_certificates"][0]
+                .as_str()
+                .unwrap()
+                .trim(),
+            ca.trim()
+        );
+        assert_eq!(
+            cdh["image"]["extra_root_certificates"][1]
                 .as_str()
                 .unwrap()
                 .trim(),
@@ -448,19 +452,9 @@ mod tests {
         let bootstrap: serde_json::Value =
             serde_json::from_str(workload_toml["data"][BOOTSTRAP_FILENAME].as_str().unwrap())
                 .unwrap();
-        let hashes = bootstrap["sealed_descriptor_sha256"].as_object().unwrap();
-        assert_eq!(hashes.len(), WORKLOAD_KEYS.len());
-        assert_eq!(
-            bootstrap["sealed_volume_destination"],
-            "/.openshell/bootstrap-input"
-        );
-        assert_eq!(
-            bootstrap["sealed_volume_container"],
-            "openshell-sandbox-bootstrap"
-        );
         for key in WORKLOAD_KEYS {
-            let descriptor = store
-                .seal_planned_file(
+            let planned = store
+                .plan_file(
                     BootstrapRole::Workload,
                     generation,
                     "sandbox-1",
@@ -469,8 +463,8 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(
-                hashes[*key].as_str(),
-                Some(format!("{:x}", Sha256::digest(descriptor.as_bytes())).as_str())
+                bootstrap["resource_uris"][*key].as_str(),
+                Some(planned.resource_uri.as_str())
             );
         }
         let next_attempt = "1111111111111111111111111111111111111111111111111111111111111111";

@@ -11,7 +11,6 @@ build_tags
 selection=.local/guest-selection.json
 PODVM_MODE=$(jq -er .mode "$selection")
 PODVM_REGION=$(jq -er .region "$selection")
-bash deployment/build/check-region.sh "$PODVM_REGION"
 PODVM_IMAGE_ID=$(jq -r .image_id "$selection")
 PODVM_QCOW2=$(jq -r .qcow "$selection")
 PODVM_REFERENCE_VALUES=$(jq -er .references "$selection")

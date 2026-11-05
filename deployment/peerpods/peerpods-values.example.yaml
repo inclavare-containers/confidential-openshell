@@ -49,8 +49,23 @@ webhook:
     repository: quay.io/confidential-containers/peer-pods-webhook
     tag: "v0.23.0@sha256:b1b2e7bb2b880728fba68fe490914d803e810c947f1e5a2af40f8b9d7cf9b07e"
 kata-deploy:
+  nodeSelector:
+    node.kubernetes.io/worker: ""
   image:
     reference: PRIVATE_REGISTRY/openshell/kata-deploy-shim-nnp@sha256:PATCHED_KATA_DEPLOY_IMAGE_SHA256
   kubectlImage:
     reference: quay.io/kata-containers/kubectl@sha256:135dbdadb36c2c414fa86049bb2fd7ce149257a1d35771cd120203c3ea9803dc
     tag: ""
+  shims:
+    remote:
+      containerd:
+        forceGuestPull: true
+      dropIn: |
+        [hypervisor.remote]
+        shared_fs = "none"
+        [runtime]
+        create_container_timeout = 600
+  containerd:
+    userDropIn: |
+      [plugins."io.containerd.cri.v1.images".pinned_images]
+      sandbox = "PRIVATE_REGISTRY/openshell/mirror/pause@sha256:PAUSE_IMAGE_SHA256"

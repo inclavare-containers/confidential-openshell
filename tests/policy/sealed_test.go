@@ -65,7 +65,7 @@ func sealedToken(t *testing.T, claims, references map[string]any) map[string]any
 		}
 	}
 	return map[string]any{"submods": map[string]any{"cpu0": map[string]any{
-		"ear.appraisal-policy-id":         "default",
+		"ear.appraisal-policy-id":         "openshell-tdx",
 		"ear.status":                      "affirming",
 		"ear.trustworthiness-vector":      vector,
 		"ear.veraison.annotated-evidence": claims,

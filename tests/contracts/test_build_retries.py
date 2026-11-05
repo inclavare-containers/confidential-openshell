@@ -72,7 +72,7 @@ exec ''' + shutil.which('git') + ' "$@"\n')
         self.assertEqual(list(destination.parent.glob('.cloud-api-adaptor.*')), [])
 
     def test_export_failure_does_not_reserve_final_handoff(self):
-        root = self.fixture('deployment/build/package-release.sh', 'deployment/build/check-region.sh',
+        root = self.fixture('deployment/build/package-release.sh',
                             'deployment/lib/common.sh', 'deployment/build/sources.lock.json',
                             'deployment/runtime/artifacts.lock.json')
         (root / '.local').mkdir()
@@ -94,13 +94,6 @@ exec ''' + shutil.which('git') + ' "$@"\n')
             self.assertFalse((root / 'artifacts/handoff').exists())
             self.assertEqual(list((root / 'artifacts').glob('.handoff.*')), [])
         self.assertEqual((root / 'attempts').read_text().splitlines(), ['export-attempt', 'export-attempt'])
-
-    def test_unsupported_region_rejected_before_build_or_prompt(self):
-        for command in ([str(ROOT / 'deployment/build/build-guest.sh'), '--region', 'cn-hangzhou'],
-                        [str(ROOT / 'deployment/build/select-guest.sh'), 'existing', 'cn-hangzhou']):
-            result = subprocess.run(['bash', *command], capture_output=True, text=True)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn('supports cn-beijing', result.stderr)
 
 
 if __name__ == '__main__':

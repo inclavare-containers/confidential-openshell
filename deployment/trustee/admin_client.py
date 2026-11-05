@@ -59,7 +59,8 @@ class AdminClient:
                 or address.path or address.query or address.fragment):
             raise ValueError('kbs_url must be an HTTPS origin')
         if settings.get('exclusive_policy_owner') is not True:
-            raise ValueError('this driver requires exclusive ownership of the KBS resource policy and AS default policy')
+            raise ValueError('this driver requires exclusive ownership of the KBS resource policy')
+        self.as_policy_id = settings.get('as_policy_id', 'openshell-tdx_cpu')
         self.key = serialization.load_pem_private_key(Path(settings['admin_key']).read_bytes(), password=None)
         if not isinstance(self.key, ec.EllipticCurvePrivateKey) or self.key.curve.name != 'secp256r1':
             raise ValueError('KBS admin key must be a P-256 PEM private key')
@@ -96,7 +97,7 @@ class AdminClient:
     def policy(self, value: bytes, *, attestation=False) -> None:
         body = {'policy': b64(value)}
         if attestation:
-            body['policy_id'] = 'default_cpu'
+            body['policy_id'] = self.as_policy_id
         self.request('POST', 'attestation-policy' if attestation else 'resource-policy',
                      json.dumps(body).encode(), json_body=True)
 
@@ -169,7 +170,9 @@ def _synchronize_locked(client: AdminClient, resources: dict[str, bytes], policy
         atomic_json(journal_path, state)
     for key, contents, attestation in [('as_policy', as_policy, True), ('policy', policy, False)]:
         digest = hashlib.sha256(contents).hexdigest()
-        if state.get(key) != digest:
+        if state.get(key) != digest or (attestation and state.get('as_policy_id') != client.as_policy_id):
             client.policy(contents, attestation=attestation)
             state[key] = digest
+            if attestation:
+                state['as_policy_id'] = client.as_policy_id
             atomic_json(journal_path, state)

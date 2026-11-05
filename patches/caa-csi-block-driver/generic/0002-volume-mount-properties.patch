@@ -1,32 +1,33 @@
-From 7f7c131fcf0aff3a937580e76b5785de146076a4 Mon Sep 17 00:00:00 2001
+From 324f4c98aa1e94379576184f9d3ab1d1724e8623 Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
 Date: Wed, 4 Nov 2026 15:25:08 +0800
 Subject: [PATCH] node: preserve CSI filesystem mount properties
 
 Forward filesystem type, readonly access, mount flags and fsGroup through
 upstream mountInfo fields. Advertise VOLUME_MOUNT_GROUP so kubelet passes
-the requested group. Copy volume context before adding consumed cloud
-identity fields; retain key references without copying provider credentials.
+the requested group. Copy volume context before adding cloud identity
+fields, preserving upstream metadata passthrough without modifying the
+request.
 
 This feature applies to ordinary volumes and requires no versioned schema
 or confidential workspace policy.
 
 Co-authored-by: Codex <noreply@openai.com>
 ---
- pkg/driver/directvolume.go          | 122 +++++++++++++++++++++++++
- pkg/driver/mount_properties_test.go | 136 ++++++++++++++++++++++++++++
- pkg/driver/nodeserver.go            |  59 ++++++++----
+ pkg/driver/directvolume.go          |  79 ++++++++++++++
+ pkg/driver/mount_properties_test.go | 164 ++++++++++++++++++++++++++++
+ pkg/driver/nodeserver.go            |  57 +++++++---
  pkg/driver/nodeserver_test.go       |  19 ++++
- 4 files changed, 320 insertions(+), 16 deletions(-)
+ 4 files changed, 304 insertions(+), 15 deletions(-)
  create mode 100644 pkg/driver/directvolume.go
  create mode 100644 pkg/driver/mount_properties_test.go
 
 diff --git a/pkg/driver/directvolume.go b/pkg/driver/directvolume.go
 new file mode 100644
-index 00000000..4289511b
+index 00000000..2bece324
 --- /dev/null
 +++ b/pkg/driver/directvolume.go
-@@ -0,0 +1,122 @@
+@@ -0,0 +1,79 @@
 +// (C) Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -34,7 +35,6 @@ index 00000000..4289511b
 +
 +import (
 +	"fmt"
-+	"sort"
 +	"strconv"
 +	"strings"
 +)
@@ -69,92 +69,50 @@ index 00000000..4289511b
 +		return "", nil
 +	}
 +	value, err := strconv.ParseUint(fsGroup, 10, 32)
-+	if err != nil || strconv.FormatUint(value, 10) != fsGroup {
++	if err != nil {
 +		return "", fmt.Errorf("invalid volume mount group %q", fsGroup)
 +	}
-+	return fsGroup, nil
++	return strconv.FormatUint(value, 10), nil
 +}
 +
-+func normalizeMountOptions(flags []string, readOnly bool) ([]string, bool, error) {
-+	allowed := map[string]bool{
-+		"async": true, "atime": true, "defaults": true, "diratime": true,
-+		"dev": true, "dirsync": true, "discard": true, "exec": true,
-+		"lazytime": true, "noatime": true, "nodev": true, "nodiratime": true,
-+		"noexec": true, "nosuid": true,
-+		"relatime": true, "ro": true, "rw": true, "strictatime": true,
-+		"suid": true, "sync": true,
-+	}
-+	conflictGroup := map[string]string{
-+		"ro": "access", "rw": "access",
-+		"sync": "io", "async": "io",
-+		"atime": "atime", "noatime": "atime", "relatime": "atime", "strictatime": "atime",
-+		"diratime": "diratime", "nodiratime": "diratime",
-+		"exec": "exec", "noexec": "exec",
-+		"dev": "dev", "nodev": "dev",
-+		"suid": "suid", "nosuid": "suid",
-+	}
-+	seen := make(map[string]struct{}, len(flags)+1)
-+	selected := make(map[string]string)
-+	options := make([]string, 0, len(flags)+1)
-+	for _, raw := range flags {
-+		option := strings.TrimSpace(strings.ToLower(raw))
-+		if option == "" {
-+			continue
-+		}
-+		if strings.ContainsAny(option, " ,\t\r\n") || !allowed[option] {
-+			return nil, false, fmt.Errorf("mount option %q is not allowed", raw)
-+		}
-+		if group := conflictGroup[option]; group != "" {
-+			if previous := selected[group]; previous != "" && previous != option {
-+				return nil, false, fmt.Errorf("mount options %q and %q conflict", previous, option)
++// normalizeMountOptions keeps filesystem-specific options and their
++// order intact. Access flags must agree; operation flags cannot replace the
++// requested device/filesystem mount with a bind, remount or propagation change.
++func normalizeMountOptions(values []string, readOnly bool) ([]string, bool, error) {
++	options := make([]string, 0, len(values)+1)
++	hasRO, hasRW := false, false
++	for _, value := range values {
++		for _, item := range strings.Split(value, ",") {
++			option := strings.TrimSpace(item)
++			if option == "" {
++				continue
 +			}
-+			selected[group] = option
-+		}
-+		if option == "ro" {
-+			readOnly = true
-+		}
-+		if _, ok := seen[option]; ok {
-+			continue
-+		}
-+		seen[option] = struct{}{}
-+		options = append(options, option)
-+	}
-+	if readOnly {
-+		if _, ok := seen["rw"]; ok {
-+			return nil, false, fmt.Errorf("readonly volume conflicts with mount option %q", "rw")
-+		}
-+		if _, ok := seen["ro"]; !ok {
-+			options = append(options, "ro")
++			switch option {
++			case "bind", "rbind", "remount", "move", "shared", "rshared", "slave", "rslave", "private", "rprivate", "unbindable", "runbindable":
++				return nil, false, fmt.Errorf("mount operation %q is not a filesystem option", option)
++			case "ro":
++				hasRO = true
++			case "rw":
++				hasRW = true
++			}
++			options = append(options, option)
 +		}
 +	}
-+	sort.Strings(options)
++	readOnly = readOnly || hasRO
++	if readOnly && hasRW {
++		return nil, false, fmt.Errorf("readonly volume conflicts with mount option \"rw\"")
++	}
++	if readOnly && !hasRO {
++		options = append(options, "ro")
++	}
 +	return options, readOnly, nil
-+}
-+
-+// directVolumeMetadataContext is the only provider metadata exposed across
-+// the host/guest boundary. Controller parameters remain in the durable record
-+// for idempotency and provider reconstruction, but are not copied wholesale
-+// into mountInfo.json.
-+func directVolumeMetadataContext(values map[string]string) map[string]string {
-+	result := make(map[string]string, 4)
-+	for _, key := range []string{
-+		"cloud-provider", "cloud-volume-path", "cloud-volume-id",
-+		// Preserve the existing upstream CDH contract. These are key
-+		// references, never key material.
-+		"encrypt-type", "kbs-key-id",
-+	} {
-+		if value := strings.TrimSpace(values[key]); value != "" {
-+			result[key] = value
-+		}
-+	}
-+	return result
 +}
 diff --git a/pkg/driver/mount_properties_test.go b/pkg/driver/mount_properties_test.go
 new file mode 100644
-index 00000000..b4882750
+index 00000000..ca3c939c
 --- /dev/null
 +++ b/pkg/driver/mount_properties_test.go
-@@ -0,0 +1,136 @@
+@@ -0,0 +1,164 @@
 +// (C) Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -168,6 +126,7 @@ index 00000000..b4882750
 +	"google.golang.org/grpc/status"
 +	"os"
 +	"path/filepath"
++	"reflect"
 +	"testing"
 +)
 +
@@ -191,9 +150,7 @@ index 00000000..b4882750
 +			"cloudProvider":              "testcloud",
 +			"cloud-volume-path":          "cloud-disk-123",
 +			"csi.storage.k8s.io/pod.uid": "pod-uid-123",
-+			"cloudAccessKeySecret":       "must-not-leak",
-+			"cloudSecurityToken":         "must-not-leak",
-+			"custom-workload-context":    "must-not-cross-boundary",
++			"custom-workload-context":    "keep-me",
 +			"encrypt-type":               "luks2",
 +			"kbs-key-id":                 "default/luks-key/workspace",
 +		},
@@ -223,9 +180,7 @@ index 00000000..b4882750
 +
 +func TestNodePublishVolumeRejectsConflictingMountOptions(t *testing.T) {
 +	for _, flags := range [][]string{
-+		{"ro", "rw"}, {"sync", "async"}, {"atime", "noatime"},
-+		{"diratime", "nodiratime"}, {"exec", "noexec"},
-+		{"dev", "nodev"}, {"suid", "nosuid"},
++		{"ro", "rw"}, {"ro,rw"}, {"bind"}, {"remount"},
 +	} {
 +		node, target, _ := setupPublishedNode(t)
 +		_, err := node.NodePublishVolume(t.Context(), publishRequest(target, csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER, false, flags...))
@@ -250,7 +205,12 @@ index 00000000..b4882750
 +	for _, test := range tests {
 +		t.Run(test.name, func(t *testing.T) {
 +			node, target, metadataPath := setupPublishedNode(t)
-+			if _, err := node.NodePublishVolume(t.Context(), publishRequest(target, test.mode, test.readonly, test.flags...)); err != nil {
++			req := publishRequest(target, test.mode, test.readonly, test.flags...)
++			original := make(map[string]string, len(req.VolumeContext))
++			for key, value := range req.VolumeContext {
++				original[key] = value
++			}
++			if _, err := node.NodePublishVolume(t.Context(), req); err != nil {
 +				t.Fatal(err)
 +			}
 +			metadata, err := readPublishedMountInfo(metadataPath)
@@ -263,21 +223,16 @@ index 00000000..b4882750
 +			if !containsOption(metadata.Options, "ro") || containsOption(metadata.Options, "rw") {
 +				t.Fatalf("readonly options not normalized: %v", metadata.Options)
 +			}
-+			if _, ok := metadata.Metadata["cloudAccessKeySecret"]; ok {
-+				t.Fatal("access key secret leaked into direct-volume metadata")
++			for key, value := range original {
++				if metadata.Metadata[key] != value {
++					t.Fatalf("volume context %q was not preserved", key)
++				}
 +			}
-+			if _, ok := metadata.Metadata["cloudSecurityToken"]; ok {
-+				t.Fatal("security token leaked into direct-volume metadata")
++			if !reflect.DeepEqual(req.VolumeContext, original) {
++				t.Fatal("publication modified the request context")
 +			}
-+			if _, ok := metadata.Metadata["custom-workload-context"]; ok {
-+				t.Fatal("unconsumed volume context crossed into direct-volume metadata")
-+			}
-+			if metadata.Metadata["cloud-provider"] != "testcloud" ||
-+				metadata.Metadata["cloud-volume-path"] != "cloud-disk-123" ||
-+				metadata.Metadata["encrypt-type"] != "luks2" ||
-+				metadata.Metadata["kbs-key-id"] != "default/luks-key/workspace" ||
-+				len(metadata.Metadata) != 5 {
-+				t.Fatalf("unexpected direct-volume metadata projection: %v", metadata.Metadata)
++			if metadata.Metadata["cloud-provider"] != "testcloud" || metadata.Metadata["cloud-volume-id"] != "pvc-workspace" {
++				t.Fatalf("missing cloud identity: %v", metadata.Metadata)
 +			}
 +		})
 +	}
@@ -291,8 +246,39 @@ index 00000000..b4882750
 +	}
 +	return false
 +}
++
++func TestNodePublishVolumePreservesFilesystemOptions(t *testing.T) {
++	node, target, metadataPath := setupPublishedNode(t)
++	flags := []string{"commit=30", "nouuid", "context=CaseSensitive", "sync", "async"}
++	if _, err := node.NodePublishVolume(t.Context(), publishRequest(target, csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER, false, flags...)); err != nil {
++		t.Fatal(err)
++	}
++	metadata, err := readPublishedMountInfo(metadataPath)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !reflect.DeepEqual(metadata.Options, flags) {
++		t.Fatalf("flags changed: %v", metadata.Options)
++	}
++}
++
++func TestNodePublishVolumeNormalizesMountGroup(t *testing.T) {
++	node, target, path := setupPublishedNode(t)
++	req := publishRequest(target, csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER, false)
++	req.VolumeCapability.GetMount().VolumeMountGroup = "02000"
++	if _, err := node.NodePublishVolume(t.Context(), req); err != nil {
++		t.Fatal(err)
++	}
++	metadata, err := readPublishedMountInfo(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if metadata.FSGroup != "2000" {
++		t.Fatalf("group=%q", metadata.FSGroup)
++	}
++}
 diff --git a/pkg/driver/nodeserver.go b/pkg/driver/nodeserver.go
-index 0cb45e43..d8d566f6 100644
+index 0cb45e43..37a6cca4 100644
 --- a/pkg/driver/nodeserver.go
 +++ b/pkg/driver/nodeserver.go
 @@ -47,14 +47,6 @@ func getKataRuntimePath() string {
@@ -310,7 +296,7 @@ index 0cb45e43..d8d566f6 100644
  type nodeServer struct {
  	csi.UnimplementedNodeServer
  	nodeID  string
-@@ -192,21 +184,49 @@ func (ns *nodeServer) NodePublishVolume(_ context.Context, req *csi.NodePublishV
+@@ -192,20 +184,48 @@ func (ns *nodeServer) NodePublishVolume(_ context.Context, req *csi.NodePublishV
  		return nil, status.Errorf(codes.FailedPrecondition, "volume %s not staged (no device path)", volumeID)
  	}
  
@@ -359,15 +345,13 @@ index 0cb45e43..d8d566f6 100644
  		VolumeType: "directvol",
  		Device:     devicePath,
 -		FsType:     "ext4",
--		Metadata:   attrib,
 +		FsType:     fsType,
 +		ReadOnly:   readOnly,
 +		Options:    options,
 +		FSGroup:    fsGroup,
-+		Metadata:   directVolumeMetadataContext(attrib),
+ 		Metadata:   attrib,
  	}
  
- 	data, err := json.Marshal(info)
 @@ -471,6 +491,13 @@ func (ns *nodeServer) NodeGetCapabilities(_ context.Context, _ *csi.NodeGetCapab
  					},
  				},

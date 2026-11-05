@@ -20,8 +20,7 @@
   },
   "verifier_config": {
     "dcap_verifier": {
-      "collateral_service": "https://api.trustedservices.intel.com/sgx/certification/v4/",
-      "use_secure_cert": true
+      "collateral_service": "https://api.trustedservices.intel.com/sgx/certification/v4/"
     }
   }
 }

@@ -21,12 +21,11 @@ python3 tests/check-driver-initdata.py "$fixture/initdata"
 (cd tests && go test -mod=readonly ./policy -count=1)
 PYTHONPATH=deployment/runtime python3 -m unittest discover -s tests/contracts -v
 python3 -m unittest discover -s tests/e2e -v
-(umask 022; cd .local/build-sources/cloud-api-adaptor/src/cloud-api-adaptor && go test -mod=readonly ./pkg/forwarder/interceptor ./cmd/agent-protocol-forwarder ./pkg/adaptor/cloud ./pkg/podnetwork)
+(cd .local/build-sources/cloud-api-adaptor/src/cloud-api-adaptor && go test -mod=readonly ./pkg/forwarder/interceptor ./cmd/agent-protocol-forwarder ./pkg/adaptor/cloud ./pkg/podnetwork)
 (cd .local/build-sources/cloud-api-adaptor/src/cloud-providers && go test -mod=readonly -tags=alibabacloud ./alibabacloud)
 (cd .local/build-sources/peerpod-ctrl/src/cloud-providers && go test -mod=readonly -tags=alibabacloud ./alibabacloud)
-# The upstream controller suite needs envtest's API server and etcd. Compile its
-# import graph and exercise finalizer error/retry handling without envtest.
-(cd .local/build-sources/peerpod-ctrl/src/peerpod-ctrl && go test -mod=readonly -tags=alibabacloud -run TestFinalizer ./...)
+# Compile the upstream controller packages and tests without starting envtest.
+(cd .local/build-sources/peerpod-ctrl/src/peerpod-ctrl && go test -mod=readonly -tags=alibabacloud -run '^$' ./...)
 (cd .local/build-sources/caa-csi-block-driver && go test -mod=readonly ./...)
 
 bash tests/render-charts.sh

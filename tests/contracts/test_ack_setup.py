@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -361,28 +362,8 @@ class Setup(CloudFixture, unittest.TestCase):
         self.assertTrue(config['oss_bucket'].startswith('cos-123-'))
         self.assertFalse(any(op.startswith('Create') for op in calls))
         args.zone = 'cn-beijing-a'
-        with self.assertRaisesRegex(SystemExit, 'does not support the configured TDX profile'):
-            inputs.discover(Client(), args)
-        args.zone = 'cn-beijing-d'
-        with self.assertRaisesRegex(SystemExit, 'cn-beijing-i'):
-            inputs.discover(Client(), args)
-
-    def test_ordinary_inventory_cannot_select_a_zone_without_tdx_support(self):
-        from unittest.mock import Mock
-        client = Mock(region='cn-beijing')
-        client.api.return_value = {'AvailableZones': {'AvailableZone': [
-            {'ZoneId': 'cn-beijing-d', 'AvailableResources': {'AvailableResource': [
-                {'Type': 'InstanceType', 'SupportedResources': {'SupportedResource': [
-                    {'Value': 'ecs.g9i.xlarge', 'Status': 'Available'}]}}]}}]}}
-        with self.assertRaisesRegex(SystemExit, 'No zone currently'):
-            inputs.select_zone(client, self.config)
-
-    def test_unsupported_saved_zone_fails_before_creating_a_cluster(self):
-        self.config.update(cluster_id='', zone_id='cn-beijing-d')
-        self.inputs()
-        with self.assertRaisesRegex(SystemExit, 'cn-beijing-i'):
-            self.prepare('--create')
-        self.assertFalse(any(op.startswith('Create') for op, _ in self.calls))
+        config, location = inputs.discover(Client(), args)
+        self.assertEqual(location['zone_id'], args.zone)
 
     def test_kubectl_deadline_is_bounded_and_reports_how_to_resume(self):
         env = {'KUBECONFIG': str(self.operator / 'administrator-kubeconfig')}
@@ -403,19 +384,9 @@ class Setup(CloudFixture, unittest.TestCase):
         self.prepare('--enable-rrsa')
         self.assertEqual([a['body'] for op, a in self.calls if op == 'ModifyCluster'], [{'enable_rrsa': True}])
 
-    def test_existing_worker_runtime_must_match_measured_profile(self):
-        for version in ('containerd://1.7.35', 'containerd://2.2.0', 'containerd://2.4.0'):
-            with self.subTest(version=version):
-                self.nodes['items'][0]['status']['nodeInfo']['containerRuntimeVersion'] = version
-                with self.assertRaisesRegex(SystemExit, 'containerd 2.3.4'):
-                    cluster.validate_nodes(self.nodes)
-        self.nodes['items'][0]['status']['nodeInfo']['containerRuntimeVersion'] = 'containerd://2.3.4'
-        cluster.validate_nodes(self.nodes)
-
-    def test_unsupported_worker_and_disabled_network_policy_fail(self):
+    def test_attach_preserves_worker_configuration_and_checks_network_policy(self):
         self.nodes['items'][0]['status']['features']['supplementalGroupsPolicy'] = False
-        with self.assertRaisesRegex(SystemExit, 'supplementalGroupsPolicy'):
-            self.prepare()
+        self.prepare()
         self.nodes['items'][0]['status']['features']['supplementalGroupsPolicy'] = True
         self.disabled_network_policy = True
         with self.assertRaisesRegex(SystemExit, 'NetworkPolicy is disabled'):
@@ -533,6 +504,15 @@ class Setup(CloudFixture, unittest.TestCase):
         peer = yaml.safe_load((self.operator / 'peerpods-values.yaml').read_text())
         csi = yaml.safe_load((self.operator / 'csi-values.yaml').read_text())
         provider = peer['providerConfigs']['alibabacloud']
+        kata = peer['kata-deploy']
+        self.assertEqual(kata['nodeSelector'], {'node.kubernetes.io/worker': ''})
+        self.assertTrue(kata['shims']['remote']['containerd']['forceGuestPull'])
+        dropin = tomllib.loads(kata['shims']['remote']['dropIn'])
+        self.assertEqual(dropin['hypervisor']['remote']['shared_fs'], 'none')
+        self.assertEqual(dropin['runtime']['create_container_timeout'], 600)
+        containerd = tomllib.loads(kata['containerd']['userDropIn'])
+        self.assertEqual(containerd['plugins']['io.containerd.cri.v1.images']['pinned_images']['sandbox'],
+                         provider['PAUSE_IMAGE'])
         self.assertEqual(provider['ALIBABA_CLOUD_ROLE_ARN'], 'arn-caa')
         self.assertEqual(provider['TAGS'], 'ClusterId=c-test,caa-csi-driver=caa-csi-block-driver')
         self.assertEqual(gzip.decompress(base64.b64decode(provider['INITDATA'])), initdata.read_bytes())

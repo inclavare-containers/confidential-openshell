@@ -54,6 +54,7 @@ jq --arg base "$BASE_URL" --arg model "$MODEL" '
 cat > "$CONFIG_DIR/codex.toml" <<EOF_CONFIG
 model = "$MODEL"
 model_provider = "bailian"
+sandbox_mode = "danger-full-access"
 
 [model_providers.bailian]
 name = "Bailian"
@@ -64,6 +65,8 @@ EOF_CONFIG
 ```
 
 This uses Codex's [native custom-provider settings](https://developers.openai.com/codex/config-advanced/#custom-model-providers).
+The sandbox mode follows the upstream OpenShell Codex harness: OpenShell
+provides the outer isolation, so Codex does not create another inner sandbox.
 
 **Claude Code** — save native settings for the
 [Bailian Messages endpoint](https://help.aliyun.com/zh/model-studio/anthropic-api-messages):

@@ -15,7 +15,9 @@ The driver uses authenticated management APIs for resources, resource policy,
 AS CPU policy and reference registration. It keeps its own state under
 `/var/lib/openshell-confidential/driver`; it does not mount or write Trustee storage.
 KBS may use any supported storage backend. The deployment requires exclusive
-management of its KBS resource policy and AS `default_cpu` policy.
+management of its KBS resource policy and named AS `openshell-tdx_cpu` policy.
+The KBS selector `openshell-tdx` selects the `openshell-tdx` policy set; AS adds
+the `_cpu` TEE-class suffix when selecting its CPU policy.
 
 For the bundled deployment, `./cos trustee install` creates a P-256 management
 identity and configures KBS to verify its JWTs with scoped endpoint ACLs.
