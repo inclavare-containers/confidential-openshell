@@ -1003,25 +1003,26 @@ impl KubernetesComputeDriver {
                 "start trusted Kata policy generator: {error}"
             ))
         })?;
-        child
-            .stdin
-            .take()
-            .expect("piped stdin")
-            .write_all(&input)
-            .await
-            .map_err(|error| {
-                KubernetesDriverError::Message(format!(
-                    "write gated Pod to Kata policy generator: {error}"
-                ))
-            })?;
-        let output = tokio::time::timeout(Duration::from_secs(330), child.wait_with_output())
-            .await
-            .map_err(|_| {
-                KubernetesDriverError::Precondition("Kata policy generation timed out".to_string())
-            })?
-            .map_err(|error| {
+        let output = tokio::time::timeout(Duration::from_secs(330), async {
+            child
+                .stdin
+                .take()
+                .expect("piped stdin")
+                .write_all(&input)
+                .await
+                .map_err(|error| {
+                    KubernetesDriverError::Message(format!(
+                        "write gated Pod to Kata policy generator: {error}"
+                    ))
+                })?;
+            child.wait_with_output().await.map_err(|error| {
                 KubernetesDriverError::Message(format!("read Kata policy generator: {error}"))
-            })?;
+            })
+        })
+        .await
+        .map_err(|_| {
+            KubernetesDriverError::Precondition("Kata policy generation timed out".to_string())
+        })??;
         if !output.status.success() {
             return Err(KubernetesDriverError::Precondition(format!(
                 "Kata policy generation failed: {}",
@@ -2368,6 +2369,35 @@ impl KubernetesComputeDriver {
         Ok((name, sandbox))
     }
 
+    fn select_owned_sandbox(
+        &self,
+        sandbox_id: &str,
+        objects: Vec<DynamicObject>,
+    ) -> Result<Option<DynamicObject>, String> {
+        if objects.is_empty() {
+            return Ok(None);
+        }
+        let owners = self
+            .confidential
+            .store
+            .workspace_owners()
+            .map_err(|error| format!("read confidential sandbox ownership: {error}"))?;
+        let mut owned = objects.into_iter().filter(|object| {
+            owners.iter().any(|owner| {
+                owner.sandbox_id == sandbox_id
+                    && object.metadata.namespace.as_deref() == Some(owner.namespace.as_str())
+                    && object.metadata.uid.as_deref() == Some(owner.sandbox_cr_uid.as_str())
+            })
+        });
+        let object = owned
+            .next()
+            .ok_or_else(|| "no Kubernetes Sandbox matches the trusted owner".to_string())?;
+        if owned.next().is_some() {
+            return Err("multiple Kubernetes Sandboxes match trusted owners".to_string());
+        }
+        Ok(Some(object))
+    }
+
     pub async fn get_sandbox(&self, sandbox_id: &str) -> Result<Option<Sandbox>, String> {
         info!(
             sandbox_id = %sandbox_id,
@@ -2382,7 +2412,7 @@ impl KubernetesComputeDriver {
         let lp = ListParams::default().labels(&selector);
         match tokio::time::timeout(KUBE_API_TIMEOUT, agent_sandbox_api.api.list(&lp)).await {
             Ok(Ok(list)) => {
-                let Some(obj) = list.items.into_iter().next() else {
+                let Some(obj) = self.select_owned_sandbox(sandbox_id, list.items)? else {
                     debug!(sandbox_id = %sandbox_id, "Sandbox not found in Kubernetes");
                     return Ok(None);
                 };
@@ -4319,10 +4349,9 @@ impl KubernetesComputeDriver {
             ))
         })?
         .map_err(KubernetesDriverError::from_kube)?;
-        let object = list
-            .items
-            .into_iter()
-            .next()
+        let object = self
+            .select_owned_sandbox(sandbox_id, list.items)
+            .map_err(KubernetesDriverError::Precondition)?
             .ok_or(KubernetesDriverError::NotFound)?;
         let cr_uid = object.metadata.uid.clone().ok_or_else(|| {
             KubernetesDriverError::Precondition("Sandbox CR lacks UID during stop".to_string())
@@ -4648,7 +4677,7 @@ impl KubernetesComputeDriver {
         .await
         {
             Ok(Ok(list)) => {
-                if let Some(obj) = list.items.into_iter().next() {
+                if let Some(obj) = self.select_owned_sandbox(sandbox_id, list.items)? {
                     match obj.metadata.name.clone() {
                         Some(name) => {
                             let ns = obj
@@ -4777,12 +4806,6 @@ impl KubernetesComputeDriver {
         let marker = {
             let profile = &self.confidential;
             let cr_uid = cr_uid.as_deref().expect("checked Sandbox CR UID");
-            profile
-                .store
-                .record_workspace_owner(sandbox_id, &obj_namespace, cr_uid)
-                .map_err(|error| {
-                    format!("record confidential sandbox owner before delete: {error}")
-                })?;
             let marker = profile
                 .store
                 .begin_delete(sandbox_id, &obj_namespace, cr_uid, None)
@@ -5566,6 +5589,16 @@ impl KubernetesComputeDriver {
         lookup_api: &AgentSandboxApi,
         object: &DynamicObject,
     ) {
+        let Ok(sandbox_id) = sandbox_id_from_object(object) else {
+            return;
+        };
+        if let Err(error) = self
+            .confidential
+            .store
+            .revoke_owned_sandbox(&sandbox_id, None)
+        {
+            warn!(%sandbox_id, %error, "could not fully withdraw authorization before suspension; revocation remains pending");
+        }
         let Some(name) = object.metadata.name.as_deref() else {
             return;
         };
@@ -5637,15 +5670,15 @@ impl KubernetesComputeDriver {
             warn!(sandbox = name, "stale bootstrap lacks sandbox identity");
             return;
         };
+        if let Err(error) = self.select_owned_sandbox(&sandbox_id, vec![object.clone()]) {
+            warn!(sandbox = name, %error, "could not identify trusted stale bootstrap owner");
+            return;
+        }
         let marker = match self
             .confidential
             .store
-            .record_workspace_owner(&sandbox_id, namespace, &uid)
-            .and_then(|()| {
-                self.confidential
-                    .store
-                    .begin_delete(&sandbox_id, namespace, &uid, None)
-            }) {
+            .begin_delete(&sandbox_id, namespace, &uid, None)
+        {
             Ok(marker) => marker,
             Err(error) => {
                 warn!(sandbox = name, %error, "could not fence stale bootstrap deletion");
@@ -9747,6 +9780,11 @@ mod tests {
             lifecycle_gates: Arc::default(),
         };
         driver.sandbox_api_version.set(SANDBOX_VERSION_V1BETA1).ok();
+        driver
+            .confidential
+            .store
+            .record_workspace_owner("sandbox-id", "openshell", "cr-uid")
+            .unwrap();
         std::fs::write(&fail, b"fail").unwrap();
         let _ =
             tokio::time::timeout(Duration::from_secs(2), driver.stop_sandbox("sandbox-id")).await;
@@ -9903,6 +9941,11 @@ mod tests {
         driver
             .sandbox_api_version
             .set(SANDBOX_VERSION_V1BETA1)
+            .unwrap();
+        driver
+            .confidential
+            .store
+            .record_workspace_owner("sandbox-id", "openshell", "cr-uid")
             .unwrap();
         let authentication = serde_json::to_vec(&serde_json::json!({
             "supervisor": {"session_id": openshell_core::SandboxSessionId::new(),
@@ -10381,6 +10424,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_does_not_adopt_an_unknown_sandbox() {
+        let (driver, steps) = delete_test_driver(vec![(
+            http::Method::GET,
+            "/apis/agents.x-k8s.io/v1beta1/namespaces/openshell/sandboxes",
+            kube_test_response(
+                http::StatusCode::OK,
+                serde_json::json!({
+                    "apiVersion":"agents.x-k8s.io/v1beta1", "kind":"SandboxList",
+                    "items":[delete_test_sandbox("forged-uid")]
+                }),
+            ),
+        )]);
+        let error = driver.delete_sandbox("sandbox-id").await.unwrap_err();
+        assert!(error.contains("trusted owner"), "{error}");
+        assert!(
+            driver
+                .confidential
+                .store
+                .workspace_owners()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(steps.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dependency_failure_revokes_authorization_even_if_suspension_fails() {
+        let (mut driver, steps) = delete_test_driver(vec![(
+            http::Method::PATCH,
+            "/apis/agents.x-k8s.io/v1beta1/namespaces/openshell/sandboxes/sandbox-cr",
+            kube_test_response(
+                http::StatusCode::SERVICE_UNAVAILABLE,
+                serde_json::json!({
+                    "apiVersion":"v1", "kind":"Status", "status":"Failure", "code":503
+                }),
+            ),
+        )]);
+        let (temp, serving, bindings) = attach_delete_test_workspace(&mut driver);
+        assert!(serving.exists());
+        let api = KubernetesComputeDriver::agent_sandbox_api(
+            driver.client.clone(),
+            SANDBOX_VERSION_V1BETA1,
+            "openshell",
+        );
+        let object = serde_json::from_value(delete_test_sandbox("old-uid")).unwrap();
+        driver
+            .suspend_sandbox_runtime_after_dependency_failure(&api, &object)
+            .await;
+        assert!(!serving.exists());
+        assert_eq!(std::fs::read_dir(bindings).unwrap().count(), 0);
+        assert!(steps.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[tokio::test]
     async fn delete_ack_waits_for_role_pods_and_sandbox_cr() {
         const CR_PATH: &str =
             "/apis/agents.x-k8s.io/v1beta1/namespaces/openshell/sandboxes/sandbox-cr";
@@ -10390,7 +10488,7 @@ mod tests {
         let sandbox = delete_test_sandbox("old-uid");
         let list = serde_json::json!({
             "apiVersion": "agents.x-k8s.io/v1beta1", "kind": "SandboxList",
-            "items": [sandbox.clone()]
+            "items": [delete_test_sandbox("forged-uid"), sandbox.clone()]
         });
         let (driver, steps) = delete_test_driver(vec![
             (
@@ -10419,6 +10517,11 @@ mod tests {
                 kube_test_response(http::StatusCode::OK, sandbox),
             ),
         ]);
+        driver
+            .confidential
+            .store
+            .record_workspace_owner("sandbox-id", "openshell", "old-uid")
+            .unwrap();
         let error = driver.delete_sandbox("sandbox-id").await.unwrap_err();
         assert!(error.contains("CR deletion was not confirmed"), "{error}");
         assert!(steps.lock().unwrap().is_empty());
@@ -11958,6 +12061,11 @@ mod tests {
             .set(SANDBOX_VERSION_V1BETA1)
             .expect("set test Sandbox API version");
 
+        driver
+            .confidential
+            .store
+            .record_workspace_owner("sandbox-1", "openshell", "old-uid")
+            .unwrap();
         tokio::time::timeout(Duration::from_secs(1), driver.stop_sandbox("sandbox-1"))
             .await
             .expect("stop timed out")
@@ -11989,6 +12097,11 @@ mod tests {
                 kube_test_response(http::StatusCode::OK, replacement),
             ),
         ]);
+        driver
+            .confidential
+            .store
+            .record_workspace_owner("sandbox-id", "openshell", "old-uid")
+            .unwrap();
         let error = driver.stop_sandbox("sandbox-id").await.unwrap_err();
         assert!(error.to_string().contains("UID changed"), "{error}");
         assert!(steps.lock().unwrap().is_empty());
