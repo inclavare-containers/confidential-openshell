@@ -12,7 +12,6 @@ image with both unset and configured system disk sizes.
 
 Fixes: #3436
 Signed-off-by: Weidong Sun <sunweidong@linux.alibaba.com>
-
 Co-authored-by: Codex <noreply@openai.com>
 ---
  src/cloud-providers/alibabacloud/provider.go  |  9 +--

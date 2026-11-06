@@ -12,6 +12,7 @@ Accept existing upstream metadata without version labels or Pod identity
 fields. Remove only empty targets and retain metadata when target cleanup
 fails, allowing an unpublish retry to finish.
 
+Signed-off-by: Weidong Sun <sunweidong@linux.alibaba.com>
 Co-authored-by: Codex <noreply@openai.com>
 ---
  pkg/driver/controllerserver.go            |   2 +

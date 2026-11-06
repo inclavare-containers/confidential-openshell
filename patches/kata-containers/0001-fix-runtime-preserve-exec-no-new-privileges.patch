@@ -12,6 +12,7 @@ Copy the existing value into grpc.Process and extend
 TestCmdToKataProcess to cover false and true. This preserves the caller
 setting without changing the guest agent or policy rules.
 
+Signed-off-by: Weidong Sun <sunweidong@linux.alibaba.com>
 Assisted-by: OpenAI Codex <noreply@openai.com>
 ---
  src/runtime/virtcontainers/kata_agent.go      | 7 ++++---

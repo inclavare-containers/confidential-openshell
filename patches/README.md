@@ -22,17 +22,21 @@ The CSI CI workflow, conformance runner and Dockerfile use the upstream versions
 Sealed Secrets use native Kata/CDH unsealing and ordinary Kubernetes Secret mounts.
 
 CAA's [on-link route fix (#3435)](https://github.com/confidential-containers/cloud-api-adaptor/pull/3435)
-and [image selection fix (#3437)](https://github.com/confidential-containers/cloud-api-adaptor/pull/3437)
-retain their submitted code diffs. Other upstream submissions should include only
-the relevant fix and its prerequisites; the measured workspace overlay is a
-separate feature integration.
+is open. The [image selection fix (#3437)](https://github.com/confidential-containers/cloud-api-adaptor/pull/3437)
+is merged upstream and retained for the selected base. Both patches retain their
+submitted code diffs.
 
-The APF target-hint fix is submitted as
-[draft PR #3439](https://github.com/confidential-containers/cloud-api-adaptor/pull/3439)
-for [issue #3438](https://github.com/confidential-containers/cloud-api-adaptor/issues/3438).
-It reproduces on upstream main without the other local patches.
+The APF target-hint [PR #3439](https://github.com/confidential-containers/cloud-api-adaptor/pull/3439)
+was closed without merging. Its patch remains downstream; any renewed upstream
+submission needs agreement on the approach.
 
-Patch authors and human DCO sign-offs are preserved. CAA/CSI patches use
+Other CAA/CSI patches require separate upstream review of their prerequisites and
+runtime contracts, including capacity, filesystem support, topology, version
+skew and attachment identity. The measured workspace overlay remains a downstream
+integration; its authorization and LUKS header handling have not become a shared
+CDH/guest-components solution. DCO trailers do not establish upstream readiness.
+
+All 17 patch files carry their human author's `Signed-off-by` trailer. CAA/CSI patches use
 `Co-authored-by: Codex <noreply@openai.com>`; Kata uses
 `Assisted-by: OpenAI Codex <noreply@openai.com>`.
 

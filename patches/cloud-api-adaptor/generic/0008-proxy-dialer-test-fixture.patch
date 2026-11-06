@@ -8,6 +8,7 @@ reading and writing the shared listener variable. Close the connection
 only when non-nil and release the reopened listener on the success path.
 This changes only the existing dialer test fixture.
 
+Signed-off-by: Weidong Sun <sunweidong@linux.alibaba.com>
 Co-authored-by: Codex <noreply@openai.com>
 ---
  .../pkg/adaptor/proxy/proxy_test.go           | 37 +++++++++----------

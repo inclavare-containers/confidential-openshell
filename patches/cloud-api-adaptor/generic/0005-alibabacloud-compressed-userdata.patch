@@ -6,6 +6,7 @@ Subject: [PATCH] alibabacloud: compress large instance user data
 Compress large cloud-config documents and decode gzip data in the guest.
 Keep the upstream cloud-config generation and preserve its exact bytes.
 
+Signed-off-by: Weidong Sun <sunweidong@linux.alibaba.com>
 Co-authored-by: Codex <noreply@openai.com>
 ---
 diff --git a/src/cloud-api-adaptor/pkg/userdata/alibabacloud_test.go b/src/cloud-api-adaptor/pkg/userdata/alibabacloud_test.go

@@ -13,7 +13,6 @@ flag preservation and installation of a route with an off-subnet gateway.
 
 Fixes: #3434
 Signed-off-by: Weidong Sun <sunweidong@linux.alibaba.com>
-
 Co-authored-by: Codex <noreply@openai.com>
 ---
  .../pkg/podnetwork/podnetwork_test.go         | 29 ++++++++++++++++++-

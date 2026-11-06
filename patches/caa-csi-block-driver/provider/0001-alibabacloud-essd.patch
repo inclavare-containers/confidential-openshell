@@ -7,6 +7,7 @@ Subject: [PATCH] alibabacloud: add ESSD provider and minimal deployment
 Use existing provider and cloud-recovery interfaces, stable create tokens and SDK credential caching.
 Keep the upstream combined DaemonSet and node-local store; add Alibaba-only RRSA and storage settings.
 
+Signed-off-by: Weidong Sun <sunweidong@linux.alibaba.com>
 Co-authored-by: Codex <noreply@openai.com>
 ---
  README.md                                          |   1 +

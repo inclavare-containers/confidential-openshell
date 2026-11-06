@@ -8,6 +8,7 @@ reaches Running, then wait for each accepted attachment to complete.
 Let ECS validate disk compatibility and report API failures to the
 existing cleanup path without an additional AttachDisk retry loop.
 
+Signed-off-by: Weidong Sun <sunweidong@linux.alibaba.com>
 Co-authored-by: Codex <noreply@openai.com>
 ---
  src/cloud-providers/alibabacloud/provider.go     |   6 +

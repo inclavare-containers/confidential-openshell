@@ -5,6 +5,7 @@ Subject: [PATCH] controller: validate actual recovered capacity
 
 Preserve the requested range for cached and recovered disks and report the provider actual capacity.
 
+Signed-off-by: Weidong Sun <sunweidong@linux.alibaba.com>
 Co-authored-by: Codex <noreply@openai.com>
 ---
  pkg/driver/capacity_test.go    | 83 ++++++++++++++++++++++++++++++++++

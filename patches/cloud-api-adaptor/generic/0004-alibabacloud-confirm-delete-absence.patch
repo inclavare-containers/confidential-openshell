@@ -14,6 +14,7 @@ no data-disk support or additional DescribeDisks permission.
 Retry IncorrectInstanceStatus.Initializing during failed-create rollback, just
 as the existing IncorrectInstanceStatus case is retried.
 
+Signed-off-by: Weidong Sun <sunweidong@linux.alibaba.com>
 Co-authored-by: Codex <noreply@openai.com>
 ---
  .../alibabacloud/instance_delete.go           |  35 ++++++

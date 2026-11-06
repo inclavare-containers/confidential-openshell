@@ -13,7 +13,6 @@ Keep the existing annotation/CRI-O paths and metadata format. Reuse the
 volume fixtures and cover the missing-UID path through a local API server.
 
 Signed-off-by: Weidong Sun <sunweidong@linux.alibaba.com>
-
 Co-authored-by: Codex <noreply@openai.com>
 ---
  .../pkg/adaptor/cloud/cloud.go                |  7 ++-

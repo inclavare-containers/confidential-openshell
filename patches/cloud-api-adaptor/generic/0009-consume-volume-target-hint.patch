@@ -7,6 +7,7 @@ Keep the peer-pod volume target hint for APF's mount wait, then omit it
 from the request forwarded to Kata Agent. The upstream genpolicy rules
 reject unexpected annotations; this transport hint is not an agent input.
 
+Signed-off-by: Weidong Sun <sunweidong@linux.alibaba.com>
 Co-authored-by: Codex <noreply@openai.com>
 ---
  src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go      | 1 +

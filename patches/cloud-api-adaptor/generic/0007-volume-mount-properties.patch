@@ -14,7 +14,6 @@ helper and volume test fixtures without introducing a versioned contract,
 attachment cache or confidential workspace policy.
 
 Signed-off-by: Weidong Sun <sunweidong@linux.alibaba.com>
-
 Co-authored-by: Codex <noreply@openai.com>
 ---
  .../pkg/adaptor/proxy/cloud_volumes_test.go   | 101 +++++++++++++++---

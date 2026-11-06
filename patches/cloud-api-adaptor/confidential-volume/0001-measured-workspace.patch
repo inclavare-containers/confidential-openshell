@@ -14,6 +14,7 @@ existing sandbox-lifetime mount path, including waits and filesystem
 fallback. Workspace ownership and mount validation apply only when the
 encrypted-volume profile is enabled.
 
+Signed-off-by: Weidong Sun <sunweidong@linux.alibaba.com>
 Co-authored-by: Codex <noreply@openai.com>
 ---
  .../cmd/agent-protocol-forwarder/main.go           |  26 +-

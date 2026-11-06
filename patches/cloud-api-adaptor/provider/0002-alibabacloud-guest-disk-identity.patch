@@ -7,6 +7,7 @@ Match Alibaba disk IDs against kernel serial/WWID information for virtio
 and NVMe devices. Require a unique match and retain the existing guest
 device-discovery retries without falling back to device ordering.
 
+Signed-off-by: Weidong Sun <sunweidong@linux.alibaba.com>
 Co-authored-by: Codex <noreply@openai.com>
 ---
  .../forwarder/interceptor/alibaba_device.go   |  68 ++++++++
