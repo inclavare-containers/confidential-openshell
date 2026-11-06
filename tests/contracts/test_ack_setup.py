@@ -524,7 +524,7 @@ class Setup(CloudFixture, unittest.TestCase):
         csi = yaml.safe_load((self.operator / 'csi-values.yaml').read_text())
         provider = peer['providerConfigs']['alibabacloud']
         kata = peer['kata-deploy']
-        self.assertEqual(kata['nodeSelector'], {'confidential.openshell.ai/worker': ''})
+        self.assertEqual(kata['nodeSelector'], {'node.kubernetes.io/worker': ''})
         self.assertTrue(kata['shims']['remote']['containerd']['forceGuestPull'])
         dropin = tomllib.loads(kata['shims']['remote']['dropIn'])
         self.assertEqual(dropin['hypervisor']['remote']['shared_fs'], 'none')

@@ -217,8 +217,8 @@ Once no sandbox is retained and no owned role VM/workspace disk remains:
    only after cloud recovery is verified and no old controller is using it.
 3. On an attached cluster, retain the cluster, VPC, node pools, CSI add-ons,
    Terway, RRSA issuer, shared cert-manager/Agent Sandbox installations and worker
-   security group. Remove only this deployment's worker labels, Kata runtime
-   configuration and registry trust after confirming no other workloads use them.
+   security group and upstream worker labels. Remove this deployment's Kata runtime
+   configuration and registry trust only after confirming no other workloads use them.
    The worker files keep `.before-openshell` backups; compare current contents
    before restoring them. Retain unrelated subsequent administrator changes.
 4. Remove the saved PodVM SNAT entry before its NAT gateway is removed. Check its

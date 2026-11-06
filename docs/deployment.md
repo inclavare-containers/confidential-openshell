@@ -145,7 +145,10 @@ Generated names and IDs are passed between steps automatically.
 
 Selects the new cluster's workers automatically. A single eligible worker is also
 selected automatically. With multiple workers in an existing cluster, lists their
-names and asks which numbered entries to use. It labels and saves the selection.
+names and asks which numbered entries to use. It adds the upstream
+`node.kubernetes.io/worker` label and saves the selection for configuration steps.
+Kata and CAA run on nodes matching that upstream label; changing the saved
+selection does not remove existing worker labels.
 Later operations use ECS Cloud Assistant; no node-name placeholders, public worker
 IPs or SSH aliases are required.
 

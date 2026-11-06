@@ -50,7 +50,7 @@ webhook:
     tag: "v0.23.0@sha256:b1b2e7bb2b880728fba68fe490914d803e810c947f1e5a2af40f8b9d7cf9b07e"
 kata-deploy:
   nodeSelector:
-    confidential.openshell.ai/worker: ""
+    node.kubernetes.io/worker: ""
   image:
     reference: PRIVATE_REGISTRY/openshell/kata-deploy-shim-nnp@sha256:PATCHED_KATA_DEPLOY_IMAGE_SHA256
   kubectlImage:
