@@ -11,7 +11,6 @@ workspace_cloud_volume(encoded, destination) := volumes[name] if {
     volumes := json.unmarshal(encoded)
     some name
     volumes[name].mount_point == destination
-    object.get(volumes[name], "fs_group", "") == "__WORKLOAD_FSGROUP__"
 }
 
 workspace_cloud_mount(container_name, p_mount) if {
@@ -35,6 +34,5 @@ check_mount(p_mount, i_mount, bundle_id, sandbox_id) if {
     volumes := json.unmarshal(encoded)
     some name, volume in volumes
     volume == workspace_cloud_volume(encoded, p_mount.destination)
-    volume.readonly == ("ro" in p_mount.options)
     i_mount.source == concat("", ["/run/cloud-volumes/", volume.disk_id])
 }

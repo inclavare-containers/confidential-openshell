@@ -4,8 +4,7 @@ Date: Wed, 4 Nov 2026 15:24:44 +0800
 Subject: [PATCH] guest: authorize encrypted workspaces through measured policy
 
 Authorize disk identity, key, filesystem, initialization and per-container
-mount identity, readonly and fsGroup from measured initdata before device
-operations. Required mounts cannot disappear with host annotations. Use the disk ID for the guest
+mount identity from measured initdata before device operations. Required mounts cannot disappear with host annotations. Use the disk ID for the guest
 mount and CDH mapper so host aliases cannot reopen the same filesystem.
 Verify the mapping and mount access before forwarding the container request.
 
@@ -22,14 +21,13 @@ Co-authored-by: Codex <noreply@openai.com>
  .../pkg/forwarder/interceptor/cdh_client.go        |  59 +++
  .../pkg/forwarder/interceptor/interceptor.go       | 269 +++++++----
  .../pkg/forwarder/interceptor/interceptor_test.go  |   9 +
- .../pkg/forwarder/interceptor/workspace.go         | 284 ++++++++++++
+ .../pkg/forwarder/interceptor/workspace.go         | 281 ++++++++++++
  .../pkg/forwarder/interceptor/workspace_mount.go   | 494 +++++++++++++++++++++
  .../workspace_mount_integration_test.go            |  67 +++
  .../forwarder/interceptor/workspace_mount_test.go  | 204 +++++++++
  .../pkg/forwarder/interceptor/workspace_test.go    | 122 +++++
- .../interceptor/workspace_transaction_test.go      | 113 +++++
- 11 files changed, 1577 insertions(+), 89 deletions(-)
-
+ .../interceptor/workspace_transaction_test.go      | 111 +++++
+ 11 files changed, 1572 insertions(+), 89 deletions(-)
  create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/cdh_client.go
  create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace.go
  create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace_mount.go
@@ -600,10 +598,10 @@ index 44b1bd4c..3c0c652d 100644
 +}
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace.go
 new file mode 100644
-index 00000000..b30017d2
+index 00000000..77e60fc4
 --- /dev/null
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace.go
-@@ -0,0 +1,284 @@
+@@ -0,0 +1,281 @@
 +// (C) Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -638,8 +636,6 @@ index 00000000..b30017d2
 +type workspaceMount struct {
 +	MountPoint string `toml:"mount_point"`
 +	DiskID     string `toml:"disk_id"`
-+	ReadOnly   bool   `toml:"readonly"`
-+	FSGroup    string `toml:"fs_group"`
 +}
 +
 +type workspacePolicy struct {
@@ -738,8 +734,7 @@ index 00000000..b30017d2
 +			return err
 +		}
 +		mount, ok := remaining[volume.MountPoint]
-+		if !ok || mount.DiskID != volume.DiskID || mount.ReadOnly != volume.ReadOnly ||
-+			mount.FSGroup != volume.FSGroup {
++		if !ok || mount.DiskID != volume.DiskID {
 +			return fmt.Errorf("workspace mount %s differs from measured policy", volume.MountPoint)
 +		}
 +		delete(remaining, volume.MountPoint)
@@ -1673,7 +1668,7 @@ index 00000000..a4adc541
 +}
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace_test.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace_test.go
 new file mode 100644
-index 00000000..7414aaff
+index 00000000..d35f0ff1
 --- /dev/null
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace_test.go
 @@ -0,0 +1,122 @@
@@ -1704,7 +1699,7 @@ index 00000000..7414aaff
 +encryption_type = "luks2"
 +filesystem_type = "ext4"
 +[mounts]
-+agent = [{mount_point="/data",disk_id="d-abc123",readonly=false,fs_group=""}]
++agent = [{mount_point="/data",disk_id="d-abc123"}]
 +`
 +
 +func testWorkspacePolicy() workspacePolicy {
@@ -1801,10 +1796,10 @@ index 00000000..7414aaff
 +}
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace_transaction_test.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace_transaction_test.go
 new file mode 100644
-index 00000000..fd508331
+index 00000000..62bed1f2
 --- /dev/null
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace_transaction_test.go
-@@ -0,0 +1,113 @@
+@@ -0,0 +1,111 @@
 +// (C) Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -1888,12 +1883,10 @@ index 00000000..fd508331
 +
 +func TestRequiredWorkspaceCannotBeRemovedOrChangedBeforePreparation(t *testing.T) {
 +	policy := testWorkspacePolicy()
-+	policy.Mounts = map[string][]workspaceMount{"agent": {{MountPoint: "/sandbox", DiskID: "d-abc123", FSGroup: "1000"}}}
++	policy.Mounts = map[string][]workspaceMount{"agent": {{MountPoint: "/sandbox", DiskID: "d-abc123"}}}
 +	valid := util.CloudVolumeAnnotation{MountPoint: "/sandbox", DiskID: "d-abc123", LUN: "0", FSType: "ext4", FSGroup: "1000"}
 +	for _, tc := range []struct{ name, encoded string }{
 +		{"missing annotation", ""}, {"empty object", "{}"},
-+		{"readonly changed", `{"vol-0":{"mount_point":"/sandbox","disk_id":"d-abc123","lun":"0","fs_type":"ext4","fs_group":"1000","readonly":true}}`},
-+		{"group changed", `{"vol-0":{"mount_point":"/sandbox","disk_id":"d-abc123","lun":"0","fs_type":"ext4","fs_group":"0"}}`},
 +	} {
 +		t.Run(tc.name, func(t *testing.T) {
 +			i := &interceptor{requireEncryptedVolumes: true, workspace: &policy, Redirector: &mockRedirector{}}

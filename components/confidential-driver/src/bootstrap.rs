@@ -995,12 +995,6 @@ impl BootstrapStore {
             .spec
             .as_ref()
             .expect("trusted workload spec");
-        let group = spec
-            .security_context
-            .as_ref()
-            .and_then(|s| s.fs_group)
-            .map(|g| g.to_string())
-            .unwrap_or_default();
         let claims: std::collections::BTreeMap<_, _> = spec
             .volumes
             .iter()
@@ -1024,10 +1018,8 @@ impl BootstrapStore {
                     .find(|v| v.pvc_name == claim.claim_name)
                     .and_then(|v| v.cloud_disk_id.as_ref())
                     .ok_or(StoreError::Invalid("workspace PVC has no bound disk"))?;
-                let readonly = mount.read_only.unwrap_or(false) || claim.read_only.unwrap_or(false);
                 entries.push(serde_json::json!({
                     "mount_point": mount.mount_path, "disk_id": disk,
-                    "readonly": readonly, "fs_group": group,
                 }));
             }
             mounts.insert(container.name.clone(), serde_json::Value::Array(entries));

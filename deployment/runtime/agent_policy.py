@@ -309,12 +309,10 @@ def generate(pod: dict, *, role: str, tools_dir: pathlib.Path,
             rules = rules.replace("check_mount(p_mount, i_mount, bundle_id, sandbox_id) if {",
                                   "check_mount(p_mount, i_mount, bundle_id, sandbox_id) if {\n"
                                   "    not workspace_mount_destination(p_mount.destination)")
-            fs_group = pod["spec"].get("securityContext", {}).get("fsGroup", "")
             pvc_names = {v["name"] for v in pod["spec"].get("volumes", []) if "persistentVolumeClaim" in v}
             mounts = {c["name"]: [m["mountPath"] for m in c.get("volumeMounts", []) if m["name"] in pvc_names]
                       for c in pod["spec"].get("containers", []) + pod["spec"].get("initContainers", [])}
-            rules += "\n" + WORKLOAD_EXTENSION.read_text().replace(
-                "__WORKLOAD_FSGROUP__", str(fs_group)).replace("__WORKSPACE_MOUNTS__", json.dumps(mounts))
+            rules += "\n" + WORKLOAD_EXTENSION.read_text().replace("__WORKSPACE_MOUNTS__", json.dumps(mounts))
         rules_path.write_text(_compact_rules(rules))
         settings = _settings(json.loads(tools["genpolicy-settings.json"].read_text()), pause_image, oci_version)
         settings_path.write_text(json.dumps(settings, separators=(",", ":")))
