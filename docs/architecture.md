@@ -22,7 +22,7 @@ AS/KBS and AS's built-in RVPS. Trustee may run on a separate trusted host.
 The driver publishes resources and policies through authenticated KBS management
 APIs; its private staging and recovery journal are never shared with Trustee.
 KBS proxies policy and reference administration to AS. The deployment owns a
-dedicated KBS resource policy and AS default CPU policy; multiple independent
+dedicated KBS resource policy and AS `openshell-tdx_cpu` policy; multiple independent
 policy writers are not supported. KBS and Gateway expose authenticated TLS endpoints
 reachable by the cloud guests. Their addresses do not define the trust boundary.
 The official Trustee images run without source changes.
