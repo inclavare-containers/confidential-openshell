@@ -4,8 +4,8 @@ Date: Wed, 4 Nov 2026 15:24:44 +0800
 Subject: [PATCH] guest: authorize encrypted workspaces through measured policy
 
 Authorize disk identity, key, filesystem, initialization and per-container
-mount properties from measured initdata before device operations. Required
-mounts cannot disappear with host annotations. Use the disk ID for the guest
+mount identity, readonly and fsGroup from measured initdata before device
+operations. Required mounts cannot disappear with host annotations. Use the disk ID for the guest
 mount and CDH mapper so host aliases cannot reopen the same filesystem.
 Verify the mapping and mount access before forwarding the container request.
 
@@ -22,13 +22,14 @@ Co-authored-by: Codex <noreply@openai.com>
  .../pkg/forwarder/interceptor/cdh_client.go        |  59 +++
  .../pkg/forwarder/interceptor/interceptor.go       | 269 +++++++----
  .../pkg/forwarder/interceptor/interceptor_test.go  |   9 +
- .../pkg/forwarder/interceptor/workspace.go         | 286 ++++++++++++
- .../pkg/forwarder/interceptor/workspace_mount.go   | 509 +++++++++++++++++++++
+ .../pkg/forwarder/interceptor/workspace.go         | 284 ++++++++++++
+ .../pkg/forwarder/interceptor/workspace_mount.go   | 494 +++++++++++++++++++++
  .../workspace_mount_integration_test.go            |  67 +++
- .../forwarder/interceptor/workspace_mount_test.go  | 210 +++++++++
+ .../forwarder/interceptor/workspace_mount_test.go  | 204 +++++++++
  .../pkg/forwarder/interceptor/workspace_test.go    | 122 +++++
- .../interceptor/workspace_transaction_test.go      | 114 +++++
- 11 files changed, 1601 insertions(+), 89 deletions(-)
+ .../interceptor/workspace_transaction_test.go      | 113 +++++
+ 11 files changed, 1577 insertions(+), 89 deletions(-)
+
  create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/cdh_client.go
  create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace.go
  create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace_mount.go
@@ -599,10 +600,10 @@ index 44b1bd4c..3c0c652d 100644
 +}
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace.go
 new file mode 100644
-index 00000000..8fcda5df
+index 00000000..b30017d2
 --- /dev/null
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace.go
-@@ -0,0 +1,286 @@
+@@ -0,0 +1,284 @@
 +// (C) Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -617,7 +618,6 @@ index 00000000..8fcda5df
 +	"net/url"
 +	"os"
 +	"os/exec"
-+	"slices"
 +	"strings"
 +	"syscall"
 +	"time"
@@ -636,11 +636,10 @@ index 00000000..8fcda5df
 +// The disk list comes from the operator's workspace journal, measured as exact
 +// initdata bytes. Host-provided annotations cannot authorize another disk/key.
 +type workspaceMount struct {
-+	MountPoint string   `toml:"mount_point"`
-+	DiskID     string   `toml:"disk_id"`
-+	ReadOnly   bool     `toml:"readonly"`
-+	FSGroup    string   `toml:"fs_group"`
-+	Options    []string `toml:"options"`
++	MountPoint string `toml:"mount_point"`
++	DiskID     string `toml:"disk_id"`
++	ReadOnly   bool   `toml:"readonly"`
++	FSGroup    string `toml:"fs_group"`
 +}
 +
 +type workspacePolicy struct {
@@ -740,7 +739,7 @@ index 00000000..8fcda5df
 +		}
 +		mount, ok := remaining[volume.MountPoint]
 +		if !ok || mount.DiskID != volume.DiskID || mount.ReadOnly != volume.ReadOnly ||
-+			mount.FSGroup != volume.FSGroup || !slices.Equal(mount.Options, volume.Options) {
++			mount.FSGroup != volume.FSGroup {
 +			return fmt.Errorf("workspace mount %s differs from measured policy", volume.MountPoint)
 +		}
 +		delete(remaining, volume.MountPoint)
@@ -891,10 +890,10 @@ index 00000000..8fcda5df
 +}
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace_mount.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace_mount.go
 new file mode 100644
-index 00000000..15211efd
+index 00000000..2f65859b
 --- /dev/null
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace_mount.go
-@@ -0,0 +1,509 @@
+@@ -0,0 +1,494 @@
 +// (C) Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -1137,7 +1136,7 @@ index 00000000..15211efd
 +				}
 +			}
 +		}
-+		mounted, err := mountedWorkspaceDevice(prepared.cdhMapperPath, prepared.sourcePath, volume.FSType, volume.ReadOnly, volume.Options)
++		mounted, err := mountedWorkspaceDevice(prepared.cdhMapperPath, prepared.sourcePath, volume.FSType, volume.ReadOnly)
 +		if err != nil || mounted {
 +			return err
 +		}
@@ -1209,7 +1208,7 @@ index 00000000..15211efd
 +
 +// Mount an initialized encrypted workspace without formatting it.
 +func mountWorkspaceFilesystem(ctx context.Context, device, mountPoint, fsType string, readOnly bool, options []string) (bool, error) {
-+	if mounted, err := mountedWorkspaceDevice(device, mountPoint, fsType, readOnly, options); err != nil || mounted {
++	if mounted, err := mountedWorkspaceDevice(device, mountPoint, fsType, readOnly); err != nil || mounted {
 +		return false, err
 +	}
 +	if err := ctx.Err(); err != nil {
@@ -1224,7 +1223,7 @@ index 00000000..15211efd
 +		return mounted, errors.Join(mountErr, inspectErr)
 +	}
 +	if mounted {
-+		_, validateErr := mountedWorkspaceDevice(device, mountPoint, fsType, readOnly, options)
++		_, validateErr := mountedWorkspaceDevice(device, mountPoint, fsType, readOnly)
 +		return true, errors.Join(mountErr, validateErr)
 +	}
 +	return false, errors.Join(mountErr, fmt.Errorf("filesystem was not mounted at %s", mountPoint))
@@ -1310,7 +1309,7 @@ index 00000000..15211efd
 +
 +// mountedWorkspaceDevice rejects reuse of a mount point backed by a different
 +// device, filesystem, or access mode.
-+func mountedWorkspaceDevice(device, mountPoint, fsType string, readOnly bool, options []string) (bool, error) {
++func mountedWorkspaceDevice(device, mountPoint, fsType string, readOnly bool) (bool, error) {
 +	resolved, err := filepath.EvalSymlinks(mountPoint)
 +	if err != nil {
 +		return false, err
@@ -1326,13 +1325,13 @@ index 00000000..15211efd
 +	if err := unix.Stat(device, &stat); err != nil {
 +		return false, fmt.Errorf("stat mounted device %s: %w", device, err)
 +	}
-+	if err := validateReusableWorkspaceMount(mountPoint, mount, &stat, fsType, readOnly, options); err != nil {
++	if err := validateReusableWorkspaceMount(mountPoint, mount, &stat, fsType, readOnly); err != nil {
 +		return false, err
 +	}
 +	return true, nil
 +}
 +
-+func validateReusableWorkspaceMount(mountPoint string, mount *mountinfo.Info, stat *unix.Stat_t, fsType string, readOnly bool, options []string) error {
++func validateReusableWorkspaceMount(mountPoint string, mount *mountinfo.Info, stat *unix.Stat_t, fsType string, readOnly bool) error {
 +	if mount.Root != "/" {
 +		return fmt.Errorf("mount point %s exposes filesystem root %q, expected /", mountPoint, mount.Root)
 +	}
@@ -1340,27 +1339,12 @@ index 00000000..15211efd
 +		mount.Minor != int(unix.Minor(uint64(stat.Rdev))) || mount.FSType != fsType {
 +		return fmt.Errorf("mount point %s is backed by an unexpected device or filesystem", mountPoint)
 +	}
-+	actual := make(map[string]bool)
++	actualReadOnly := false
 +	for _, option := range strings.Split(mount.Options+","+mount.VFSOptions, ",") {
-+		actual[option] = true
++		actualReadOnly = actualReadOnly || option == "ro"
 +	}
-+	expected := map[string]bool{"ro": readOnly, "nodev": false, "noexec": false, "nosuid": false}
-+	for _, option := range options {
-+		switch option {
-+		case "ro", "nodev", "noexec", "nosuid":
-+			expected[option] = true
-+		case "dev":
-+			expected["nodev"] = false
-+		case "exec":
-+			expected["noexec"] = false
-+		case "suid":
-+			expected["nosuid"] = false
-+		}
-+	}
-+	for _, option := range []string{"ro", "nodev", "noexec", "nosuid"} {
-+		if actual[option] != expected[option] {
-+			return fmt.Errorf("mount point %s option %s=%t, expected %t", mountPoint, option, actual[option], expected[option])
-+		}
++	if actualReadOnly != readOnly {
++		return fmt.Errorf("mount point %s readonly=%t, expected %t", mountPoint, actualReadOnly, readOnly)
 +	}
 +	return nil
 +}
@@ -1479,10 +1463,10 @@ index 00000000..2ca3957d
 +}
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace_mount_test.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace_mount_test.go
 new file mode 100644
-index 00000000..b5125bb8
+index 00000000..a4adc541
 --- /dev/null
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace_mount_test.go
-@@ -0,0 +1,210 @@
+@@ -0,0 +1,204 @@
 +// (C) Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -1594,11 +1578,11 @@ index 00000000..b5125bb8
 +		Major: 8, Minor: 1, Root: "/workspace", FSType: "ext4", Options: "rw,relatime",
 +	}
 +
-+	err := validateReusableWorkspaceMount("/run/cloud-volumes/vol-0", mount, stat, "ext4", false, nil)
++	err := validateReusableWorkspaceMount("/run/cloud-volumes/vol-0", mount, stat, "ext4", false)
 +	require.ErrorContains(t, err, "filesystem root")
 +
 +	mount.Root = "/"
-+	require.NoError(t, validateReusableWorkspaceMount("/run/cloud-volumes/vol-0", mount, stat, "ext4", false, nil))
++	require.NoError(t, validateReusableWorkspaceMount("/run/cloud-volumes/vol-0", mount, stat, "ext4", false))
 +}
 +
 +func TestRewriteWorkspaceMountRejectsDuplicateDestination(t *testing.T) {
@@ -1614,26 +1598,20 @@ index 00000000..b5125bb8
 +	assert.Equal(t, "/csi-source", req.OCI.Mounts[1].Source)
 +}
 +
-+func TestValidateReusableWorkspaceMountRequiresSecurityOptions(t *testing.T) {
++func TestValidateReusableWorkspaceMountRequiresReadOnly(t *testing.T) {
 +	stat := &unix.Stat_t{Mode: unix.S_IFBLK, Rdev: unix.Mkdev(8, 1)}
 +	mount := &mountinfo.Info{
 +		Major: 8, Minor: 1, Root: "/", FSType: "ext4",
 +		Options: "ro,nosuid,nodev,relatime", VFSOptions: "rw",
 +	}
-+
 +	require.NoError(t, validateReusableWorkspaceMount(
 +		"/run/cloud-volumes/vol-0", mount, stat, "ext4", true,
-+		[]string{"nodev", "nosuid", "ro"},
 +	))
++	mount.Options = "rw,nosuid,nodev,relatime"
 +	err := validateReusableWorkspaceMount(
 +		"/run/cloud-volumes/vol-0", mount, stat, "ext4", true,
-+		[]string{"nodev", "nosuid", "noexec", "ro"},
 +	)
-+	require.ErrorContains(t, err, "option noexec=false, expected true")
-+	require.NoError(t, validateReusableWorkspaceMount(
-+		"/run/cloud-volumes/vol-0", mount, stat, "ext4", true,
-+		[]string{"nodev", "nosuid", "noexec", "exec", "ro"},
-+	), "reuse must respect the final access option, as mounting does")
++	require.ErrorContains(t, err, "readonly=false, expected true")
 +}
 +
 +func TestWorkspaceMapperEncryptionParameters(t *testing.T) {
@@ -1695,7 +1673,7 @@ index 00000000..b5125bb8
 +}
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace_test.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace_test.go
 new file mode 100644
-index 00000000..6e23dcd8
+index 00000000..7414aaff
 --- /dev/null
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace_test.go
 @@ -0,0 +1,122 @@
@@ -1726,7 +1704,7 @@ index 00000000..6e23dcd8
 +encryption_type = "luks2"
 +filesystem_type = "ext4"
 +[mounts]
-+agent = [{mount_point="/data",disk_id="d-abc123",readonly=false,fs_group="",options=[]}]
++agent = [{mount_point="/data",disk_id="d-abc123",readonly=false,fs_group=""}]
 +`
 +
 +func testWorkspacePolicy() workspacePolicy {
@@ -1823,10 +1801,10 @@ index 00000000..6e23dcd8
 +}
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace_transaction_test.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace_transaction_test.go
 new file mode 100644
-index 00000000..88b0f786
+index 00000000..fd508331
 --- /dev/null
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace_transaction_test.go
-@@ -0,0 +1,114 @@
+@@ -0,0 +1,113 @@
 +// (C) Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -1916,7 +1894,6 @@ index 00000000..88b0f786
 +		{"missing annotation", ""}, {"empty object", "{}"},
 +		{"readonly changed", `{"vol-0":{"mount_point":"/sandbox","disk_id":"d-abc123","lun":"0","fs_type":"ext4","fs_group":"1000","readonly":true}}`},
 +		{"group changed", `{"vol-0":{"mount_point":"/sandbox","disk_id":"d-abc123","lun":"0","fs_type":"ext4","fs_group":"0"}}`},
-+		{"filesystem options changed", `{"vol-0":{"mount_point":"/sandbox","disk_id":"d-abc123","lun":"0","fs_type":"ext4","fs_group":"1000","options":["suid"]}}`},
 +	} {
 +		t.Run(tc.name, func(t *testing.T) {
 +			i := &interceptor{requireEncryptedVolumes: true, workspace: &policy, Redirector: &mockRedirector{}}

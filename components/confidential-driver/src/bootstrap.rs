@@ -1028,7 +1028,6 @@ impl BootstrapStore {
                 entries.push(serde_json::json!({
                     "mount_point": mount.mount_path, "disk_id": disk,
                     "readonly": readonly, "fs_group": group,
-                    "options": if readonly { vec!["ro"] } else { Vec::<&str>::new() },
                 }));
             }
             mounts.insert(container.name.clone(), serde_json::Value::Array(entries));
