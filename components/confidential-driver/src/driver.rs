@@ -5421,26 +5421,25 @@ impl KubernetesComputeDriver {
             warn!(sandbox_id, %error, "could not finish sandbox-runtime suspension cleanup");
             return;
         }
-        let mut revoke_failed = false;
-        if let Err(error) = self
+        let mut revoke_failed = self
             .confidential
             .store
             .deauthorize_workspace_key(namespace, cr_uid)
-        {
-            warn!(sandbox_id, %error, "could not deauthorize confidential workspace");
-            revoke_failed = true;
-        }
-        if let Err(error) = self
+            .inspect_err(|error| {
+                warn!(sandbox_id, %error, "could not deauthorize confidential workspace");
+            })
+            .is_err();
+        revoke_failed |= self
             .confidential
             .store
             .revoke_sandbox_uid(sandbox_id, cr_uid)
-        {
-            warn!(sandbox_id, %error, "could not revoke confidential sandbox bootstrap");
-            revoke_failed = true;
-        }
+            .inspect_err(|error| {
+                warn!(sandbox_id, %error, "could not revoke confidential sandbox bootstrap");
+            })
+            .is_err();
 
         let annotations = object.metadata.annotations.as_ref();
-        if let Err(error) = self
+        revoke_failed |= self
             .delete_sandbox_runtime_generation_secrets_for_pods(
                 sandbox_id,
                 namespace,
@@ -5453,10 +5452,10 @@ impl KubernetesComputeDriver {
                     .map(String::as_str),
             )
             .await
-        {
-            warn!(sandbox_id, %error, "could not retire old role-owned Secrets");
-            revoke_failed = true;
-        }
+            .inspect_err(|error| {
+                warn!(sandbox_id, %error, "could not retire old role-owned Secrets");
+            })
+            .is_err();
         if revoke_failed {
             return;
         }
