@@ -22,7 +22,10 @@ files; it does not approve or constrain their changes. Package naming and depend
 paths differ because this driver builds in the integration workspace. The submodule stays
 unchanged; the source manifest records provenance; tests and code review validate the local changes.
 
-The CoCo 0.22 integration keeps official AA/CDH and Trustee binaries unchanged. Its local
+The integration uses unchanged official AA/CDH and Trustee binaries from pinned
+post-v0.22.0 commits. Exact source commits and artifact digests are recorded in the
+[guest lock](../../deployment/artifacts.lock.json) and
+[runtime lock](../../deployment/runtime/artifacts.lock.json). Its local
 publisher uses Trustee's authenticated management APIs, while measured role/attempt
 authorization, workspace ownership and recovery journals remain project-owned contracts.
 Native OpenShell authentication and protocol remain upstream.

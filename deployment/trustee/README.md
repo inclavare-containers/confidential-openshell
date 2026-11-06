@@ -1,7 +1,8 @@
 # Upstream Trustee
 
-The runtime uses the two official Trustee 0.22 images pinned in
-[the runtime lock](../runtime/artifacts.lock.json): `images.trustee_as` and
+The runtime uses two official Trustee images from a pinned post-v0.22.0 commit.
+[The runtime lock](../runtime/artifacts.lock.json) records the exact commit in
+`sources.trustee` and image digests in `images.trustee_as` and
 `images.trustee_kbs`. The gRPC AS includes BuiltIn RVPS. Its administrative API
 listens on `127.0.0.1:50004`; KBS exposes the trusted HTTPS endpoint.
 

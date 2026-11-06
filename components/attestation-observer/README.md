@@ -1,6 +1,7 @@
 # Passive attestation observer
 
-Optional display-only companion for the stock Trustee v0.22.0 deployment.
+Optional display-only companion for the unmodified Trustee images from the
+post-v0.22.0 commit pinned in the [runtime lock](../../deployment/runtime/artifacts.lock.json).
 It verifies existing session EAR signatures, persists a bounded-field summary
 per initdata digest, and serves read-only queries through the official KBS
 external-plugin protocol. It never initiates attestation or retrieves resources.
