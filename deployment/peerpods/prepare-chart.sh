@@ -5,6 +5,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 need jq helm
 mkdir -p .local/charts/peerpods
 cp -a repos/cloud-api-adaptor/src/cloud-api-adaptor/install/charts/peerpods/. .local/charts/peerpods/
+sed -i 's|node\.kubernetes\.io/worker|confidential.openshell.ai/worker|' .local/charts/peerpods/templates/daemonset.yaml
 mkdir -p .local/charts/peerpods/charts
 CHART_CACHE="$HANDOFF/charts"
 while IFS=$'\t' read -r name digest; do
