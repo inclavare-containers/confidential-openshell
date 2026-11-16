@@ -38,7 +38,12 @@ trap 'rm -rf -- "${work}"' EXIT
 tree="${work}/root"
 mkdir -p "${tree}"
 cp -a "${source_dir}/podvm/files/." "${tree}/"
-cp -a "${root}/deployment/guest/files/." "${tree}/"
+# Copy the same overlay files included in the input digest, without local empty directories.
+(
+    cd "${root}/deployment/guest/files"
+    find . -type f ! -path '*/__pycache__/*' ! -name '*.pyc' -print0 \
+        | tar --null -T - -cf -
+) | tar -xf - -C "${tree}"
 find "${tree}" -type d -name __pycache__ -prune -exec rm -rf -- {} +
 find "${tree}" -type f -name '*.pyc' -delete
 

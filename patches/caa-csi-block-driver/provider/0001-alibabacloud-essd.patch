@@ -6,6 +6,7 @@ Subject: [PATCH] alibabacloud: add ESSD provider and minimal deployment
 
 Use existing provider and cloud-recovery interfaces, stable create tokens and SDK credential caching.
 Keep the upstream combined DaemonSet and node-local store; add Alibaba-only RRSA and storage settings.
+Reject a rounded disk size above the caller capacity limit before CreateDisk.
 
 Signed-off-by: Weidong Sun <sunweidong@linux.alibaba.com>
 Co-authored-by: Codex <noreply@openai.com>
@@ -24,9 +25,9 @@ Co-authored-by: Codex <noreply@openai.com>
  go.mod                                             |  15 ++
  go.sum                                             | 238 +++++++++++++++++
  pkg/provider/alibabacloud/credentials_test.go      |  89 +++++++
- pkg/provider/alibabacloud/provider.go              | 293 +++++++++++++++++++++
- pkg/provider/alibabacloud/provider_test.go         | 185 +++++++++++++
- 16 files changed, 1108 insertions(+), 2 deletions(-)
+ pkg/provider/alibabacloud/provider.go              | 296 +++++++++++++++++++++
+ pkg/provider/alibabacloud/provider_test.go         | 200 ++++++++++++++
+ 16 files changed, 1126 insertions(+), 2 deletions(-)
  create mode 100644 deploy/bootstrap-params-alibabacloud.yaml
  create mode 100644 deploy/daemonset-alibabacloud.yaml
  create mode 100644 deploy/storageclass-alibabacloud.yaml
@@ -908,10 +909,10 @@ index 00000000..7a4a29ea
 +}
 diff --git a/pkg/provider/alibabacloud/provider.go b/pkg/provider/alibabacloud/provider.go
 new file mode 100644
-index 00000000..3b12f655
+index 00000000..abb2316a
 --- /dev/null
 +++ b/pkg/provider/alibabacloud/provider.go
-@@ -0,0 +1,293 @@
+@@ -0,0 +1,296 @@
 +// (C) Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -1000,7 +1001,7 @@ index 00000000..3b12f655
 +	return ecs.NewClient(&config)
 +}
 +
-+func (p *AlibabaCloudProvider) CreateVolume(ctx context.Context, volumeID string, sizeBytes int64) (*provider.VolumeInfo, error) {
++func (p *AlibabaCloudProvider) CreateVolume(ctx context.Context, volumeID string, sizeBytes, limitBytes int64) (*provider.VolumeInfo, error) {
 +	ctx, cancel := context.WithTimeout(ctx, waitTimeout)
 +	defer cancel()
 +	disk, err := p.findDisk(ctx, volumeID)
@@ -1020,6 +1021,9 @@ index 00000000..3b12f655
 +	size, err := bytesToGiB(sizeBytes)
 +	if err != nil {
 +		return nil, err
++	}
++	if limitBytes > 0 && int64(size)*gib > limitBytes {
++		return nil, fmt.Errorf("%w: rounded size %d exceeds limit %d", provider.ErrCapacityOutOfRange, int64(size)*gib, limitBytes)
 +	}
 +	client, err := p.client()
 +	if err != nil {
@@ -1207,10 +1211,10 @@ index 00000000..3b12f655
 +}
 diff --git a/pkg/provider/alibabacloud/provider_test.go b/pkg/provider/alibabacloud/provider_test.go
 new file mode 100644
-index 00000000..b9eb83c0
+index 00000000..acfcfcf4
 --- /dev/null
 +++ b/pkg/provider/alibabacloud/provider_test.go
-@@ -0,0 +1,185 @@
+@@ -0,0 +1,200 @@
 +// (C) Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -1219,6 +1223,7 @@ index 00000000..b9eb83c0
 +import (
 +	"context"
 +	"encoding/json"
++	"errors"
 +	"net/http"
 +	"net/http/httptest"
 +	"strings"
@@ -1226,6 +1231,7 @@ index 00000000..b9eb83c0
 +
 +	openapi "github.com/alibabacloud-go/darabonba-openapi/v2/utils"
 +	"github.com/alibabacloud-go/tea/tea"
++	"github.com/confidential-devhub/caa-csi-block-driver/pkg/provider"
 +)
 +
 +func TestValidation(t *testing.T) {
@@ -1300,12 +1306,25 @@ index 00000000..b9eb83c0
 +		AccessKeyId: tea.String("test-id"), AccessKeySecret: tea.String("test-secret"),
 +	}}
 +	ctx := context.Background()
-+	info, err := p.CreateVolume(ctx, "pvc-test", 20*gib)
++	// A range with no whole-GiB size must fail before creating a cloud disk.
++	for _, size := range []int64{gib / 2, gib + gib/2} {
++		if _, err := p.CreateVolume(ctx, "pvc-test", size, size); !errors.Is(err, provider.ErrCapacityOutOfRange) {
++			t.Fatalf("unsatisfiable range %d: %v", size, err)
++		}
++	}
++	if creates != 0 || exists {
++		t.Fatal("capacity rejection left a cloud disk")
++	}
++	info, err := p.CreateVolume(ctx, "pvc-test", 19*gib+1, 20*gib)
 +	if err != nil || info.Path != "d-test" || info.Metadata["cloud-volume-path"] != "d-test" {
 +		t.Fatalf("create: %v, %v", info, err)
 +	}
++	if info.SizeBytes != 20*gib {
++		t.Fatalf("actual rounded capacity: %d", info.SizeBytes)
++	}
 +	// Repeated create reuses the cloud disk.
-+	if _, err := p.CreateVolume(ctx, "pvc-test", gib); err != nil || creates != 1 {
++	// Return its actual size for the controller's AlreadyExists decision.
++	if _, err := p.CreateVolume(ctx, "pvc-test", gib, gib); err != nil || creates != 1 {
 +		t.Fatalf("stage/replay created another disk: %d, %v", creates, err)
 +	}
 +	if info, err := p.GetVolumeInfo(ctx, "pvc-test"); err != nil || info.SizeBytes != 20*gib {
@@ -1351,7 +1370,7 @@ index 00000000..b9eb83c0
 +			Endpoint: tea.String(strings.TrimPrefix(server.URL, "http://")), Protocol: tea.String("http"),
 +			AccessKeyId: tea.String("test-id"), AccessKeySecret: tea.String("test-secret"),
 +		}}
-+		if _, err := p.CreateVolume(context.Background(), identity[1], gib); err == nil {
++		if _, err := p.CreateVolume(context.Background(), identity[1], gib, 0); err == nil {
 +			t.Fatal("ambiguous create unexpectedly succeeded")
 +		}
 +	}
@@ -1382,17 +1401,20 @@ index 00000000..b9eb83c0
 +	p := &AlibabaCloudProvider{config: Config{Region: "cn-beijing", ClusterID: "fixture"}, sdk: openapi.Config{
 +		Endpoint: tea.String(strings.TrimPrefix(server.URL, "http://")), Protocol: tea.String("http"), AccessKeyId: tea.String("fake"), AccessKeySecret: tea.String("fake"),
 +	}}
-+	if _, err := p.CreateVolume(context.Background(), "pvc-test", gib); err != nil {
++	if _, err := p.CreateVolume(context.Background(), "pvc-test", gib, 0); err != nil {
 +		t.Fatal(err)
 +	}
 +	if lookups != 2 {
 +		t.Fatalf("returned before the existing disk was ready: %d reads", lookups)
 +	}
 +	state = "Deleting"
-+	if _, err := p.CreateVolume(context.Background(), "pvc-test", gib); err == nil {
++	if _, err := p.CreateVolume(context.Background(), "pvc-test", gib, 0); err == nil {
 +		t.Fatal("returned deleting disk")
 +	}
 +	if volumes, err := p.ListManagedVolumes(context.Background()); err != nil || len(volumes) != 0 {
 +		t.Fatalf("recovered deleting disk: %v %v", volumes, err)
 +	}
 +}
+-- 
+2.43.0
+

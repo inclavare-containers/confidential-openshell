@@ -3,24 +3,24 @@ From: Weidong Sun <sunweidong@linux.alibaba.com>
 Date: Tue, 3 Nov 2026 20:11:26 +0800
 Subject: [PATCH] volumes: apply fsGroup to retained contents
 
-Apply group ownership and access recursively while preserving file owners and existing execute bits. Set directory setgid for new files, avoid following symlinks, and report failures to the caller.
+Apply group ownership and access on root mismatch. Preserve private file modes on remount, directory setgid, existing owners and execute bits, and symlink isolation.
 
 Signed-off-by: Weidong Sun <sunweidong@linux.alibaba.com>
 Co-authored-by: Codex <noreply@openai.com>
 ---
- .../pkg/forwarder/interceptor/fsgroup.go      | 64 +++++++++++++++
- .../pkg/forwarder/interceptor/fsgroup_test.go | 78 +++++++++++++++++++
- .../pkg/forwarder/interceptor/interceptor.go  | 12 +--
- 3 files changed, 144 insertions(+), 10 deletions(-)
+ .../pkg/forwarder/interceptor/fsgroup.go           | 74 +++++++++++++++++
+ .../pkg/forwarder/interceptor/fsgroup_test.go      | 97 ++++++++++++++++++++++
+ .../pkg/forwarder/interceptor/interceptor.go       | 12 +--
+ 3 files changed, 173 insertions(+), 10 deletions(-)
  create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/fsgroup.go
  create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/fsgroup_test.go
 
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/fsgroup.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/fsgroup.go
 new file mode 100644
-index 00000000..805d7edb
+index 00000000..99b4035f
 --- /dev/null
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/fsgroup.go
-@@ -0,0 +1,64 @@
+@@ -0,0 +1,74 @@
 +// (C) Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -31,6 +31,7 @@ index 00000000..805d7edb
 +	"io/fs"
 +	"os"
 +	"strconv"
++	"syscall"
 +)
 +
 +// Apply group access recursively without changing owners or following symlinks.
@@ -46,6 +47,15 @@ index 00000000..805d7edb
 +	gid, err := strconv.ParseUint(group, 10, 32)
 +	if err != nil {
 +		return fmt.Errorf("invalid fsGroup %q: %w", group, err)
++	}
++	// OnRootMismatch preserves private modes chosen after the first mount.
++	info, err := root.Lstat(".")
++	if err != nil {
++		return err
++	}
++	const rootMode = 0o770 | os.ModeSetgid
++	if uint64(info.Sys().(*syscall.Stat_t).Gid) == gid && info.Mode()&rootMode == rootMode {
++		return nil
 +	}
 +	apply := func(path string, info os.FileInfo) error {
 +		if info.Mode()&os.ModeSymlink != 0 {
@@ -87,10 +97,10 @@ index 00000000..805d7edb
 +}
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/fsgroup_test.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/fsgroup_test.go
 new file mode 100644
-index 00000000..e5bbc00d
+index 00000000..2a2a345f
 --- /dev/null
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/fsgroup_test.go
-@@ -0,0 +1,78 @@
+@@ -0,0 +1,97 @@
 +// (C) Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -100,6 +110,7 @@ index 00000000..e5bbc00d
 +	"os"
 +	"os/exec"
 +	"path/filepath"
++	"strconv"
 +	"syscall"
 +	"testing"
 +
@@ -169,6 +180,24 @@ index 00000000..e5bbc00d
 +	require.Equal(t, before.Mode(), after.Mode())
 +	require.Equal(t, before.Sys().(*syscall.Stat_t).Gid, after.Sys().(*syscall.Stat_t).Gid)
 +}
++
++func TestFSGroupRemountPreservesPrivateFiles(t *testing.T) {
++	root := t.TempDir()
++	group := strconv.Itoa(os.Getgid())
++	require.NoError(t, applyCloudVolumeFSGroup(root, group, false))
++	private := filepath.Join(root, ".ssh")
++	require.NoError(t, os.Mkdir(private, 0700))
++	for name, mode := range map[string]os.FileMode{"id_ed25519": 0600, "readonly-key": 0400} {
++		require.NoError(t, os.WriteFile(filepath.Join(private, name), []byte("private"), mode))
++	}
++
++	require.NoError(t, applyCloudVolumeFSGroup(root, group, false))
++	for name, mode := range map[string]os.FileMode{".": 0700, "id_ed25519": 0600, "readonly-key": 0400} {
++		info, err := os.Stat(filepath.Join(private, name))
++		require.NoError(t, err)
++		require.Equal(t, mode, info.Mode().Perm(), name)
++	}
++}
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
 index a5b3cfbe..b32afaf7 100644
 --- a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
@@ -193,5 +222,5 @@ index a5b3cfbe..b32afaf7 100644
  
  			rewrote := false
 -- 
-2.43.7
+2.43.0
 

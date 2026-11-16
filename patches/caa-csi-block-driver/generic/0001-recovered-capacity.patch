@@ -1,24 +1,30 @@
 From 0848764355780d20e7dbd2b546c6b089c0445444 Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
 Date: Wed, 4 Nov 2026 11:31:52 +0800
-Subject: [PATCH] controller: validate actual recovered capacity
+Subject: [PATCH] controller: honor volume capacity ranges
 
-Preserve the requested range for cached and recovered disks and report the provider actual capacity.
+Preserve the requested range for cached and recovered disks and report actual capacity. Pass the upper bound to providers so unsupported rounded sizes fail with OutOfRange before creating a volume.
 
 Signed-off-by: Weidong Sun <sunweidong@linux.alibaba.com>
 Co-authored-by: Codex <noreply@openai.com>
 ---
- pkg/driver/capacity_test.go    | 83 ++++++++++++++++++++++++++++++++++
- pkg/driver/controllerserver.go | 24 ++++++++--
- 2 files changed, 102 insertions(+), 5 deletions(-)
+ pkg/driver/capacity_test.go           | 111 ++++++++++++++++++++++++++++++++++
+ pkg/driver/controllerserver.go        |  29 +++++++--
+ pkg/driver/nodeserver.go              |   2 +-
+ pkg/provider/aws/provider.go          |   6 +-
+ pkg/provider/azure/provider.go        |   6 +-
+ pkg/provider/interface.go             |  12 +++-
+ pkg/provider/libvirt/provider.go      |   5 +-
+ pkg/provider/libvirt/provider_test.go |   4 +-
+ 8 files changed, 160 insertions(+), 15 deletions(-)
  create mode 100644 pkg/driver/capacity_test.go
 
 diff --git a/pkg/driver/capacity_test.go b/pkg/driver/capacity_test.go
 new file mode 100644
-index 00000000..12d88064
+index 00000000..0831ffec
 --- /dev/null
 +++ b/pkg/driver/capacity_test.go
-@@ -0,0 +1,83 @@
+@@ -0,0 +1,111 @@
 +// (C) Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -26,6 +32,7 @@ index 00000000..12d88064
 +
 +import (
 +	"context"
++	"fmt"
 +	"os"
 +	"testing"
 +
@@ -39,11 +46,38 @@ index 00000000..12d88064
 +	provider.BlockVolumeProvider
 +	size  int64
 +	calls int
++	limit int64
++	err   error
 +}
 +
-+func (p *recoveredCapacityProvider) CreateVolume(_ context.Context, name string, _ int64) (*provider.VolumeInfo, error) {
++func (p *recoveredCapacityProvider) CreateVolume(_ context.Context, name string, _, limit int64) (*provider.VolumeInfo, error) {
 +	p.calls++
++	p.limit = limit
++	if p.err != nil {
++		return nil, p.err
++	}
 +	return &provider.VolumeInfo{VolumeID: name, Path: "d-retained", Provider: "capacity-fixture", SizeBytes: p.size}, nil
++}
++
++func TestCreateVolumeReportsUnsupportedCapacityRange(t *testing.T) {
++	t.Setenv("CSI_VOLUME_STORE_DIR", t.TempDir())
++	p := &recoveredCapacityProvider{err: fmt.Errorf("rounded disk: %w", provider.ErrCapacityOutOfRange)}
++	provider.RegisterProvider("capacity-fixture", func(map[string]string) (provider.BlockVolumeProvider, error) { return p, nil })
++	server := &controllerServer{store: newVolumeStore()}
++	req := &csi.CreateVolumeRequest{
++		Name: "pvc-capacity", CapacityRange: &csi.CapacityRange{RequiredBytes: 1536 << 20, LimitBytes: 1536 << 20},
++		Parameters:         map[string]string{"cloudProvider": "capacity-fixture"},
++		VolumeCapabilities: []*csi.VolumeCapability{{AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{}}, AccessMode: &csi.VolumeCapability_AccessMode{Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER}}},
++	}
++	if _, err := server.CreateVolume(t.Context(), req); status.Code(err) != codes.OutOfRange {
++		t.Fatalf("error=%v, want OutOfRange", err)
++	}
++	if p.limit != req.CapacityRange.LimitBytes {
++		t.Fatalf("provider limit=%d, requested=%d", p.limit, req.CapacityRange.LimitBytes)
++	}
++	if _, err := server.store.Load(req.Name); !os.IsNotExist(err) {
++		t.Fatalf("failed creation was persisted: %v", err)
++	}
 +}
 +
 +func TestCreateVolumeValidatesActualRecoveredCapacity(t *testing.T) {
@@ -103,7 +137,7 @@ index 00000000..12d88064
 +	}
 +}
 diff --git a/pkg/driver/controllerserver.go b/pkg/driver/controllerserver.go
-index c0bf177a..b2bb250a 100644
+index c0bf177a..155ad727 100644
 --- a/pkg/driver/controllerserver.go
 +++ b/pkg/driver/controllerserver.go
 @@ -105,15 +105,22 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
@@ -134,7 +168,17 @@ index c0bf177a..b2bb250a 100644
  		}
  		csLogger.Printf("CreateVolume: %s already exists, returning existing", req.GetName())
  		volumeCtx := map[string]string{"cloudProvider": rec.Provider}
-@@ -182,6 +189,13 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
+@@ -176,12 +183,22 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
+ 			return nil, status.Error(codes.InvalidArgument, "unsupported VolumeContentSource type")
+ 		}
+ 	} else {
+-		volInfo, err = p.CreateVolume(ctx, req.GetName(), capacity)
++		volInfo, err = p.CreateVolume(ctx, req.GetName(), capacity, limit)
++	}
++	if errors.Is(err, provider.ErrCapacityOutOfRange) {
++		return nil, status.Error(codes.OutOfRange, err.Error())
+ 	}
+ 	if err != nil {
  		return nil, status.Errorf(codes.Internal, "provider.CreateVolume failed: %v", err)
  	}
  
@@ -148,6 +192,139 @@ index c0bf177a..b2bb250a 100644
  	if err := cs.store.Save(&volumeRecord{
  		VolumeID:      req.GetName(),
  		Provider:      volInfo.Provider,
+diff --git a/pkg/driver/nodeserver.go b/pkg/driver/nodeserver.go
+index 0cb45e43..0f1d9069 100644
+--- a/pkg/driver/nodeserver.go
++++ b/pkg/driver/nodeserver.go
+@@ -157,7 +157,7 @@ func (ns *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
+ 		}
+ 	}
+ 
+-	volInfo, err := p.CreateVolume(ctx, volumeID, sizeBytes)
++	volInfo, err := p.CreateVolume(ctx, volumeID, sizeBytes, 0)
+ 	if err != nil {
+ 		return nil, status.Errorf(codes.Internal, "provider.CreateVolume failed: %v", err)
+ 	}
+diff --git a/pkg/provider/aws/provider.go b/pkg/provider/aws/provider.go
+index 8de42472..45e9b8be 100644
+--- a/pkg/provider/aws/provider.go
++++ b/pkg/provider/aws/provider.go
+@@ -138,7 +138,7 @@ func newEC2Client(cfg Config) (*ec2.Client, error) {
+ 	return ec2.NewFromConfig(awsCfg), nil
+ }
+ 
+-func (p *AWSProvider) CreateVolume(ctx context.Context, volumeID string, sizeBytes int64) (*provider.VolumeInfo, error) {
++func (p *AWSProvider) CreateVolume(ctx context.Context, volumeID string, sizeBytes, limitBytes int64) (*provider.VolumeInfo, error) {
+ 
+ 	if p.config.AvailabilityZone == "" {
+ 		return nil, fmt.Errorf("awsAvailabilityZone is required to create volumes")
+@@ -157,6 +157,10 @@ func (p *AWSProvider) CreateVolume(ctx context.Context, volumeID string, sizeByt
+ 	if sizeGiB == 0 {
+ 		sizeGiB = 1
+ 	}
++	sizeBytes = int64(sizeGiB) * (1 << 30)
++	if limitBytes > 0 && sizeBytes > limitBytes {
++		return nil, fmt.Errorf("%w: rounded size %d exceeds limit %d", provider.ErrCapacityOutOfRange, sizeBytes, limitBytes)
++	}
+ 
+ 	logger.Printf("Creating EBS volume %s (%d GiB, type=%s, az=%s)",
+ 		volumeID, sizeGiB, p.config.VolumeType, p.config.AvailabilityZone)
+diff --git a/pkg/provider/azure/provider.go b/pkg/provider/azure/provider.go
+index e53142a7..2301d352 100644
+--- a/pkg/provider/azure/provider.go
++++ b/pkg/provider/azure/provider.go
+@@ -211,7 +211,7 @@ func (p *AzureProvider) buildDiskProperties(creationData *armcompute.CreationDat
+ 	return props
+ }
+ 
+-func (p *AzureProvider) CreateVolume(ctx context.Context, volumeID string, sizeBytes int64) (*provider.VolumeInfo, error) {
++func (p *AzureProvider) CreateVolume(ctx context.Context, volumeID string, sizeBytes, limitBytes int64) (*provider.VolumeInfo, error) {
+ 	ctx, cancel := context.WithTimeout(ctx, waitTimeout)
+ 	defer cancel()
+ 
+@@ -231,6 +231,10 @@ func (p *AzureProvider) CreateVolume(ctx context.Context, volumeID string, sizeB
+ 	}
+ 
+ 	sizeGiB := bytesToGiB(sizeBytes)
++	sizeBytes = int64(sizeGiB) * (1 << 30)
++	if limitBytes > 0 && sizeBytes > limitBytes {
++		return nil, fmt.Errorf("%w: rounded size %d exceeds limit %d", provider.ErrCapacityOutOfRange, sizeBytes, limitBytes)
++	}
+ 	logger.Printf("Creating Azure Managed Disk %s (%d GiB, sku=%s, location=%s)",
+ 		name, sizeGiB, p.config.DiskSKU, p.config.Location)
+ 
+diff --git a/pkg/provider/interface.go b/pkg/provider/interface.go
+index 801e8ee0..32dc318b 100644
+--- a/pkg/provider/interface.go
++++ b/pkg/provider/interface.go
+@@ -3,7 +3,13 @@
+ 
+ package provider
+ 
+-import "context"
++import (
++	"context"
++	"errors"
++)
++
++// ErrCapacityOutOfRange reports a size range that cannot be provisioned.
++var ErrCapacityOutOfRange = errors.New("unsupported capacity range")
+ 
+ // VolumeInfo holds provider-agnostic metadata about a block volume.
+ type VolumeInfo struct {
+@@ -18,9 +24,9 @@ type VolumeInfo struct {
+ // All mutating methods must be idempotent: repeated calls with the same
+ // arguments should produce the same result without side effects.
+ type BlockVolumeProvider interface {
+-	// CreateVolume provisions a new block volume of the given size.
++	// CreateVolume provisions at least sizeBytes without exceeding a nonzero limitBytes.
+ 	// Returns existing volume info if the volume already exists (idempotent).
+-	CreateVolume(ctx context.Context, volumeID string, sizeBytes int64) (*VolumeInfo, error)
++	CreateVolume(ctx context.Context, volumeID string, sizeBytes, limitBytes int64) (*VolumeInfo, error)
+ 	// DeleteVolume removes a block volume.
+ 	// Returns nil if the volume does not exist (idempotent).
+ 	DeleteVolume(ctx context.Context, volumeID string) error
+diff --git a/pkg/provider/libvirt/provider.go b/pkg/provider/libvirt/provider.go
+index 28644803..5e8a9acb 100644
+--- a/pkg/provider/libvirt/provider.go
++++ b/pkg/provider/libvirt/provider.go
+@@ -54,10 +54,13 @@ func (p *LibvirtProvider) volumePath(volumeID string) string {
+ 	return filepath.Join(p.config.PoolPath, fmt.Sprintf("csi-vol-%s.raw", volumeID))
+ }
+ 
+-func (p *LibvirtProvider) CreateVolume(_ context.Context, volumeID string, sizeBytes int64) (*provider.VolumeInfo, error) {
++func (p *LibvirtProvider) CreateVolume(_ context.Context, volumeID string, sizeBytes, limitBytes int64) (*provider.VolumeInfo, error) {
+ 	volPath := p.volumePath(volumeID)
+ 
+ 	if _, err := os.Stat(volPath); os.IsNotExist(err) {
++		if limitBytes > 0 && sizeBytes > limitBytes {
++			return nil, fmt.Errorf("%w: size %d exceeds limit %d", provider.ErrCapacityOutOfRange, sizeBytes, limitBytes)
++		}
+ 		logger.Printf("Creating volume %s at %s (%d bytes)", volumeID, volPath, sizeBytes)
+ 
+ 		f, err := os.Create(volPath)
+diff --git a/pkg/provider/libvirt/provider_test.go b/pkg/provider/libvirt/provider_test.go
+index 1d9ed770..96d1af6b 100644
+--- a/pkg/provider/libvirt/provider_test.go
++++ b/pkg/provider/libvirt/provider_test.go
+@@ -257,7 +257,7 @@ func TestCreateVolume_FileCreation(t *testing.T) {
+ 	p := newTestProvider(t)
+ 	volPath := p.volumePath("new-vol")
+ 
+-	_, err := p.CreateVolume(ctx, "new-vol", 1024*1024)
++	_, err := p.CreateVolume(ctx, "new-vol", 1024*1024, 0)
+ 	// mkfs.ext4 may not be available in the test env
+ 	if err != nil {
+ 		if errors.Is(err, exec.ErrNotFound) {
+@@ -283,7 +283,7 @@ func TestCreateVolume_Idempotent(t *testing.T) {
+ 		t.Fatal(err)
+ 	}
+ 
+-	info, err := p.CreateVolume(ctx, "idempotent-vol", 2048)
++	info, err := p.CreateVolume(ctx, "idempotent-vol", 2048, 0)
+ 	if err != nil {
+ 		t.Fatalf("CreateVolume on existing file should reuse: %v", err)
+ 	}
 -- 
-2.43.7
+2.43.0
 
