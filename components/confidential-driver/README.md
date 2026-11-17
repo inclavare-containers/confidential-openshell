@@ -32,6 +32,10 @@ the guest. Released CoCo CDH 0.22 accepts the `sealed.<ES256 JWS>` vault descrip
 its persistent host P-256 signer publishes the verification JWK at
 `kbs:///default/bootstrap-signer/key`. The publisher retains desired resources and authorization in T's private
 state, then uses authenticated KBS APIs to upload resources and update AS/KBS policy.
+Each startup stages both roles' bootstrap files and the optional workspace key under one
+lock, then invokes the publisher once before creating Kubernetes Secrets. A failed batch
+withdraws its newly staged serving copies and bindings while retaining the private workspace
+key and unchanged prior publications.
 Its publication journal records requests before sending them, so retries can clean
 up resources even after a successful upload's response is lost. Trustee storage
 paths and filesystem ownership are not part of the driver interface. This

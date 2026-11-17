@@ -88,6 +88,25 @@ pub struct PlannedSecret {
     pub(super) resource_path: String,
 }
 
+// Borrow plaintext only while preparing a publication; never include it in Debug output.
+pub(super) struct BootstrapFile<'a> {
+    pub role: BootstrapRole,
+    pub generation: &'a str,
+    pub sandbox_id: &'a str,
+    pub sandbox_cr_uid: &'a str,
+    pub attempt_id: &'a str,
+    pub key: &'a str,
+    pub plaintext: &'a [u8],
+    pub initdata_sha384: &'a str,
+}
+
+pub(super) struct WorkspaceKey<'a> {
+    pub namespace: &'a str,
+    pub sandbox_cr_uid: &'a str,
+    pub initdata_sha384: &'a str,
+    pub attempt: Option<&'a str>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct Binding {
     pub(super) resource_path: String,
@@ -1037,136 +1056,125 @@ impl BootstrapStore {
         sandbox_cr_uid: &str,
         workload_initdata_sha384: &str,
     ) -> Result<PlannedSecret> {
-        self.authorize_workspace_key(namespace, sandbox_cr_uid, workload_initdata_sha384, None)
+        self.publish_batch(
+            &[],
+            Some(&WorkspaceKey {
+                namespace,
+                sandbox_cr_uid,
+                initdata_sha384: workload_initdata_sha384,
+                attempt: None,
+            }),
+        )?;
+        self.plan_workspace_key(namespace, sandbox_cr_uid)
     }
 
-    pub(super) fn ensure_workspace_key_for_attempt(
+    fn stage_workspace_key(
         &self,
-        namespace: &str,
-        uid: &str,
-        digest: &str,
-        attempt: &str,
-    ) -> Result<PlannedSecret> {
-        self.authorize_workspace_key(namespace, uid, digest, Some(attempt))
-    }
-
-    fn authorize_workspace_key(
-        &self,
-        namespace: &str,
-        sandbox_cr_uid: &str,
-        workload_initdata_sha384: &str,
-        attempt: Option<&str>,
-    ) -> Result<PlannedSecret> {
+        workspace: &WorkspaceKey<'_>,
+        rollback: &mut Vec<(PathBuf, PathBuf)>,
+    ) -> Result<()> {
+        let WorkspaceKey {
+            namespace,
+            sandbox_cr_uid,
+            initdata_sha384: workload_initdata_sha384,
+            attempt,
+        } = *workspace;
         validate_workspace_identity(namespace, sandbox_cr_uid)?;
         validate_digest(workload_initdata_sha384)?;
-        if self.policy.is_none() {
-            return Err(StoreError::Policy);
-        }
         let planned = self.plan_workspace_key(namespace, sandbox_cr_uid)?;
         let id = workspace_hash(namespace, sandbox_cr_uid);
-        self.with_lock(|| {
-            if self.revoking(&format!("workspace-{id}")).exists() {
+        if self.revoking(&format!("workspace-{id}")).exists() {
+            return Err(StoreError::Revoked);
+        }
+        if let Some(expected) = attempt {
+            let record: ActiveAttempt = serde_json::from_slice(&read_private(
+                &self
+                    .state
+                    .join("active-attempts")
+                    .join(format!("{id}.json")),
+            )?)?;
+            if record.attempt != expected
+                || record.sandbox_cr_uid != sandbox_cr_uid
+                || self
+                    .state
+                    .join("pending-revocations")
+                    .join(format!("{id}.json"))
+                    .exists()
+                || self
+                    .tombstone(&identity_hash(
+                        BootstrapRole::Workload,
+                        &record.generation,
+                        &record.sandbox_id,
+                        &record.attempt,
+                    ))
+                    .exists()
+            {
                 return Err(StoreError::Revoked);
             }
-            if let Some(expected) = attempt {
-                let record: ActiveAttempt = serde_json::from_slice(&read_private(
-                    &self
-                        .state
-                        .join("active-attempts")
-                        .join(format!("{id}.json")),
-                )?)?;
-                if record.attempt != expected
-                    || record.sandbox_cr_uid != sandbox_cr_uid
-                    || self
-                        .state
-                        .join("pending-revocations")
-                        .join(format!("{id}.json"))
-                        .exists()
-                    || self
-                        .tombstone(&identity_hash(
-                            BootstrapRole::Workload,
-                            &record.generation,
-                            &record.sandbox_id,
-                            &record.attempt,
-                        ))
-                        .exists()
-                {
-                    return Err(StoreError::Revoked);
-                }
-            }
+        }
 
-            for item in fs::read_dir(self.state.join("pending-deletes"))? {
-                let pending = self.read_pending_delete(&item?.path())?;
-                if pending.namespace == namespace && pending.sandbox_cr_uid == sandbox_cr_uid {
-                    return Err(StoreError::Revoked);
-                }
+        for item in fs::read_dir(self.state.join("pending-deletes"))? {
+            let pending = self.read_pending_delete(&item?.path())?;
+            if pending.namespace == namespace && pending.sandbox_cr_uid == sandbox_cr_uid {
+                return Err(StoreError::Revoked);
             }
-            if !self.has_workspace_owner(namespace, sandbox_cr_uid, &id)? {
-                return Err(StoreError::Invalid("workspace owner not recorded"));
-            }
-            let journal: WorkspaceVolumeJournal =
-                serde_json::from_slice(&read_regular(&self.workspace_journal(&id))?)?;
-            if journal.namespace != namespace
-                || journal.sandbox_cr_uid != sandbox_cr_uid
-                || journal.identity_sha256 != id
-                || journal.volumes.is_empty()
-            {
+        }
+        if !self.has_workspace_owner(namespace, sandbox_cr_uid, &id)? {
+            return Err(StoreError::Invalid("workspace owner not recorded"));
+        }
+        let journal: WorkspaceVolumeJournal =
+            serde_json::from_slice(&read_regular(&self.workspace_journal(&id))?)?;
+        if journal.namespace != namespace
+            || journal.sandbox_cr_uid != sandbox_cr_uid
+            || journal.identity_sha256 != id
+            || journal.volumes.is_empty()
+        {
+            return Err(StoreError::Conflict);
+        }
+        let private = self.workspace_key(&id);
+        if !private.exists() {
+            let mut key = [0u8; 32];
+            SystemRandom::new()
+                .fill(&mut key)
+                .map_err(|_| StoreError::Crypto)?;
+            atomic_new(&private, &key)?;
+        }
+        let key = read_private(&private)?;
+        if key.len() != 32 {
+            return Err(StoreError::Conflict);
+        }
+        let binding = WorkspaceBinding {
+            resource_path: planned.resource_path.clone(),
+            initdata_sha384: workload_initdata_sha384.to_owned(),
+            namespace: namespace.to_owned(),
+            sandbox_cr_uid: sandbox_cr_uid.to_owned(),
+            resource_sha256: hex::encode(Sha256::digest(&key)),
+            identity_sha256: id.clone(),
+        };
+        let binding_path = self.workspace_binding(&id);
+        let serving = self.workspace_resource(&id);
+        let served = if serving.exists() {
+            if read_regular(&serving)? != key {
                 return Err(StoreError::Conflict);
             }
-            let private = self.workspace_key(&id);
-            if !private.exists() {
-                let mut key = [0u8; 32];
-                SystemRandom::new()
-                    .fill(&mut key)
-                    .map_err(|_| StoreError::Crypto)?;
-                atomic_new(&private, &key)?;
+            true
+        } else {
+            false
+        };
+        let new_binding = !binding_path.exists();
+        if !new_binding {
+            let previous: WorkspaceBinding = serde_json::from_slice(&read_regular(&binding_path)?)?;
+            if previous == binding && served {
+                return Ok(());
             }
-            let key = read_private(&private)?;
-            if key.len() != 32 {
-                return Err(StoreError::Conflict);
-            }
-            let binding = WorkspaceBinding {
-                resource_path: planned.resource_path.clone(),
-                initdata_sha384: workload_initdata_sha384.to_owned(),
-                namespace: namespace.to_owned(),
-                sandbox_cr_uid: sandbox_cr_uid.to_owned(),
-                resource_sha256: hex::encode(Sha256::digest(&key)),
-                identity_sha256: id.clone(),
-            };
-            let binding_path = self.workspace_binding(&id);
-            let serving = self.workspace_resource(&id);
-            let served = if serving.exists() {
-                if read_regular(&serving)? != key {
-                    return Err(StoreError::Conflict);
-                }
-                true
-            } else {
-                false
-            };
-            let new_binding = !binding_path.exists();
-            if !new_binding {
-                let previous: WorkspaceBinding =
-                    serde_json::from_slice(&read_regular(&binding_path)?)?;
-                if previous == binding && served {
-                    return Ok(());
-                }
-            }
-            if served {
-                fs::remove_file(&serving)?;
-                sync_dir(serving.parent().unwrap())?;
-            }
-            atomic_replace(&binding_path, &serde_json::to_vec(&binding)?)?;
-            let operation = (|| {
-                atomic_new(&serving, &key)?;
-                self.refresh_policy()?;
-                Ok(())
-            })();
-            if operation.is_err() {
-                self.withdraw_failed_publication(&binding_path, &serving)?;
-            }
-            operation
-        })?;
-        Ok(planned)
+        }
+        rollback.push((binding_path.clone(), serving.clone()));
+        if served {
+            fs::remove_file(&serving)?;
+            sync_dir(serving.parent().unwrap())?;
+        }
+        atomic_replace(&binding_path, &serde_json::to_vec(&binding)?)?;
+        atomic_new(&serving, &key)
     }
 
     /// Withdraw access immediately, retaining the private 32-byte key for
@@ -1187,6 +1195,7 @@ impl BootstrapStore {
     /// Publish one original Kubernetes Secret data value. A retry with the
     /// same identity, key, measurement and bytes is idempotent; changed input
     /// is rejected. The binding is durable before the resource is exposed.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn publish_file(
         &self,
@@ -1199,6 +1208,64 @@ impl BootstrapStore {
         plaintext: &[u8],
         expected_initdata_sha384: &str,
     ) -> Result<PublishedSecret> {
+        let file = BootstrapFile {
+            role,
+            generation,
+            sandbox_id,
+            sandbox_cr_uid,
+            attempt_id,
+            key,
+            plaintext,
+            initdata_sha384: expected_initdata_sha384,
+        };
+        Ok(self.publish_batch(&[file], None)?.remove(0))
+    }
+
+    /// Stage both roles and their optional workspace key under one lock, then
+    /// publish their resources and AS/KBS policies with one renderer invocation.
+    pub(super) fn publish_batch(
+        &self,
+        files: &[BootstrapFile<'_>],
+        workspace: Option<&WorkspaceKey<'_>>,
+    ) -> Result<Vec<PublishedSecret>> {
+        if self.policy.is_none() {
+            return Err(StoreError::Policy);
+        }
+        self.with_lock(|| {
+            let mut rollback = Vec::new();
+            let operation = (|| {
+                let published = files
+                    .iter()
+                    .map(|file| self.stage_file(file, &mut rollback))
+                    .collect::<Result<Vec<_>>>()?;
+                if let Some(workspace) = workspace {
+                    self.stage_workspace_key(workspace, &mut rollback)?;
+                }
+                self.refresh_policy()?;
+                Ok(published)
+            })();
+            if operation.is_err() && !rollback.is_empty() {
+                self.withdraw_failed_publications(&rollback)?;
+            }
+            operation
+        })
+    }
+
+    fn stage_file(
+        &self,
+        file: &BootstrapFile<'_>,
+        rollback: &mut Vec<(PathBuf, PathBuf)>,
+    ) -> Result<PublishedSecret> {
+        let BootstrapFile {
+            role,
+            generation,
+            sandbox_id,
+            sandbox_cr_uid,
+            attempt_id,
+            key,
+            plaintext,
+            initdata_sha384: expected_initdata_sha384,
+        } = *file;
         validate(
             role,
             generation,
@@ -1208,9 +1275,6 @@ impl BootstrapStore {
             Some(expected_initdata_sha384),
         )?;
         validate_workspace_identity("bootstrap", sandbox_cr_uid)?;
-        if self.policy.is_none() {
-            return Err(StoreError::Policy);
-        }
         let identity = identity_hash(role, generation, sandbox_id, attempt_id);
         let id = file_hash(&identity, key);
         let planned = self.plan_file(role, generation, sandbox_id, attempt_id, key)?;
@@ -1232,43 +1296,36 @@ impl BootstrapStore {
             identity_sha256: identity.clone(),
         };
         let input = descriptor_input(&uri)?;
-        let sealed_descriptor = self.with_lock(|| {
-            if self.has_pending_delete_for_sandbox(sandbox_id)? {
-                return Err(StoreError::Revoked);
+        if self.has_pending_delete_for_sandbox(sandbox_id)? {
+            return Err(StoreError::Revoked);
+        }
+        if self.tombstone(&identity).exists()
+            || self.revoking(&identity).exists()
+            || self.quarantine(&id).exists()
+        {
+            return Err(StoreError::Revoked);
+        }
+        let new_binding = !binding_path.exists();
+        if !new_binding {
+            let prior: Binding = serde_json::from_slice(&read_regular(&binding_path)?)?;
+            if prior != binding {
+                return Err(StoreError::Conflict);
             }
-            if self.tombstone(&identity).exists()
-                || self.revoking(&identity).exists()
-                || self.quarantine(&id).exists()
-            {
-                return Err(StoreError::Revoked);
+        }
+        if new_binding || !resource.exists() {
+            rollback.push((binding_path.clone(), resource.clone()));
+        }
+        if new_binding {
+            atomic_new(&binding_path, &serde_json::to_vec(&binding)?)?;
+        }
+        let sealed_descriptor = self.load_or_sign_descriptor(&id, &input)?;
+        if resource.exists() {
+            if hex::encode(Sha256::digest(read_regular(&resource)?)) != digest {
+                return Err(StoreError::Conflict);
             }
-            let new_binding = !binding_path.exists();
-            if new_binding {
-                atomic_new(&binding_path, &serde_json::to_vec(&binding)?)?;
-            } else {
-                let prior: Binding = serde_json::from_slice(&read_regular(&binding_path)?)?;
-                if prior != binding {
-                    return Err(StoreError::Conflict);
-                }
-            }
-            let was_unserved = !resource.exists();
-            let operation = (|| {
-                let descriptor = self.load_or_sign_descriptor(&id, &input)?;
-                if resource.exists() {
-                    if hex::encode(Sha256::digest(read_regular(&resource)?)) != digest {
-                        return Err(StoreError::Conflict);
-                    }
-                } else {
-                    atomic_new(&resource, plaintext)?;
-                }
-                self.refresh_policy()?;
-                Ok(descriptor)
-            })();
-            if operation.is_err() && (was_unserved || new_binding) {
-                self.withdraw_failed_publication(&binding_path, &resource)?;
-            }
-            operation
-        })?;
+        } else {
+            atomic_new(&resource, plaintext)?;
+        }
         Ok(PublishedSecret {
             sealed_descriptor,
             #[cfg(test)]
@@ -1616,14 +1673,16 @@ impl BootstrapStore {
         self.revoke_identities([format!("workspace-{id}")])
     }
 
-    fn withdraw_failed_publication(&self, binding: &Path, serving: &Path) -> Result<()> {
-        if serving.exists() {
-            fs::remove_file(serving)?;
-            sync_dir(serving.parent().unwrap())?;
-        }
-        if binding.exists() {
-            fs::remove_file(binding)?;
-            sync_dir(binding.parent().unwrap())?;
+    fn withdraw_failed_publications(&self, resources: &[(PathBuf, PathBuf)]) -> Result<()> {
+        for (binding, serving) in resources {
+            if serving.exists() {
+                fs::remove_file(serving)?;
+                sync_dir(serving.parent().unwrap())?;
+            }
+            if binding.exists() {
+                fs::remove_file(binding)?;
+                sync_dir(binding.parent().unwrap())?;
+            }
         }
         self.refresh_policy()
     }
@@ -2087,6 +2146,145 @@ pathlib.Path(args[args.index('--output') + 1]).write_text('package policy\ndefau
         (tmp, store)
     }
 
+    fn startup_files() -> Vec<BootstrapFile<'static>> {
+        let supervisor_keys = crate::confidential::SUPERVISOR_KEYS
+            .iter()
+            .copied()
+            .chain(["client-ca.crt", "upstream-proxy-ca.pem"]);
+        crate::confidential::WORKLOAD_KEYS
+            .iter()
+            .copied()
+            .map(|key| (BootstrapRole::Workload, key, INITDATA))
+            .chain(supervisor_keys.map(|key| {
+                (BootstrapRole::Supervisor, key, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+            }))
+            .map(|(role, key, initdata_sha384)| BootstrapFile {
+                role,
+                generation: GENERATION,
+                sandbox_id: "sandbox-batch",
+                sandbox_cr_uid: "uid",
+                attempt_id: ATTEMPT,
+                key,
+                plaintext: key.as_bytes(),
+                initdata_sha384,
+            })
+            .collect()
+    }
+
+    fn startup_workspace(store: &BootstrapStore) -> WorkspaceKey<'static> {
+        store
+            .record_attempt("sandbox-batch", "ns", "uid", GENERATION, ATTEMPT)
+            .unwrap();
+        store
+            .record_workspace_volume("ns", "uid", "workspace-pvc", Some("pv"), Some("d-disk"))
+            .unwrap();
+        WorkspaceKey {
+            namespace: "ns",
+            sandbox_cr_uid: "uid",
+            initdata_sha384: INITDATA,
+            attempt: Some(ATTEMPT),
+        }
+    }
+
+    fn renderer_calls(temp: &TempDir) -> usize {
+        fs::read_to_string(temp.path().join("renderer-calls"))
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    #[test]
+    fn startup_batch_publishes_both_roles_and_workspace_once() {
+        let (temp, store) = fixture();
+        let files = startup_files();
+        let workspace = startup_workspace(&store);
+        let before = renderer_calls(&temp);
+        let published = store.publish_batch(&files, Some(&workspace)).unwrap();
+        assert_eq!(renderer_calls(&temp), before + 1);
+        assert_eq!(published.len(), 9);
+        assert_eq!(fs::read_dir(store.binding_directory()).unwrap().count(), 9);
+        assert_eq!(fs::read_dir(&store.repository).unwrap().count(), 11);
+        let policy = fs::read_to_string(temp.path().join("as.rego")).unwrap();
+        assert!(policy.contains(files[0].initdata_sha384));
+        assert!(policy.contains(files[3].initdata_sha384));
+        let id = workspace_hash("ns", "uid");
+        let key = read_private(&store.workspace_key(&id)).unwrap();
+        assert_eq!(key.len(), 32);
+        assert_eq!(read_regular(&store.workspace_resource(&id)).unwrap(), key);
+
+        let retried = store.publish_batch(&files, Some(&workspace)).unwrap();
+        assert_eq!(renderer_calls(&temp), before + 2);
+        for (first, retry) in published.iter().zip(retried) {
+            assert_eq!(first.sealed_descriptor, retry.sealed_descriptor);
+        }
+        assert_eq!(read_private(&store.workspace_key(&id)).unwrap(), key);
+        store.revoke_owned_sandbox("sandbox-batch", None).unwrap();
+        assert_eq!(fs::read_dir(&store.repository).unwrap().count(), 1);
+        assert!(matches!(
+            store.publish_batch(&files, Some(&workspace)),
+            Err(StoreError::Revoked)
+        ));
+    }
+
+    #[test]
+    fn failed_startup_batch_preserves_existing_grant_and_private_workspace_key() {
+        let (temp, store) = fixture();
+        let files = startup_files();
+        let workspace = startup_workspace(&store);
+        let existing = store.publish_batch(&files[..1], None).unwrap();
+        let before = renderer_calls(&temp);
+        fs::write(temp.path().join("fail_after_as"), b"fail").unwrap();
+        assert!(matches!(
+            store.publish_batch(&files, Some(&workspace)),
+            Err(StoreError::Policy)
+        ));
+        assert_eq!(renderer_calls(&temp), before + 2);
+        assert_eq!(fs::read_dir(&store.repository).unwrap().count(), 2);
+        assert_eq!(fs::read_dir(store.binding_directory()).unwrap().count(), 1);
+        assert_eq!(
+            fs::read_dir(store.workspace_binding_directory())
+                .unwrap()
+                .count(),
+            0
+        );
+        let id = workspace_hash("ns", "uid");
+        let key = read_private(&store.workspace_key(&id)).unwrap();
+        assert_eq!(key.len(), 32);
+        assert!(!store.workspace_resource(&id).exists());
+        let policy = fs::read_to_string(temp.path().join("as.rego")).unwrap();
+        assert!(policy.contains(files[0].initdata_sha384));
+        assert!(!policy.contains(files[3].initdata_sha384));
+
+        fs::remove_file(temp.path().join("fail_after_as")).unwrap();
+        let published = store.publish_batch(&files, Some(&workspace)).unwrap();
+        assert_eq!(
+            published[0].sealed_descriptor,
+            existing[0].sealed_descriptor
+        );
+        assert_eq!(read_regular(&store.workspace_resource(&id)).unwrap(), key);
+    }
+
+    #[test]
+    fn batch_staging_conflict_withdraws_new_prefix_and_preserves_existing_resource() {
+        let (temp, store) = fixture();
+        let mut files = startup_files();
+        let existing = store.publish_batch(&files[8..], None).unwrap();
+        let serving = store.resource(existing[0].resource_uri.rsplit('/').next().unwrap());
+        let bytes = read_regular(&serving).unwrap();
+        let binding = read_regular(&existing[0].binding_path).unwrap();
+        files[8].plaintext = b"changed";
+        let before = renderer_calls(&temp);
+        assert!(matches!(
+            store.publish_batch(&files, None),
+            Err(StoreError::Conflict)
+        ));
+        assert_eq!(renderer_calls(&temp), before + 1);
+        assert_eq!(fs::read_dir(&store.repository).unwrap().count(), 2);
+        assert_eq!(fs::read_dir(store.binding_directory()).unwrap().count(), 1);
+        assert_eq!(read_regular(&serving).unwrap(), bytes);
+        assert_eq!(read_regular(&existing[0].binding_path).unwrap(), binding);
+    }
+
     #[test]
     fn policy_process_deadline_is_enforced() {
         let (tmp, store) = fixture();
@@ -2316,22 +2514,40 @@ pathlib.Path(args[args.index('--output') + 1]).write_text('package policy\ndefau
             store
                 .record_attempt("api-sandbox", "ns", "uid", GENERATION, ATTEMPT)
                 .unwrap();
-            let published = store
-                .publish_file(
-                    BootstrapRole::Workload,
-                    GENERATION,
-                    "api-sandbox",
-                    "uid",
-                    ATTEMPT,
-                    "tls.key",
-                    b"driver-api-integration-fixture",
-                    INITDATA,
-                )
+            store
+                .record_workspace_volume("ns", "uid", "workspace-pvc", Some("pv"), Some("d-disk"))
                 .unwrap();
+            let mut files = startup_files();
+            for file in &mut files {
+                file.sandbox_id = "api-sandbox";
+            }
+            let workspace = WorkspaceKey {
+                namespace: "ns",
+                sandbox_cr_uid: "uid",
+                initdata_sha384: INITDATA,
+                attempt: Some(ATTEMPT),
+            };
+            let published = store.publish_batch(&files, Some(&workspace)).unwrap();
+            let mut resources: Vec<_> = published
+                .iter()
+                .zip(&files)
+                .map(|(published, file)| {
+                    serde_json::json!({
+                        "resource_path": published.resource_path,
+                        "initdata_sha384": file.initdata_sha384,
+                        "sha256": hex::encode(Sha256::digest(file.plaintext)),
+                    })
+                })
+                .collect();
+            let id = workspace_hash("ns", "uid");
+            resources.push(serde_json::json!({
+                "resource_path": store.plan_workspace_key("ns", "uid").unwrap().resource_path,
+                "initdata_sha384": INITDATA,
+                "sha256": hex::encode(Sha256::digest(read_private(&store.workspace_key(&id)).unwrap())),
+            }));
             fs::write(
                 root.join("receipt.json"),
-                serde_json::to_vec(&serde_json::json!({"resource_path": published.resource_path}))
-                    .unwrap(),
+                serde_json::to_vec(&serde_json::json!({"resources": resources})).unwrap(),
             )
             .unwrap();
         }

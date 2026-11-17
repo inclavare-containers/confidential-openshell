@@ -58,12 +58,12 @@ def cert(area, name, parent=None):
     return key, certificate
 
 
-def signed(issuer, parent, tee):
+def signed(issuer, parent, tee, digest='a' * 96):
     numbers = issuer[0].public_key().public_numbers()
     jwk = {'kty': 'EC', 'alg': 'ES256', 'crv': 'P-256',
            'x': h.b64url(numbers.x.to_bytes(32, 'big')), 'y': h.b64url(numbers.y.to_bytes(32, 'big')),
            'x5c': [base64.b64encode(c.public_bytes(serialization.Encoding.DER)).decode() for c in [issuer[1], parent[1]]]}
-    return h.signed_token(issuer[0], jwk, tee, 'a' * 96)
+    return h.signed_token(issuer[0], jwk, tee, digest)
 
 
 def check(kbs_root, as_root):
@@ -182,17 +182,28 @@ def check(kbs_root, as_root):
             completed = subprocess.run(command, cwd=ROOT, env=driver_env, capture_output=True, text=True)
             if completed.returncode:
                 raise RuntimeError(completed.stdout[-6000:] + completed.stderr[-6000:])
-            path = json.loads((driver_state / 'receipt.json').read_text())['resource_path']
-            url = client.endpoint + '/kbs/v0/' + path
-            status, body = get(token)
-            assert status == 200, (status, body)
-            jwe = json.loads(body)
-            cek = recipient.decrypt(h.unb64url(jwe['encrypted_key']), padding.OAEP(padding.MGF1(hashes.SHA256()), hashes.SHA256(), None))
-            assert AESGCM(cek).decrypt(h.unb64url(jwe['iv']), h.unb64url(jwe['ciphertext']) + h.unb64url(jwe['tag']), jwe['protected'].encode()) == b'driver-api-integration-fixture'
+            resources = json.loads((driver_state / 'receipt.json').read_text())['resources']
+            tokens = {}
+            for resource in resources:
+                digest = resource['initdata_sha384']
+                tokens[digest] = signed(signer, as_ca, tee, digest)
+                url = client.endpoint + '/kbs/v0/' + resource['resource_path']
+                status, body = get(tokens[digest])
+                assert status == 200, (status, body)
+                jwe = json.loads(body)
+                cek = recipient.decrypt(h.unb64url(jwe['encrypted_key']), padding.OAEP(padding.MGF1(hashes.SHA256()), hashes.SHA256(), None))
+                plaintext = AESGCM(cek).decrypt(h.unb64url(jwe['iv']), h.unb64url(jwe['ciphertext']) + h.unb64url(jwe['tag']), jwe['protected'].encode())
+                assert hashlib.sha256(plaintext).hexdigest() == resource['sha256']
+                other_digest = ('b' if digest == 'a' * 96 else 'a') * 96
+                assert get(signed(signer, as_ca, tee, other_digest))[0] == 403
+            result['checks']['rust_batch_resources_decrypted'] = len(resources)
+            result['checks']['rust_batch_cross_role_denied'] = True
             completed = subprocess.run(command, cwd=ROOT, env={**driver_env, 'OPENSHELL_TEST_API_ACTION': 'revoke'}, capture_output=True, text=True)
             if completed.returncode:
                 raise RuntimeError(completed.stdout[-6000:] + completed.stderr[-6000:])
-            assert get(token)[0] != 200
+            for resource in resources:
+                url = client.endpoint + '/kbs/v0/' + resource['resource_path']
+                assert get(tokens[resource['initdata_sha384']])[0] != 200
             result['checks']['rust_store_publish_restart_revoke'] = True
             result['passed'] = True
         finally:

@@ -3,7 +3,7 @@
 
 //! Kubernetes compute driver.
 
-use crate::bootstrap::{BootstrapRole, BootstrapStore, PendingDelete};
+use crate::bootstrap::{BootstrapFile, BootstrapRole, BootstrapStore, PendingDelete, WorkspaceKey};
 use crate::confidential::{GuestInitdata, INITDATA_ANNOTATION, SUPERVISOR_KEYS, WORKLOAD_KEYS};
 use crate::config::{
     DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, DEFAULT_SANDBOX_UID, DEFAULT_WORKSPACE_STORAGE_SIZE,
@@ -1198,18 +1198,17 @@ impl KubernetesComputeDriver {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn seal_bootstrap_secret(
-        &self,
-        secret: &mut Secret,
+    fn bootstrap_files<'a>(
+        secret: &'a Secret,
         role: BootstrapRole,
-        generation: &str,
-        sandbox_id: &str,
-        sandbox_cr_uid: &str,
-        attempt: &str,
-        initdata_digest: &str,
+        generation: &'a str,
+        sandbox_id: &'a str,
+        sandbox_cr_uid: &'a str,
+        attempt: &'a str,
+        initdata_digest: &'a str,
         expected_keys: &[&str],
-    ) -> Result<(), KubernetesDriverError> {
-        let data = secret.data.as_mut().ok_or_else(|| {
+    ) -> Result<Vec<BootstrapFile<'a>>, KubernetesDriverError> {
+        let data = secret.data.as_ref().ok_or_else(|| {
             KubernetesDriverError::Precondition("bootstrap Secret has no data".to_string())
         })?;
         if data
@@ -1225,28 +1224,19 @@ impl KubernetesComputeDriver {
                 "bootstrap Secret keys differ from the role's expected resources".to_string(),
             ));
         }
-        let profile = self.confidential.as_ref();
-        for (key, bytes) in data.iter_mut() {
-            let published = profile
-                .store
-                .publish_file(
-                    role,
-                    generation,
-                    sandbox_id,
-                    sandbox_cr_uid,
-                    attempt,
-                    key,
-                    &bytes.0,
-                    initdata_digest,
-                )
-                .map_err(|error| {
-                    KubernetesDriverError::Message(format!(
-                        "publish confidential bootstrap {key}: {error}"
-                    ))
-                })?;
-            bytes.0 = published.sealed_descriptor.into_bytes();
-        }
-        Ok(())
+        Ok(data
+            .iter()
+            .map(|(key, bytes)| BootstrapFile {
+                role,
+                generation,
+                sandbox_id,
+                sandbox_cr_uid,
+                attempt_id: attempt,
+                key,
+                plaintext: &bytes.0,
+                initdata_sha384: initdata_digest,
+            })
+            .collect())
     }
 
     async fn record_workspace_volumes(
@@ -3679,8 +3669,8 @@ impl KubernetesComputeDriver {
             Some(client_tls),
             supervisor_owner.clone(),
         );
-        self.seal_bootstrap_secret(
-            &mut sandbox_secret,
+        let mut files = Self::bootstrap_files(
+            &sandbox_secret,
             BootstrapRole::Workload,
             generation,
             sandbox_id,
@@ -3689,8 +3679,8 @@ impl KubernetesComputeDriver {
             &workload_initdata.digest,
             WORKLOAD_KEYS,
         )?;
-        self.seal_bootstrap_secret(
-            &mut supervisor_secret,
+        files.extend(Self::bootstrap_files(
+            &supervisor_secret,
             BootstrapRole::Supervisor,
             generation,
             sandbox_id,
@@ -3698,21 +3688,31 @@ impl KubernetesComputeDriver {
             bootstrap_attempt,
             &supervisor_initdata.digest,
             &supervisor_keys,
-        )?;
-        if persistent_workspace {
-            self.confidential
-                .store
-                .ensure_workspace_key_for_attempt(
-                    namespace,
-                    cr_uid,
-                    &workload_initdata.digest,
-                    bootstrap_attempt,
-                )
-                .map_err(|error| {
-                    KubernetesDriverError::Message(format!(
-                        "authorize confidential workspace key: {error}"
-                    ))
-                })?;
+        )?);
+        let workspace = persistent_workspace.then_some(WorkspaceKey {
+            namespace,
+            sandbox_cr_uid: cr_uid,
+            initdata_sha384: &workload_initdata.digest,
+            attempt: Some(bootstrap_attempt),
+        });
+        let published = self
+            .confidential
+            .store
+            .publish_batch(&files, workspace.as_ref())
+            .map_err(|error| {
+                KubernetesDriverError::Message(format!(
+                    "publish confidential bootstrap resources: {error}"
+                ))
+            })?;
+        for (bytes, published) in sandbox_secret
+            .data
+            .as_mut()
+            .unwrap()
+            .values_mut()
+            .chain(supervisor_secret.data.as_mut().unwrap().values_mut())
+            .zip(published)
+        {
+            bytes.0 = published.sealed_descriptor.into_bytes();
         }
         let secrets = Api::<Secret>::namespaced(self.client.clone(), namespace);
         secrets
