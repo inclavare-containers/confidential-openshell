@@ -46,8 +46,8 @@ webhook:
   enabled: true
   replicas: 1
   image:
-    repository: ghcr.io/confidential-containers/peer-pods-webhook
-    tag: "36dfe90219fd57b26a3d984c0be20ca67eed45e8@sha256:6b76785b6c57f95437b745132935329c19bd357852139dea1a457cc6ffd47e0f"
+    repository: PRIVATE_REGISTRY/openshell/mirror/peerpod_webhook
+    tag: "locked@sha256:WEBHOOK_IMAGE_SHA256"
 kata-deploy:
   deploymentMode: daemonset
   nodeSelector:
@@ -55,7 +55,7 @@ kata-deploy:
   image:
     reference: PRIVATE_REGISTRY/openshell/mirror/kata_deploy@sha256:KATA_DEPLOY_IMAGE_SHA256
   kubectlImage:
-    reference: quay.io/kata-containers/kubectl@sha256:135dbdadb36c2c414fa86049bb2fd7ce149257a1d35771cd120203c3ea9803dc
+    reference: PRIVATE_REGISTRY/openshell/mirror/kata_kubectl@sha256:KATA_KUBECTL_IMAGE_SHA256
     tag: ""
   shims:
     remote:

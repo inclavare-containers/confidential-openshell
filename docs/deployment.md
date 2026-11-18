@@ -255,8 +255,7 @@ Starts the TLS registry and checks HTTPS. Durable registry storage is under
 
 Publishes built images, mirrors all pinned upstream dependencies and the unchanged
 Community harness image, and mirrors the official kata-deploy image.
-Success requires both stages and saves destination digests. Either stage failing
-stops this command.
+The command records the destination digests for worker and gateway configuration.
 
 ### Worker trust
 

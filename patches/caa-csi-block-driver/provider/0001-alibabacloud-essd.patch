@@ -1,4 +1,4 @@
-From bb18f92f1fa069caa217830fb441ece0fc43b569 Mon Sep 17 00:00:00 2001
+From 4814b325fcfaab53202fd0f288d49989d85874dc Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
 Date: Wed, 4 Nov 2026 11:31:52 +0800
 Subject: [PATCH] alibabacloud: add ESSD provider and minimal
@@ -425,14 +425,14 @@ index 00000000..0a36fca6
 +  clusterId: ACK_CLUSTER_ID
 diff --git a/docs/alibabacloud.md b/docs/alibabacloud.md
 new file mode 100644
-index 00000000..afcbebac
+index 00000000..562b6652
 --- /dev/null
 +++ b/docs/alibabacloud.md
 @@ -0,0 +1,28 @@
 +# Alibaba Cloud ESSD
 +
 +This provider implements the existing block-volume and cloud-recovery interfaces.
-+CAA must also support Alibaba disk attachment and guest disk-ID discovery.
++CAA must also support Alibaba disk attachment and guest device paths.
 +ESSD PL0 volumes support create, lookup, recovery and delete; expansion, snapshots
 +and clones are not implemented.
 +

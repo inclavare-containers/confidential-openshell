@@ -14,7 +14,9 @@ and the `compute_driver` setting together, preserving any custom admission
 settings, and install the updated unit. Existing sandbox annotations retain
 the driver name recorded at their last start; the next native Stop/Start updates
 `internal.openshell.ai/compute-driver` to `confidential`. Do not rewrite the
-Gateway database to change this display.
+Gateway database to change this display. After upgrading the gateway and driver, set
+`enable_sandbox_updates = true` in `[openshell.gateway]` of the installed
+`/etc/openshell-confidential/gateway.toml` and restart the gateway.
 
 Follow the [sequential deployment runbook](../../docs/deployment.md) for
 installation and checks. Edit private operator copies outside

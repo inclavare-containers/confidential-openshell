@@ -1,4 +1,4 @@
-From 1dd25d239414fbdeebe225a245a5a237087ee7de Mon Sep 17 00:00:00 2001
+From bedeba55f3900d351e00e256fd65eae2dae7392d Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
 Date: Wed, 4 Nov 2026 15:24:44 +0800
 Subject: [PATCH] guest: authorize encrypted workspaces through
@@ -20,8 +20,8 @@ Co-authored-by: Codex <noreply@openai.com>
 ---
  .../cmd/agent-protocol-forwarder/main.go      |  26 +-
  .../cmd/agent-protocol-forwarder/main_test.go |  19 +
- .../forwarder/interceptor/alibaba_device.go   |  68 +++
- .../interceptor/alibaba_device_test.go        | 145 +++++
+ .../forwarder/interceptor/alibaba_device.go   |  64 +++
+ .../interceptor/alibaba_device_test.go        | 132 +++++
  .../pkg/forwarder/interceptor/cdh_client.go   |  59 +++
  .../pkg/forwarder/interceptor/interceptor.go  | 281 +++++++---
  .../forwarder/interceptor/interceptor_test.go |   9 +
@@ -31,7 +31,7 @@ Co-authored-by: Codex <noreply@openai.com>
  .../interceptor/workspace_mount_test.go       | 204 ++++++++
  .../forwarder/interceptor/workspace_test.go   | 122 +++++
  .../interceptor/workspace_transaction_test.go | 111 ++++
- 13 files changed, 1791 insertions(+), 95 deletions(-)
+ 13 files changed, 1774 insertions(+), 95 deletions(-)
  create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/alibaba_device.go
  create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/alibaba_device_test.go
  create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/cdh_client.go
@@ -139,10 +139,10 @@ index 829589f2..4c494076 100644
  			"-tls-skip-verify",
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/alibaba_device.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/alibaba_device.go
 new file mode 100644
-index 00000000..7a9a3bd4
+index 00000000..42dcc5de
 --- /dev/null
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/alibaba_device.go
-@@ -0,0 +1,68 @@
+@@ -0,0 +1,64 @@
 +// (C) Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -167,10 +167,6 @@ index 00000000..7a9a3bd4
 +type alibabaDeviceLocator struct {
 +	sysBlockRoot string
 +	deviceRoot   string
-+}
-+
-+func isAlibabaDiskIdentity(diskID string) bool {
-+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(diskID)), "d-")
 +}
 +
 +func findAlibabaDataDisk(diskID string) (string, error) {
@@ -213,10 +209,10 @@ index 00000000..7a9a3bd4
 +}
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/alibaba_device_test.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/alibaba_device_test.go
 new file mode 100644
-index 00000000..313105fb
+index 00000000..3b6700a4
 --- /dev/null
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/alibaba_device_test.go
-@@ -0,0 +1,145 @@
+@@ -0,0 +1,132 @@
 +// (C) Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -327,19 +323,6 @@ index 00000000..313105fb
 +	locator, _, _ := newTestAlibabaLocator(t)
 +	if _, err := locator.find("workspace123"); !errors.Is(err, errAlibabaDiskIDInvalid) {
 +		t.Fatalf("expected invalid identity error, got %v", err)
-+	}
-+}
-+
-+func TestIsAlibabaDiskIdentity(t *testing.T) {
-+	for _, diskID := range []string{"d-workspace123", " D-WORKSPACE123 ", "d-invalid-suffix"} {
-+		if !isAlibabaDiskIdentity(diskID) {
-+			t.Errorf("%q must use the Alibaba identity-only locator", diskID)
-+		}
-+	}
-+	for _, diskID := range []string{"", "vol-123", "/subscriptions/disk"} {
-+		if isAlibabaDiskIdentity(diskID) {
-+			t.Errorf("%q was misclassified as Alibaba Cloud", diskID)
-+		}
 +	}
 +}
 +

@@ -2,7 +2,7 @@ package policy
 
 import rego.v1
 
-# Upstream Trustee 0.22 CPU appraisal for the official Ubuntu UKI boot flow.
+# Upstream Trustee CPU appraisal for the official Ubuntu UKI boot flow.
 # The verifier checks the quote, REPORTDATA and replay of all four RTMRs.
 # This policy binds that verified evidence to independently derived image
 # measurements, a reviewed ECS firmware profile and the current initdata.

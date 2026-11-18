@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate a Kata 4.2 policy from the trusted OpenShell launch template.
+"""Generate a Kata 4.4 policy from the trusted OpenShell launch template.
 
 The confidential driver calls this program before it adds initdata to a Pod.
 One Pod JSON document is read from stdin; only Rego is written to stdout.
@@ -240,7 +240,7 @@ def _genpolicy_pod(pod: dict, role: str) -> dict:
     for volume in result["spec"].get("volumes", []):
         pvc = volume.get("persistentVolumeClaim")
         if pvc is not None and pvc.get("readOnly") is False:
-            # Comparison expands the Kubernetes default. Kata 4.2's PVC
+            # Comparison expands the Kubernetes default. Kata 4.4's PVC
             # schema omits this field; absence has the same read-write meaning.
             pvc.pop("readOnly")
         downward = volume.get("downwardAPI")

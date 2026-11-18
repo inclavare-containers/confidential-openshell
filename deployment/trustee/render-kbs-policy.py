@@ -145,7 +145,7 @@ def write_policy(output: Path, policy: str) -> None:
 
 
 def require_supported_line_lengths(policy: str, description: str) -> None:
-    # Trustee 0.22's regorus 0.11 loader rejects a source line once its
+    # Trustee's regorus loader rejects a source line once its
     # column count exceeds 1024, before any resource authorization is run.
     if any(len(line) >= REGORUS_MAX_COLUMN for line in policy.splitlines()):
         raise ValueError(f"{description} exceeds Trustee's Rego line limit")

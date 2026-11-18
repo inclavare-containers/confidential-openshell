@@ -1,8 +1,11 @@
-From 1efbe7331b4d973d6fb93ed4791c824cf4160a4b Mon Sep 17 00:00:00 2001
+From 5d0202a1cf8bbdd4600c2eea47bdac476e61cec8 Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
-Date: Wed, 18 Nov 2026 12:28:03 +0800
+Date: Wed, 18 Nov 2026 15:10:47 +0800
 Subject: [PATCH] node: publish mountInfo.json by atomic rename
 
+Publish a complete metadata file before notifying the volume consumer. Remove the temporary file if publication fails.
+
+Signed-off-by: Weidong Sun <sunweidong@linux.alibaba.com>
 ---
  pkg/driver/metadata_atomic.go      | 48 ++++++++++++++++++++++++++++++
  pkg/driver/metadata_atomic_test.go | 32 ++++++++++++++++++++

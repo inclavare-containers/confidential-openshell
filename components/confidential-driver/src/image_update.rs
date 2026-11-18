@@ -139,7 +139,7 @@ impl KubernetesComputeDriver {
                 &expected.resource_uid,
             )
             .map_err(|error| KubernetesDriverError::Precondition(error.to_string()))?;
-        // Commands and environment stay in the trusted launch record.
+        // Derive the next launch from the trusted record and gateway request.
         let next = updated_launch(&launch, request, configuration)?;
         // Account for the operation marker before the gateway accepts the update.
         let annotation_bytes: usize = candidate
@@ -582,7 +582,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn stopped_update_supplies_the_next_trusted_launch_and_preserves_private_inputs() {
+    fn stopped_update_retries_and_keeps_configuration_off_the_sandbox_cr() {
         let pod = json!({"spec": {
             "containers": [{"name":"agent","image":"previous"}],
             "initContainers": [{"name":WORKSPACE_INIT_CONTAINER_NAME,"image":"previous"}]
@@ -616,7 +616,7 @@ mod tests {
         let configuration = UpdateSandboxConfigurationRequest {
             preconditions: Some(preconditions.clone()),
             main_process: Some(SandboxMainProcessUpdate {
-                command: vec!["private-command".into()],
+                command: vec!["updated-command".into()],
                 tty: false,
             }),
             environment: Some(SandboxEnvironmentUpdate {
@@ -627,7 +627,7 @@ mod tests {
         profile.store.record_launch(&prior).unwrap();
         assert!(!prepare_update(&mut object, &preconditions, &configuration).unwrap());
         let public = serde_json::to_string(&object).unwrap();
-        assert!(!public.contains("private-command") && !public.contains("private-value"));
+        assert!(!public.contains("updated-command") && !public.contains("private-value"));
 
         // Retry after the CR patch succeeded and before the trusted write completed.
         assert!(prepare_update(&mut object, &preconditions, &configuration).unwrap());
@@ -647,7 +647,7 @@ mod tests {
         assert_eq!(saved.updated_environment.unwrap()["VALUE"], "private-value");
         let main = openshell_core::sandbox_env::MainProcessConfig::decode(&saved.main_process_spec)
             .unwrap();
-        assert_eq!(main.command, ["private-command"]);
+        assert_eq!(main.command, ["updated-command"]);
         assert!(!main.tty);
     }
 }

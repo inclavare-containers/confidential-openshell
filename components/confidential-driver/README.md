@@ -53,7 +53,8 @@ rejects user env or `envFrom` reintroduced into a role Pod.
 The trusted host retains launch inputs for each namespace and Sandbox CR UID. A stopped
 sandbox accepts image, command and environment changes through the gateway's
 `SandboxUpdates/UpdateSandbox` RPC. The next start uses the approved configuration to
-generate fresh policy and sealed bootstrap data. Final deletion removes the trusted records.
+generate fresh policy and sealed bootstrap data. The supervisor Pod receives the approved
+command through the upstream main-process setting. User environment stays in the sealed workload data. Final deletion removes the trusted records.
 
 The supervisor connects directly to the native Gateway HTTPS endpoint with the trusted host's
 public CA and gateway-minted sandbox JWT released through its sealed bootstrap. User client

@@ -1,14 +1,16 @@
-From d14a967c2d402f074675b23b29ab8b670bdd0146 Mon Sep 17 00:00:00 2001
+From 23474467d4503dc31ef3bbc131698fd8046029b5 Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
-Date: Wed, 18 Nov 2026 14:17:57 +0800
+Date: Wed, 18 Nov 2026 15:10:47 +0800
 Subject: [PATCH] alibabacloud: report stable guest paths for attached disks
+
+Use the ECS serial number and instance type to populate VolumeDevices with the NVMe or virtio by-id link for each disk. The guest can then use the existing path-based mount flow.
 
 Signed-off-by: Weidong Sun <sunweidong@linux.alibaba.com>
 ---
  src/cloud-providers/alibabacloud/provider.go  | 33 +++++++-------
  src/cloud-providers/alibabacloud/volumes.go   | 43 +++++++++++--------
- .../alibabacloud/volumes_test.go              | 16 ++++---
- 3 files changed, 53 insertions(+), 39 deletions(-)
+ .../alibabacloud/volumes_test.go              | 20 ++++++---
+ 3 files changed, 57 insertions(+), 39 deletions(-)
 
 diff --git a/src/cloud-providers/alibabacloud/provider.go b/src/cloud-providers/alibabacloud/provider.go
 index 7c9467c3..01d58ad8 100644
@@ -194,7 +196,7 @@ index 9f21d94e..7847d332 100644
  	}
  }
 diff --git a/src/cloud-providers/alibabacloud/volumes_test.go b/src/cloud-providers/alibabacloud/volumes_test.go
-index b0404e5a..bb245b7c 100644
+index b0404e5a..3c8f2e75 100644
 --- a/src/cloud-providers/alibabacloud/volumes_test.go
 +++ b/src/cloud-providers/alibabacloud/volumes_test.go
 @@ -73,7 +73,7 @@ func (f *fakeVolumeECSClient) DescribeDisks(request *ecs.DescribeDisksRequest) (
@@ -225,16 +227,22 @@ index b0404e5a..bb245b7c 100644
  		if tea.StringValue(req.DiskId) != volumes[n].DiskID || tea.StringValue(req.InstanceId) != "i-peerpod" {
  			t.Fatalf("unexpected attachment request %v", req)
  		}
-@@ -117,7 +121,7 @@ func TestAttachAlibabaDataDisksWaitsForReadyStates(t *testing.T) {
+@@ -117,9 +121,13 @@ func TestAttachAlibabaDataDisksWaitsForReadyStates(t *testing.T) {
  			disk.Status = tea.String("Attaching")
  		}
  	}
 -	if err := p.attachDataDisks(context.Background(), "i-peerpod", []provider.CloudVolume{{DiskID: "d-one"}}); err != nil {
-+	if _, err := p.attachDataDisks(context.Background(), "i-peerpod", []provider.CloudVolume{{DiskID: "d-one"}}, false); err != nil {
++	devices, err := p.attachDataDisks(context.Background(), "i-peerpod", []provider.CloudVolume{{DiskID: "d-one"}}, false)
++	if err != nil {
  		t.Fatal(err)
  	}
++	if devices["d-one"] != "/dev/disk/by-id/virtio-serial-d-one" {
++		t.Fatal(devices)
++	}
  	if client.instanceQueries != 3 || client.diskQueries != 2 {
-@@ -129,7 +133,7 @@ func TestAttachAlibabaDataDisksReturnsAPIErrors(t *testing.T) {
+ 		t.Fatalf("instance queries=%d, disk queries=%d", client.instanceQueries, client.diskQueries)
+ 	}
+@@ -129,7 +137,7 @@ func TestAttachAlibabaDataDisksReturnsAPIErrors(t *testing.T) {
  	for _, failure := range []error{errors.New("disk is in another zone"), context.DeadlineExceeded, &tea.SDKError{Code: tea.String("IncorrectInstanceStatus")}} {
  		p, client := newFakeVolumeProvider(t, "Running")
  		client.attachError = failure
@@ -243,7 +251,7 @@ index b0404e5a..bb245b7c 100644
  		if !errors.Is(err, failure) || len(client.attachRequests) != 1 || client.diskQueries != 0 {
  			t.Fatalf("error=%v, attachment calls=%d, disk queries=%d", err, len(client.attachRequests), client.diskQueries)
  		}
-@@ -151,7 +155,7 @@ func TestAttachAlibabaDataDisksHonorsCancellation(t *testing.T) {
+@@ -151,7 +159,7 @@ func TestAttachAlibabaDataDisksHonorsCancellation(t *testing.T) {
  					cancel()
  				}
  			}
@@ -252,7 +260,7 @@ index b0404e5a..bb245b7c 100644
  				t.Fatalf("expected cancellation, got %v", err)
  			}
  			if stage == "before attach" && len(client.attachRequests) != 0 {
-@@ -163,7 +167,7 @@ func TestAttachAlibabaDataDisksHonorsCancellation(t *testing.T) {
+@@ -163,7 +171,7 @@ func TestAttachAlibabaDataDisksHonorsCancellation(t *testing.T) {
  
  func TestAttachAlibabaDataDisksWithoutVolumes(t *testing.T) {
  	p, client := newFakeVolumeProvider(t, "Starting")

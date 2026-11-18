@@ -1,9 +1,12 @@
-From 948ad8f03afcce44729fd5a88bb145d49494e0a4 Mon Sep 17 00:00:00 2001
+From 1af9328dee28cc479177b55b8c2e562059b5b171 Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
-Date: Wed, 18 Nov 2026 12:28:03 +0800
+Date: Wed, 18 Nov 2026 15:10:47 +0800
 Subject: [PATCH] node: recover volume identity and preserve republish
  semantics
 
+Recover a published volume after a node plugin restart and retain the mount properties that determine whether a repeated publish is compatible.
+
+Signed-off-by: Weidong Sun <sunweidong@linux.alibaba.com>
 ---
  pkg/driver/controllerserver.go            |   2 +
  pkg/driver/directvolume.go                |  96 ++++++-
