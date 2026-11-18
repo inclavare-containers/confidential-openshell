@@ -59,11 +59,12 @@ def signed_token(issuer, issuer_jwk, tee_pubkey, digest, tcb="OutOfDate", attrib
     claims = {
         "exp": int(time.time()) + 120, "nbf": int(time.time()) - 10,
         "submods": {"cpu0": {
-            "ear.appraisal-policy-id": "openshell-tdx", "ear.status": "affirming",
-            "ear.trustworthiness-vector": {
+            "ear_appraisal_policy_ids": ["openshell-tdx"], "ear_status": "affirming",
+            "ear_trustworthiness_vector": {
                 "hardware": 2, "configuration": 2, "executables": 3, "file-system": 2,
             },
-            "ear.veraison.annotated-evidence": {"runtime_data_claims": {"tee-pubkey": tee_pubkey}, "tdx": {
+            "ear_verifier_claims": {"runtime_data": {"tee-pubkey": tee_pubkey}},
+            "ear_attester_claims": {"tee": "tdx", "claims": {
                 "tcb_status": tcb,
                 "quote": {"body": {"td_attributes": attributes}},
                 "uefi_event_logs": [event],

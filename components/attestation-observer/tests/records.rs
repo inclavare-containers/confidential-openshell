@@ -10,9 +10,9 @@ use std::fs;
 
 fn claims() -> Value {
     json!({"iat": 100, "exp": 200, "submods": {"cpu0": {
-        "ear.status": "affirming", "ear.appraisal-policy-id": "default",
-        "ear.trustworthiness-vector": {"hardware": 2},
-        "ear.veraison.annotated-evidence": {"tdx": {"tcb_status": "UpToDate", "quote": {"body": {"mr_td": "b".repeat(96)}},
+        "ear_status": "affirming", "ear_appraisal_policy_ids": ["default"],
+        "ear_trustworthiness_vector": {"hardware": 2},
+        "ear_attester_claims": {"tee": "tdx", "claims": {"tcb_status": "UpToDate", "quote": {"body": {"mr_td": "b".repeat(96)}},
             "uefi_event_logs": [{"type_name":"EV_EVENT_TAG", "details": {"unicode_name": "AAEL",
                 "data": {"operation": "InitData", "domain": "github.com/confidential-containers", "content": {"digest": format!("sha384:{}", "a".repeat(96))}}}}]}}
     }}})
@@ -46,7 +46,7 @@ fn historical_signature_and_unambiguous_measurement_required() {
     );
     for mode in ["duplicate", "domain", "future", "status"] {
         let mut bad = value.clone();
-        let path = "/submods/cpu0/ear.veraison.annotated-evidence/tdx/uefi_event_logs";
+        let path = "/submods/cpu0/ear_attester_claims/claims/uefi_event_logs";
         match mode {
             "duplicate" => {
                 let events = bad.pointer_mut(path).unwrap().as_array_mut().unwrap();
@@ -59,7 +59,7 @@ fn historical_signature_and_unambiguous_measurement_required() {
                 bad["iat"] = json!(2000);
                 bad["exp"] = json!(3000);
             }
-            _ => bad["submods"]["cpu0"]["ear.status"] = json!("unknown"),
+            _ => bad["submods"]["cpu0"]["ear_status"] = json!("unknown"),
         }
         assert!(
             summarize(&signed(&key, &bad), &public, 1000).is_err(),
@@ -78,6 +78,9 @@ async fn partial_sessions_retry_latest_survives_restart_and_source_outage() {
     let public = key.public_key_pem();
     let observer = Observer::new(sessions.clone(), output.clone(), public.as_bytes()).unwrap();
     let record = sessions.join("session");
+    for index in ["#expiry", "#expiry.tmp"] {
+        fs::write(record.parent().unwrap().join(index), b"{}").unwrap();
+    }
     fs::write(&record, br#"{"Authed":{}}"#).unwrap();
     observer.scan().await;
     assert!(observer.observation(&"a".repeat(96)).await.report.is_none());
@@ -99,8 +102,7 @@ async fn partial_sessions_retry_latest_survives_restart_and_source_outage() {
     // Failed persistence is retried on the next poll, including the same EAR.
     let mut newer = claims();
     newer["iat"] = json!(101);
-    newer["submods"]["cpu0"]["ear.veraison.annotated-evidence"]["tdx"]["tcb_status"] =
-        json!("OutOfDate");
+    newer["submods"]["cpu0"]["ear_attester_claims"]["claims"]["tcb_status"] = json!("OutOfDate");
     fs::write(
         &record,
         json!({"Attested":{"token":signed(&key, &newer)}}).to_string(),
@@ -201,11 +203,11 @@ async fn stable_references_watermarks_and_status_times_survive_restart() {
     assert_eq!(retained.ear_sha256, first.ear_sha256);
     // Neither none nor late contradictory evidence may overwrite the latest known result.
     value["iat"] = json!(140);
-    value["submods"]["cpu0"]["ear.status"] = json!("none");
+    value["submods"]["cpu0"]["ear_status"] = json!("none");
     write(&value);
     observer.scan().await;
     value["iat"] = json!(110);
-    value["submods"]["cpu0"]["ear.status"] = json!("contraindicated");
+    value["submods"]["cpu0"]["ear_status"] = json!("contraindicated");
     write(&value);
     observer.scan().await;
     let restarted = Observer::new(sessions.clone(), output.clone(), public.as_bytes()).unwrap();
@@ -215,7 +217,7 @@ async fn stable_references_watermarks_and_status_times_survive_restart() {
     );
     // A new warning changes the represented evidence but not the True status time.
     value["iat"] = json!(150);
-    value["submods"]["cpu0"]["ear.status"] = json!("warning");
+    value["submods"]["cpu0"]["ear_status"] = json!("warning");
     write(&value);
     restarted.scan().await;
     let warning = restarted.observation(&"a".repeat(96)).await.report.unwrap();
@@ -234,7 +236,7 @@ async fn stable_references_watermarks_and_status_times_survive_restart() {
             .exists()
     );
     value["iat"] = json!(160);
-    value["submods"]["cpu0"]["ear.status"] = json!("contraindicated");
+    value["submods"]["cpu0"]["ear_status"] = json!("contraindicated");
     write(&value);
     restarted.scan().await;
     let rejected = restarted.observation(&"a".repeat(96)).await.report.unwrap();

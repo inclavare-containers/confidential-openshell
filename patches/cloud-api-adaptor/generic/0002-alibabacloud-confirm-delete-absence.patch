@@ -1,7 +1,8 @@
-From 2f595d905f7540dfb78d0be6fcb5bf586a04f9bf Mon Sep 17 00:00:00 2001
+From 864ba45c92fbe1c0eb7b29aca1ff5e9e6decd819 Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
 Date: Tue, 3 Nov 2026 19:30:00 +0800
-Subject: [PATCH] alibabacloud: confirm instance absence after deletion errors
+Subject: [PATCH] alibabacloud: confirm instance absence after deletion
+ errors
 
 A concurrent cleanup can remove an instance before another caller receives
 its deletion error. Read that exact instance after a failed deletion and

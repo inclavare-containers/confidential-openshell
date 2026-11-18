@@ -5,7 +5,7 @@ secrets:
   existingSecretName: ""
 image:
   name: PRIVATE_REGISTRY/openshell/cloud-api-adaptor
-  tag: "v0.23.0@sha256:PATCHED_CAA_IMAGE_SHA256"
+  tag: "locked@sha256:PATCHED_CAA_IMAGE_SHA256"
 daemonset:
   podLabels:
     pod-identity.alibabacloud.com/injection: "on"
@@ -41,18 +41,19 @@ resourceCtrl:
       pod-identity.alibabacloud.com/role-name: CAA_RAM_ROLE_NAME
   image:
     repository: PRIVATE_REGISTRY/openshell/peerpod-ctrl
-    tag: "v0.23.0-alibabacloud@sha256:PATCHED_PEERPOD_CONTROLLER_IMAGE_SHA256"
+    tag: "locked@sha256:PATCHED_PEERPOD_CONTROLLER_IMAGE_SHA256"
 webhook:
   enabled: true
   replicas: 1
   image:
-    repository: quay.io/confidential-containers/peer-pods-webhook
-    tag: "v0.23.0@sha256:b1b2e7bb2b880728fba68fe490914d803e810c947f1e5a2af40f8b9d7cf9b07e"
+    repository: ghcr.io/confidential-containers/peer-pods-webhook
+    tag: "36dfe90219fd57b26a3d984c0be20ca67eed45e8@sha256:6b76785b6c57f95437b745132935329c19bd357852139dea1a457cc6ffd47e0f"
 kata-deploy:
+  deploymentMode: daemonset
   nodeSelector:
     node.kubernetes.io/worker: ""
   image:
-    reference: PRIVATE_REGISTRY/openshell/kata-deploy-shim-nnp@sha256:PATCHED_KATA_DEPLOY_IMAGE_SHA256
+    reference: PRIVATE_REGISTRY/openshell/mirror/kata_deploy@sha256:KATA_DEPLOY_IMAGE_SHA256
   kubectlImage:
     reference: quay.io/kata-containers/kubectl@sha256:135dbdadb36c2c414fa86049bb2fd7ce149257a1d35771cd120203c3ea9803dc
     tag: ""

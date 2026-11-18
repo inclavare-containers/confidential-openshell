@@ -1,8 +1,8 @@
-From 3c89fb780e648a656ce2d7a0cc0968b0f2425de5 Mon Sep 17 00:00:00 2001
+From bb18f92f1fa069caa217830fb441ece0fc43b569 Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
 Date: Wed, 4 Nov 2026 11:31:52 +0800
-Subject: [PATCH] alibabacloud: add ESSD provider and minimal deployment
- configuration
+Subject: [PATCH] alibabacloud: add ESSD provider and minimal
+ deployment configuration
 
 Use existing provider and cloud-recovery interfaces, stable create tokens and SDK credential caching.
 Keep the upstream combined DaemonSet and node-local store; add Alibaba-only RRSA and storage settings.
@@ -11,23 +11,23 @@ Reject a rounded disk size above the caller capacity limit before CreateDisk.
 Signed-off-by: Weidong Sun <sunweidong@linux.alibaba.com>
 Co-authored-by: Codex <noreply@openai.com>
 ---
- README.md                                          |   1 +
- charts/caa-csi-block-driver/templates/_helpers.tpl |   3 +
- .../templates/bootstrap-params.yaml                |   4 +
- .../caa-csi-block-driver/templates/daemonset.yaml  |  30 +++
- .../templates/storageclass.yaml                    |   7 +-
- charts/caa-csi-block-driver/values.yaml            |  14 +-
- cmd/main.go                                        |   1 +
- deploy/bootstrap-params-alibabacloud.yaml          |  15 ++
- deploy/daemonset-alibabacloud.yaml                 | 168 ++++++++++++
- deploy/storageclass-alibabacloud.yaml              |  19 ++
- docs/alibabacloud.md                               |  28 ++
- go.mod                                             |  15 ++
- go.sum                                             | 238 +++++++++++++++++
- pkg/provider/alibabacloud/credentials_test.go      |  89 +++++++
- pkg/provider/alibabacloud/provider.go              | 296 +++++++++++++++++++++
- pkg/provider/alibabacloud/provider_test.go         | 200 ++++++++++++++
- 16 files changed, 1126 insertions(+), 2 deletions(-)
+ README.md                                     |   1 +
+ .../templates/_helpers.tpl                    |   3 +
+ .../templates/bootstrap-params.yaml           |   4 +
+ .../templates/daemonset.yaml                  |  30 ++
+ .../templates/storageclass.yaml               |   7 +-
+ charts/caa-csi-block-driver/values.yaml       |  14 +-
+ cmd/main.go                                   |   1 +
+ deploy/bootstrap-params-alibabacloud.yaml     |  15 +
+ deploy/daemonset-alibabacloud.yaml            | 168 ++++++++++
+ deploy/storageclass-alibabacloud.yaml         |  19 ++
+ docs/alibabacloud.md                          |  28 ++
+ go.mod                                        |  18 +
+ go.sum                                        | 239 +++++++++++++
+ pkg/provider/alibabacloud/credentials_test.go |  94 ++++++
+ pkg/provider/alibabacloud/provider.go         | 314 ++++++++++++++++++
+ pkg/provider/alibabacloud/provider_test.go    | 200 +++++++++++
+ 16 files changed, 1153 insertions(+), 2 deletions(-)
  create mode 100644 deploy/bootstrap-params-alibabacloud.yaml
  create mode 100644 deploy/daemonset-alibabacloud.yaml
  create mode 100644 deploy/storageclass-alibabacloud.yaml
@@ -76,7 +76,7 @@ index 850081be..d73aa08f 100644
        "cloudProviderVolumePath": {{ .Values.libvirt.volumeDir | quote }}
        {{- end }}
 diff --git a/charts/caa-csi-block-driver/templates/daemonset.yaml b/charts/caa-csi-block-driver/templates/daemonset.yaml
-index 377b0e18..f3192b67 100644
+index 377b0e18..da5b53b9 100644
 --- a/charts/caa-csi-block-driver/templates/daemonset.yaml
 +++ b/charts/caa-csi-block-driver/templates/daemonset.yaml
 @@ -23,6 +23,9 @@ spec:
@@ -93,11 +93,6 @@ index 377b0e18..f3192b67 100644
                    key: AWS_SECRET_ACCESS_KEY
              {{- end }}
              {{- end }}
-+          {{- if and (eq .Values.provider "alibabacloud") .Values.alibabacloud.credentialsSecret }}
-+          envFrom:
-+            - secretRef:
-+                name: {{ .Values.alibabacloud.credentialsSecret | quote }}
-+          {{- end }}
 +            {{- if and (eq .Values.provider "alibabacloud") .Values.alibabacloud.rrsa.enabled }}
 +            - name: ALIBABA_CLOUD_ROLE_ARN
 +              value: {{ required "alibabacloud.rrsa.roleArn is required" .Values.alibabacloud.rrsa.roleArn | quote }}
@@ -106,6 +101,11 @@ index 377b0e18..f3192b67 100644
 +            - name: ALIBABA_CLOUD_OIDC_TOKEN_FILE
 +              value: /var/run/secrets/ack.alibabacloud.com/rrsa-tokens/token
 +            {{- end }}
++          {{- if and (eq .Values.provider "alibabacloud") .Values.alibabacloud.credentialsSecret }}
++          envFrom:
++            - secretRef:
++                name: {{ .Values.alibabacloud.credentialsSecret | quote }}
++          {{- end }}
            {{- with .Values.resources.driver }}
            resources:
              {{- toYaml . | nindent 12 }}
@@ -226,7 +226,7 @@ index 00000000..8126a8ee
 +    }\n"
 diff --git a/deploy/daemonset-alibabacloud.yaml b/deploy/daemonset-alibabacloud.yaml
 new file mode 100644
-index 00000000..cc8c5a62
+index 00000000..48c1935e
 --- /dev/null
 +++ b/deploy/daemonset-alibabacloud.yaml
 @@ -0,0 +1,168 @@
@@ -252,7 +252,7 @@ index 00000000..cc8c5a62
 +        app.kubernetes.io/name: caa-csi-block-driver
 +        app.kubernetes.io/instance: caa-csi-block
 +    spec:
-+      serviceAccountName: caa-csi-block
++      serviceAccountName: caa-csi-provisioner
 +      containers:
 +      - name: csi-provisioner
 +        image: registry.k8s.io/sig-storage/csi-provisioner@sha256:6de50bacfd72627ffe4209e3db8ad7391d04ea6fb741bf51feab6c5dcfd80002
@@ -458,56 +458,46 @@ index 00000000..afcbebac
 +upstream namespace, ServiceAccount, RBAC and CSIDriver resources. Replace the
 +uppercase sample values and image digest before applying them.
 diff --git a/go.mod b/go.mod
-index 0d6321f6..ad2bc215 100644
+index b7c9f06b..02884322 100644
 --- a/go.mod
 +++ b/go.mod
-@@ -6,6 +6,10 @@ require (
+@@ -6,6 +6,7 @@ require (
  	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.21.0
  	github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.13.1
  	github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v5 v5.7.0
-+	github.com/alibabacloud-go/darabonba-openapi/v2 v2.2.4
-+	github.com/alibabacloud-go/ecs-20140526/v7 v7.11.7
-+	github.com/alibabacloud-go/tea v1.5.2
 +	github.com/aliyun/credentials-go v1.4.13
  	github.com/aws/aws-sdk-go-v2 v1.30.3
  	github.com/aws/aws-sdk-go-v2/config v1.27.27
  	github.com/aws/aws-sdk-go-v2/credentials v1.17.27
-@@ -19,6 +23,10 @@ require (
+@@ -16,9 +17,26 @@ require (
+ 	google.golang.org/protobuf v1.36.11
+ )
+ 
++require (
++	github.com/clbanning/mxj/v2 v2.7.0 // indirect
++	github.com/gorilla/websocket v1.5.3 // indirect
++	github.com/json-iterator/go v1.1.12 // indirect
++	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
++	github.com/modern-go/reflect2 v1.0.2 // indirect
++	github.com/tjfoc/gmsm v1.4.1 // indirect
++	gopkg.in/ini.v1 v1.67.0 // indirect
++)
++
  require (
  	github.com/Azure/azure-sdk-for-go/sdk/internal v1.11.2 // indirect
  	github.com/AzureAD/microsoft-authentication-library-for-go v1.6.0 // indirect
 +	github.com/alibabacloud-go/alibabacloud-gateway-spi v0.0.5 // indirect
++	github.com/alibabacloud-go/darabonba-openapi/v2 v2.2.4
 +	github.com/alibabacloud-go/debug v1.0.1 // indirect
++	github.com/alibabacloud-go/ecs-20140526/v7 v7.11.7
 +	github.com/alibabacloud-go/openapi-util v0.1.1 // indirect
++	github.com/alibabacloud-go/tea v1.5.2
 +	github.com/alibabacloud-go/tea-utils/v2 v2.0.9 // indirect
  	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.16.11 // indirect
  	github.com/aws/aws-sdk-go-v2/internal/configsources v1.3.15 // indirect
  	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.6.15 // indirect
-@@ -28,15 +36,22 @@ require (
- 	github.com/aws/aws-sdk-go-v2/service/sso v1.22.4 // indirect
- 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.26.4 // indirect
- 	github.com/aws/aws-sdk-go-v2/service/sts v1.30.3 // indirect
-+	github.com/clbanning/mxj/v2 v2.7.0 // indirect
- 	github.com/golang-jwt/jwt/v5 v5.3.0 // indirect
- 	github.com/golang/protobuf v1.5.4 // indirect
- 	github.com/google/uuid v1.6.0 // indirect
-+	github.com/gorilla/websocket v1.5.3 // indirect
- 	github.com/jmespath/go-jmespath v0.4.0 // indirect
-+	github.com/json-iterator/go v1.1.12 // indirect
- 	github.com/kylelemons/godebug v1.1.0 // indirect
-+	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
-+	github.com/modern-go/reflect2 v1.0.2 // indirect
- 	github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c // indirect
-+	github.com/tjfoc/gmsm v1.4.1 // indirect
- 	golang.org/x/crypto v0.47.0 // indirect
- 	golang.org/x/net v0.49.0 // indirect
- 	golang.org/x/sys v0.40.0 // indirect
- 	golang.org/x/text v0.33.0 // indirect
- 	google.golang.org/genproto/googleapis/rpc v0.0.0-20240227224415-6ceb2ff114de // indirect
-+	gopkg.in/ini.v1 v1.67.0 // indirect
- )
 diff --git a/go.sum b/go.sum
-index cc2887e5..12aac17a 100644
+index 187db1d2..b1a6b15b 100644
 --- a/go.sum
 +++ b/go.sum
 @@ -1,3 +1,4 @@
@@ -571,11 +561,13 @@ index cc2887e5..12aac17a 100644
  github.com/aws/aws-sdk-go-v2 v1.30.3 h1:jUeBtG0Ih+ZIFH0F4UkmL9w3cSpaMv9tYYDbzILP8dY=
  github.com/aws/aws-sdk-go-v2 v1.30.3/go.mod h1:nIQjQVp5sfpQcTc9mPSr1B0PaWK5ByX9MOoDadSN4lc=
  github.com/aws/aws-sdk-go-v2/config v1.27.27 h1:HdqgGt1OAP0HkEDDShEl0oSYa9ZZBSOmKpdpsDMdO90=
-@@ -44,52 +94,240 @@ github.com/aws/aws-sdk-go-v2/service/sts v1.30.3 h1:ZsDKRLXGWHk8WdtyYMoGNO7bTudr
+@@ -44,40 +94,96 @@ github.com/aws/aws-sdk-go-v2/service/sts v1.30.3 h1:ZsDKRLXGWHk8WdtyYMoGNO7bTudr
  github.com/aws/aws-sdk-go-v2/service/sts v1.30.3/go.mod h1:zwySh8fpFyXp9yOr/KVzxOl8SRqgf/IDw5aUt9UKFcQ=
  github.com/aws/smithy-go v1.20.3 h1:ryHwveWzPV5BIof6fyDvor6V3iUL7nTfiTKXHiW05nE=
  github.com/aws/smithy-go v1.20.3/go.mod h1:krry+ya/rV9RDcV/Q16kpu6ypI4K2czasz0NC3qS14E=
 +github.com/census-instrumentation/opencensus-proto v0.2.1/go.mod h1:f6KPmirojxKA12rnyqOA5BBL4O983OfeGPqjHWSTneU=
+ github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=
+ github.com/cespare/xxhash/v2 v2.3.0/go.mod h1:VGX0DQ3Q6kWi7AoAeZDth3/j3BFtOZR5XLFGgcrjCOs=
 +github.com/clbanning/mxj/v2 v2.7.0 h1:WA/La7UGCanFe5NpHF0Q3DNtnCsVoxbPKuyBNHWRyME=
 +github.com/clbanning/mxj/v2 v2.7.0/go.mod h1:hNiWqW14h+kc+MdF9C6/YoRfjEJoR3ou6tn/Qo+ve2s=
 +github.com/client9/misspell v0.3.4/go.mod h1:qj6jICC3Q7zFZvVWo7KLAzC3yx5G7kyvSDkc90ppPyw=
@@ -588,6 +580,10 @@ index cc2887e5..12aac17a 100644
 +github.com/envoyproxy/go-control-plane v0.9.0/go.mod h1:YTl/9mNaCwkRvm6d1a2C3ymFceY/DCBVvsKhRF0iEA4=
 +github.com/envoyproxy/go-control-plane v0.9.4/go.mod h1:6rpuAdCZL397s3pYoYcLgu1mIlRU8Am5FuJP05cCM98=
 +github.com/envoyproxy/protoc-gen-validate v0.1.0/go.mod h1:iSmxcyjqTsJpI2R4NaDN7+kN2VEUnK/pcBlmesArF7c=
+ github.com/go-logr/logr v1.4.3 h1:CjnDlHq8ikf6E492q6eKboGOC0T8CDaOvkHCIg8idEI=
+ github.com/go-logr/logr v1.4.3/go.mod h1:9T104GzyrTigFIr8wt5mBrctHMim0Nb2HLGrmQ40KvY=
+ github.com/go-logr/stdr v1.2.2 h1:hSWxHoqTgW2S2qGc0LTAI563KZ5YKYRhT3MFKZMbjag=
+ github.com/go-logr/stdr v1.2.2/go.mod h1:mMo/vtBO5dYbehREoey6XUKy/eSumjCCveDpRre4VKE=
  github.com/golang-jwt/jwt/v5 v5.3.0 h1:pv4AsKCKKZuqlgs5sUmn4x8UlGa0kEVt/puTpKx9vvo=
  github.com/golang-jwt/jwt/v5 v5.3.0/go.mod h1:fxCRLWMO43lRc8nhHWY6LGqRcf+1gQWArsqaEUEa5bE=
 +github.com/golang/glog v0.0.0-20160126235308-23def4e6c14b/go.mod h1:SBH7ygxi8pfUlaOkMMuAQtPIUF8ecWP5IEl/CR7VP2Q=
@@ -607,8 +603,9 @@ index cc2887e5..12aac17a 100644
 +github.com/google/go-cmp v0.3.0/go.mod h1:8QqcDgzrUqlUb/G2PQTWiueGozuR1884gddMywk6iLU=
 +github.com/google/go-cmp v0.3.1/go.mod h1:8QqcDgzrUqlUb/G2PQTWiueGozuR1884gddMywk6iLU=
 +github.com/google/go-cmp v0.4.0/go.mod h1:v8dTdLbMG2kIc/vJvl+f65V22dbkXbowE6jgT/gNBxE=
- github.com/google/go-cmp v0.6.0 h1:ofyhxvXcZhMsU5ulbFiLKl/XBFqE1GSq7atu8tAmTRI=
- github.com/google/go-cmp v0.6.0/go.mod h1:17dUlkBOakJ0+DkrSSNjCkIjxS6bF9zb3elmeNGIjoY=
++github.com/google/go-cmp v0.6.0/go.mod h1:17dUlkBOakJ0+DkrSSNjCkIjxS6bF9zb3elmeNGIjoY=
+ github.com/google/go-cmp v0.7.0 h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=
+ github.com/google/go-cmp v0.7.0/go.mod h1:pXiqmnSA92OHEEa9HXL2W4E7lf9JzCmGVUdgjX3N/iU=
 +github.com/google/gofuzz v1.0.0/go.mod h1:dBl0BpW6vV/+mYPU4Po3pmUjxk6FQPldtuIdl/M65Eg=
  github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=
  github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=
@@ -658,6 +655,13 @@ index cc2887e5..12aac17a 100644
 +github.com/yuin/goldmark v1.1.27/go.mod h1:3hX8gzYuyVAZsxl0MRgGTJEmQBFcNTphYh9decYSb74=
 +github.com/yuin/goldmark v1.1.30/go.mod h1:3hX8gzYuyVAZsxl0MRgGTJEmQBFcNTphYh9decYSb74=
 +github.com/yuin/goldmark v1.4.13/go.mod h1:6yULJ656Px+3vBD8DxQVa3kxgyrAnzto9xy5taEt/CY=
+ go.opentelemetry.io/auto/sdk v1.2.1 h1:jXsnJ4Lmnqd11kwkBV2LgLoFMZKizbCi5fNZ/ipaZ64=
+ go.opentelemetry.io/auto/sdk v1.2.1/go.mod h1:KRTj+aOaElaLi+wW1kO/DZRXwkF4C5xPbEe3ZiIhN7Y=
+ go.opentelemetry.io/otel v1.44.0 h1:JjwHmHpA4iZ3wBxluu2fbbE7j4kqlE8jXyAyPXH7HqU=
+@@ -90,26 +196,159 @@ go.opentelemetry.io/otel/sdk/metric v1.44.0 h1:3LlKgI+VjbVsjNRFZJZAJ30WjXC5VkNRk
+ go.opentelemetry.io/otel/sdk/metric v1.44.0/go.mod h1:5B5pMARnXxKhltooO4xUuCBorl65a4EpnTalObqOigA=
+ go.opentelemetry.io/otel/trace v1.44.0 h1:jxF5CsGYCe74MCRx2X4g7WsY/VBKRqqpNvXlX/6gtIk=
+ go.opentelemetry.io/otel/trace v1.44.0/go.mod h1:oLl1jrMQAVo6v3GAggN+1VH9VIz9iUSvW53sW1Q8PIE=
 +golang.org/x/crypto v0.0.0-20190308221718-c2843e01d9a2/go.mod h1:djNgcEr1/C05ACkg1iLfiJU5Ep61QUkGW8qpdssI0+w=
 +golang.org/x/crypto v0.0.0-20191011191535-87dc89f01550/go.mod h1:yigFU9vqHzYiE8UmvKecakEJjdnWj3jj499lnFckfCI=
 +golang.org/x/crypto v0.0.0-20191219195013-becbf705a915/go.mod h1:LzIPMQfyMNhhGPhUkYOs5KpL4U8rLKemX1yGLhDgUto=
@@ -672,8 +676,8 @@ index cc2887e5..12aac17a 100644
 +golang.org/x/crypto v0.21.0/go.mod h1:0BP7YvVV9gBbVKyeTG0Gyn+gZm94bibOW5BjDEYAOMs=
 +golang.org/x/crypto v0.23.0/go.mod h1:CKFgDieR+mRhux2Lsu27y0fO304Db0wZe70UKqHu0v8=
 +golang.org/x/crypto v0.24.0/go.mod h1:Z1PMYSOR5nyMcyAVAIQSKCDwalqy85Aqn1x3Ws4L5DM=
- golang.org/x/crypto v0.47.0 h1:V6e3FRj+n4dbpw86FJ8Fv7XVOql7TEwpHapKoMJ/GO8=
- golang.org/x/crypto v0.47.0/go.mod h1:ff3Y9VzzKbwSSEzWqJsJVBnWmRwRSHt/6Op5n9bQc4A=
+ golang.org/x/crypto v0.57.0 h1:3ZVCjf8Ggz7zneR/EHRVx68Ctf+2pmIMP2UFhh9cC6M=
+ golang.org/x/crypto v0.57.0/go.mod h1:Fdz0i5U6CoizGwLda9DttjSk6qlZo25zYNtR+ycvuZA=
 +golang.org/x/exp v0.0.0-20190121172915-509febef88a4/go.mod h1:CJ0aWSM057203Lf6IL+f9T1iT9GByDxfZKAQTCR3kQA=
 +golang.org/x/lint v0.0.0-20181026193005-c67002cb31c3/go.mod h1:UVdnD1Gm6xHRNCYTkRU2/jEulfH38KcIWyp/GAMgvoE=
 +golang.org/x/lint v0.0.0-20190227174305-5b3e6a55c961/go.mod h1:wehouNa3lNwaWXcvxsM5YxQ5yQlVC4a0KAMCusXpPoU=
@@ -705,8 +709,8 @@ index cc2887e5..12aac17a 100644
 +golang.org/x/net v0.23.0/go.mod h1:JKghWKKOSdJwpW2GEx0Ja7fmaKnMsbu+MWVZTokSYmg=
 +golang.org/x/net v0.25.0/go.mod h1:JkAGAh7GEvH74S6FOH42FLoXpXbE/aqXSrIQjXgsiwM=
 +golang.org/x/net v0.26.0/go.mod h1:5YKkiSynbBIh3p6iOc/vibscux0x38BZDkn8sCUPxHE=
- golang.org/x/net v0.49.0 h1:eeHFmOGUTtaaPSGNmjBKpbng9MulQsJURQUAfUwY++o=
- golang.org/x/net v0.49.0/go.mod h1:/ysNB2EvaqvesRkuLAyjI1ycPZlQHM3q01F02UY/MV8=
+ golang.org/x/net v0.60.0 h1:79p50tfZlm0J9YfoDsSi639qSXNGVwEzOPLCxM2FsYU=
+ golang.org/x/net v0.60.0/go.mod h1:2DA/G1UfVbCpQPeWTmMPGY7Cs2PkBkwu743bVX5PIVg=
 +golang.org/x/oauth2 v0.0.0-20180821212333-d2e6202438be/go.mod h1:N/0e6XlmueqKjAGxoOufVs8QHGRruUQn6yWY3a++T0U=
 +golang.org/x/sync v0.0.0-20180314180146-1d60e4601c6f/go.mod h1:RxMgew5VJxzue5/jJTE5uejpjVlOe/izrB70Jof72aM=
 +golang.org/x/sync v0.0.0-20181108010431-42b317875d0f/go.mod h1:RxMgew5VJxzue5/jJTE5uejpjVlOe/izrB70Jof72aM=
@@ -738,8 +742,8 @@ index cc2887e5..12aac17a 100644
 +golang.org/x/sys v0.18.0/go.mod h1:/VUhepiaJMQUp4+oa/7Zr1D23ma6VTLIYjOOTFZPUcA=
 +golang.org/x/sys v0.20.0/go.mod h1:/VUhepiaJMQUp4+oa/7Zr1D23ma6VTLIYjOOTFZPUcA=
 +golang.org/x/sys v0.21.0/go.mod h1:/VUhepiaJMQUp4+oa/7Zr1D23ma6VTLIYjOOTFZPUcA=
- golang.org/x/sys v0.40.0 h1:DBZZqJ2Rkml6QMQsZywtnjnnGvHza6BTfYFWY9kjEWQ=
- golang.org/x/sys v0.40.0/go.mod h1:OgkHotnGiDImocRcuBABYBEXf8A9a87e/uXjp9XT3ks=
+ golang.org/x/sys v0.48.0 h1:bbX/i/6MgT9BVLM9RT1thmxL04yeTAhbEz4SyadbXoo=
+ golang.org/x/sys v0.48.0/go.mod h1:hNLxWAXmnKAxqDtdwIYC4bM9oQPEecfsnNMuSxOs3og=
 +golang.org/x/telemetry v0.0.0-20240228155512-f48c80bd79b2/go.mod h1:TeRTkGYfJXctD9OcfyVLyj2J3IxLnKwHJR8f4D8a3YE=
 +golang.org/x/term v0.0.0-20201126162022-7de9c90e9dd1/go.mod h1:bj7SfCRtBDWHUb9snDiAeCFNEtKQo2Wmx5Cou7ajbmo=
 +golang.org/x/term v0.0.0-20210927222741-03fcf44c2211/go.mod h1:jbD1KX2456YbFQfuXm/mYQcufACuNUgVhRMnK/tPxf8=
@@ -762,8 +766,8 @@ index cc2887e5..12aac17a 100644
 +golang.org/x/text v0.14.0/go.mod h1:18ZOQIKpY8NJVqYksKHtTdi31H5itFRjB5/qKTNYzSU=
 +golang.org/x/text v0.15.0/go.mod h1:18ZOQIKpY8NJVqYksKHtTdi31H5itFRjB5/qKTNYzSU=
 +golang.org/x/text v0.16.0/go.mod h1:GhwF1Be+LQoKShO3cGOHzqOgRrGaYc9AvblQOmPVHnI=
- golang.org/x/text v0.33.0 h1:B3njUFyqtHDUI5jMn1YIr5B0IE2U0qck04r6d4KPAxE=
- golang.org/x/text v0.33.0/go.mod h1:LuMebE6+rBincTi9+xWTY8TztLzKHc/9C1uBCG27+q8=
+ golang.org/x/text v0.42.0 h1:JbOZXgfeCPU9gacVtYliJqOhD+zhrEqK4LfdpmlUZqI=
+ golang.org/x/text v0.42.0/go.mod h1:ojzP1Z+2QtioaF8DTtO8K5q7JWVVYwZKenzujK0Zd0E=
 +golang.org/x/tools v0.0.0-20180917221912-90fa682c2a6e/go.mod h1:n7NCudcB/nEzxVGmLbDWY5pfWTLqBcC2KZ6jyYvM4mQ=
 +golang.org/x/tools v0.0.0-20190114222345-bf090417da8b/go.mod h1:n7NCudcB/nEzxVGmLbDWY5pfWTLqBcC2KZ6jyYvM4mQ=
 +golang.org/x/tools v0.0.0-20190226205152-f727befe758c/go.mod h1:9Yl7xja0Znq3iFh3HoIrodX9oNMXvdceNzlUR8zjMvY=
@@ -779,26 +783,28 @@ index cc2887e5..12aac17a 100644
 +golang.org/x/xerrors v0.0.0-20190717185122-a985d3407aa7/go.mod h1:I/5z698sn9Ka8TeJc9MKroUUfqBBauWjQqLJ2OPfmY0=
 +golang.org/x/xerrors v0.0.0-20191011141410-1b5146add898/go.mod h1:I/5z698sn9Ka8TeJc9MKroUUfqBBauWjQqLJ2OPfmY0=
 +golang.org/x/xerrors v0.0.0-20191204190536-9bdfabe68543/go.mod h1:I/5z698sn9Ka8TeJc9MKroUUfqBBauWjQqLJ2OPfmY0=
+ gonum.org/v1/gonum v0.17.0 h1:VbpOemQlsSMrYmn7T2OUvQ4dqxQXU+ouZFQsZOx50z4=
+ gonum.org/v1/gonum v0.17.0/go.mod h1:El3tOrEuMpv2UdMrbNlKEh9vd86bmQ6vqIcDwxEOc1E=
 +google.golang.org/appengine v1.1.0/go.mod h1:EbEs0AVv82hx2wNQdGPgUI5lhzA/G0D9YwlJXL52JkM=
 +google.golang.org/appengine v1.4.0/go.mod h1:xpcJRLb0r/rnEns0DIKYYv+WjYCduHsrkT7/EB5XEv4=
 +google.golang.org/genproto v0.0.0-20180817151627-c66870c02cf8/go.mod h1:JiN7NxoALGmiZfu7CAH4rXhgtRTLTxftemlI0sWmxmc=
 +google.golang.org/genproto v0.0.0-20190819201941-24fa4b261c55/go.mod h1:DMBHOl98Agz4BDEuKkezgsaosCRResVns1a3J2ZsMNc=
- google.golang.org/genproto/googleapis/rpc v0.0.0-20240227224415-6ceb2ff114de h1:cZGRis4/ot9uVm639a+rHCUaG0JJHEsdyzSQTMX+suY=
- google.golang.org/genproto/googleapis/rpc v0.0.0-20240227224415-6ceb2ff114de/go.mod h1:H4O17MA/PE9BsGx3w+a+W2VOLLD1Qf7oJneAoU6WktY=
+ google.golang.org/genproto/googleapis/rpc v0.0.0-20260526163538-3dc84a4a5aaa h1:mZHHdPZl0dbGHCflZgAq/Q468DWVFcU2whhB2KAo8fk=
+ google.golang.org/genproto/googleapis/rpc v0.0.0-20260526163538-3dc84a4a5aaa/go.mod h1:4Hqkh8ycfw05ld/3BWL7rJOSfebL2Q+DVDeRgYgxUU8=
 +google.golang.org/grpc v1.19.0/go.mod h1:mqu4LbDTu4XGKhr4mRzUsmM4RtVoemTSY81AxZiDr8c=
 +google.golang.org/grpc v1.23.0/go.mod h1:Y5yQAOtifL1yxbo5wqy6BxZv8vAUGQwXBOALyacEbxg=
 +google.golang.org/grpc v1.25.1/go.mod h1:c3i+UQWmh7LiEpx4sFZnkU36qjEYZ0imhYfXVyQciAY=
 +google.golang.org/grpc v1.31.0/go.mod h1:N36X2cJ7JwdamYAgDz+s+rVMFjt3numwzf/HckM8pak=
- google.golang.org/grpc v1.63.2 h1:MUeiw1B2maTVZthpU5xvASfTh3LDbxHd6IJ6QQVU+xM=
- google.golang.org/grpc v1.63.2/go.mod h1:WAX/8DgncnokcFUldAxq7GeB5DXHDbMF+lLvDomNkRA=
+ google.golang.org/grpc v1.83.2 h1:EManeRomTObA0BU7I8vXgg/78uE5MJ9M8B39EX2WscU=
+ google.golang.org/grpc v1.83.2/go.mod h1:YPI1hK3kDked6iHvgX3tR0y+nX/qpMFKhPgFsokw1S8=
 +google.golang.org/protobuf v0.0.0-20200109180630-ec00e32a8dfd/go.mod h1:DFci5gLYBciE7Vtevhsrf46CRTquxDuWsQurQQe4oz8=
 +google.golang.org/protobuf v0.0.0-20200221191635-4d8936d0db64/go.mod h1:kwYJMbMJ01Woi6D6+Kah6886xMZcty6N08ah7+eCXa0=
 +google.golang.org/protobuf v0.0.0-20200228230310-ab0ca4ff8a60/go.mod h1:cfTl7dwQJ+fmap5saPgwCLgHXTUD7jkjRqWcaiX5VyM=
 +google.golang.org/protobuf v1.20.1-0.20200309200217-e05f789c0967/go.mod h1:A+miEFZTKqfCUM6K7xSMQL9OKL/b6hQv+e19PK+JZNE=
 +google.golang.org/protobuf v1.21.0/go.mod h1:47Nbq4nVaFHyn7ilMalzfO3qCViNmqZ2kzikPIcrTAo=
 +google.golang.org/protobuf v1.23.0/go.mod h1:EGpADcykh3NcUnDUJcl1+ZksZNG86OlYog2l/sGQquU=
- google.golang.org/protobuf v1.33.0 h1:uNO2rsAINq/JlFpSdYEKIZ0uKD/R9cpdv0T+yoGwGmI=
- google.golang.org/protobuf v1.33.0/go.mod h1:c6P6GXX6sHbq/GpV6MGZEdwhWPcYBgnhAHhKbcUYpos=
+ google.golang.org/protobuf v1.36.11 h1:fV6ZwhNocDyBLK0dj+fg8ektcVegBBuEolpbTQyBNVE=
+ google.golang.org/protobuf v1.36.11/go.mod h1:HTf+CrKn2C3g5S8VImy6tdcUvCska2kB7j23XfzDpco=
  gopkg.in/check.v1 v0.0.0-20161208181325-20d25e280405/go.mod h1:Co6ibVJAznAaIkqp8huTwlJQCZ016jof/cbN4VW5Yz0=
 +gopkg.in/check.v1 v1.0.0-20200227125254-8fa46927fb4f/go.mod h1:Co6ibVJAznAaIkqp8huTwlJQCZ016jof/cbN4VW5Yz0=
 +gopkg.in/ini.v1 v1.56.0/go.mod h1:pNLf8WUiyNEtQjuu5G5vTm06TEv9tsIgeAvK8hOrP4k=
@@ -814,10 +820,10 @@ index cc2887e5..12aac17a 100644
 +honnef.co/go/tools v0.0.0-20190523083050-ea95bdfd59fc/go.mod h1:rf3lG4BRIbNafJWhAfAdb/ePZxsR/4RtNHQocxwk9r4=
 diff --git a/pkg/provider/alibabacloud/credentials_test.go b/pkg/provider/alibabacloud/credentials_test.go
 new file mode 100644
-index 00000000..7a4a29ea
+index 00000000..62348ecb
 --- /dev/null
 +++ b/pkg/provider/alibabacloud/credentials_test.go
-@@ -0,0 +1,89 @@
+@@ -0,0 +1,94 @@
 +// (C) Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -828,6 +834,7 @@ index 00000000..7a4a29ea
 +	"crypto/tls"
 +	"crypto/x509"
 +	"encoding/json"
++	"github.com/aliyun/credentials-go/credentials"
 +	"net"
 +	"net/http"
 +	"net/http/httptest"
@@ -840,6 +847,10 @@ index 00000000..7a4a29ea
 +)
 +
 +func TestSDKCredentialCacheSurvivesProviderRecreation(t *testing.T) {
++	previousCredential := defaultCredential
++	defaultCredential = credentials.FromCredentialsProvider("default", &serializedCredentials{})
++	t.Cleanup(func() { defaultCredential = previousCredential })
++
 +	var stsCalls atomic.Int64
 +	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 +		_ = r.ParseForm()
@@ -909,10 +920,10 @@ index 00000000..7a4a29ea
 +}
 diff --git a/pkg/provider/alibabacloud/provider.go b/pkg/provider/alibabacloud/provider.go
 new file mode 100644
-index 00000000..abb2316a
+index 00000000..843fff42
 --- /dev/null
 +++ b/pkg/provider/alibabacloud/provider.go
-@@ -0,0 +1,296 @@
+@@ -0,0 +1,314 @@
 +// (C) Copyright Confidential Containers Contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -924,6 +935,7 @@ index 00000000..abb2316a
 +	"encoding/json"
 +	"errors"
 +	"fmt"
++	"os"
 +	"sync"
 +	"time"
 +
@@ -958,21 +970,35 @@ index 00000000..abb2316a
 +// controller process environment; retain the SDK object so its normal refresh
 +// cache survives those provider instances. Product/region settings stay local.
 +type serializedCredentials struct {
-+	providers.CredentialsProvider
-+	mu sync.Mutex
++	mu       sync.Mutex
++	provider providers.CredentialsProvider
 +}
++
++func (p *serializedCredentials) GetProviderName() string { return "default" }
 +
 +func (p *serializedCredentials) GetCredentials() (*providers.Credentials, error) {
 +	p.mu.Lock()
 +	defer p.mu.Unlock()
-+	return p.CredentialsProvider.GetCredentials()
++	source := p.provider
++	if source == nil {
++		if os.Getenv("ALIBABA_CLOUD_OIDC_TOKEN_FILE") != "" {
++			oidc, err := providers.NewOIDCCredentialsProviderBuilder().Build()
++			if err != nil {
++				return nil, err
++			}
++			source = oidc
++		} else {
++			source = providers.NewDefaultCredentialsProvider()
++		}
++	}
++	creds, err := source.GetCredentials()
++	if err == nil {
++		p.provider = source
++	}
++	return creds, err
 +}
 +
-+var defaultCredential = sync.OnceValue(func() credentials.Credential {
-+	return credentials.FromCredentialsProvider("default", &serializedCredentials{
-+		CredentialsProvider: providers.NewDefaultCredentialsProvider(),
-+	})
-+})
++var defaultCredential = credentials.FromCredentialsProvider("default", &serializedCredentials{})
 +
 +func init() {
 +	provider.RegisterProvider("alibabacloud", func(params map[string]string) (provider.BlockVolumeProvider, error) {
@@ -990,7 +1016,7 @@ index 00000000..abb2316a
 +	return &AlibabaCloudProvider{
 +		config: Config{Region: params["region"], Zone: params["zoneId"], ClusterID: params["clusterId"]},
 +		sdk: openapi.Config{
-+			RegionId: tea.String(params["region"]), Credential: defaultCredential(),
++			RegionId: tea.String(params["region"]), Credential: defaultCredential,
 +			ReadTimeout: tea.Int(30000), ConnectTimeout: tea.Int(10000),
 +		},
 +	}, nil
@@ -1081,7 +1107,8 @@ index 00000000..abb2316a
 +	if err != nil || disk == nil {
 +		return err
 +	}
-+	if tea.StringValue(disk.InstanceId) != "" || tea.StringValue(disk.Status) == "In_use" {
++	status := tea.StringValue(disk.Status)
++	if tea.StringValue(disk.InstanceId) != "" || status == "In_use" || status == "Attaching" || status == "Detaching" {
 +		return fmt.Errorf("disk %s is attached", tea.StringValue(disk.DiskId))
 +	}
 +	client, err := p.client()
@@ -1146,7 +1173,9 @@ index 00000000..abb2316a
 +	}
 +	volumes := make([]*provider.VolumeInfo, 0, len(disks))
 +	for _, disk := range disks {
-+		if !diskReady(disk) {
++		switch tea.StringValue(disk.Status) {
++		case "Available", "In_use", "Attaching", "Detaching":
++		default:
 +			continue
 +		}
 +		if info := volumeInfo(disk); info.VolumeID != "" {
@@ -1202,7 +1231,7 @@ index 00000000..abb2316a
 +
 +func bytesToGiB(size int64) (int32, error) {
 +	if size < 0 || size > 65536*gib {
-+		return 0, errors.New("ESSD PL0 size must be between 1 and 65536 GiB")
++		return 0, fmt.Errorf("%w: ESSD PL0 size must be between 1 and 65536 GiB", provider.ErrCapacityOutOfRange)
 +	}
 +	if size == 0 {
 +		return 1, nil
@@ -1416,5 +1445,5 @@ index 00000000..acfcfcf4
 +	}
 +}
 -- 
-2.43.0
+2.43.7
 

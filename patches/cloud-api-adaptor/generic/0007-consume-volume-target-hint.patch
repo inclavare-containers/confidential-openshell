@@ -1,4 +1,4 @@
-From c2dec96df60f95e324c7c6f3b9e863918f9e1b1d Mon Sep 17 00:00:00 2001
+From 88870ddc5f0b46019d956158c6bef1f0d2d8705a Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
 Date: Wed, 4 Nov 2026 22:40:18 +0800
 Subject: [PATCH] forwarder: consume the internal volume target hint
@@ -10,15 +10,15 @@ reject unexpected annotations; this transport hint is not an agent input.
 Signed-off-by: Weidong Sun <sunweidong@linux.alibaba.com>
 Co-authored-by: Codex <noreply@openai.com>
 ---
- src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go      | 1 +
- src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor_test.go | 2 ++
+ src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go  | 1 +
+ .../pkg/forwarder/interceptor/interceptor_test.go               | 2 ++
  2 files changed, 3 insertions(+)
 
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
-index d47fd4e9..f9131e1d 100644
+index fc8bd9eb..8b04ffa5 100644
 --- a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
-@@ -208,6 +208,7 @@ func (i *interceptor) CreateContainer(ctx context.Context, req *pb.CreateContain
+@@ -223,6 +223,7 @@ func (i *interceptor) CreateContainer(ctx context.Context, req *pb.CreateContain
  	}
  
  	volumeTargetPath := req.OCI.Annotations[volumeTargetPathKey]
@@ -27,7 +27,7 @@ index d47fd4e9..f9131e1d 100644
  	if len(req.OCI.Mounts) > 0 {
  		for _, m := range req.OCI.Mounts {
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor_test.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor_test.go
-index 8aa4d6c2..44b1bd4c 100644
+index 7983a5e4..f0580969 100644
 --- a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor_test.go
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor_test.go
 @@ -165,6 +165,7 @@ func TestInterceptorCreateContainer(t *testing.T) {
@@ -48,3 +48,4 @@ index 8aa4d6c2..44b1bd4c 100644
  		found := false
 -- 
 2.43.7
+

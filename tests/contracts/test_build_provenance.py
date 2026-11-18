@@ -101,14 +101,14 @@ class ProvenanceTests(unittest.TestCase):
             self.assertIn('missing or mismatched upstream', output.getvalue())
 
     def test_release_refuses_missing_selected_patch_input(self):
-        self.put('artifacts/containerd-shim-kata-v2')
+        self.put('artifacts/images/csi.tar')
         lock = self.root / 'deployment/build/sources.lock.json'
         lock.parent.mkdir(parents=True)
         lock.write_text('{}')
         observed = {name: {'upstream_checkout': 'verified'} for name in
                     ['openshell', 'cloud-api-adaptor', 'caa-csi-block-driver']}
-        observed['kata-containers'] = {'patch_check': 'not_present'}
-        with patch('sys.argv', ['manifest.py', '--profile', 'release', '--artifact', 'kata-shim=artifacts/containerd-shim-kata-v2']), patch.object(manifest, 'git', return_value=''), patch.object(manifest, 'inventory', return_value=observed):
+        observed['caa-csi-block-driver']['patch_check'] = 'not_present'
+        with patch('sys.argv', ['manifest.py', '--profile', 'release', '--artifact', 'csi-image-archive=artifacts/images/csi.tar']), patch.object(manifest, 'git', return_value=''), patch.object(manifest, 'inventory', return_value=observed):
             with contextlib.redirect_stderr(io.StringIO()) as output, self.assertRaises(SystemExit):
                 manifest.main()
             self.assertIn('missing or mismatched patched input', output.getvalue())
@@ -174,7 +174,7 @@ class StrictTestSourceChecks(unittest.TestCase):
             (root / 'deployment/artifacts.lock.json').write_text('{}')
             (root / 'deployment/runtime').mkdir()
             (root / 'deployment/runtime/artifacts.lock.json').write_text('{}')
-            lock = {'schema': 1, 'kata-containers': {'base': '0' * 40, 'result_tree': '0' * 40}}
+            lock = {'schema': 1}
             for name in ['openshell', 'cloud-api-adaptor', 'caa-csi-block-driver']:
                 source = root / 'repos' / name
                 source.mkdir(parents=True)
@@ -223,14 +223,12 @@ class StrictTestSourceChecks(unittest.TestCase):
             self.run_git(target, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
                          'commit', '--allow-empty', '-qm', 'wrong base')
 
-    def test_verified_required_sources_allow_absent_kata(self):
+    def test_verified_required_sources_complete_inventory(self):
         with self.sources() as root:
             result = self.check(root)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn('Kata patch check: not_run', result.stderr)
             report = json.loads(result.stdout)
-            self.assertFalse(report['source_inventory_complete'])
-            self.assertEqual(report['sources']['kata-containers']['patch_check'], 'not_present')
+            self.assertTrue(report['source_inventory_complete'])
             self.assertEqual(report['sources']['peerpod-ctrl']['source_repository'], 'cloud-api-adaptor')
             self.assertEqual(report['sources']['peerpod-ctrl']['upstream_checkout'], 'verified')
             self.assertEqual(report['sources']['peerpod-ctrl']['patch_check'], 'verified')

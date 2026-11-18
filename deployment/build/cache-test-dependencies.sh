@@ -2,7 +2,10 @@
 usage='Usage: bash deployment/build/cache-test-dependencies.sh
 Fetch locked Cargo and Go modules before running the offline test suite.'
 source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
-need cargo go
+need cargo go tar zstd curl jq sha256sum
+mkdir -p artifacts/cache/kata-policy
+release_download kata_tools "$ROOT/artifacts/cache/kata-tools.tar.zst"
+tar -I zstd -xOf artifacts/cache/kata-tools.tar.zst ./opt/kata/share/defaults/kata-containers/rules.rego > artifacts/cache/kata-policy/rules.rego
 cargo fetch --locked
 for component in cloud-api-adaptor peerpod-ctrl caa-csi-block-driver; do
   bash deployment/build/prepare-sources.sh "$component"

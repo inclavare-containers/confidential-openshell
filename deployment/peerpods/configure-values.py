@@ -51,7 +51,7 @@ def main():
     )
     peer['resourceCtrl']['image']['repository'], peer['resourceCtrl']['image']['tag'] = split('peerpod-ctrl')
     peer['webhook']['image']['repository'], peer['webhook']['image']['tag'] = split('peerpod_webhook')
-    peer['kata-deploy']['image']['reference'] = image('kata-deploy')
+    peer['kata-deploy']['image']['reference'] = image('kata_deploy')
     peer['kata-deploy']['kubectlImage'] = {'reference': image('kata_kubectl'), 'tag': ''}
     peer['kata-deploy']['containerd']['userDropIn'] = (
         '[plugins."io.containerd.cri.v1.images".pinned_images]\n'

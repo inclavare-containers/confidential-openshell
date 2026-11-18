@@ -38,6 +38,7 @@ pub fn supervisor_pod(
     provider_spiffe_socket_path: Option<&str>,
     owner: OwnerReference,
     tracing_environment: &[(&str, String)],
+    attach_request_timeout_seconds: Option<u64>,
 ) -> Result<Pod, String> {
     let mut pod = upstream::supervisor_pod(
         namespace,
@@ -63,8 +64,10 @@ pub fn supervisor_pod(
         proxy_connect_by_hostname,
         upstream_proxy_ca_bundle_staged,
         provider_spiffe_socket_path,
+        None,
         owner,
         tracing_environment,
+        attach_request_timeout_seconds,
     )?;
     let spec = pod.spec.as_mut().expect("native supervisor Pod has a spec");
     spec.enable_service_links = Some(false);
@@ -88,7 +91,7 @@ pub fn supervisor_pod(
     // Explicit image groups keep containerd and genpolicy aligned for guest pull.
     security.supplemental_groups = Some(vec![0]);
     // Kata Memory EmptyDir uses guest tmpfs, keeping sockets, TLS state and logs
-    // off host-backed volumes. Kata 4.2 does not forward its sizeLimit.
+    // off host-backed volumes.
     for volume in spec.volumes.as_mut().expect("native supervisor volumes") {
         if matches!(volume.name.as_str(), "run" | "logs") {
             volume
@@ -132,6 +135,7 @@ mod tests {
             None,
             sandbox_owner_reference("demo", "uid-1", "agents.x-k8s.io/v1beta1", false),
             &[],
+            None,
         )
         .expect("render supervisor Pod");
         let spec = pod.spec.as_ref().expect("supervisor spec");

@@ -49,12 +49,9 @@ for module, name in delegates.items():
             or 'pub use upstream::*;' not in entry.read_text()):
         raise SystemExit(f'upstream implementation must be delegated directly: {module}')
 print(f"delegated to pinned upstream: {', '.join(sorted(delegates))}")
-for file in sorted((source / 'src').glob('*.rs')):
-    if file.stem in shared or file.name == 'lifecycle_tests.rs':
-        continue
-    target = local / 'src' / file.name
-    if not target.is_file():
-        raise SystemExit(f'missing derived source: {target}')
+for name in ('driver.rs', 'main.rs', 'image_update.rs', 'lifecycle_tests.rs'):
+    file = source / 'src' / name
+    target = local / 'src' / name
     result = subprocess.run(['git', 'diff', '--no-index', '--stat', '--',
                              str(file), str(target)])
     if result.returncode not in (0, 1):

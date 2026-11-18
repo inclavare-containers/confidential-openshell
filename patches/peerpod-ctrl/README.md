@@ -1,7 +1,7 @@
 # PeerPod controller patch selection
 
 The controller is part of CAA. Its independent queue applies the
-[exact-absence error-handling fix](../cloud-api-adaptor/generic/0004-alibabacloud-confirm-delete-absence.patch):
+[exact-absence error-handling fix](../cloud-api-adaptor/generic/0002-alibabacloud-confirm-delete-absence.patch):
 preserve deletion errors unless a typed response confirms that the target instance
 does not exist, and handle non-SDK errors without a type-assertion panic.
 

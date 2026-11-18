@@ -1,8 +1,8 @@
 # Upstream Ubuntu TDX guest
 
-The main profile uses CAA v0.23.0's official Ubuntu mkosi image definitions,
+The main profile uses the locked CAA main revision's Ubuntu mkosi image definitions,
 production profile, UKI boot and SquashFS dm-verity root. Released CoCo guest
-components at the locked upstream commit provide the TDX AA and CDH. Kata agent 4.2.0 and pause remain
+components at the locked upstream commit provide the TDX AA and CDH. Kata agent 4.4.0 and pause remain
 unmodified released binaries. `deployment/artifacts.lock.json` pins source,
 OCI artifacts and binary hashes.
 

@@ -1,4 +1,4 @@
-From 7bb1c70087f6a8f8519ac2e746cbbedfba1d3a4b Mon Sep 17 00:00:00 2001
+From 128dd506ccc9ec285e854ff83fc3ec522a6cce9b Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
 Date: Tue, 3 Nov 2026 20:11:26 +0800
 Subject: [PATCH] volumes: apply fsGroup to retained contents
@@ -8,9 +8,9 @@ Apply group ownership and access on root mismatch. Preserve private file modes o
 Signed-off-by: Weidong Sun <sunweidong@linux.alibaba.com>
 Co-authored-by: Codex <noreply@openai.com>
 ---
- .../pkg/forwarder/interceptor/fsgroup.go           | 74 +++++++++++++++++
- .../pkg/forwarder/interceptor/fsgroup_test.go      | 97 ++++++++++++++++++++++
- .../pkg/forwarder/interceptor/interceptor.go       | 12 +--
+ .../pkg/forwarder/interceptor/fsgroup.go      | 74 ++++++++++++++
+ .../pkg/forwarder/interceptor/fsgroup_test.go | 97 +++++++++++++++++++
+ .../pkg/forwarder/interceptor/interceptor.go  | 12 +--
  3 files changed, 173 insertions(+), 10 deletions(-)
  create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/fsgroup.go
  create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/fsgroup_test.go
@@ -199,10 +199,10 @@ index 00000000..2a2a345f
 +	}
 +}
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
-index a5b3cfbe..b32afaf7 100644
+index 777d4fe6..acd27396 100644
 --- a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
-@@ -185,16 +185,8 @@ func (i *interceptor) CreateContainer(ctx context.Context, req *pb.CreateContain
+@@ -200,16 +200,8 @@ func (i *interceptor) CreateContainer(ctx context.Context, req *pb.CreateContain
  			}
  			i.cloudMountPaths = append(i.cloudMountPaths, hostMountPoint)
  
@@ -222,5 +222,5 @@ index a5b3cfbe..b32afaf7 100644
  
  			rewrote := false
 -- 
-2.43.0
+2.43.7
 

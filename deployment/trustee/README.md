@@ -1,6 +1,6 @@
 # Upstream Trustee
 
-The runtime uses two official Trustee images from a pinned post-v0.22.0 commit.
+The runtime uses official Trustee v0.23.0 AS and KBS images.
 [The runtime lock](../runtime/artifacts.lock.json) records the exact commit in
 `sources.trustee` and image digests in `images.trustee_as` and
 `images.trustee_kbs`. The gRPC AS includes BuiltIn RVPS. Its administrative API

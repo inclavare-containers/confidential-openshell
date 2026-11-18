@@ -39,15 +39,15 @@ def verify_ear(token, public_key):
     if claims.get('iat', time.time() + 60) > time.time() + 30 or claims.get('exp', 0) <= time.time() + 5:
         raise ValueError('expired or future EAR')
     cpu = claims['submods']['cpu0']
-    if cpu.get('ear.status') != 'affirming' or cpu.get('ear.appraisal-policy-id') != 'openshell-tdx':
+    if cpu.get('ear_status') != 'affirming' or cpu.get('ear_appraisal_policy_ids') != ['openshell-tdx']:
         raise ValueError('non-affirming appraisal')
-    vector = cpu.get('ear.trustworthiness-vector', {})
+    vector = cpu.get('ear_trustworthiness_vector', {})
     if any(vector.get(key) != value for key, value in {'hardware': 2, 'configuration': 2, 'executables': 3, 'file-system': 2}.items()):
         raise ValueError('unexpected trust vector')
-    evidence = cpu['ear.veraison.annotated-evidence']
-    if not isinstance(evidence.get('runtime_data_claims', {}).get('tee-pubkey'), dict):
+    evidence = cpu['ear_attester_claims']
+    if evidence['tee'] != 'tdx' or not isinstance(cpu['ear_verifier_claims']['runtime_data'].get('tee-pubkey'), dict):
         raise ValueError('missing guest recipient key')
-    events = [e.get('details', {}).get('data', {}) for e in evidence['tdx']['uefi_event_logs']
+    events = [e.get('details', {}).get('data', {}) for e in evidence['claims']['uefi_event_logs']
               if e.get('type_name') == 'EV_EVENT_TAG' and e.get('details', {}).get('unicode_name') == 'AAEL'
               and e.get('details', {}).get('data', {}).get('operation') == 'InitData']
     if len(events) != 1 or events[0].get('domain') != 'github.com/confidential-containers':

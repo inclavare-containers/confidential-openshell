@@ -12,7 +12,7 @@ Environment=OPENSHELL_TELEMETRY_ENABLED=false
 EnvironmentFile=/etc/openshell-confidential/driver.env
 ExecStart=/usr/local/bin/openshell-driver-confidential-kubernetes \
   --confidential-runtime-class kata-remote \
-  --bootstrap-timeout-seconds 900 \
+  --runtime-bootstrap-grace-seconds 900 \
   --guest-initdata-base /etc/openshell-confidential/guest-initdata-base.toml \
   --confidential-client-tls-ca /var/lib/openshell-confidential/tls/ca.crt \
   --kata-policy-generator /opt/confidential-openshell/deployment/runtime/agent_policy.py \

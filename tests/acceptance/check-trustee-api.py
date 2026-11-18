@@ -133,7 +133,7 @@ def check(kbs_root, as_root):
             except RuntimeError as error:
                 assert 'HTTP 401' in str(error) or 'HTTP 403' in str(error), error
             result['checks']['wrong_admin_denied'] = True
-            policy = b'package policy\ndefault allow = false\nallow if { input.submods.cpu0["ear.status"] == "affirming" }\n'
+            policy = b'package policy\ndefault allow = false\nallow if { input.submods.cpu0["ear_status"] == "affirming" }\n'
             as_policy = b'package policy\ndefault hardware = 0\n'
             resource = 'resource/default/bootstrap/' + 'a' * 64
             fixture = b'synthetic-resource-via-admin-api'

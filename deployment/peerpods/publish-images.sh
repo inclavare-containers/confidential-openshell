@@ -9,7 +9,7 @@ load_selection
 install -d -m 0700 "$OPERATOR_DIR"
 [[ -z $REGISTRY_CA ]] || export SSL_CERT_FILE="$REGISTRY_CA"
 for name in pause supervisor sandbox workload agent_sandbox_controller \
-  kata_kubectl peerpod_webhook cert_manager_controller cert_manager_webhook \
+  kata_deploy kata_kubectl peerpod_webhook cert_manager_controller cert_manager_webhook \
   cert_manager_cainjector cert_manager_startup csi_provisioner csi_node_registrar; do
   ref=$(jq -er --arg name "$name" '.images[$name]' deployment/runtime/artifacts.lock.json)
   dest="$REGISTRY_ADDR/openshell/mirror/$name:locked"

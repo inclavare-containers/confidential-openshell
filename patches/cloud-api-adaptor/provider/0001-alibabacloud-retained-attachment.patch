@@ -1,4 +1,4 @@
-From fa29fef3034746a1275d3a91641828f82e5481d5 Mon Sep 17 00:00:00 2001
+From 5eb48c94853731196e4c1cf4099b3493e4b45827 Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
 Date: Wed, 4 Nov 2026 15:29:33 +0800
 Subject: [PATCH] alibabacloud: attach existing data disks to the PodVM
@@ -11,16 +11,18 @@ existing cleanup path without an additional AttachDisk retry loop.
 Signed-off-by: Weidong Sun <sunweidong@linux.alibaba.com>
 Co-authored-by: Codex <noreply@openai.com>
 ---
- src/cloud-providers/alibabacloud/provider.go     |   6 +
- src/cloud-providers/alibabacloud/volumes.go      | 120 ++++++++++++++++
- src/cloud-providers/alibabacloud/volumes_test.go | 172 +++++++++++++++++++++++
+ src/cloud-providers/alibabacloud/provider.go  |   6 +
+ src/cloud-providers/alibabacloud/volumes.go   | 120 ++++++++++++
+ .../alibabacloud/volumes_test.go              | 172 ++++++++++++++++++
  3 files changed, 298 insertions(+)
+ create mode 100644 src/cloud-providers/alibabacloud/volumes.go
+ create mode 100644 src/cloud-providers/alibabacloud/volumes_test.go
 
 diff --git a/src/cloud-providers/alibabacloud/provider.go b/src/cloud-providers/alibabacloud/provider.go
-index 6fb42f5d..bf78449f 100644
+index 2fa011e6..7c9467c3 100644
 --- a/src/cloud-providers/alibabacloud/provider.go
 +++ b/src/cloud-providers/alibabacloud/provider.go
-@@ -70,6 +70,7 @@ func encodeUserData(data string) (string, error) {
+@@ -61,6 +61,7 @@ func encodeUserData(data string) (string, error) {
  
  // Make ecsClient a mockable interface
  type ecsClient interface {
@@ -28,7 +30,7 @@ index 6fb42f5d..bf78449f 100644
  	RunInstances(
  		params *ecs.RunInstancesRequest) (*ecs.RunInstancesResponse, error)
  	DeleteInstance(
-@@ -80,6 +81,7 @@ type ecsClient interface {
+@@ -71,6 +72,7 @@ type ecsClient interface {
  	// Describe InstanceAttribute
  	DescribeInstanceAttribute(
  		params *ecs.DescribeInstanceAttributeRequest) (*ecs.DescribeInstanceAttributeResponse, error)
@@ -36,7 +38,7 @@ index 6fb42f5d..bf78449f 100644
  	// Create NIC
  	CreateNetworkInterface(
  		params *ecs.CreateNetworkInterfaceRequest) (*ecs.CreateNetworkInterfaceResponse, error)
-@@ -353,6 +355,10 @@ func (p *alibabaCloudProvider) CreateInstance(ctx context.Context, podName, sand
+@@ -344,6 +346,10 @@ func (p *alibabaCloudProvider) CreateInstance(ctx context.Context, podName, sand
  	}
  	logger.Printf("Instance %s is ready.", instanceID)
  
@@ -353,3 +355,4 @@ index 00000000..b0404e5a
 +}
 -- 
 2.43.7
+

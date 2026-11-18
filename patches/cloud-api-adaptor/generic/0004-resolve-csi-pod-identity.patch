@@ -1,7 +1,8 @@
-From 6fa0191185b3d06cfc2eed17179faa96ea57d2a9 Mon Sep 17 00:00:00 2001
+From 0db5d6efc739bf3657f8729a7e7c50728f45f600 Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
 Date: Wed, 4 Nov 2026 15:23:27 +0800
-Subject: [PATCH] volumes: resolve missing Pod UID before selecting CSI disks
+Subject: [PATCH] volumes: resolve missing Pod UID before selecting CSI
+ disks
 
 Kata remote CreateVM can send only the Pod name and namespace. When its
 annotations omit a UID, the existing scan includes direct volumes from
@@ -15,25 +16,35 @@ volume fixtures and cover the missing-UID path through a local API server.
 Signed-off-by: Weidong Sun <sunweidong@linux.alibaba.com>
 Co-authored-by: Codex <noreply@openai.com>
 ---
- .../pkg/adaptor/cloud/cloud.go                |  7 ++-
+ .../pkg/adaptor/cloud/cloud.go                | 13 +++-
+ .../pkg/adaptor/cloud/cloud_test.go           |  2 +-
+ .../pkg/adaptor/cloud/types.go                |  1 +
  .../pkg/adaptor/k8sops/peerpod.go             | 16 +++++
  .../pkg/adaptor/k8sops/peerpod_test.go        | 55 ++++++++++++++++
+ .../pkg/adaptor/proxy/cloud_volumes_test.go   |  3 +
+ .../pkg/adaptor/proxy/proxy.go                |  6 +-
+ .../pkg/adaptor/proxy/proxy_test.go           |  6 +-
+ .../pkg/adaptor/proxy/service.go              |  9 ++-
+ .../pkg/adaptor/proxy/service_test.go         |  6 +-
  src/cloud-api-adaptor/pkg/util/cloud.go       | 25 ++++++--
  .../pkg/util/cloud_csi_test.go                | 62 ++++++++++++-------
- 5 files changed, 138 insertions(+), 27 deletions(-)
+ 12 files changed, 164 insertions(+), 40 deletions(-)
  create mode 100644 src/cloud-api-adaptor/pkg/adaptor/k8sops/peerpod_test.go
 
 diff --git a/src/cloud-api-adaptor/pkg/adaptor/cloud/cloud.go b/src/cloud-api-adaptor/pkg/adaptor/cloud/cloud.go
-index 9a97384c..679abc1f 100644
+index 90728d07..aff3ce7f 100644
 --- a/src/cloud-api-adaptor/pkg/adaptor/cloud/cloud.go
 +++ b/src/cloud-api-adaptor/pkg/adaptor/cloud/cloud.go
-@@ -195,7 +195,12 @@ func (s *cloudService) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (r
+@@ -196,7 +196,15 @@ func (s *cloudService) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (r
  	image := util.GetImageFromAnnotation(req.Annotations)
  
  	// Get CSI volumes that need to be attached to the PodVM
 -	csiVolumes := util.GetCSIVolumesForPod(req.Annotations)
++	podUID := util.GetPodUID(req.Annotations)
 +	csiVolumes, err := util.GetCSIVolumesForPod(req.Annotations, func() (string, error) {
-+		return s.ppService.GetPodUID(ctx, pod, namespace)
++		uid, err := s.ppService.GetPodUID(ctx, pod, namespace)
++		podUID = uid
++		return uid, err
 +	})
 +	if err != nil {
 +		return nil, fmt.Errorf("resolve CSI volumes: %w", err)
@@ -41,6 +52,48 @@ index 9a97384c..679abc1f 100644
  	if len(csiVolumes) > 0 {
  		logger.Printf("Found %d CSI volumes to attach to PodVM", len(csiVolumes))
  	}
+@@ -322,6 +330,7 @@ func (s *cloudService) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (r
+ 		podNamespace: namespace,
+ 		netNSPath:    netNSPath,
+ 		agentProxy:   agentProxy,
++		podUID:       podUID,
+ 		podNetwork:   podNetworkConfig,
+ 		cloudConfig:  cloudConfig,
+ 		spec:         vmSpec,
+@@ -405,7 +414,7 @@ func (s *cloudService) StartVM(ctx context.Context, req *pb.StartVMRequest) (res
+ 	go func() {
+ 		defer close(errCh)
+ 
+-		if err := sandbox.agentProxy.Start(context.Background(), serverURL, instance.VolumeDevices); err != nil {
++		if err := sandbox.agentProxy.Start(context.Background(), serverURL, instance.VolumeDevices, sandbox.podUID); err != nil {
+ 			logger.Printf("error running agent proxy: %v", err)
+ 			errCh <- err
+ 		}
+diff --git a/src/cloud-api-adaptor/pkg/adaptor/cloud/cloud_test.go b/src/cloud-api-adaptor/pkg/adaptor/cloud/cloud_test.go
+index 7c326dbf..c3d08fa7 100644
+--- a/src/cloud-api-adaptor/pkg/adaptor/cloud/cloud_test.go
++++ b/src/cloud-api-adaptor/pkg/adaptor/cloud/cloud_test.go
+@@ -61,7 +61,7 @@ type mockProxy struct {
+ 	socketPath string
+ }
+ 
+-func (p *mockProxy) Start(ctx context.Context, serverURL *url.URL, _ map[string]string) error {
++func (p *mockProxy) Start(ctx context.Context, serverURL *url.URL, _ map[string]string, _ string) error {
+ 	close(p.readyCh)
+ 	<-p.stopCh
+ 	return nil
+diff --git a/src/cloud-api-adaptor/pkg/adaptor/cloud/types.go b/src/cloud-api-adaptor/pkg/adaptor/cloud/types.go
+index a3aa2349..a5f9ae92 100644
+--- a/src/cloud-api-adaptor/pkg/adaptor/cloud/types.go
++++ b/src/cloud-api-adaptor/pkg/adaptor/cloud/types.go
+@@ -37,6 +37,7 @@ type cloudService struct {
+ type sandboxID string
+ 
+ type sandbox struct {
++	podUID       string
+ 	agentProxy   proxy.AgentProxy
+ 	podNetwork   *tunneler.Config
+ 	cloudConfig  *cloudinit.CloudConfig
 diff --git a/src/cloud-api-adaptor/pkg/adaptor/k8sops/peerpod.go b/src/cloud-api-adaptor/pkg/adaptor/k8sops/peerpod.go
 index 918908da..e5c47267 100644
 --- a/src/cloud-api-adaptor/pkg/adaptor/k8sops/peerpod.go
@@ -129,11 +182,167 @@ index 00000000..c60432a4
 +	require.Equal(t, "disk-a", volumes[0].DiskID)
 +	require.Equal(t, "disk-c", volumes[1].DiskID)
 +}
+diff --git a/src/cloud-api-adaptor/pkg/adaptor/proxy/cloud_volumes_test.go b/src/cloud-api-adaptor/pkg/adaptor/proxy/cloud_volumes_test.go
+index fdc2b95e..9a28b551 100644
+--- a/src/cloud-api-adaptor/pkg/adaptor/proxy/cloud_volumes_test.go
++++ b/src/cloud-api-adaptor/pkg/adaptor/proxy/cloud_volumes_test.go
+@@ -227,7 +227,9 @@ func TestCloudVolumes_SkipsVolumesFromOtherPods(t *testing.T) {
+ 	tests := []struct {
+ 		name        string
+ 		annotations map[string]string
++		vmUID       string
+ 	}{
++		{name: "UID from CreateVM", vmUID: podUID},
+ 		{
+ 			name:        "containerd sandbox uid",
+ 			annotations: map[string]string{"io.kubernetes.cri.sandbox-uid": podUID},
+@@ -246,6 +248,7 @@ func TestCloudVolumes_SkipsVolumesFromOtherPods(t *testing.T) {
+ 
+ 			service, cleanup := setupMockAgentAndService(t)
+ 			defer cleanup()
++			service.podUID = tt.vmUID
+ 
+ 			writeTestMountInfo(t, dir, otherPath, map[string]interface{}{"device": "other-disk", "fstype": "ext4"})
+ 			writeTestMountInfo(t, dir, volPath, map[string]interface{}{"device": "my-disk", "fstype": "ext4"})
+diff --git a/src/cloud-api-adaptor/pkg/adaptor/proxy/proxy.go b/src/cloud-api-adaptor/pkg/adaptor/proxy/proxy.go
+index ebc229f3..62b45bc3 100644
+--- a/src/cloud-api-adaptor/pkg/adaptor/proxy/proxy.go
++++ b/src/cloud-api-adaptor/pkg/adaptor/proxy/proxy.go
+@@ -36,7 +36,7 @@ var logger = log.New(log.Writer(), "[adaptor/proxy] ", log.LstdFlags|log.Lmsgpre
+ type AgentProxy interface {
+ 	// Start serves the agent socket until ctx ends. volumeDevices maps a cloud
+ 	// volume disk ID to its device path in the pod VM, when the provider knows it.
+-	Start(ctx context.Context, serverURL *url.URL, volumeDevices map[string]string) error
++	Start(ctx context.Context, serverURL *url.URL, volumeDevices map[string]string, podUID string) error
+ 	Ready() chan struct{}
+ 	Shutdown() error
+ 	CAService() tlsutil.CAService
+@@ -131,7 +131,7 @@ func (p *agentProxy) dial(ctx context.Context, address string) (net.Conn, error)
+ 	return conn, nil
+ }
+ 
+-func (p *agentProxy) Start(ctx context.Context, serverURL *url.URL, volumeDevices map[string]string) error {
++func (p *agentProxy) Start(ctx context.Context, serverURL *url.URL, volumeDevices map[string]string, podUID string) error {
+ 	if err := os.MkdirAll(filepath.Dir(p.socketPath), os.ModePerm); err != nil {
+ 		return fmt.Errorf("failed to create parent directories for socket: %s", p.socketPath)
+ 	}
+@@ -150,7 +150,7 @@ func (p *agentProxy) Start(ctx context.Context, serverURL *url.URL, volumeDevice
+ 		return p.dial(ctx, serverURL.Host)
+ 	}
+ 
+-	proxyService := newProxyService(dialer, p.pauseImage, volumeDevices)
++	proxyService := newProxyService(dialer, p.pauseImage, volumeDevices, podUID)
+ 	defer func() {
+ 		if err := proxyService.Close(); err != nil {
+ 			logger.Printf("error closing agent proxy connection: %v", err)
+diff --git a/src/cloud-api-adaptor/pkg/adaptor/proxy/proxy_test.go b/src/cloud-api-adaptor/pkg/adaptor/proxy/proxy_test.go
+index 027cedc5..20325306 100644
+--- a/src/cloud-api-adaptor/pkg/adaptor/proxy/proxy_test.go
++++ b/src/cloud-api-adaptor/pkg/adaptor/proxy/proxy_test.go
+@@ -95,7 +95,7 @@ func TestStartStop(t *testing.T) {
+ 	proxyErrCh := make(chan error)
+ 	go func() {
+ 		defer close(proxyErrCh)
+-		if err := proxy.Start(context.Background(), serverURL, nil); err != nil {
++		if err := proxy.Start(context.Background(), serverURL, nil, ""); err != nil {
+ 			proxyErrCh <- err
+ 		}
+ 	}()
+@@ -269,7 +269,7 @@ func TestStartInvalidSocketPath(t *testing.T) {
+ 		Host:   testUnreachablePort,
+ 	}
+ 
+-	err := proxy.Start(context.Background(), serverURL, nil)
++	err := proxy.Start(context.Background(), serverURL, nil, "")
+ 	assert.ErrorContains(t, err, "failed to create parent directories")
+ }
+ 
+@@ -289,7 +289,7 @@ func TestStartConnectionFailure(t *testing.T) {
+ 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout2Second)
+ 	defer cancel()
+ 
+-	err := proxy.Start(ctx, serverURL, nil)
++	err := proxy.Start(ctx, serverURL, nil, "")
+ 	assert.Error(t, err)
+ }
+ 
+diff --git a/src/cloud-api-adaptor/pkg/adaptor/proxy/service.go b/src/cloud-api-adaptor/pkg/adaptor/proxy/service.go
+index cd146e9d..9ea24f3f 100644
+--- a/src/cloud-api-adaptor/pkg/adaptor/proxy/service.go
++++ b/src/cloud-api-adaptor/pkg/adaptor/proxy/service.go
+@@ -20,6 +20,7 @@ import (
+ )
+ 
+ type proxyService struct {
++	podUID string
+ 	agentproto.Redirector
+ 	pauseImage    string
+ 	volumeDevices map[string]string
+@@ -34,7 +35,7 @@ const (
+ 	defaultGPUsAnnotation = "io.katacontainers.config.hypervisor.default_gpus"
+ )
+ 
+-func newProxyService(dialer func(context.Context) (net.Conn, error), pauseImage string, volumeDevices map[string]string) *proxyService {
++func newProxyService(dialer func(context.Context) (net.Conn, error), pauseImage string, volumeDevices map[string]string, podUID string) *proxyService {
+ 
+ 	redirector := agentproto.NewRedirector(dialer)
+ 
+@@ -42,6 +43,7 @@ func newProxyService(dialer func(context.Context) (net.Conn, error), pauseImage
+ 		Redirector:    redirector,
+ 		pauseImage:    pauseImage,
+ 		volumeDevices: volumeDevices,
++		podUID:        podUID,
+ 	}
+ }
+ 
+@@ -110,7 +112,10 @@ func (s *proxyService) CreateContainer(ctx context.Context, req *pb.CreateContai
+ 	// name), so the LUN index here is consistent with the cloud provider's
+ 	// disk attachment order.
+ 	cloudVolumes := make(map[string]util.CloudVolumeAnnotation)
+-	podUID := util.GetPodUID(req.OCI.Annotations)
++	podUID := s.podUID
++	if podUID == "" {
++		podUID = util.GetPodUID(req.OCI.Annotations)
++	}
+ 
+ 	dirEntries, dirErr := os.ReadDir(util.KataDirectVolumesDir)
+ 	if dirErr == nil {
+diff --git a/src/cloud-api-adaptor/pkg/adaptor/proxy/service_test.go b/src/cloud-api-adaptor/pkg/adaptor/proxy/service_test.go
+index 5e8c2fb5..3175d14d 100644
+--- a/src/cloud-api-adaptor/pkg/adaptor/proxy/service_test.go
++++ b/src/cloud-api-adaptor/pkg/adaptor/proxy/service_test.go
+@@ -132,7 +132,7 @@ func TestNewProxyService(t *testing.T) {
+ 		return nil, nil
+ 	}
+ 
+-	service := newProxyService(dialer, testPauseImage, nil)
++	service := newProxyService(dialer, testPauseImage, nil, "")
+ 	assert.NotNil(t, service, "expected non-nil service")
+ 	assert.Equal(t, testPauseImage, service.pauseImage, "expected pause:3.9")
+ }
+@@ -300,7 +300,7 @@ func TestProxyServiceCreateContainer(t *testing.T) {
+ 					return net.Dial(testNetworkTCP, errorAgentListener.Addr().String())
+ 				}
+ 
+-				errorService := newProxyService(errorDialer, "", nil)
++				errorService := newProxyService(errorDialer, "", nil, "")
+ 				err = errorService.Connect(context.Background())
+ 				require.NoError(t, err, "failed to connect")
+ 
+@@ -466,7 +466,7 @@ func setupMockAgentAndService(t *testing.T) (*proxyService, func()) {
+ 		return net.Dial(testNetworkTCP, agentListener.Addr().String())
+ 	}
+ 
+-	service := newProxyService(dialer, "", nil)
++	service := newProxyService(dialer, "", nil, "")
+ 	err := service.Connect(context.Background())
+ 	require.NoError(t, err)
+ 
 diff --git a/src/cloud-api-adaptor/pkg/util/cloud.go b/src/cloud-api-adaptor/pkg/util/cloud.go
-index 39f3f462..eade8bad 100644
+index 8eff2db5..60e69fb0 100644
 --- a/src/cloud-api-adaptor/pkg/util/cloud.go
 +++ b/src/cloud-api-adaptor/pkg/util/cloud.go
-@@ -180,15 +180,16 @@ type CloudVolumeAnnotation struct {
+@@ -183,15 +183,16 @@ type CloudVolumeAnnotation struct {
  // mountInfo.json files written by the CSI block driver. Each file
  // describes a cloud volume that should be attached to the PodVM.
  // Volumes are filtered by pod UID (from annotations) to prevent
@@ -153,7 +362,7 @@ index 39f3f462..eade8bad 100644
  	}
  
  	for _, entry := range entries {
-@@ -206,7 +207,21 @@ func GetCSIVolumesForPod(annotations map[string]string) []provider.CloudVolume {
+@@ -209,7 +210,21 @@ func GetCSIVolumesForPod(annotations map[string]string) []provider.CloudVolume {
  			continue
  		}
  
@@ -176,7 +385,7 @@ index 39f3f462..eade8bad 100644
  			continue
  		}
  
-@@ -239,5 +254,5 @@ func GetCSIVolumesForPod(annotations map[string]string) []provider.CloudVolume {
+@@ -242,5 +257,5 @@ func GetCSIVolumesForPod(annotations map[string]string) []provider.CloudVolume {
  		})
  	}
  

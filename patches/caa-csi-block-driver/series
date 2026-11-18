@@ -1,4 +1,5 @@
 generic/0001-recovered-capacity.patch
 generic/0002-volume-mount-properties.patch
 generic/0003-atomic-volume-publication.patch
+generic/0004-volume-recovery.patch
 provider/0001-alibabacloud-essd.patch

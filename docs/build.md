@@ -27,7 +27,7 @@ then starts Docker. Success prints Python and Docker server versions.
 ./cos host toolchains
 ```
 
-Installs the pinned Rust 1.95.0 and Go 1.26.10 toolchains. These sources need
+Installs the pinned Rust 1.95.0 and Go 1.26.11 toolchains. These sources need
 newer compiler versions than Ubuntu 24.04 supplies. Matching versions are reused.
 
 ### Release tools
@@ -54,7 +54,7 @@ guest image.
 ./cos build sources
 ```
 
-Initializes pinned submodules, fetches Kata, prepares the patch queues and packages
+Initializes the pinned submodules, fetches the released Kata chart, prepares the patch queues and packages
 charts. Expect passed input checks and `Source trees and charts ready`.
 Prepared copies live under `.local/build-sources/`; `repos/` remains unchanged.
 A supplied checkout with initialized submodules needs no GitHub authentication
@@ -69,16 +69,6 @@ for the remaining public inputs.
 ```
 
 Produces `artifacts/openshell-driver-confidential-kubernetes`.
-
-### Kata host shim
-
-```bash
-./cos build kata-shim
-```
-
-Produces `artifacts/containerd-shim-kata-v2` and its checksum, and runs the exec
-conversion test. The fix is merged upstream; pinned Kata 4.2.0 needs the backport.
-The guest agent and policy generator use unmodified release binaries.
 
 ### Cloud API adaptor
 

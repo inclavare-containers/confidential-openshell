@@ -1,6 +1,6 @@
 # Architecture and trust boundaries
 
-Confidential OpenShell runs the unmodified OpenShell v0.1.6 Gateway, CLI and
+Confidential OpenShell runs the unmodified OpenShell v0.1.9 Gateway, CLI and
 supervisor with an external confidential Kubernetes ComputeDriver. The coding
 workload uses the unmodified, digest-pinned OpenShell Community base image,
 which includes OpenCode, Codex, Claude Code and their developer tools.
@@ -13,8 +13,8 @@ Native OpenShell generates TLS and JWT signing state through its Kubernetes
 initialization Job/cert-manager or standalone certificate generator. This profile
 uses the released generator on T and seals guest bootstrap instead of distributing
 plaintext credentials through Kubernetes Secrets. See the pinned
-[Helm deployment](https://github.com/NVIDIA/OpenShell/blob/v0.1.6/deploy/helm/openshell/README.md)
-and [certificate generator](https://github.com/NVIDIA/OpenShell/blob/v0.1.6/crates/openshell-server/src/certgen.rs).
+[Helm deployment](https://github.com/NVIDIA/OpenShell/blob/v0.1.9/deploy/helm/openshell/README.md)
+and [certificate generator](https://github.com/NVIDIA/OpenShell/blob/v0.1.9/crates/openshell-server/src/certgen.rs).
 
 The trusted user domain **T** contains build execution role **B**, the operator
 CLI, Gateway, driver and its private authorization journals, and Trustee

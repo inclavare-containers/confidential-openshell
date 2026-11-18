@@ -22,12 +22,11 @@ import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 WORKLOAD_EXTENSION = ROOT / "deployment/policy/agent-policy-workload.rego"
-GUEST_PULL_EXTENSION = ROOT / "deployment/policy/agent-policy-guest-pull.rego"
 DEFAULT_OCI_VERSION = "1.3.0"
 KATA_TOOL_HASHES = {
-    "genpolicy": "48b12625bd47bb9279b444ed0d52233bf30ffab86e7af69f0ebbf7b8bcd4c9dd",
-    "rules.rego": "e30ecf1a3ded94d7b1d3228a46fffcea1652fb91cdc1d09026e91255c34abdfd",
-    "genpolicy-settings.json": "46bf9ac5460393f626ff2ed6fa2501ec5a82893da57c06e5c53a8f8e50e9dfa0",
+    "genpolicy": "3f3b65d4410a86e58955c15a10c3b324fa7d41d41205064c73e5d121fe32c1d9",
+    "rules.rego": "0dd95a1d9d194e8e2ce71ba5befb40c813475457b100c35d9f26a1dc77894d10",
+    "genpolicy-settings.json": "04bf91a0ec5154fd4aa16c20b23dc985bfeba4d90f041b01b2d70993bc4272d6",
 }
 ROLE_LABEL = "openshell.ai/boundary-role"
 INITDATA_ANNOTATION = "io.katacontainers.config.hypervisor.cc_init_data"
@@ -195,10 +194,10 @@ def _checked_tools(directory: pathlib.Path) -> dict[str, pathlib.Path]:
     for name, expected in KATA_TOOL_HASHES.items():
         path = directory.resolve() / name
         if not path.is_file():
-            raise PolicyError(f"missing regular Kata 4.2 tool: {path}")
+            raise PolicyError(f"missing regular Kata 4.4 tool: {path}")
         actual = hashlib.sha256(path.read_bytes()).hexdigest()
         if actual != expected:
-            raise PolicyError(f"Kata 4.2 tool digest mismatch: {path}")
+            raise PolicyError(f"Kata 4.4 tool digest mismatch: {path}")
         result[name] = path
     return result
 
@@ -247,7 +246,7 @@ def _genpolicy_pod(pod: dict, role: str) -> dict:
         downward = volume.get("downwardAPI")
         if downward is not None:
             # Kata models this bind mount, but not the source defaultMode.
-            downward.pop("defaultMode")
+            downward.pop("defaultMode", None)
         projected = volume.get("projected")
         if projected is not None:
             # Kata models the mount, but not projected-token sources.
@@ -258,17 +257,17 @@ def _genpolicy_pod(pod: dict, role: str) -> dict:
     return result
 
 
-def _validate_policy(policy: str, names: set[str], pause_image: str, role: str) -> None:
+def _bind_policy(policy: str, names: set[str], pause_image: str, workspace_mounts: dict) -> str:
     for needle in ("package agent_policy", "default CreateContainerRequest := false",
-                   "default ExecProcessRequest := false", "default SetPolicyRequest := false",
-                   "openshell_guest_pull(p_oci, i_storages)"):
+                   "default ExecProcessRequest := false", "default SetPolicyRequest := false"):
         if needle not in policy:
             raise PolicyError(f"generated policy lacks restrictive rule: {needle}")
     marker = "policy_data := "
     if policy.count(marker) != 1:
         raise PolicyError("generated policy has no unique policy_data")
     try:
-        data, _ = json.JSONDecoder().raw_decode(policy.split(marker, 1)[1])
+        rules, raw_data = policy.split(marker, 1)
+        data = json.loads(raw_data)
     except ValueError as exc:
         raise PolicyError(f"generated policy data is invalid: {exc}") from exc
     defaults = data.get("request_defaults", {}).get("ExecProcessRequest", {})
@@ -282,13 +281,22 @@ def _validate_policy(policy: str, names: set[str], pause_image: str, role: str) 
         name = container.get("OCI", {}).get("Annotations", {}).get("io.kubernetes.cri.container-name")
         if name is not None:
             actual_names.append(name)
+        bindings = workspace_mounts.get(name, [])
+        if bindings:
+            mounts = {mount["destination"]: mount for mount in container["OCI"]["Mounts"]}
+            approved = data.setdefault("workspace_mounts", {}).setdefault(name, {})
+            for binding in bindings:
+                destination, disk = binding["mount_point"], binding["disk_id"]
+                mounts[destination]["source"] = "^" + re.escape("/run/cloud-volumes/" + disk) + "$"
+                approved[destination] = disk
     if len(actual_names) != len(set(actual_names)) or set(actual_names) != names:
         raise PolicyError("generated container policy differs from Pod containers")
+    return rules + marker + json.dumps(data, separators=(",", ":"))
 
 
 def generate(pod: dict, *, role: str, tools_dir: pathlib.Path,
              pause_image: str, runtime_class: str = "kata-remote",
-             registry_ca: pathlib.Path | None = None,
+             registry_ca: pathlib.Path | None = None, workspace_mounts: dict | None = None,
              oci_version: str = DEFAULT_OCI_VERSION) -> str:
     names = _validate_pod(pod, role, runtime_class)
     tools = _checked_tools(tools_dir)
@@ -299,20 +307,8 @@ def generate(pod: dict, *, role: str, tools_dir: pathlib.Path,
         settings_path = work / "settings.json"
         pod_path.write_text(json.dumps(_genpolicy_pod(pod, role), separators=(",", ":")) + "\n")
         rules = tools["rules.rego"].read_text()
-        insertion = "    allow_by_anno(p_oci, i_oci, p_storages, i_storages)\n"
-        if rules.count(insertion) != 1:
-            raise PolicyError("Kata rules changed; guest image binding insertion is unsafe")
-        rules = rules.replace(insertion, insertion + "    openshell_guest_pull(p_oci, i_storages)\n")
-        rules += "\n" + GUEST_PULL_EXTENSION.read_text()
-        if role == "workload":
-            # Workspace mounts cannot also match Kata's ordinary shared-bind rules.
-            rules = rules.replace("check_mount(p_mount, i_mount, bundle_id, sandbox_id) if {",
-                                  "check_mount(p_mount, i_mount, bundle_id, sandbox_id) if {\n"
-                                  "    not workspace_mount_destination(p_mount.destination)")
-            pvc_names = {v["name"] for v in pod["spec"].get("volumes", []) if "persistentVolumeClaim" in v}
-            mounts = {c["name"]: [m["mountPath"] for m in c.get("volumeMounts", []) if m["name"] in pvc_names]
-                      for c in pod["spec"].get("containers", []) + pod["spec"].get("initContainers", [])}
-            rules += "\n" + WORKLOAD_EXTENSION.read_text().replace("__WORKSPACE_MOUNTS__", json.dumps(mounts))
+        if workspace_mounts:
+            rules += "\n" + WORKLOAD_EXTENSION.read_text()
         rules_path.write_text(_compact_rules(rules))
         settings = _settings(json.loads(tools["genpolicy-settings.json"].read_text()), pause_image, oci_version)
         settings_path.write_text(json.dumps(settings, separators=(",", ":")))
@@ -356,13 +352,13 @@ def generate(pod: dict, *, role: str, tools_dir: pathlib.Path,
             policy = result.stdout.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise PolicyError("Kata genpolicy returned non-UTF-8 policy") from exc
-        _validate_policy(policy, names, pause_image, role)
-        return policy
+        return _bind_policy(policy, names, pause_image, workspace_mounts or {})
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--role", required=True, choices=("supervisor", "workload"))
+    parser.add_argument("--workspace-mounts", type=json.loads, default={})
     parser.add_argument("--tools-dir", required=True, type=pathlib.Path)
     parser.add_argument("--runtime-class", default="kata-remote")
     parser.add_argument("--pause-image", required=True)
@@ -372,7 +368,7 @@ def main() -> int:
     try:
         policy = generate(_read_pod(), role=args.role, tools_dir=args.tools_dir,
                           runtime_class=args.runtime_class,
-                          pause_image=args.pause_image, registry_ca=args.registry_ca,
+                          pause_image=args.pause_image, registry_ca=args.registry_ca, workspace_mounts=args.workspace_mounts,
                           oci_version=args.oci_version)
     except (PolicyError, KeyError, TypeError) as exc:
         print(f"agent policy: {exc}", file=sys.stderr)

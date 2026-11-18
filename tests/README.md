@@ -1,10 +1,9 @@
 # Tests
 
 Run `./cos build test` from the repository root with the pinned toolchain and
-cached dependencies. Cargo uses offline/locked mode; Go disables proxy/sumdb.
+cached dependencies and the released Kata policy rules. Cargo uses offline/locked mode; Go disables proxy/sumdb.
 The runner prepares missing CAA/CSI/controller build copies, checks their source
-identities and leaves the pinned `repos/` checkouts unchanged. Missing Kata sources
-are reported as `not_run`; they do not block the remaining integration checks.
+identities and leaves the pinned `repos/` checkouts unchanged.
 
 ## Cache dependencies and run
 

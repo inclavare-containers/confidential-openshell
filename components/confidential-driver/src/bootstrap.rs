@@ -602,6 +602,27 @@ impl BootstrapStore {
         })
     }
 
+    pub(super) fn replace_launch(
+        &self,
+        prior: &crate::launch::LaunchIntent,
+        next: &crate::launch::LaunchIntent,
+    ) -> Result<()> {
+        self.with_lock(|| {
+            if self.has_pending_delete_for_sandbox(&prior.sandbox_id)? {
+                return Err(StoreError::Revoked);
+            }
+            let path = self.launch_path(&prior.namespace, &prior.sandbox_cr_uid);
+            let saved: crate::launch::LaunchIntent = serde_json::from_slice(&read_private(&path)?)?;
+            if saved != *prior {
+                return Err(StoreError::Conflict);
+            }
+            if saved != *next {
+                atomic_replace(&path, &serde_json::to_vec(next)?)?;
+            }
+            Ok(())
+        })
+    }
+
     fn launch_path(&self, namespace: &str, uid: &str) -> PathBuf {
         self.state
             .join("launch-intents")
@@ -2621,7 +2642,7 @@ pathlib.Path(args[args.index('--output') + 1]).write_text('package policy\ndefau
         let (tmp, store) = fixture();
         let launch = crate::launch::LaunchIntent {
             sandbox_id: "sandbox-launch".into(), namespace: "ns".into(), sandbox_cr_uid: "uid".into(),
-            sandbox_name: "native".into(), main_process_spec: "trusted command".into(), log_level: "info".into(),
+            last_update: None, updated_environment: None, sandbox_name: "native".into(), main_process_spec: "trusted command".into(), log_level: "info".into(),
             agent_uid: 1000, agent_gid: 1000, volume_claim_templates: serde_json::Value::Null,
             workload: serde_json::from_value(serde_json::json!({"apiVersion":"v1", "kind":"Pod",
                 "spec":{"containers":[{"name":"agent", "image":"approved", "command":["native"]}],

@@ -35,3 +35,6 @@ pub use config::{
 pub use driver::{ConfidentialDriverSettings, KubernetesComputeDriver, KubernetesDriverError};
 pub use grpc::ComputeDriverService;
 pub use openshell_core::DynamicStringAllowlist as OperatorNamespaceAllowlist;
+
+#[path = "../../../repos/openshell/crates/openshell-driver-kubernetes/src/app_listener.rs"]
+pub mod app_listener;

@@ -1,4 +1,4 @@
-From 0848764355780d20e7dbd2b546c6b089c0445444 Mon Sep 17 00:00:00 2001
+From cfc2cd539f35800fdd1309b5c71735b6ebb3cd95 Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
 Date: Wed, 4 Nov 2026 11:31:52 +0800
 Subject: [PATCH] controller: honor volume capacity ranges
@@ -8,15 +8,15 @@ Preserve the requested range for cached and recovered disks and report actual ca
 Signed-off-by: Weidong Sun <sunweidong@linux.alibaba.com>
 Co-authored-by: Codex <noreply@openai.com>
 ---
- pkg/driver/capacity_test.go           | 111 ++++++++++++++++++++++++++++++++++
- pkg/driver/controllerserver.go        |  29 +++++++--
+ pkg/driver/capacity_test.go           | 111 ++++++++++++++++++++++++++
+ pkg/driver/controllerserver.go        |  32 ++++++--
  pkg/driver/nodeserver.go              |   2 +-
  pkg/provider/aws/provider.go          |   6 +-
  pkg/provider/azure/provider.go        |   6 +-
- pkg/provider/interface.go             |  12 +++-
- pkg/provider/libvirt/provider.go      |   5 +-
- pkg/provider/libvirt/provider_test.go |   4 +-
- 8 files changed, 160 insertions(+), 15 deletions(-)
+ pkg/provider/interface.go             |  12 ++-
+ pkg/provider/libvirt/provider.go      |  11 ++-
+ pkg/provider/libvirt/provider_test.go |   7 +-
+ 8 files changed, 171 insertions(+), 16 deletions(-)
  create mode 100644 pkg/driver/capacity_test.go
 
 diff --git a/pkg/driver/capacity_test.go b/pkg/driver/capacity_test.go
@@ -137,7 +137,7 @@ index 00000000..0831ffec
 +	}
 +}
 diff --git a/pkg/driver/controllerserver.go b/pkg/driver/controllerserver.go
-index c0bf177a..155ad727 100644
+index c0bf177a..dd7ad5d4 100644
 --- a/pkg/driver/controllerserver.go
 +++ b/pkg/driver/controllerserver.go
 @@ -105,15 +105,22 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
@@ -168,7 +168,7 @@ index c0bf177a..155ad727 100644
  		}
  		csLogger.Printf("CreateVolume: %s already exists, returning existing", req.GetName())
  		volumeCtx := map[string]string{"cloudProvider": rec.Provider}
-@@ -176,12 +183,22 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
+@@ -176,12 +183,25 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
  			return nil, status.Error(codes.InvalidArgument, "unsupported VolumeContentSource type")
  		}
  	} else {
@@ -184,7 +184,10 @@ index c0bf177a..155ad727 100644
  
 +	// Providers also recover existing cloud volumes when local records are
 +	// missing. Validate the returned size before saving or advertising capacity.
-+	if volInfo == nil || !compatible(volInfo.SizeBytes) {
++	if volInfo == nil {
++		return nil, status.Error(codes.Internal, "provider returned no volume")
++	}
++	if !compatible(volInfo.SizeBytes) {
 +		return nil, status.Errorf(codes.AlreadyExists, "provider volume %s is incompatible with the requested capacity range", req.GetName())
 +	}
 +	capacity = volInfo.SizeBytes
@@ -193,10 +196,10 @@ index c0bf177a..155ad727 100644
  		VolumeID:      req.GetName(),
  		Provider:      volInfo.Provider,
 diff --git a/pkg/driver/nodeserver.go b/pkg/driver/nodeserver.go
-index 0cb45e43..0f1d9069 100644
+index 368006ed..3f2a7213 100644
 --- a/pkg/driver/nodeserver.go
 +++ b/pkg/driver/nodeserver.go
-@@ -157,7 +157,7 @@ func (ns *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
+@@ -156,7 +156,7 @@ func (ns *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
  		}
  	}
  
@@ -206,10 +209,10 @@ index 0cb45e43..0f1d9069 100644
  		return nil, status.Errorf(codes.Internal, "provider.CreateVolume failed: %v", err)
  	}
 diff --git a/pkg/provider/aws/provider.go b/pkg/provider/aws/provider.go
-index 8de42472..45e9b8be 100644
+index d322a568..7df0b062 100644
 --- a/pkg/provider/aws/provider.go
 +++ b/pkg/provider/aws/provider.go
-@@ -138,7 +138,7 @@ func newEC2Client(cfg Config) (*ec2.Client, error) {
+@@ -144,7 +144,7 @@ func newEC2Client(cfg Config) (*ec2.Client, error) {
  	return ec2.NewFromConfig(awsCfg), nil
  }
  
@@ -218,7 +221,7 @@ index 8de42472..45e9b8be 100644
  
  	if p.config.AvailabilityZone == "" {
  		return nil, fmt.Errorf("awsAvailabilityZone is required to create volumes")
-@@ -157,6 +157,10 @@ func (p *AWSProvider) CreateVolume(ctx context.Context, volumeID string, sizeByt
+@@ -163,6 +163,10 @@ func (p *AWSProvider) CreateVolume(ctx context.Context, volumeID string, sizeByt
  	if sizeGiB == 0 {
  		sizeGiB = 1
  	}
@@ -230,7 +233,7 @@ index 8de42472..45e9b8be 100644
  	logger.Printf("Creating EBS volume %s (%d GiB, type=%s, az=%s)",
  		volumeID, sizeGiB, p.config.VolumeType, p.config.AvailabilityZone)
 diff --git a/pkg/provider/azure/provider.go b/pkg/provider/azure/provider.go
-index e53142a7..2301d352 100644
+index 2aec9691..645743c4 100644
 --- a/pkg/provider/azure/provider.go
 +++ b/pkg/provider/azure/provider.go
 @@ -211,7 +211,7 @@ func (p *AzureProvider) buildDiskProperties(creationData *armcompute.CreationDat
@@ -254,7 +257,7 @@ index e53142a7..2301d352 100644
  		name, sizeGiB, p.config.DiskSKU, p.config.Location)
  
 diff --git a/pkg/provider/interface.go b/pkg/provider/interface.go
-index 801e8ee0..32dc318b 100644
+index 4394d091..4191f28a 100644
 --- a/pkg/provider/interface.go
 +++ b/pkg/provider/interface.go
 @@ -3,7 +3,13 @@
@@ -285,26 +288,42 @@ index 801e8ee0..32dc318b 100644
  	// Returns nil if the volume does not exist (idempotent).
  	DeleteVolume(ctx context.Context, volumeID string) error
 diff --git a/pkg/provider/libvirt/provider.go b/pkg/provider/libvirt/provider.go
-index 28644803..5e8a9acb 100644
+index a44c1a2a..c4ff0ead 100644
 --- a/pkg/provider/libvirt/provider.go
 +++ b/pkg/provider/libvirt/provider.go
-@@ -54,10 +54,13 @@ func (p *LibvirtProvider) volumePath(volumeID string) string {
- 	return filepath.Join(p.config.PoolPath, fmt.Sprintf("csi-vol-%s.raw", volumeID))
+@@ -68,13 +68,17 @@ func (p *LibvirtProvider) volumePath(volumeID string) string {
+ 	return filepath.Join(p.config.PoolPath, volumeFilePrefix+volumeID+rawSuffix)
  }
  
--func (p *LibvirtProvider) CreateVolume(_ context.Context, volumeID string, sizeBytes int64) (*provider.VolumeInfo, error) {
-+func (p *LibvirtProvider) CreateVolume(_ context.Context, volumeID string, sizeBytes, limitBytes int64) (*provider.VolumeInfo, error) {
+-func (p *LibvirtProvider) CreateVolume(ctx context.Context, volumeID string, sizeBytes int64) (*provider.VolumeInfo, error) {
++func (p *LibvirtProvider) CreateVolume(ctx context.Context, volumeID string, sizeBytes, limitBytes int64) (*provider.VolumeInfo, error) {
+ 	if err := validateID(volumeID); err != nil {
+ 		return nil, err
+ 	}
  	volPath := p.volumePath(volumeID)
  
- 	if _, err := os.Stat(volPath); os.IsNotExist(err) {
+-	if _, err := os.Stat(volPath); os.IsNotExist(err) {
++	info, err := os.Stat(volPath)
++	if os.IsNotExist(err) {
 +		if limitBytes > 0 && sizeBytes > limitBytes {
 +			return nil, fmt.Errorf("%w: size %d exceeds limit %d", provider.ErrCapacityOutOfRange, sizeBytes, limitBytes)
 +		}
  		logger.Printf("Creating volume %s at %s (%d bytes)", volumeID, volPath, sizeBytes)
  
  		f, err := os.Create(volPath)
+@@ -94,7 +98,10 @@ func (p *LibvirtProvider) CreateVolume(ctx context.Context, volumeID string, siz
+ 			return nil, fmt.Errorf("failed to format %s as %s: %w (output: %s)", volPath, defaultFsType, err, string(out))
+ 		}
+ 		logger.Printf("Formatted %s as %s", volPath, defaultFsType)
++	} else if err != nil {
++		return nil, err
+ 	} else {
++		sizeBytes = info.Size()
+ 		logger.Printf("Volume already exists at %s, reusing (preserving data)", volPath)
+ 	}
+ 
 diff --git a/pkg/provider/libvirt/provider_test.go b/pkg/provider/libvirt/provider_test.go
-index 1d9ed770..96d1af6b 100644
+index b4bc30ef..6f5b4f37 100644
 --- a/pkg/provider/libvirt/provider_test.go
 +++ b/pkg/provider/libvirt/provider_test.go
 @@ -257,7 +257,7 @@ func TestCreateVolume_FileCreation(t *testing.T) {
@@ -316,7 +335,7 @@ index 1d9ed770..96d1af6b 100644
  	// mkfs.ext4 may not be available in the test env
  	if err != nil {
  		if errors.Is(err, exec.ErrNotFound) {
-@@ -283,7 +283,7 @@ func TestCreateVolume_Idempotent(t *testing.T) {
+@@ -283,10 +283,13 @@ func TestCreateVolume_Idempotent(t *testing.T) {
  		t.Fatal(err)
  	}
  
@@ -325,6 +344,12 @@ index 1d9ed770..96d1af6b 100644
  	if err != nil {
  		t.Fatalf("CreateVolume on existing file should reuse: %v", err)
  	}
++	if info.SizeBytes != int64(len("existing data")) {
++		t.Errorf("recovered size = %d, want existing file size", info.SizeBytes)
++	}
+ 	if info.VolumeID != "idempotent-vol" {
+ 		t.Errorf("VolumeID = %q, want %q", info.VolumeID, "idempotent-vol")
+ 	}
 -- 
-2.43.0
+2.43.7
 

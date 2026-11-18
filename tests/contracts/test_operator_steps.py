@@ -154,7 +154,7 @@ class ReleaseInstallation(unittest.TestCase):
                 archive.addfile(entry, io.BytesIO(data))
             if broken and name == 'cloud-api-adaptor':
                 path.write_bytes(b'broken archive with a valid handoff checksum')
-        (source / 'outputs/containerd-shim-kata-v2').write_bytes(b'public shim fixture')
+        (source / 'outputs/openshell-driver-confidential-kubernetes').write_bytes(b'public driver fixture')
         contents = ''.join(hashlib.sha256(p.read_bytes()).hexdigest() + '  ' + str(p.relative_to(source)) + '\n'
                            for p in sorted(source.rglob('*')) if p.is_file() and p.name != 'SHA256SUMS')
         (source / 'SHA256SUMS').write_text(contents)
@@ -180,7 +180,6 @@ class ReleaseInstallation(unittest.TestCase):
             self.assertEqual(success.returncode, 0, success.stderr)
             self.assertEqual((destination / 'README').read_bytes(), b'public source fixture')
             self.assertEqual(destination.stat().st_mode & 0o777, 0o755)
-            self.assertTrue((root / 'operator/shim.sha256').is_file())
 
     def test_existing_deployment_is_preserved(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -227,7 +226,7 @@ class HandoffCopy(unittest.TestCase):
             def changed(source, staged, *args, **kwargs):
                 real_copy(source, staged, *args, **kwargs)
                 if Path(source) == root / 'handoff':
-                    (Path(staged) / 'outputs/containerd-shim-kata-v2').write_text('changed')
+                    (Path(staged) / 'outputs/openshell-driver-confidential-kubernetes').write_text('changed')
 
             with patch.object(release.shutil, 'copytree', side_effect=changed):
                 with self.assertRaises(subprocess.CalledProcessError):

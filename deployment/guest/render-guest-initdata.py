@@ -26,7 +26,6 @@ def main() -> int:
     ca = args.kbs_ca.read_text().rstrip()
     registry_cas = [path.read_text().rstrip() for path in args.registry_ca]
     aa = f'''[eventlog_config]
-enable_eventlog = true
 init_pcr = 17
 [token_configs.kbs]
 url = {json.dumps(endpoint)}

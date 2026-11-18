@@ -3,11 +3,10 @@
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$root"
-component="${1:?usage: prepare-sources.sh cloud-api-adaptor|peerpod-ctrl|caa-csi-block-driver|kata-containers [local Kata source]}"
+component="${1:?usage: prepare-sources.sh cloud-api-adaptor|peerpod-ctrl|caa-csi-block-driver}"
 case "$component" in
   cloud-api-adaptor|caa-csi-block-driver) source="$root/repos/$component" ;;
   peerpod-ctrl) source="$root/repos/cloud-api-adaptor" ;;
-  kata-containers) source="${2:?provide an existing pinned local Kata checkout}" ;;
   *) echo 'unsupported patch component' >&2; exit 1 ;;
 esac
 if [[ "$component" == peerpod-ctrl ]]; then

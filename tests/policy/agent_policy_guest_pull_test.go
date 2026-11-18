@@ -2,105 +2,56 @@ package policy_test
 
 import (
 	"context"
-	"encoding/json"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/open-policy-agent/opa/v1/rego"
+	"github.com/open-policy-agent/opa/v1/storage/inmem"
 )
 
-func TestGuestPullBindsSourceAndMetadataToMeasuredImage(t *testing.T) {
-	module, err := os.ReadFile("../../deployment/policy/agent-policy-guest-pull.rego")
+func TestReleasedGuestPullPolicy(t *testing.T) {
+	rules, err := os.ReadFile("../../artifacts/cache/kata-policy/rules.rego")
 	if err != nil {
 		t.Fatal(err)
 	}
-	image := "registry.example/openshell/supervisor@sha256:" +
-		"1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
-	annotations := map[string]any{
-		"io.kubernetes.cri.container-type":         "container",
-		"io.katacontainers.pkg.oci.container_type": "pod_container",
-		"io.kubernetes.cri.image-name":             image,
-	}
-	metadata, err := json.Marshal(map[string]any{"metadata": annotations})
+	image := "registry.example/workload@sha256:" + strings.Repeat("a", 64)
+	ctx := context.Background()
+	query, err := rego.New(
+		rego.Query(`data.agent_policy.allow_storages(input.container, input.storages, "bundle", "sandbox")`),
+		rego.Module("rules.rego", string(rules)+"\npolicy_data := data.generated"),
+		rego.Store(inmem.NewFromObject(map[string]any{"generated": map[string]any{"common": map[string]any{"root_path": "/bundle/rootfs"}, "cluster_config": map[string]any{"guest_pull": true}}})),
+	).PrepareForEval(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, tc := range []struct {
-		name, source, option string
-		storage              bool
-		duplicate            bool
-		allowed              bool
+		name, role, source string
+		options            []string
+		count              int
+		allowed            bool
 	}{
-		{"pinned image", image, "image_guest_pull=" + string(metadata), true, false, true},
-		{"different image", "registry.example/openshell/attacker@sha256:" +
-			"1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef", "image_guest_pull=" + string(metadata), true, false, false},
-		{"different digest", "registry.example/openshell/supervisor@sha256:" +
-			"abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890", "image_guest_pull=" + string(metadata), true, false, false},
-		{"tagged image", "registry.example/openshell/supervisor:latest", "image_guest_pull=" + string(metadata), true, false, false},
-		{"missing metadata", image, "image_guest_pull={\"metadata\":{}}", true, false, false},
-		{"spoof sandbox metadata", image, "image_guest_pull={\"metadata\":{\"io.kubernetes.cri.container-type\":\"sandbox\",\"io.katacontainers.pkg.oci.container_type\":\"pod_sandbox\",\"io.kubernetes.cri.image-name\":\"" + image + "\"}}", true, false, false},
-		{"wrong driver option", image, "other={\"metadata\":{}}", true, false, false},
-		{"duplicate guest pull", image, "image_guest_pull=" + string(metadata), true, true, false},
-		{"host rootfs fallback", "", "", false, false, false},
+		{"pinned workload", "container", image, []string{}, 1, true},
+		{"mirrored digest", "container", strings.Replace(image, "registry.example", "mirror.example", 1), []string{}, 1, true},
+		{"wrong digest", "container", image[:len(image)-1] + "b", []string{}, 1, false},
+		{"legacy metadata", "container", image, []string{"image_guest_pull={}"}, 1, false},
+		{"missing storage", "container", image, []string{}, 0, false},
+		{"extra storage", "container", image, []string{}, 2, false},
+		{"bundled pause", "sandbox", "pause", []string{}, 1, true},
+		{"wrong pause", "sandbox", image, []string{}, 1, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			var storages []any
-			if tc.storage {
-				storages = []any{map[string]any{"driver": "image_guest_pull", "source": tc.source,
-					"driver_options": []string{tc.option}}}
-				if tc.duplicate {
-					storages = append(storages, storages[0])
-				}
+			container := map[string]any{"image": image, "storages": []any{}, "OCI": map[string]any{"Annotations": map[string]string{
+				"io.kubernetes.cri.container-type": tc.role, "io.katacontainers.pkg.oci.container_type": "pod_" + tc.role,
+			}}}
+			storages := []any{}
+			for range tc.count {
+				storages = append(storages, map[string]any{"driver": "image_guest_pull", "fstype": "overlay", "fs_group": nil, "shared": false, "mount_point": "/bundle/rootfs", "options": []string{}, "source": tc.source, "driver_options": tc.options})
 			}
-			input := map[string]any{
-				"oci":      map[string]any{"Annotations": annotations},
-				"storages": storages,
-			}
-			result, err := rego.New(
-				rego.Query("data.agent_policy.openshell_guest_pull(input.oci, input.storages)"),
-				rego.Module("agent-policy-guest-pull.rego", "package agent_policy\n"+string(module)),
-				rego.Input(input),
-			).Eval(context.Background())
-			if err != nil {
-				t.Fatal(err)
-			}
-			if (len(result) != 0) != tc.allowed {
-				t.Fatalf("allowed=%t, result=%v", tc.allowed, result)
+			results, err := query.Eval(ctx, rego.EvalInput(map[string]any{"container": container, "storages": storages}))
+			if err != nil || results.Allowed() != tc.allowed {
+				t.Fatalf("allowed=%v, want %v, error=%v", results.Allowed(), tc.allowed, err)
 			}
 		})
-	}
-}
-
-func TestGuestPullPauseUsesBundledImage(t *testing.T) {
-	module, err := os.ReadFile("../../deployment/policy/agent-policy-guest-pull.rego")
-	if err != nil {
-		t.Fatal(err)
-	}
-	annotations := map[string]any{
-		"io.kubernetes.cri.container-type":         "sandbox",
-		"io.katacontainers.pkg.oci.container_type": "pod_sandbox",
-	}
-	metadata, err := json.Marshal(map[string]any{"metadata": annotations})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, tc := range []struct {
-		source  string
-		allowed bool
-	}{{"pause", true}, {"registry.example/attacker:latest", false}} {
-		input := map[string]any{"oci": map[string]any{"Annotations": annotations},
-			"storages": []any{map[string]any{"driver": "image_guest_pull", "source": tc.source,
-				"driver_options": []string{"image_guest_pull=" + string(metadata)}}}}
-		result, err := rego.New(
-			rego.Query("data.agent_policy.openshell_guest_pull(input.oci, input.storages)"),
-			rego.Module("agent-policy-guest-pull.rego", "package agent_policy\n"+string(module)),
-			rego.Input(input),
-		).Eval(context.Background())
-		if err != nil {
-			t.Fatal(err)
-		}
-		if (len(result) != 0) != tc.allowed {
-			t.Fatalf("source=%q allowed=%t, result=%v", tc.source, tc.allowed, result)
-		}
 	}
 }

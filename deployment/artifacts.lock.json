@@ -3,7 +3,7 @@
   "platform": "linux/amd64",
   "podvm": {
     "source": "cloud-api-adaptor",
-    "commit": "9ca88115b6daa43f023a8a3b61ee48190707b6e1",
+    "commit": "36dfe90219fd57b26a3d984c0be20ca67eed45e8",
     "distribution": "ubuntu",
     "release": "resolute",
     "profile": "production",
@@ -17,35 +17,35 @@
     "tools_base_image": "ubuntu@sha256:0d39fcc8335d6d74d5502f6df2d30119ff4790ebbb60b364818d5112d9e3e932"
   },
   "guest_components": {
-    "version": "post-v0.22.0-de1142e1",
+    "version": "v0.23.1",
     "repository": "confidential-containers/guest-components",
-    "commit": "de1142e1dfb9d56ece0bd758c6efda7fb52c56bd",
+    "commit": "095f5c040377b7bce2c42a7d133e27c869010dee",
     "binaries": {
       "attestation-agent": {
-        "ref": "ghcr.io/confidential-containers/guest-components/attestation-agent@sha256:a3aff6e2fd814e2a6a2dabf287cfdeeecc0e769ba67d14abb950e30cc1fc5159",
-        "binary_sha256": "792b177099c5be2fc7f9fdbd6d988f4cce7a0030129baf64562eda7093bcc854",
+        "ref": "ghcr.io/confidential-containers/guest-components/attestation-agent@sha256:903beec21c86a825138e3ef17a38dce3b6fe2764dfa1d1f3c04a1806865f1b6a",
+        "binary_sha256": "c66d01b8b55f03bb26eac93b79a8fea28827ed98e3916501a83926b74b600ad6",
         "archive": "attestation-agent.tar.xz"
       },
       "confidential-data-hub": {
-        "ref": "ghcr.io/confidential-containers/guest-components/confidential-data-hub@sha256:4a61cede4e71d5b93843b2d01771f06390c6d232841ffd49acd1b88a1ffb9e85",
-        "binary_sha256": "5ad4855d94a34adb2d3f57f159c4049122c9821d916ddb36af6c100738461e39",
+        "ref": "ghcr.io/confidential-containers/guest-components/confidential-data-hub@sha256:6b5f1beb2d5af5f75888030cabf58dfd8afb611883d1ef2022ec3da41d5f2ba8",
+        "binary_sha256": "cb65ad09bc6317238e58ff4194d5b44384f0813915767fcec54527fb644e6650",
         "archive": "confidential-data-hub.tar.xz"
       },
       "api-server-rest": {
-        "ref": "ghcr.io/confidential-containers/guest-components/api-server-rest@sha256:404f12058f735eba37c054909368c8260d9e56a8e68ea0add4ca20ee83837f12",
-        "binary_sha256": "4a3cd264681387270f52cf12382c92b024afe4172cc7fff6ab5a4a1345f2e294",
+        "ref": "ghcr.io/confidential-containers/guest-components/api-server-rest@sha256:71a1e8c417107ed74b96f8198d75846c3ff23f94d00d56ace2806f6927aed818",
+        "binary_sha256": "86578451372019ef576b49317cd7e131ece4f89983c6bea046d1c88acd43d5b0",
         "archive": "api-server-rest.tar.xz"
       }
     }
   },
   "kata_agent": {
-    "version": "4.2.0",
+    "version": "4.4.0",
     "repository": "kata-containers/kata-containers",
-    "commit": "c7351e797efff8bfc6bd73da0eb1909be12e2cfe",
-    "ref": "ghcr.io/kata-containers/cached-artefacts/agent@sha256:b47c171ea6ba896bde6d51dbbd3c6fd320b9199955956918680283b589e5c93d",
+    "commit": "f9cbda4d235b345340bf461e4aaba8c89e841d8d",
+    "ref": "ghcr.io/kata-containers/cached-artefacts/agent@sha256:db469b83f0989d0a8799ed4f90a22db93a51c2a42f121f06a6a8ff475c1d580c",
     "archive": "kata-static-agent.tar.zst",
     "binary_member": "./usr/bin/kata-agent",
-    "binary_sha256": "f6c94d5bc5abe6492768b3d58c42e5ef02a7d5683ab547da4581d43ea0d5f6de"
+    "binary_sha256": "484a835e9f2a24e6ff67a62989ee332429270cf3ca5fee4823879933f8415286"
   },
   "pause_image": {
     "ref": "registry.k8s.io/pause@sha256:7031c1b283388d2c2e09b57badb803c05ebed362dc88d84b480cc47f72a21097",

@@ -265,7 +265,7 @@ mod tests {
         data.insert(
             "aa.toml".to_string(),
             toml::Value::String(format!(
-                "[eventlog_config]\nenable_eventlog = true\n[token_configs.kbs]\nurl = 'https://10.0.0.1:8443'\ncert = '''{ca}'''\n"
+                "[token_configs.kbs]\nurl = 'https://10.0.0.1:8443'\ncert = '''{ca}'''\n"
             )),
         );
         data.insert(
@@ -351,6 +351,7 @@ mod tests {
             )
             .unwrap();
         store.record_launch(&crate::launch::LaunchIntent {
+            last_update: None, updated_environment: None,
             sandbox_id: "sandbox-1".into(), namespace: "sandbox".into(), sandbox_cr_uid: "cr-uid-1".into(),
             sandbox_name: "test".into(), main_process_spec: "test".into(), log_level: "info".into(),
             agent_uid: 1000, agent_gid: 1000, volume_claim_templates: serde_json::Value::Null,

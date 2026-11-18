@@ -10,6 +10,7 @@ use tracing::info;
 
 use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
+use openshell_core::sandbox_env::SupervisorOtlpArgs;
 use openshell_driver_confidential_kubernetes::{
     ComputeDriverService, ConfidentialDriverSettings, DEFAULT_GATEWAY_ID,
     DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, KubernetesComputeConfig, KubernetesComputeDriver,
@@ -22,11 +23,6 @@ use openshell_driver_confidential_kubernetes::{
 #[command(version = VERSION)]
 #[allow(clippy::struct_excessive_bools)]
 struct Args {
-    /// Time budget for policy generation, guest boot and image preparation.
-    #[arg(long, env = "OPENSHELL_BOOTSTRAP_TIMEOUT_SECONDS", default_value_t = 300,
-        value_parser = clap::value_parser!(u64).range(1..=3600))]
-    bootstrap_timeout_seconds: u64,
-
     /// `RuntimeClass` backed by an attested confidential guest for both Pods.
     #[arg(long, env = "OPENSHELL_CONFIDENTIAL_RUNTIME_CLASS")]
     confidential_runtime_class: String,
@@ -85,6 +81,14 @@ struct Args {
         default_value = "{}"
     )]
     admission_config_json: openshell_core::resource_admission::DriverAdmissionConfig,
+    /// Runtime bootstrap budget in seconds.
+    #[arg(long, env = "OPENSHELL_RUNTIME_BOOTSTRAP_GRACE_SECONDS", default_value = "300",
+        value_parser = clap::value_parser!(u64).range(1..=86_400))]
+    runtime_bootstrap_grace_seconds: u64,
+    /// Initial attachment budget passed to dedicated supervisor Pods.
+    #[arg(long, env = "OPENSHELL_ATTACH_REQUEST_TIMEOUT_SECONDS",
+        value_parser = clap::value_parser!(u64).range(1..=86_400))]
+    sandbox_attach_request_timeout_seconds: Option<u64>,
     /// Public compute-driver Unix socket used by an external gateway.
     #[arg(long, env = "OPENSHELL_COMPUTE_DRIVER_SOCKET")]
     bind_socket: Option<PathBuf>,
@@ -99,20 +103,8 @@ struct Args {
     #[arg(long, env = "OPENSHELL_LOG_LEVEL", default_value = "info")]
     log_level: String,
 
-    #[arg(long, env = "OPENSHELL_OTLP_ENDPOINT")]
-    otlp_endpoint: Option<String>,
-
-    /// OTLP/gRPC collector endpoint for supervisor OCSF event export.
-    #[arg(long, env = "OPENSHELL_OTLP_OCSF_ENDPOINT")]
-    otlp_ocsf_endpoint: Option<String>,
-
-    /// OCSF schema version that supervisors downgrade exported events to.
-    #[arg(
-        long,
-        env = "OPENSHELL_OTLP_OCSF_SCHEMA_VERSION",
-        requires = "otlp_ocsf_endpoint"
-    )]
-    otlp_ocsf_schema_version: Option<String>,
+    #[command(flatten)]
+    otlp: SupervisorOtlpArgs,
 
     #[arg(long, env = "OPENSHELL_GATEWAY_NAME")]
     gateway_name: Option<String>,
@@ -272,12 +264,18 @@ async fn main() -> Result<()> {
     let _tracing = openshell_otel::install_driver_tracing(
         openshell_driver_confidential_kubernetes::otel_tracing::TRACING,
         openshell_otel::DriverTracingConfig {
-            endpoint: args.otlp_endpoint.as_deref(),
+            endpoint: args.otlp.endpoint.as_deref(),
+            protocol: args.otlp.protocol.into(),
+            ca_file: args.otlp.ca_file.as_deref(),
+            cert_file: args.otlp.cert_file.as_deref(),
+            key_file: args.otlp.key_file.as_deref(),
             gateway_name: args.gateway_name.as_deref(),
             service_version: VERSION,
             log_level: &args.log_level,
+            ansi: openshell_core::color::stdout_ansi(),
         },
     );
+    args.otlp.warn_deprecated();
 
     let managed_ssh_gateway_pod_selector = args
         .managed_ssh_gateway_pod_selector
@@ -292,6 +290,7 @@ async fn main() -> Result<()> {
         })
         .collect::<Result<BTreeMap<_, _>>>()?;
 
+    let supervisor_otlp = args.otlp.supervisor_otlp();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let driver = KubernetesComputeDriver::new(
         KubernetesComputeConfig {
@@ -322,8 +321,12 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(openshell_core::config::default_supervisor_image),
             supervisor_image_pull_policy: args.supervisor_image_pull_policy,
             sandbox_runtime: KubernetesSandboxRuntimeConfig {
+                app_listener:
+                    openshell_driver_confidential_kubernetes::config::KubernetesAppListenerConfig::default(),
                 boundary_port: args.sandbox_runtime_boundary_port,
             },
+            runtime_bootstrap_grace_seconds: args.runtime_bootstrap_grace_seconds,
+            sandbox_attach_request_timeout_seconds: args.sandbox_attach_request_timeout_seconds,
             https_proxy: args.https_proxy,
             no_proxy: args.no_proxy,
             proxy_auth_secret_name: None,
@@ -332,14 +335,8 @@ async fn main() -> Result<()> {
             proxy_connect_by_hostname: args.proxy_connect_by_hostname.then_some(true),
             proxy_ca_bundle: args.proxy_ca_bundle,
             grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
-            supervisor_otlp_endpoint: args.otlp_endpoint.clone(),
+            supervisor_otlp,
             supervisor_gateway_name: args.gateway_name.clone(),
-            supervisor_ocsf_export: args.otlp_ocsf_endpoint.clone().map(|endpoint| {
-                openshell_core::sandbox_env::OcsfOtlpExport {
-                    endpoint,
-                    schema_version: args.otlp_ocsf_schema_version.clone(),
-                }
-            }),
             ssh_socket_path: args.sandbox_ssh_socket_path,
             client_tls_secret_name: String::new(),
             host_gateway_ip: args.host_gateway_ip.unwrap_or_default(),
@@ -352,6 +349,7 @@ async fn main() -> Result<()> {
             }),
             workspace_storage_class: std::env::var("OPENSHELL_K8S_WORKSPACE_STORAGE_CLASS")
                 .unwrap_or_default(),
+            supervisor_runtime_class_name: args.confidential_runtime_class.clone(),
             default_runtime_class_name: args.confidential_runtime_class,
             allowed_pod_annotations: args.allowed_pod_annotations,
             allowed_pod_labels: args.allowed_pod_labels,
@@ -364,7 +362,6 @@ async fn main() -> Result<()> {
         },
         shutdown_rx,
         ConfidentialDriverSettings {
-            bootstrap_timeout: std::time::Duration::from_secs(args.bootstrap_timeout_seconds),
             initdata_base: args.guest_initdata_base,
             client_tls_ca: args.confidential_client_tls_ca,
             policy_generator: args.kata_policy_generator,
@@ -386,7 +383,10 @@ async fn main() -> Result<()> {
     .await
     .into_diagnostic()?;
 
-    let service = ComputeDriverServer::new(ComputeDriverService::new(driver));
+    let driver_service = ComputeDriverService::new(driver);
+    let configuration_updates_service = openshell_core::proto::compute::v1::compute_driver_configuration_updates_server::ComputeDriverConfigurationUpdatesServer::new(driver_service.clone());
+    let app_endpoints_service = openshell_core::proto::compute::v1::compute_driver_app_endpoints_server::ComputeDriverAppEndpointsServer::new(driver_service.clone());
+    let service = ComputeDriverServer::new(driver_service);
     let shutdown = async move {
         shutdown_signal().await;
         let _ = shutdown_tx.send(true);
@@ -400,6 +400,8 @@ async fn main() -> Result<()> {
         tonic::transport::Server::builder()
             .layer(openshell_otel::compute_driver_rpc_layer())
             .add_service(service)
+            .add_service(configuration_updates_service)
+            .add_service(app_endpoints_service)
             .serve_with_incoming_shutdown(
                 openshell_core::external_driver_socket::SameUidUnixIncoming::new(listener),
                 shutdown,
@@ -411,6 +413,8 @@ async fn main() -> Result<()> {
         tonic::transport::Server::builder()
             .layer(openshell_otel::compute_driver_rpc_layer())
             .add_service(service)
+            .add_service(configuration_updates_service)
+            .add_service(app_endpoints_service)
             .serve_with_shutdown(args.bind_address, shutdown)
             .await
             .into_diagnostic()
@@ -419,15 +423,13 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    #[test]
-    fn accepts_gateway_otlp_configuration() {
-        let args = Args::try_parse_from([
+    fn required_args() -> &'static [&'static str] {
+        &[
             "openshell-driver-confidential-kubernetes",
             "--confidential-runtime-class",
             "kata-confidential",
-            "--trustee-config", "/tmp/trustee-client.json",
+            "--trustee-config",
+            "/tmp/trustee-client.json",
             "--guest-initdata-base",
             "/tmp/initdata.toml",
             "--confidential-client-tls-ca",
@@ -448,19 +450,56 @@ mod tests {
             "/tmp/policy.rego",
             "--as-policy-output",
             "/tmp/as-policy.rego",
+        ]
+    }
+
+    #[test]
+    fn bootstrap_timeout_arguments_reject_invalid_values() {
+        let defaults = Args::try_parse_from(required_args()).unwrap();
+        assert_eq!(defaults.runtime_bootstrap_grace_seconds, 300);
+        assert!(defaults.sandbox_attach_request_timeout_seconds.is_none());
+        for flag in [
+            "--runtime-bootstrap-grace-seconds",
+            "--sandbox-attach-request-timeout-seconds",
+        ] {
+            for value in ["0", "86401", "invalid"] {
+                assert!(
+                    Args::try_parse_from(required_args().iter().copied().chain([flag, value]))
+                        .is_err()
+                );
+            }
+            for value in ["1", "900", "86400"] {
+                let args =
+                    Args::try_parse_from(required_args().iter().copied().chain([flag, value]))
+                        .unwrap();
+                let seconds = value.parse::<u64>().unwrap();
+                if flag == "--runtime-bootstrap-grace-seconds" {
+                    assert_eq!(args.runtime_bootstrap_grace_seconds, seconds);
+                } else {
+                    assert_eq!(args.sandbox_attach_request_timeout_seconds, Some(seconds));
+                }
+            }
+        }
+    }
+
+    use super::*;
+
+    #[test]
+    fn accepts_gateway_otlp_configuration() {
+        let args = Args::try_parse_from(required_args().iter().copied().chain([
             "--otlp-endpoint",
             "http://collector.example:4317",
             "--gateway-name",
             "kubernetes-dev",
-        ])
+        ]))
         .expect("OTLP endpoint should parse");
 
         assert_eq!(
-            args.otlp_endpoint.as_deref(),
+            args.otlp.endpoint.as_deref(),
             Some("http://collector.example:4317")
         );
         assert_eq!(args.gateway_name.as_deref(), Some("kubernetes-dev"));
-        assert_eq!(args.bootstrap_timeout_seconds, 300);
+        assert_eq!(args.runtime_bootstrap_grace_seconds, 300);
         assert!(args.kata_policy_registry_ca.is_none());
     }
 }

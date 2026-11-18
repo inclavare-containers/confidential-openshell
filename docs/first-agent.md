@@ -140,4 +140,4 @@ openshell sandbox delete "$SANDBOX"
 ```
 
 Provider/profile management, file transfer and lifecycle commands are the
-[standard OpenShell workflow](https://github.com/NVIDIA/OpenShell/blob/v0.1.6/docs/about/run-your-first-agent.mdx).
+[standard OpenShell workflow](https://github.com/NVIDIA/OpenShell/blob/v0.1.9/docs/about/run-your-first-agent.mdx).

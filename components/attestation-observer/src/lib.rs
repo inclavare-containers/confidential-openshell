@@ -162,12 +162,16 @@ pub fn summarize(token: &str, key: &DecodingKey, observed_at: u64) -> Result<Rep
         return Err("invalid EAR time");
     }
     let cpu = &claims["submods"]["cpu0"];
-    let appraisal = bounded_text(cpu.get("ear.status")).ok_or("missing appraisal")?;
+    let appraisal = bounded_text(cpu.get("ear_status")).ok_or("missing appraisal")?;
     if !["affirming", "warning", "contraindicated", "none"].contains(&appraisal.as_str()) {
         return Err("unknown EAR appraisal");
     }
-    let policy_id = bounded_text(cpu.get("ear.appraisal-policy-id")).ok_or("missing policy id")?;
-    let evidence = &cpu["ear.veraison.annotated-evidence"]["tdx"];
+    let policy_id =
+        bounded_text(cpu["ear_appraisal_policy_ids"].get(0)).ok_or("missing policy id")?;
+    if cpu["ear_attester_claims"]["tee"] != "tdx" {
+        return Err("unexpected TEE");
+    }
+    let evidence = &cpu["ear_attester_claims"]["claims"];
     let events = evidence["uefi_event_logs"]
         .as_array()
         .ok_or("missing event log")?;
@@ -199,7 +203,7 @@ pub fn summarize(token: &str, key: &DecodingKey, observed_at: u64) -> Result<Rep
                 .map(|v| (name.to_owned(), v.to_owned()))
         })
         .collect();
-    let vector = &cpu["ear.trustworthiness-vector"];
+    let vector = &cpu["ear_trustworthiness_vector"];
     let trustworthiness = ["hardware", "executables", "configuration", "file-system"]
         .into_iter()
         .filter_map(|name| vector[name].as_i64().map(|v| (name.to_owned(), v)))
@@ -331,8 +335,14 @@ impl Observer {
                 let mut ignored = 0;
                 for entry in fs::read_dir(sessions)? {
                     let entry = entry?;
-                    if !entry.file_type()?.is_file() {
+                    if entry.file_name().as_encoded_bytes().starts_with(b"#") {
                         continue;
+                    }
+                    match entry.file_type() {
+                        Ok(kind) if kind.is_file() => {}
+                        Ok(_) => continue,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(error) => return Err(error),
                     }
                     let parsed = read_bounded(&entry.path())
                         .ok()

@@ -10,20 +10,21 @@ approved_initdata_events := {}
 default allow := false
 
 approved_tdx(appraisal) if {
-	appraisal["ear.appraisal-policy-id"] == "openshell-tdx"
-	appraisal["ear.status"] == "affirming"
-	vector := appraisal["ear.trustworthiness-vector"]
+	appraisal["ear_appraisal_policy_ids"] == ["openshell-tdx"]
+	appraisal["ear_status"] == "affirming"
+	vector := appraisal["ear_trustworthiness_vector"]
 	vector.hardware == 2
 	vector.configuration == 2
 	vector.executables == 3
 	vector["file-system"] == 2
-	evidence := appraisal["ear.veraison.annotated-evidence"].tdx
+	appraisal.ear_attester_claims.tee == "tdx"
+	evidence := appraisal.ear_attester_claims.claims
 	evidence.tcb_status in {"UpToDate", "OutOfDate"}
 	regex.match("^[0-9a-f][02468ace][0-9a-f]{14}$", evidence.quote.body.td_attributes)
 }
 
 measured_initdata(appraisal) := digest if {
-	logs := appraisal["ear.veraison.annotated-evidence"].tdx.uefi_event_logs
+	logs := appraisal.ear_attester_claims.claims.uefi_event_logs
 	is_array(logs)
 	matches := [event |
 		some event in logs

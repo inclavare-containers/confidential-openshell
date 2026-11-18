@@ -1,11 +1,11 @@
 {
   "repository": "https://github.com/confidential-containers/trustee",
-  "version": "v0.22.0",
-  "commit": "512fed65642015b849f38fb13bfdec7806639987",
+  "version": "v0.23.0",
+  "commit": "564a3ba51eaedd4734e88e1883a905dd780ee45b",
   "files": {
     "proto/plugin.proto": {
       "upstream": "protos/plugin.proto",
-      "sha256": "eef0b46145c9c2af448e3852746595012988f7e303ca425b96f4fea1fb5ff87b"
+      "sha256": "6b9ddfef90afb9ec2445a7f4cfee364cab7db079a73687a51d7e2f0080be615d"
     }
   },
   "session_adapter": "kbs/src/attestation/session.rs (private persisted SessionStatus format; version-bound)"

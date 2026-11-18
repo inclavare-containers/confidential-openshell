@@ -26,9 +26,10 @@ class LiveEvidence(unittest.TestCase):
         key = ec.generate_private_key(ec.SECP256R1())
         digest = 'a' * 96
         claims = {'iat': int(time.time()), 'exp': int(time.time()) + 300, 'submods': {'cpu0': {
-            'ear.status': 'affirming', 'ear.appraisal-policy-id': 'openshell-tdx',
-            'ear.trustworthiness-vector': {'hardware': 2, 'configuration': 2, 'executables': 3, 'file-system': 2},
-            'ear.veraison.annotated-evidence': {'runtime_data_claims': {'tee-pubkey': {}}, 'tdx': {
+            'ear_status': 'affirming', 'ear_appraisal_policy_ids': ['openshell-tdx'],
+            'ear_trustworthiness_vector': {'hardware': 2, 'configuration': 2, 'executables': 3, 'file-system': 2},
+            'ear_verifier_claims': {'runtime_data': {'tee-pubkey': {}}},
+            'ear_attester_claims': {'tee': 'tdx', 'claims': {
                 'uefi_event_logs': [{'type_name': 'EV_EVENT_TAG', 'details': {'unicode_name': 'AAEL',
                     'data': {'domain': 'github.com/confidential-containers', 'operation': 'InitData', 'content': {'digest': 'sha384:' + digest}}}}]}}}}}
 
@@ -44,7 +45,7 @@ class LiveEvidence(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'expired'):
             probe.verify_ear(signed(), key.public_key())
         claims['exp'] = int(time.time()) + 300
-        claims['submods']['cpu0']['ear.status'] = 'warning'
+        claims['submods']['cpu0']['ear_status'] = 'warning'
         with self.assertRaisesRegex(ValueError, 'non-affirming'):
             probe.verify_ear(signed(), key.public_key())
 

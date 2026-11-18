@@ -1,4 +1,4 @@
-From d7680a105c9b0ea0376c05a342e92a88215724d8 Mon Sep 17 00:00:00 2001
+From c40df4eaf88a985c7fda18e032d639eb889f6161 Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
 Date: Tue, 3 Nov 2026 11:58:13 +0800
 Subject: [PATCH] alibabacloud: compress large instance user data
@@ -9,6 +9,14 @@ Keep the upstream cloud-config generation and preserve its exact bytes.
 Signed-off-by: Weidong Sun <sunweidong@linux.alibaba.com>
 Co-authored-by: Codex <noreply@openai.com>
 ---
+ .../pkg/userdata/alibabacloud_test.go         | 42 +++++++++
+ .../pkg/userdata/provision.go                 | 22 ++++-
+ src/cloud-providers/alibabacloud/provider.go  | 31 ++++++-
+ .../alibabacloud/userdata_test.go             | 93 +++++++++++++++++++
+ 4 files changed, 184 insertions(+), 4 deletions(-)
+ create mode 100644 src/cloud-api-adaptor/pkg/userdata/alibabacloud_test.go
+ create mode 100644 src/cloud-providers/alibabacloud/userdata_test.go
+
 diff --git a/src/cloud-api-adaptor/pkg/userdata/alibabacloud_test.go b/src/cloud-api-adaptor/pkg/userdata/alibabacloud_test.go
 new file mode 100644
 index 00000000..3bdfca33
@@ -58,7 +66,7 @@ index 00000000..3bdfca33
 +	}
 +}
 diff --git a/src/cloud-api-adaptor/pkg/userdata/provision.go b/src/cloud-api-adaptor/pkg/userdata/provision.go
-index 487ebd88..79ea2c1e 100644
+index 63538c4d..5c61a594 100644
 --- a/src/cloud-api-adaptor/pkg/userdata/provision.go
 +++ b/src/cloud-api-adaptor/pkg/userdata/provision.go
 @@ -1,9 +1,12 @@
@@ -263,3 +271,4 @@ index 00000000..7113457d
 +}
 -- 
 2.43.7
+

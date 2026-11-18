@@ -19,7 +19,7 @@ openshell-attestation-observer = { path = "../attestation-observer" }
 reqwest = { workspace = true }
 rustls = { workspace = true }
 jsonwebtoken = { workspace = true }
-openshell-core = { path = "../../repos/openshell/crates/openshell-core", default-features = false, features = ["jwt"] }
+openshell-core = { path = "../../repos/openshell/crates/openshell-core", default-features = false, features = ["jwt", "otel", "clap"] }
 openshell-crypto = { path = "../../repos/openshell/crates/openshell-crypto", default-features = false, features = ["aws-lc", "tls-kube"] }
 openshell-supervisor-control = { path = "../../repos/openshell/crates/openshell-supervisor-control" }
 openshell-isolation-interface = { path = "../../repos/openshell/crates/openshell-isolation-interface" }
@@ -45,6 +45,7 @@ tracing-subscriber = { workspace = true }
 thiserror = { workspace = true }
 miette = { workspace = true }
 notify = "8"
+regex = "1"
 rand = { workspace = true }
 rcgen = { workspace = true }
 sha2 = { workspace = true }

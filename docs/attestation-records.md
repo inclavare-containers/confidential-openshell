@@ -161,7 +161,7 @@ raw EAR, session cookie, public-key payload, evidence body and secret values.
 
 The observer reads the official KBS `kbs_protocol_session` namespace and verifies
 ES256 EARs with the configured AS public key. This read adapter depends on the
-private persisted session format of Trustee v0.22.0; its query interface uses the
+private persisted session format of Trustee v0.23.0; its query interface uses the
 official external-plugin protocol. Recheck both when upgrading Trustee.
 Verbose EAR evidence is required to extract the measured initdata event.
 

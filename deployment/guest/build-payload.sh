@@ -79,15 +79,14 @@ for binary in attestation-agent confidential-data-hub api-server-rest; do
     install -D -m 0755 "${cached}" "${tree}/usr/local/bin/${binary}"
 done
 
-agent="${KATA_AGENT_BIN:-${artifacts}/cache/kata-agent-4.2.0}"
+agent_version=$(jq -er .kata_agent.version "$lock")
+agent="${KATA_AGENT_BIN:-${artifacts}/cache/kata-agent-${agent_version}}"
 expected_agent="$(jq -r '.kata_agent.binary_sha256' "${lock}")"
 if [[ ! -f "${agent}" ]]; then
     # Follow CAA: fetch the standalone, provenance-verified official OCI agent.
     command -v oras >/dev/null
     command -v gh >/dev/null
     reference="$(jq -r '.kata_agent.ref' "${lock}")"
-    test "$(jq -r '.kata_agent.commit' "${lock}")" = \
-        "$(jq -r '."kata-containers".base' "${root}/deployment/build/sources.lock.json")"
     mkdir -p "${work}/kata"
     (
         cd "${work}/kata"
@@ -98,9 +97,9 @@ if [[ ! -f "${agent}" ]]; then
         tar -I zstd -xOf "$(jq -r '.kata_agent.archive' "${lock}")" \
             "$(jq -r '.kata_agent.binary_member' "${lock}")" > kata-agent
         printf '%s  %s\n' "${expected_agent}" kata-agent | sha256sum -c -
-        install -m 0755 kata-agent "${artifacts}/cache/kata-agent-4.2.0"
+        install -m 0755 kata-agent "${artifacts}/cache/kata-agent-${agent_version}"
     )
-    agent="${artifacts}/cache/kata-agent-4.2.0"
+    agent="${artifacts}/cache/kata-agent-${agent_version}"
 fi
 printf '%s  %s\n' "${expected_agent}" "${agent}" | sha256sum -c -
 install -D -m 0755 "${agent}" "${tree}/usr/local/bin/kata-agent"

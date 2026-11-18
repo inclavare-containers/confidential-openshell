@@ -1,7 +1,8 @@
-From f76bba6adbd157ec4ef5c54d6af3b93315bb4fd3 Mon Sep 17 00:00:00 2001
+From 1dd25d239414fbdeebe225a245a5a237087ee7de Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
 Date: Wed, 4 Nov 2026 15:24:44 +0800
-Subject: [PATCH] guest: authorize encrypted workspaces through measured policy
+Subject: [PATCH] guest: authorize encrypted workspaces through
+ measured policy
 
 Authorize disk identity, key, filesystem, initialization and per-container
 mount identity from measured initdata before device operations. Required mounts cannot disappear with host annotations. Use the disk ID for the guest
@@ -17,18 +18,22 @@ encrypted-volume profile is enabled.
 Signed-off-by: Weidong Sun <sunweidong@linux.alibaba.com>
 Co-authored-by: Codex <noreply@openai.com>
 ---
- .../cmd/agent-protocol-forwarder/main.go           |  26 +-
- .../cmd/agent-protocol-forwarder/main_test.go      |  19 +
- .../pkg/forwarder/interceptor/cdh_client.go        |  59 +++
- .../pkg/forwarder/interceptor/interceptor.go       | 269 +++++++----
- .../pkg/forwarder/interceptor/interceptor_test.go  |   9 +
- .../pkg/forwarder/interceptor/workspace.go         | 281 ++++++++++++
- .../pkg/forwarder/interceptor/workspace_mount.go   | 494 +++++++++++++++++++++
- .../workspace_mount_integration_test.go            |  67 +++
- .../forwarder/interceptor/workspace_mount_test.go  | 204 +++++++++
- .../pkg/forwarder/interceptor/workspace_test.go    | 122 +++++
- .../interceptor/workspace_transaction_test.go      | 111 +++++
- 11 files changed, 1572 insertions(+), 89 deletions(-)
+ .../cmd/agent-protocol-forwarder/main.go      |  26 +-
+ .../cmd/agent-protocol-forwarder/main_test.go |  19 +
+ .../forwarder/interceptor/alibaba_device.go   |  68 +++
+ .../interceptor/alibaba_device_test.go        | 145 +++++
+ .../pkg/forwarder/interceptor/cdh_client.go   |  59 +++
+ .../pkg/forwarder/interceptor/interceptor.go  | 281 +++++++---
+ .../forwarder/interceptor/interceptor_test.go |   9 +
+ .../pkg/forwarder/interceptor/workspace.go    | 281 ++++++++++
+ .../forwarder/interceptor/workspace_mount.go  | 494 ++++++++++++++++++
+ .../workspace_mount_integration_test.go       |  67 +++
+ .../interceptor/workspace_mount_test.go       | 204 ++++++++
+ .../forwarder/interceptor/workspace_test.go   | 122 +++++
+ .../interceptor/workspace_transaction_test.go | 111 ++++
+ 13 files changed, 1791 insertions(+), 95 deletions(-)
+ create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/alibaba_device.go
+ create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/alibaba_device_test.go
  create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/cdh_client.go
  create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace.go
  create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace_mount.go
@@ -38,7 +43,7 @@ Co-authored-by: Codex <noreply@openai.com>
  create mode 100644 src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace_transaction_test.go
 
 diff --git a/src/cloud-api-adaptor/cmd/agent-protocol-forwarder/main.go b/src/cloud-api-adaptor/cmd/agent-protocol-forwarder/main.go
-index 189a3595..e36fccec 100644
+index 9b1715ef..c9cd054c 100644
 --- a/src/cloud-api-adaptor/cmd/agent-protocol-forwarder/main.go
 +++ b/src/cloud-api-adaptor/cmd/agent-protocol-forwarder/main.go
 @@ -9,6 +9,7 @@ import (
@@ -97,8 +102,8 @@ index 189a3595..e36fccec 100644
  		cfg.tlsConfig = &tlsConfig
  	}
  
--	interceptor := interceptor.NewInterceptor(cfg.kataAgentSocketPath, cfg.podNamespace)
-+	interceptor := interceptor.NewInterceptorWithEncryptedVolumes(cfg.kataAgentSocketPath, cfg.podNamespace, cfg.requireEncryptedVolumes)
+-	interceptor := interceptor.NewInterceptor(cfg.kataAgentSocketPath, cfg.podNamespace, cfg.daemonConfig.CloudProvider)
++	interceptor := interceptor.NewInterceptorWithEncryptedVolumes(cfg.kataAgentSocketPath, cfg.podNamespace, cfg.daemonConfig.CloudProvider, cfg.requireEncryptedVolumes)
  
  	podNode := podnetwork.NewPodNode(cfg.podNamespace, cfg.HostInterface, cfg.daemonConfig.PodNetwork)
  
@@ -132,6 +137,231 @@ index 829589f2..4c494076 100644
  	t.Run("config with tls-skip-verify flag", func(t *testing.T) {
  		_, cleanup := setupTestConfig(t, `{"pod-namespace": "test-ns"}`,
  			"-tls-skip-verify",
+diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/alibaba_device.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/alibaba_device.go
+new file mode 100644
+index 00000000..7a9a3bd4
+--- /dev/null
++++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/alibaba_device.go
+@@ -0,0 +1,68 @@
++// (C) Copyright Confidential Containers Contributors
++// SPDX-License-Identifier: Apache-2.0
++
++package interceptor
++
++import (
++	"errors"
++	"fmt"
++	"os"
++	"path/filepath"
++	"regexp"
++	"strings"
++)
++
++var (
++	alibabaDiskIDPattern    = regexp.MustCompile(`^d-[A-Za-z0-9]+$`)
++	errAlibabaDiskIDInvalid = errors.New("invalid Alibaba Cloud disk identity")
++	errAlibabaDiskNotFound  = errors.New("Alibaba Cloud disk is not visible")
++	errAlibabaDiskAmbiguous = errors.New("Alibaba Cloud disk identity is ambiguous")
++)
++
++type alibabaDeviceLocator struct {
++	sysBlockRoot string
++	deviceRoot   string
++}
++
++func isAlibabaDiskIdentity(diskID string) bool {
++	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(diskID)), "d-")
++}
++
++func findAlibabaDataDisk(diskID string) (string, error) {
++	return (alibabaDeviceLocator{sysBlockRoot: "/sys/block", deviceRoot: "/dev"}).find(diskID)
++}
++
++// Match the cloud disk ID to its kernel identity, with or without the d- prefix.
++// /sys/block enumerates whole devices; selecting a filesystem is a separate step.
++func (l alibabaDeviceLocator) find(diskID string) (string, error) {
++	if !alibabaDiskIDPattern.MatchString(diskID) {
++		return "", fmt.Errorf("%w: %q", errAlibabaDiskIDInvalid, diskID)
++	}
++	entries, err := os.ReadDir(l.sysBlockRoot)
++	if err != nil {
++		return "", err
++	}
++	wanted := strings.ToLower(strings.TrimPrefix(diskID, "d-"))
++	matched := ""
++	for _, entry := range entries {
++		for _, field := range []string{"device/serial", "serial", "device/wwid", "wwid"} {
++			data, err := os.ReadFile(filepath.Join(l.sysBlockRoot, entry.Name(), field))
++			if err != nil {
++				continue
++			}
++			identity := strings.TrimPrefix(strings.ToLower(strings.Trim(string(data), " \t\r\n\x00")), "d-")
++			if identity != wanted {
++				continue
++			}
++			if matched != "" {
++				return "", fmt.Errorf("%w: %s", errAlibabaDiskAmbiguous, diskID)
++			}
++			matched = filepath.Join(l.deviceRoot, entry.Name())
++			break
++		}
++	}
++	if matched == "" {
++		return "", fmt.Errorf("%w: %s", errAlibabaDiskNotFound, diskID)
++	}
++	return matched, nil
++}
+diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/alibaba_device_test.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/alibaba_device_test.go
+new file mode 100644
+index 00000000..313105fb
+--- /dev/null
++++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/alibaba_device_test.go
+@@ -0,0 +1,145 @@
++// (C) Copyright Confidential Containers Contributors
++// SPDX-License-Identifier: Apache-2.0
++
++package interceptor
++
++import (
++	"errors"
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++func addTestBlockDevice(t *testing.T, sysBlock, deviceRoot, name string, identities map[string]string) {
++	t.Helper()
++	dir := filepath.Join(sysBlock, name)
++	if err := os.MkdirAll(dir, 0o755); err != nil {
++		t.Fatal(err)
++	}
++	for relative, value := range identities {
++		path := filepath.Join(dir, relative)
++		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
++			t.Fatal(err)
++		}
++		if err := os.WriteFile(path, []byte(value+"\n"), 0o644); err != nil {
++			t.Fatal(err)
++		}
++	}
++	if err := os.WriteFile(filepath.Join(deviceRoot, name), nil, 0o600); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func newTestAlibabaLocator(t *testing.T) (alibabaDeviceLocator, string, string) {
++	t.Helper()
++	root := t.TempDir()
++	sysBlock := filepath.Join(root, "sys", "block")
++	deviceRoot := filepath.Join(root, "dev")
++	for _, dir := range []string{sysBlock, deviceRoot} {
++		if err := os.MkdirAll(dir, 0o755); err != nil {
++			t.Fatal(err)
++		}
++	}
++	return alibabaDeviceLocator{
++		sysBlockRoot: sysBlock,
++		deviceRoot:   deviceRoot,
++	}, sysBlock, deviceRoot
++}
++
++func TestFindAlibabaDataDiskByNVMeSerial(t *testing.T) {
++	locator, sysBlock, deviceRoot := newTestAlibabaLocator(t)
++	addTestBlockDevice(t, sysBlock, deviceRoot, "nvme0n1", map[string]string{"device/serial": "systemdisk"})
++	addTestBlockDevice(t, sysBlock, deviceRoot, "nvme1n1", map[string]string{"serial": "d-workspace123"})
++
++	device, err := locator.find("d-workspace123")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if device != filepath.Join(deviceRoot, "nvme1n1") {
++		t.Fatalf("got device %q", device)
++	}
++}
++
++func TestFindAlibabaDataDiskByVirtioSerial(t *testing.T) {
++	locator, sysBlock, deviceRoot := newTestAlibabaLocator(t)
++	addTestBlockDevice(t, sysBlock, deviceRoot, "vda", map[string]string{"device/serial": "systemdisk"})
++	addTestBlockDevice(t, sysBlock, deviceRoot, "vdb", map[string]string{"device/serial": "workspace123"})
++
++	device, err := locator.find("d-workspace123")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if device != filepath.Join(deviceRoot, "vdb") {
++		t.Fatalf("got device %q", device)
++	}
++}
++
++func TestFindAlibabaDataDiskRejectsAmbiguousIdentity(t *testing.T) {
++	locator, sysBlock, deviceRoot := newTestAlibabaLocator(t)
++	addTestBlockDevice(t, sysBlock, deviceRoot, "vdb", map[string]string{"device/serial": "workspace123"})
++	addTestBlockDevice(t, sysBlock, deviceRoot, "vdc", map[string]string{"device/wwid": "d-workspace123"})
++
++	if _, err := locator.find("d-workspace123"); !errors.Is(err, errAlibabaDiskAmbiguous) {
++		t.Fatal("expected duplicate disk identities to fail closed")
++	}
++}
++
++func TestFindAlibabaDataDiskRejectsConsumedDiskPrefixWhileTargetIsMissing(t *testing.T) {
++	locator, sysBlock, deviceRoot := newTestAlibabaLocator(t)
++	addTestBlockDevice(t, sysBlock, deviceRoot, "vdb", map[string]string{"device/serial": "dabc123"})
++
++	if device, err := locator.find("d-abc123"); !errors.Is(err, errAlibabaDiskNotFound) {
++		t.Fatalf("wrong disk must not satisfy target identity: device=%q err=%v", device, err)
++	}
++
++	// A later retry may resolve the target after udev exposes it, but must never
++	// have returned the prefix-consuming false match while only vdb was visible.
++	addTestBlockDevice(t, sysBlock, deviceRoot, "vdc", map[string]string{"device/serial": "abc123"})
++	device, err := locator.find("d-abc123")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if device != filepath.Join(deviceRoot, "vdc") {
++		t.Fatalf("got device %q", device)
++	}
++}
++
++func TestFindAlibabaDataDiskRejectsInvalidIdentity(t *testing.T) {
++	locator, _, _ := newTestAlibabaLocator(t)
++	if _, err := locator.find("workspace123"); !errors.Is(err, errAlibabaDiskIDInvalid) {
++		t.Fatalf("expected invalid identity error, got %v", err)
++	}
++}
++
++func TestIsAlibabaDiskIdentity(t *testing.T) {
++	for _, diskID := range []string{"d-workspace123", " D-WORKSPACE123 ", "d-invalid-suffix"} {
++		if !isAlibabaDiskIdentity(diskID) {
++			t.Errorf("%q must use the Alibaba identity-only locator", diskID)
++		}
++	}
++	for _, diskID := range []string{"", "vol-123", "/subscriptions/disk"} {
++		if isAlibabaDiskIdentity(diskID) {
++			t.Errorf("%q was misclassified as Alibaba Cloud", diskID)
++		}
++	}
++}
++
++func TestFindAlibabaDataDiskWithPartitions(t *testing.T) {
++	locator, sysBlock, deviceRoot := newTestAlibabaLocator(t)
++	addTestBlockDevice(t, sysBlock, deviceRoot, "vdb", map[string]string{
++		"device/serial": "workspace123", "vdb1/partition": "1",
++	})
++	device, err := locator.find("d-workspace123")
++	if err != nil || device != filepath.Join(deviceRoot, "vdb") {
++		t.Fatalf("whole-disk lookup: device=%q err=%v", device, err)
++	}
++}
++
++func TestFindAlibabaDataDiskNVMeSerialWithoutPrefix(t *testing.T) {
++	locator, sysBlock, deviceRoot := newTestAlibabaLocator(t)
++	addTestBlockDevice(t, sysBlock, deviceRoot, "nvme1n1", map[string]string{"device/serial": "workspace123"})
++	device, err := locator.find("d-workspace123")
++	if err != nil || device != filepath.Join(deviceRoot, "nvme1n1") {
++		t.Fatalf("NVMe lookup: device=%q err=%v", device, err)
++	}
++}
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/cdh_client.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/cdh_client.go
 new file mode 100644
 index 00000000..a87c24fd
@@ -198,20 +428,18 @@ index 00000000..a87c24fd
 +	return nil
 +}
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
-index 565ba101..edb069e0 100644
+index 8b04ffa5..c66c5197 100644
 --- a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor.go
-@@ -5,7 +5,9 @@ package interceptor
- 
+@@ -6,6 +6,7 @@ package interceptor
  import (
  	"context"
-+	"errors"
  	"fmt"
 +	"io"
  	"log"
  	"net"
  	"os"
-@@ -14,6 +16,7 @@ import (
+@@ -14,6 +15,7 @@ import (
  	"sort"
  	"strconv"
  	"strings"
@@ -219,7 +447,7 @@ index 565ba101..edb069e0 100644
  	"syscall"
  	"time"
  
-@@ -29,9 +32,10 @@ import (
+@@ -29,9 +31,10 @@ import (
  
  const (
  	volumeTargetPathKey  = "io.confidentialcontainers.org.peerpodvolumes.target_path"
@@ -230,12 +458,13 @@ index 565ba101..edb069e0 100644
 +	cdhSocketPath        = "/run/confidential-containers/cdh.sock"
  )
  
- var allowedFSTypes = map[string]bool{
-@@ -49,12 +53,14 @@ type Interceptor interface {
+ // kernel views of block devices and mounts; tests point these at fixtures
+@@ -55,13 +58,15 @@ type Interceptor interface {
  type interceptor struct {
  	agentproto.Redirector
  
 -	nsPath          string
+-	cloudProvider   string
 -	cloudMountPaths []string
 +	nsPath                  string
 +	cloudMountPaths         []string
@@ -243,6 +472,7 @@ index 565ba101..edb069e0 100644
 +	workspace               *workspacePolicy
 +	workspaceMu             sync.Mutex
 +	workspaceVolumes        []*preparedWorkspaceVolume
++	cloudProvider           string
  }
  
 -// unmountCloudVolumes unmounts all cloud volume mount points in reverse order.
@@ -250,25 +480,27 @@ index 565ba101..edb069e0 100644
  func (i *interceptor) unmountCloudVolumes() {
  	for idx := len(i.cloudMountPaths) - 1; idx >= 0; idx-- {
  		mp := i.cloudMountPaths[idx]
-@@ -95,6 +101,10 @@ func dial(ctx context.Context, agentSocket string) (net.Conn, error) {
- }
- 
- func NewInterceptor(agentSocket, nsPath string) Interceptor {
-+	return NewInterceptorWithEncryptedVolumes(agentSocket, nsPath, false)
+@@ -105,6 +110,10 @@ func dial(ctx context.Context, agentSocket string) (net.Conn, error) {
+ // cloud-api-adaptor provider name; leave it empty to detect the cloud from
+ // device paths when locating attached volumes.
+ func NewInterceptor(agentSocket, nsPath, cloudProvider string) Interceptor {
++	return NewInterceptorWithEncryptedVolumes(agentSocket, nsPath, cloudProvider, false)
 +}
 +
-+func NewInterceptorWithEncryptedVolumes(agentSocket, nsPath string, required bool) Interceptor {
++func NewInterceptorWithEncryptedVolumes(agentSocket, nsPath, cloudProvider string, required bool) Interceptor {
  
  	agentDialer := func(ctx context.Context) (net.Conn, error) {
  		return dial(ctx, agentSocket)
-@@ -103,13 +113,19 @@ func NewInterceptor(agentSocket, nsPath string) Interceptor {
+@@ -113,14 +122,20 @@ func NewInterceptor(agentSocket, nsPath, cloudProvider string) Interceptor {
  	redirector := agentproto.NewRedirector(agentDialer)
  
  	return &interceptor{
--		Redirector: redirector,
--		nsPath:     nsPath,
+-		Redirector:    redirector,
+-		nsPath:        nsPath,
+-		cloudProvider: cloudProvider,
 +		Redirector:              redirector,
 +		nsPath:                  nsPath,
++		cloudProvider:           cloudProvider,
 +		requireEncryptedVolumes: required,
  	}
  }
@@ -283,7 +515,7 @@ index 565ba101..edb069e0 100644
  	logger.Printf("CreateContainer: containerID:%s", req.ContainerId)
  
  	// Specify the network namespace path in the container spec
-@@ -123,87 +139,109 @@ func (i *interceptor) CreateContainer(ctx context.Context, req *pb.CreateContain
+@@ -134,91 +149,114 @@ func (i *interceptor) CreateContainer(ctx context.Context, req *pb.CreateContain
  		logger.Printf("    %s: %q", ns.Type, ns.Path)
  	}
  
@@ -371,8 +603,12 @@ index 565ba101..edb069e0 100644
 +					return nil, fmt.Errorf("cloud volume %q has unsafe name", volName)
 +				}
  
--			diskID := volInfo.DiskID
--			device, err := findDataDiskDevice(lunIdx, diskID)
+-			var device string
+-			if volInfo.Device != "" {
+-				device, err = findDataDiskByPath(ctx, volInfo.Device)
+-			} else {
+-				device, err = findDataDiskDevice(ctx, i.cloudProvider, lunIdx, volInfo.DiskID)
+-			}
 -			if err != nil {
 -				return nil, fmt.Errorf("cloud volume %s: %w", volName, err)
 -			}
@@ -397,7 +633,12 @@ index 565ba101..edb069e0 100644
 -				return nil, fmt.Errorf("cloud volume %s device %s not available: %w", volName, device, err)
 -			}
 +				diskID := volInfo.DiskID
-+				device, err := findDataDiskDevice(lunIdx, diskID)
++				var device string
++				if volInfo.Device != "" {
++					device, err = findDataDiskByPath(ctx, volInfo.Device)
++				} else {
++					device, err = findDataDiskDevice(ctx, i.cloudProvider, lunIdx, diskID)
++				}
 +				if err != nil {
 +					return nil, fmt.Errorf("cloud volume %s: %w", volName, err)
 +				}
@@ -459,7 +700,7 @@ index 565ba101..edb069e0 100644
  		}
  	}
  
-@@ -230,19 +268,13 @@ func (i *interceptor) CreateContainer(ctx context.Context, req *pb.CreateContain
+@@ -245,19 +283,13 @@ func (i *interceptor) CreateContainer(ctx context.Context, req *pb.CreateContain
  		}
  	}
  
@@ -480,7 +721,7 @@ index 565ba101..edb069e0 100644
  func normalizeBindMountOptions(options []string, readOnly bool) []string {
  	result := make([]string, 0, len(options)+1)
  	seen := make(map[string]struct{}, len(options)+1)
-@@ -266,6 +298,10 @@ func normalizeBindMountOptions(options []string, readOnly bool) []string {
+@@ -281,6 +313,10 @@ func normalizeBindMountOptions(options []string, readOnly bool) []string {
  	return result
  }
  
@@ -491,7 +732,7 @@ index 565ba101..edb069e0 100644
  func waitForDeviceMounted(ctx context.Context, path string) error {
  
  	ctx, cancel := context.WithTimeout(ctx, volumeCheckTimeout)
-@@ -357,12 +393,24 @@ func (i *interceptor) DestroySandbox(ctx context.Context, req *pb.DestroySandbox
+@@ -372,12 +408,24 @@ func (i *interceptor) DestroySandbox(ctx context.Context, req *pb.DestroySandbox
  
  	logger.Printf("DestroySandbox")
  
@@ -517,7 +758,7 @@ index 565ba101..edb069e0 100644
  	}
  
  	return res, err
-@@ -823,3 +871,62 @@ func formatAndMount(device, mountPoint, fsType string, readOnly bool, options []
+@@ -890,3 +938,62 @@ func formatAndMount(device, mountPoint, fsType string, readOnly bool, options []
  	logger.Printf("Mounted %s at %s (type=%s)", device, mountPoint, fsType)
  	return nil
  }
@@ -581,10 +822,10 @@ index 565ba101..edb069e0 100644
 +	return nil
 +}
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor_test.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor_test.go
-index 44b1bd4c..3c0c652d 100644
+index f0580969..5c41c929 100644
 --- a/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor_test.go
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/interceptor_test.go
-@@ -1198,3 +1198,12 @@ func TestIsTargetPathEdgeCases(t *testing.T) {
+@@ -1291,3 +1291,12 @@ func TestIsTargetPathEdgeCases(t *testing.T) {
  		assert.False(t, isTargetPath(path, "/path/target"))
  	})
  }
@@ -886,7 +1127,7 @@ index 00000000..77e60fc4
 +}
 diff --git a/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace_mount.go b/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace_mount.go
 new file mode 100644
-index 00000000..2f65859b
+index 00000000..eae54063
 --- /dev/null
 +++ b/src/cloud-api-adaptor/pkg/forwarder/interceptor/workspace_mount.go
 @@ -0,0 +1,494 @@
@@ -903,7 +1144,6 @@ index 00000000..2f65859b
 +	"os/exec"
 +	"path/filepath"
 +	"sort"
-+	"strconv"
 +	"strings"
 +	"syscall"
 +	"time"
@@ -1069,8 +1309,9 @@ index 00000000..2f65859b
 +}
 +
 +func prepareWorkspaceVolume(ctx context.Context, name string, volume util.CloudVolumeAnnotation, workspace *workspacePolicy) (*preparedWorkspaceVolume, error) {
-+	lun, _ := strconv.Atoi(volume.LUN) // validated by DecodeCloudVolumeAnnotations
-+	device, err := findDataDiskDevice(lun, volume.DiskID)
++	device, err := retryDiskDetect(ctx, "workspace disk "+volume.DiskID, func() (string, error) {
++		return findAlibabaDataDisk(volume.DiskID)
++	})
 +	if err != nil {
 +		return nil, fmt.Errorf("cloud volume %s device discovery: %w", name, err)
 +	}
@@ -1912,3 +2153,6 @@ index 00000000..62bed1f2
 +	require.NoError(t, err)
 +	return volumes
 +}
+-- 
+2.43.7
+

@@ -1,4 +1,4 @@
-From 324f4c98aa1e94379576184f9d3ab1d1724e8623 Mon Sep 17 00:00:00 2001
+From 0daa76e1791f74a4c30aad7ee15b829071956380 Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
 Date: Wed, 4 Nov 2026 15:25:08 +0800
 Subject: [PATCH] node: preserve CSI filesystem mount properties
@@ -279,10 +279,10 @@ index 00000000..ca3c939c
 +	}
 +}
 diff --git a/pkg/driver/nodeserver.go b/pkg/driver/nodeserver.go
-index 0cb45e43..37a6cca4 100644
+index 3f2a7213..8f23c3a6 100644
 --- a/pkg/driver/nodeserver.go
 +++ b/pkg/driver/nodeserver.go
-@@ -47,14 +47,6 @@ func getKataRuntimePath() string {
+@@ -46,14 +46,6 @@ func getKataRuntimePath() string {
  	return "kata-runtime"
  }
  
@@ -297,7 +297,7 @@ index 0cb45e43..37a6cca4 100644
  type nodeServer struct {
  	csi.UnimplementedNodeServer
  	nodeID  string
-@@ -192,20 +184,48 @@ func (ns *nodeServer) NodePublishVolume(_ context.Context, req *csi.NodePublishV
+@@ -191,20 +183,48 @@ func (ns *nodeServer) NodePublishVolume(_ context.Context, req *csi.NodePublishV
  		return nil, status.Errorf(codes.FailedPrecondition, "volume %s not staged (no device path)", volumeID)
  	}
  
@@ -353,7 +353,7 @@ index 0cb45e43..37a6cca4 100644
  		Metadata:   attrib,
  	}
  
-@@ -471,6 +491,13 @@ func (ns *nodeServer) NodeGetCapabilities(_ context.Context, _ *csi.NodeGetCapab
+@@ -433,6 +453,13 @@ func (ns *nodeServer) NodeGetCapabilities(_ context.Context, _ *csi.NodeGetCapab
  					},
  				},
  			},

@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """Verify the installed runtime profile and configure the ACK kubelet timeout."""
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -59,10 +58,7 @@ def kubelet_timeout(text):
 
 
 def main():
-    pause, shim_sha = sys.argv[1:]
-    observed = hashlib.sha256(Path('/opt/kata/bin/containerd-shim-kata-v2').read_bytes()).hexdigest()
-    if observed != shim_sha:
-        raise SystemExit('Worker shim differs from the published handoff. Check the kata-deploy rollout.')
+    pause = sys.argv[1]
     kubelet_path = Path('/etc/kubernetes/kubelet-customized-args.conf')
     environment_files = subprocess.check_output(
         ['systemctl', 'show', 'kubelet.service', '-p', 'EnvironmentFiles', '--value'], text=True)
@@ -108,7 +104,7 @@ def main():
     subprocess.run(['crictl', '--runtime-endpoint', 'unix:///run/containerd/containerd.sock',
                     '--image-endpoint', 'unix:///run/containerd/containerd.sock', 'pull', pause], check=True)
     print(json.dumps({'kata_profile': str(kata_path), 'shared_fs': 'none', 'guest_pull': True,
-                      'create_container_timeout': 600, 'pause_image': pause, 'shim_sha256': observed,
+                      'create_container_timeout': 600, 'pause_image': pause,
                       'kubelet_restarted': kubelet_restart,
                       'passed': True}))
 

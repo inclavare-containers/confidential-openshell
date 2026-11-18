@@ -15,11 +15,21 @@ pub struct LaunchIntent {
     pub sandbox_cr_uid: String,
     pub sandbox_name: String,
     pub main_process_spec: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_update: Option<LaunchRevision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_environment: Option<std::collections::HashMap<String, String>>,
     pub log_level: String,
     pub agent_uid: u32,
     pub agent_gid: u32,
     pub workload: Pod,
     pub volume_claim_templates: serde_json::Value,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
+pub struct LaunchRevision {
+    pub revision: u64,
+    pub operation_id: String,
 }
 
 impl LaunchIntent {

@@ -1,6 +1,6 @@
 # OpenShell configuration reference
 
-OpenShell v0.1.6 Gateway/driver units, private driver configuration, Kubernetes
+OpenShell v0.1.9 Gateway/driver units, private driver configuration, Kubernetes
 RBAC and network policies. Supervisors connect directly to the trusted Gateway
 using sandbox-scoped JWTs over TLS. The Gateway authenticates operator client
 certificates and rejects anonymous user requests. Operator private keys stay on

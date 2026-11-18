@@ -34,7 +34,11 @@ mod lifecycle_reconciliation {
             watch_client: client,
             sandbox_api_version: Arc::new(OnceCell::new()),
             lifecycle_gates: Arc::default(),
-            config: KubernetesComputeConfig { default_runtime_class_name: "kata-remote".into(), ..Default::default() },
+            config: KubernetesComputeConfig {
+                default_runtime_class_name: "kata-remote".into(),
+                supervisor_runtime_class_name: "kata-remote".into(),
+                ..Default::default()
+            },
             operator_allowlist: None,
             confidential: test_confidential_profile(),
         };
@@ -261,9 +265,11 @@ mod lifecycle_reconciliation {
             refreshed(version, restarted_snapshot(version)),
         ];
         for _ in 0..2 {
-            steps.push((http::Method::GET,
+            steps.push((
+                http::Method::GET,
                 "/apis/agents.x-k8s.io/v1beta1/namespaces/openshell/sandboxes/other-cr",
-                kube_test_not_found("sandboxes", "other-cr")));
+                kube_test_not_found("sandboxes", "other-cr"),
+            ));
         }
         steps.extend(preparing_dependencies());
         let (driver, steps, _) = read_only_driver(steps);
@@ -276,8 +282,12 @@ mod lifecycle_reconciliation {
             .await;
         // Restart may already have created its Pod while the CR is still
         // stopped. Reconciliation must skip even reading that companion.
-        tokio::time::timeout(Duration::from_secs(1), driver.reconcile_sandbox_runtime_resources())
-            .await.expect("busy sandbox must not block the other sandbox");
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            driver.reconcile_sandbox_runtime_resources(),
+        )
+        .await
+        .expect("busy sandbox must not block the other sandbox");
         drop(guard);
         driver.reconcile_sandbox_runtime_resources().await;
         assert!(steps.lock().unwrap().is_empty());

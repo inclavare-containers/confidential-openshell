@@ -13,7 +13,6 @@ ROOT = Path(__file__).resolve().parents[2]
 LAYOUTS = {
     'attestation-observer': r'openshell-attestation-observer',
     'driver': r'openshell-driver-confidential-kubernetes',
-    'kata-shim': r'containerd-shim-kata-v2',
     'guest-payload': r'guest-payload.tar',
     'guest-image': r'guest/openshell-guest-[0-9a-f]{12}\.qcow2',
     'guest-references': r'guest/openshell-guest-[0-9a-f]{12}\.references\.json',
@@ -164,10 +163,6 @@ def main():
         for name in ['cloud-api-adaptor', 'peerpod-ctrl', 'caa-csi-block-driver']:
             if observed.get(name, {}).get('patch_check') != 'verified':
                 parser.error(f'test source check failed: patched input {name}')
-        kata = observed.get('kata-containers', {}).get('patch_check', 'not_present')
-        print('required test sources: verified', file=sys.stderr)
-        print('Kata patch check: ' + ('not_run (checkout not present)' if kata == 'not_present' else kata),
-              file=sys.stderr)
     dirty = bool(git(ROOT, 'status', '--porcelain', '--untracked-files=normal'))
     if args.profile != 'source-only':
         if dirty or not (artifacts or args.image):
@@ -177,8 +172,6 @@ def main():
                 parser.error(f'missing or mismatched upstream checkout: {name}')
         required = set()
         for name in artifacts:
-            if name == 'kata-shim':
-                required.add('kata-containers')
             if name.startswith('guest-') or name == 'caa-image-archive':
                 required.add('cloud-api-adaptor')
             if name == 'peerpod-controller-image-archive':
@@ -192,8 +185,6 @@ def main():
                 required.add('peerpod-ctrl')
             if pair.startswith('csi='):
                 required.add('caa-csi-block-driver')
-            if pair.startswith('kata-deploy='):
-                required.add('kata-containers')
         for name in required:
             if observed[name]['patch_check'] != 'verified':
                 parser.error(f'missing or mismatched patched input: {name}')
@@ -202,7 +193,7 @@ def main():
               'scope': 'source inventory' if args.profile == 'source-only' else 'caller-selected output inventory; not proof of build execution',
               'sources': observed, 'artifacts': {}, 'images': {}, 'input_sha256': {}}
     report['source_inventory_complete'] = all(
-        (e['upstream_checkout'] == 'verified' or name == 'kata-containers')
+        e['upstream_checkout'] == 'verified'
         and e.get('patch_check', 'verified') == 'verified' for name, e in observed.items())
     for relative in ['deployment/artifacts.lock.json', 'deployment/runtime/artifacts.lock.json', 'deployment/build/sources.lock.json']:
         report['input_sha256'][relative] = digest(ROOT / relative)

@@ -19,8 +19,6 @@ for repo in openshell cloud-api-adaptor caa-csi-block-driver; do
   tar -xf "$HANDOFF/source/$repo.tar" -C "$staging/repos/$repo"
 done
 install -d -m 0700 "$OPERATOR_DIR"
-install -m 0755 "$HANDOFF/outputs/containerd-shim-kata-v2" "$OPERATOR_DIR/"
-(cd "$OPERATOR_DIR" && sha256sum containerd-shim-kata-v2 > shim.sha256)
 chmod 0755 "$staging"
 mv -T "$staging" "$SOURCE_ROOT"
 cd "$SOURCE_ROOT"

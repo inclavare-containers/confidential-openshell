@@ -1,6 +1,6 @@
 # Deploy
 
-Deploy native OpenShell 0.1.6 with pinned CoCo components, Trustee, ACK and Intel TDX.
+Deploy native OpenShell 0.1.9 with pinned CoCo components, Trustee, ACK and Intel TDX.
 Complete [build](build.md), including release installation, first. Run the commands
 below as root from `/opt/confidential-openshell` on the **trusted service host**.
 It hosts Gateway, driver and the private registry; Trustee can run here or on a
@@ -254,7 +254,7 @@ Starts the TLS registry and checks HTTPS. Durable registry storage is under
 ```
 
 Publishes built images, mirrors all pinned upstream dependencies and the unchanged
-Community harness image, then publishes kata-deploy with the verified host shim.
+Community harness image, and mirrors the official kata-deploy image.
 Success requires both stages and saves destination digests. Either stage failing
 stops this command.
 
@@ -303,7 +303,7 @@ DaemonSets and controller/webhook deployments.
 ./cos workers configure
 ```
 
-Verifies the installed shim and the guest-pull, shared-filesystem, timeout and
+Verifies the guest-pull, shared-filesystem, timeout and
 pause-image settings installed by kata-deploy.
 Sets the kubelet request timeout to the same 600 seconds: guest image pulls run
 inside container creation and otherwise inherit kubelet's shorter default deadline.

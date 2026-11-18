@@ -212,9 +212,9 @@ def check_released_as(binary, rootfs, policy, area):
         der = checker.utils.encode_dss_signature(int.from_bytes(raw_signature[:32], "big"), int.from_bytes(raw_signature[32:], "big"))
         key.verify(der, (header + "." + claims).encode(), checker.ec.ECDSA(checker.hashes.SHA256()))
         appraisal = json.loads(checker.unb64url(claims))["submods"]["cpu0"]
-        vector = appraisal["ear.trustworthiness-vector"]
+        vector = appraisal["ear_trustworthiness_vector"]
         expected = {"hardware": 97, "executables": 33, "configuration": 36, "file-system": 35}
-        if any(vector[name] != value for name, value in expected.items()) or appraisal["ear.status"] == "affirming":
+        if any(vector[name] != value for name, value in expected.items()) or appraisal["ear_status"] == "affirming":
             raise RuntimeError("TDX-only policy affirmed synthetic sample evidence")
         return {"binary_sha256": checker.sha256_file(binary), "set_policy_and_exact_storage": True,
                 "builtin_rvps_registration_and_readback": True, "sample_ES256_verified": True,

@@ -1,4 +1,4 @@
-From 82bc07177a402b8c5a1f2f4ebdcee55312739093 Mon Sep 17 00:00:00 2001
+From 3801f5e0dabcfdc253f8e1625cbe291a90a86a25 Mon Sep 17 00:00:00 2001
 From: Weidong Sun <sunweidong@linux.alibaba.com>
 Date: Wed, 4 Nov 2026 15:39:18 +0800
 Subject: [PATCH] tests: synchronize the proxy dialer listener fixture
@@ -15,10 +15,10 @@ Co-authored-by: Codex <noreply@openai.com>
  1 file changed, 18 insertions(+), 19 deletions(-)
 
 diff --git a/src/cloud-api-adaptor/pkg/adaptor/proxy/proxy_test.go b/src/cloud-api-adaptor/pkg/adaptor/proxy/proxy_test.go
-index 9964231b..96431e94 100644
+index 20325306..c6604b80 100644
 --- a/src/cloud-api-adaptor/pkg/adaptor/proxy/proxy_test.go
 +++ b/src/cloud-api-adaptor/pkg/adaptor/proxy/proxy_test.go
-@@ -149,35 +149,34 @@ func TestDialerSuccess(t *testing.T) {
+@@ -148,35 +148,34 @@ func TestDialerSuccess(t *testing.T) {
  
  		require.NoError(t, listener.Close(), "expect no error closing listener")
  

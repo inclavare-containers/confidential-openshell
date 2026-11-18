@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "platform": "linux/amd64",
-  "openshell_version": "0.1.6",
+  "openshell_version": "0.1.9",
   "tools": {
     "aliyun": {
       "version": "3.5.1",
@@ -33,18 +33,18 @@
     }
   },
   "charts": {
-    "kata-deploy-4.2.0.tgz": "52a3e9139e810d58867a7676fb38957870dd09e8b2033e54cebdda7c97598e8c",
-    "peerpodctrl-0.5.0.tgz": "19b4854a1534a9fd2c7ae19463b336ce13b40a1d0c11abc602f29c7adf75799b",
-    "peerpods-webhook-0.5.0.tgz": "f2d1a278835b95c26361ef6f23f494ccbf4787c4aa1ddbe240f96f62a540b685"
+    "kata-deploy-4.4.0.tgz": "eab4e1e75c344d828c932309607014248688fd2e3b76c8e1a57701a93af2d637",
+    "peerpodctrl-0.5.0.tgz": "71c0a6af81efbea805afb2c04d608d1c8625a6738b1a7f80c3e2936961004a02",
+    "peerpods-webhook-0.5.0.tgz": "444f645f245dbe6903b6cc2bca7b3bf0e8238fcd2f6cb4c1763b8c769ef81b40"
   },
   "downloads": {
     "gateway": {
-      "url": "https://github.com/NVIDIA/OpenShell/releases/download/v0.1.6/openshell-gateway-x86_64-unknown-linux-gnu.tar.gz",
-      "sha256": "811265a55993beb333905a5b560764a40aa9177250171f711dce8ba820f7eff8"
+      "url": "https://github.com/NVIDIA/OpenShell/releases/download/v0.1.9/openshell-gateway-x86_64-unknown-linux-gnu.tar.gz",
+      "sha256": "c32085d64ccef037121c0e87bee1a57d6e886d77f77bb8b260cb08f0a6cce6a3"
     },
     "cli": {
-      "url": "https://github.com/NVIDIA/OpenShell/releases/download/v0.1.6/openshell-x86_64-unknown-linux-musl.tar.gz",
-      "sha256": "2951c67366f3e3584ed9cec8d49b9f0b0eefc8cacea8b0582ac164590492f136"
+      "url": "https://github.com/NVIDIA/OpenShell/releases/download/v0.1.9/openshell-x86_64-unknown-linux-musl.tar.gz",
+      "sha256": "3856ac7b6b2e33d6c8ab72a1036444156516e7303da85a9b13f661a2aa63bd2d"
     },
     "agent_sandbox_manifest": {
       "url": "https://github.com/kubernetes-sigs/agent-sandbox/releases/download/v1.0.2/sandbox.yaml",
@@ -55,26 +55,26 @@
       "sha256": "ef5d707f5afbb2c3ce9892f5ff3fca0dec6864db8830a1c454b3d4822c485843"
     },
     "kata_tools": {
-      "url": "https://github.com/kata-containers/kata-containers/releases/download/4.2.0/kata-tools-static-4.2.0-amd64.tar.zst",
-      "sha256": "a4f8e1b6ee500b6e94d3925249e741c75bb4a89bf275b5d5066d6275c68e29ef"
+      "url": "https://github.com/kata-containers/kata-containers/releases/download/4.4.0/kata-tools-static-4.4.0-amd64.tar.zst",
+      "sha256": "bec610d4e01eb97eb41f1f00848e44fdf0d3422a881b2b751abe867a656ee40b"
     }
   },
   "images": {
-    "sandbox": "ghcr.io/nvidia/openshell/sandbox@sha256:1038eb5c1f191fa3c34684fd7041b891c78ec570979d487f36e06e08f91bfb63",
+    "sandbox": "ghcr.io/nvidia/openshell/sandbox@sha256:a22db0292463d7bbdbbac0bc16625c1d2fc60a1d86b77638169f9d6c11035920",
     "workload": "ghcr.io/nvidia/openshell-community/sandboxes/base@sha256:c2a43bb0d765774e2790b3babfb20997bb2eac7b4bf4c6d7d8661e99817bf904",
     "pause": "registry.k8s.io/pause@sha256:8d4106c88ec0bd28001e34c975d65175d994072d65341f62a8ab0754b0fafe10",
-    "supervisor": "ghcr.io/nvidia/openshell/supervisor@sha256:ce859a7d77ee515d3fe0b3c7dc61286516f402eb1d25c761d806d9ae5ed96c0b",
-    "trustee_as": "ghcr.io/confidential-containers/staged-images/coco-as-grpc@sha256:64f5df731a39ab6a4d72d77cd2596d8f2d994b18d41b30a43861bbc4933ebb1a",
-    "trustee_kbs": "ghcr.io/confidential-containers/staged-images/kbs-grpc-as@sha256:ac3b61254c672a9c715fe813022962fc7cbf8b9c199cc9950700bb68719ce8b6",
-    "caa": "quay.io/confidential-containers/cloud-api-adaptor@sha256:0d6fff9437a1bd663f9740bc58f76f135cd33308593238f00b4f26347d800d8e",
-    "peerpod_ctrl_runtime": "quay.io/confidential-containers/peerpod-ctrl@sha256:64d463b70a708eee9912ef289f38dd4a76612561094dcc822fbfa10dd63015d4",
-    "peerpod_webhook": "quay.io/confidential-containers/peer-pods-webhook@sha256:b1b2e7bb2b880728fba68fe490914d803e810c947f1e5a2af40f8b9d7cf9b07e",
+    "supervisor": "ghcr.io/nvidia/openshell/supervisor@sha256:e93c39c4afe715ae5409b19d20cea74db767c51ac8cf1f92970d7925efe925e5",
+    "trustee_as": "ghcr.io/confidential-containers/attestation-service@sha256:5d48359ce4b47c3670f2152b7faab7d5367e058ddede828fba25f74df7143780",
+    "trustee_kbs": "ghcr.io/confidential-containers/key-broker-service@sha256:b130e7dc7f2aea98cbaa659cb4537f2c36a10ef5d23dca33718f838cdf1a875a",
+    "caa": "ghcr.io/confidential-containers/cloud-api-adaptor@sha256:4bbcbbaa0beb71e1217c75e5d44c4d8d8d46c868ade3298c216389b9653db33d",
+    "peerpod_ctrl_runtime": "ghcr.io/confidential-containers/peerpod-ctrl@sha256:98e91b85addece32e8ffa09afb8dddb29664386d3734fbc9eed4a23b6898d066",
+    "peerpod_webhook": "ghcr.io/confidential-containers/peer-pods-webhook@sha256:6b76785b6c57f95437b745132935329c19bd357852139dea1a457cc6ffd47e0f",
     "agent_sandbox_controller": "registry.k8s.io/agent-sandbox/agent-sandbox-controller@sha256:e38c6b2e5daeb2681f8f5ab172671de19d4d3d7052c88a40a34f298bb84649f8",
     "cert_manager_controller": "quay.io/jetstack/cert-manager-controller@sha256:1e4af57beb469cc3bb0fb48b9201caea2723819b9ffd3c3ea98568f55b4dd38b",
     "cert_manager_webhook": "quay.io/jetstack/cert-manager-webhook@sha256:953a97df613f7da7eda8ce4b1c8d8e6b50963db0800fab595d040db6eb5cb060",
     "cert_manager_cainjector": "quay.io/jetstack/cert-manager-cainjector@sha256:a2b12d27950d1603d2c8168c3ccd95d07b93ce6ec4b530316196a31db592a9c0",
     "cert_manager_startup": "quay.io/jetstack/cert-manager-startupapicheck@sha256:1dae953280843bd637c619597eb0d9144f3d5185b518490494a080b521a1f3c7",
-    "kata_deploy": "quay.io/kata-containers/kata-deploy@sha256:39d96c53f60838ced18967b6249031daab0e71cb775edbf9e8c43cfbc6584ad5",
+    "kata_deploy": "quay.io/kata-containers/kata-deploy@sha256:5cfdfd2de450eb9df56f6762546e8304771c8fa304ff6b447cf0a8df68d1440f",
     "kata_kubectl": "quay.io/kata-containers/kubectl@sha256:135dbdadb36c2c414fa86049bb2fd7ce149257a1d35771cd120203c3ea9803dc",
     "csi_provisioner": "registry.k8s.io/sig-storage/csi-provisioner@sha256:6de50bacfd72627ffe4209e3db8ad7391d04ea6fb741bf51feab6c5dcfd80002",
     "csi_node_registrar": "registry.k8s.io/sig-storage/csi-node-driver-registrar@sha256:cd21e19cd8bbd5bc56f1b4f1398a436e7897da2995d6d036c9729be3f4e456e6",
@@ -84,18 +84,18 @@
   "sources": {
     "trustee": {
       "repository": "https://github.com/confidential-containers/trustee",
-      "commit": "ade2f25782d69d16efa9aeaf6d58c5a48bd5bc56"
+      "commit": "564a3ba51eaedd4734e88e1883a905dd780ee45b"
     }
   },
   "build": {
     "peerpod_ctrl": {
       "repository": "openshell/peerpod-ctrl",
-      "tag": "9ca88115-alibabacloud"
+      "tag": "36dfe902-alibabacloud"
     },
     "caa": {
-      "go_version": "1.26.10",
+      "go_version": "1.26.11",
       "build_args": {
-        "VERSION": "post-v0.23.0-9ca88115"
+        "VERSION": "post-v0.23.0-36dfe902"
       }
     }
   }

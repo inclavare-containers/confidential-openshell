@@ -14,13 +14,12 @@ def main():
     argparse.ArgumentParser(prog='./cos workers configure', description=__doc__).parse_args()
     cloud = Cloud()
     pause = (OPERATOR / 'pause-image.txt').read_text().strip()
-    shim = (OPERATOR / 'shim.sha256').read_text().split()[0]
-    require(re.fullmatch(r'[^\s@]+@sha256:[0-9a-f]{64}', pause) and re.fullmatch(r'[0-9a-f]{64}', shim),
+    require(re.fullmatch(r'[^\s@]+@sha256:[0-9a-f]{64}', pause),
             'Publish the verified release first: ./cos registry publish.')
     source = (ROOT / 'deployment/peerpods/worker-profile.py').read_bytes()
     command = '\n'.join([
         '#!/bin/bash', 'set -euo pipefail',
-        'printf %s ' + shlex.quote(base64.b64encode(source).decode()) + ' | base64 -d | python3 - ' + shlex.quote(pause) + ' ' + shlex.quote(shim),
+        'printf %s ' + shlex.quote(base64.b64encode(source).decode()) + ' | base64 -d | python3 - ' + shlex.quote(pause),
         '',
     ])
     for name, instance in selected(cloud):

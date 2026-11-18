@@ -511,7 +511,7 @@ class Setup(CloudFixture, unittest.TestCase):
         current = cloud.Cloud()
         current.save(podvm_vswitch_id='vsw-podvm', podvm_security_group_id='sg-podvm', podvm_image_id='m-test',
                      ram_roles={'caa': 'arn-caa', 'csi': 'arn-csi'})
-        for name in ('cloud-api-adaptor', 'pause', 'peerpod-ctrl', 'peerpod_webhook', 'kata-deploy',
+        for name in ('cloud-api-adaptor', 'pause', 'peerpod-ctrl', 'peerpod_webhook', 'kata_deploy',
                      'kata_kubectl', 'caa-csi-block-driver', 'csi_provisioner', 'csi_node_registrar'):
             cloud.write(self.operator / (name + '-image.txt'), f'192.168.16.223:5000/{name}@sha256:' + 'a' * 64)
         initdata = self.operator / 'initdata'

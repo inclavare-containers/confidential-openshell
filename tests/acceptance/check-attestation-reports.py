@@ -26,9 +26,9 @@ spec.loader.exec_module(h)
 
 def signed(key, digest):
     claims = {'iat': int(time.time()) - 600, 'exp': int(time.time()) - 300, 'submods': {'cpu0': {
-        'ear.status': 'affirming', 'ear.appraisal-policy-id': 'default',
-        'ear.trustworthiness-vector': {'hardware': 2, 'configuration': 2, 'executables': 3, 'file-system': 2},
-        'ear.veraison.annotated-evidence': {'tdx': {'tcb_status': 'UpToDate', 'quote': {'body': {'mr_td': 'b' * 96}},
+        'ear_status': 'affirming', 'ear_appraisal_policy_ids': ['default'],
+        'ear_trustworthiness_vector': {'hardware': 2, 'configuration': 2, 'executables': 3, 'file-system': 2},
+        'ear_attester_claims': {'tee': 'tdx', 'claims': {'tcb_status': 'UpToDate', 'quote': {'body': {'mr_td': 'b' * 96}},
             'uefi_event_logs': [{'type_name': 'EV_EVENT_TAG', 'details': {'unicode_name': 'AAEL',
                 'data': {'domain': 'github.com/confidential-containers', 'operation': 'InitData', 'content': {'digest': 'sha384:' + digest}}}}]}}
     }}}

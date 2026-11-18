@@ -1,6 +1,6 @@
 # Confidential Kubernetes compute driver
 
-This standalone binary implements the OpenShell v0.1.6 `ComputeDriver` contract for a
+This standalone binary implements the OpenShell v0.1.9 `ComputeDriver` contract for a
 supervisor/workload pair running in attested Pod VMs. It is a controlled derivative of
 NVIDIA's Kubernetes driver, with project-owned bootstrap publication and lifecycle
 integration. See [source provenance](UPSTREAM.md), the
@@ -91,9 +91,7 @@ authentication, while already-open streams require runtime termination.
 
 Supervisor sockets, TLS state and logs use guest-memory EmptyDir volumes, with explicit
 UID/GID, fsGroup and `supplementalGroups: [0]` for guest pull, and no service-link
-environment injection. Kata 4.2 does not forward
-EmptyDir `sizeLimit` into guest tmpfs, so those volumes consume guest memory without a
-per-volume bound. The default OCI spec version is `1.3.0`; set
+environment injection. These volumes consume guest memory. The default OCI spec version is `1.3.0`; set
 `OPENSHELL_KATA_OCI_VERSION` to match another runtime. KBS and registry trust roots are configured independently in measured AA/CDH
 configuration before resource retrieval and image pulls. Registry pulls use system trust roots;
 an optional `--kata-policy-registry-ca` file adds certificates while preserving the base
