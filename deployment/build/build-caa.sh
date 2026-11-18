@@ -21,7 +21,7 @@ CAA_CONTEXT="$PWD/artifacts/caa-context"
 install -d -m 0700 "$CAA_CONTEXT"
 install -m 0755 "$CAA_SOURCE/src/cloud-api-adaptor/cloud-api-adaptor" "$CAA_CONTEXT/cloud-api-adaptor"
 sha256sum "$CAA_CONTEXT/cloud-api-adaptor"
-docker build --platform linux/amd64 --build-arg "RUNTIME_IMAGE=$CAA_RUNTIME" \
+docker build --platform linux/amd64 --output type=docker --build-arg "RUNTIME_IMAGE=$CAA_RUNTIME" \
   -f deployment/build/Dockerfile.caa \
   -t "openshell/cloud-api-adaptor:$CAA_TAG" "$CAA_CONTEXT"
 

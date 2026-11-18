@@ -9,6 +9,7 @@ bind_address = "0.0.0.0:9443"
 health_bind_address = "127.0.0.1:17671"
 log_level = "info"
 compute_driver = "confidential"
+enable_sandbox_updates = true
 policy_validation_failure_mode = "fail_closed"
 
 [openshell.gateway.tls]
