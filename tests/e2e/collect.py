@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shlex
 import stat
 import sys
 
@@ -76,6 +77,33 @@ def verify_work(source, result, public_test, original_test):
             'result_sha256': digest(json.dumps(result, sort_keys=True).encode())}
 
 
+def runs_public_test(command):
+    """Recognize the public test in a shell AND-list whose exit status is zero."""
+    if not isinstance(command, str) or 'test_clamp.py' not in command:
+        return False
+    # Keep quotes so a literal '&&' in an argument cannot split a command.
+    lexer = shlex.shlex(command.strip(), posix=False, punctuation_chars=';&|()<>\n')
+    lexer.whitespace = ' \t'
+    lexer.whitespace_split = True
+    commands = [[]]
+    try:
+        for token in lexer:
+            if token == '&&':
+                commands.append([])
+            elif token[0] in lexer.punctuation_chars:
+                return False
+            else:
+                commands[-1].append(token)
+    except ValueError:
+        return False
+    for words in commands:
+        if words == ['python3', 'test_clamp.py']:
+            return True
+        if words and words[0] in ('exec', 'exit', 'return'):
+            return False
+    return False
+
+
 def verify_events(events):
     """OpenCode run --format json. Retain hashes/counts, not raw content."""
     require(0 < len(events) <= 2000, 'bounded event count required')
@@ -110,7 +138,7 @@ def verify_events(events):
             state = part['state']
             require(isinstance(state.get('input', {}), dict) and
                     isinstance(state.get('metadata', {}), dict), 'tool state fields')
-            if name == 'bash' and state.get('input', {}).get('command') == 'python3 test_clamp.py':
+            if name == 'bash' and runs_public_test(state.get('input', {}).get('command')):
                 ran_tests |= state.get('metadata', {}).get('exit') == 0
     require(len(sessions) == 1, 'mixed sessions')
     require(text_seen and finished and ran_tests and tools.intersection({'edit', 'write', 'apply_patch'}),

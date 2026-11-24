@@ -59,6 +59,24 @@ class EventAcceptance(unittest.TestCase):
     def test_completed_tool_task_passes(self):
         self.assertEqual(collect.verify_events(self.events())['tool_calls'], 3)
 
+    def test_public_test_in_successful_and_list(self):
+        for command in ('python3 test_clamp.py && cat result.json',
+                        'cd /sandbox/project && python3 test_clamp.py'):
+            with self.subTest(command=command):
+                events = self.events()
+                events[2]['part']['state']['input']['command'] = command
+                self.assertTrue(collect.verify_events(events)['test_command_completed'])
+
+    def test_mention_or_masked_failure_is_not_a_successful_test(self):
+        for command in ("echo 'python3 test_clamp.py'",
+                        "echo '&&' python3 test_clamp.py '&&'",
+                        'python3 test_clamp.py || true',
+                        'exit 0 && python3 test_clamp.py'):
+            with self.subTest(command=command), self.assertRaises(ValueError):
+                events = self.events()
+                events[2]['part']['state']['input']['command'] = command
+                collect.verify_events(events)
+
     def test_fake_tool_success_missing_edit_and_mixed_session_rejected(self):
         cases = []
         failed = self.events()
