@@ -1,4 +1,5 @@
 [Unit]
 Description=OpenShell guest for the local Kata runtime
 Requires=basic.target openshell-kata-agent.service
+Wants=openshell-workspace.service
 After=basic.target

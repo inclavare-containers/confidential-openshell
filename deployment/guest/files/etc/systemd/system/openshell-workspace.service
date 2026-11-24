@@ -1,0 +1,6 @@
+[Unit]
+Description=OpenShell native Kata workspace
+
+[Service]
+Type=exec
+ExecStart=/usr/libexec/peerpod/open-kata-workspace

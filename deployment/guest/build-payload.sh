@@ -28,7 +28,7 @@ payload_inputs_sha256() {
             \( -name '*.go' -o -name 'go.mod' -o -name 'go.sum' -o -name 'Makefile' \
                -o -path '*/podvm/files/*' \) ! -path '*/__pycache__/*' ! -name '*.pyc' -print0
         find deployment/guest/files -type f ! -path '*/__pycache__/*' ! -name '*.pyc' -print0
-        printf '%s\0' deployment/guest/build-payload.sh deployment/artifacts.lock.json
+        printf '%s\0' deployment/guest/{build-payload,build-cdh-tool}.sh deployment/artifacts.lock.json
     ) | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1
 }
 input_sources_sha256="$(payload_inputs_sha256)"
@@ -47,8 +47,8 @@ cp -a "${source_dir}/podvm/files/." "${tree}/"
 find "${tree}" -type d -name __pycache__ -prune -exec rm -rf -- {} +
 find "${tree}" -type f -name '*.pyc' -delete
 
-# The APF/PUD adapters are the only local executable builds. AA/CDH, Kata and
-# pause are unmodified checksum-pinned upstream artifacts.
+# The APF/PUD adapters use the pinned patch tree. AA/CDH, Kata and pause
+# are unmodified checksum-pinned upstream artifacts.
 make -C "${source_dir}" RELEASE_BUILD=true BUILTIN_CLOUD_PROVIDERS=alibabacloud \
     agent-protocol-forwarder process-user-data
 for binary in agent-protocol-forwarder process-user-data; do
@@ -78,6 +78,17 @@ for binary in attestation-agent confidential-data-hub api-server-rest; do
     printf '%s  %s\n' "${expected}" "${cached}" | sha256sum -c -
     install -D -m 0755 "${cached}" "${tree}/usr/local/bin/${binary}"
 done
+
+cdh_tool="ttrpc-cdh-tool"
+cdh_cached="${artifacts}/cache/${cdh_tool}-$(jq -er '.guest_components.commit' "${lock}")"
+expected_cdh_tool="$(jq -er '.guest_components.binaries["ttrpc-cdh-tool"].binary_sha256' "${lock}")"
+if ! printf '%s  %s\n' "${expected_cdh_tool}" "${cdh_cached}" | sha256sum -c - >/dev/null 2>&1; then
+    "${root}/deployment/guest/build-cdh-tool.sh" "${work}/cdh-tool"
+    built_cdh_tool="${work}/cdh-tool/target/release/${cdh_tool}"
+    printf '%s  %s\n' "${expected_cdh_tool}" "${built_cdh_tool}" | sha256sum -c -
+    install -m 0755 "${built_cdh_tool}" "${cdh_cached}"
+fi
+install -D -m 0755 "${cdh_cached}" "${tree}/usr/local/bin/${cdh_tool}"
 
 agent_version=$(jq -er .kata_agent.version "$lock")
 agent="${KATA_AGENT_BIN:-${artifacts}/cache/kata-agent-${agent_version}}"

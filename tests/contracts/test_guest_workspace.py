@@ -3,14 +3,27 @@ import importlib.machinery
 import importlib.util
 import os
 from pathlib import Path
+import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
-loader = importlib.machinery.SourceFileLoader('workspace_init', str(ROOT/'deployment/guest/files/usr/libexec/peerpod/initialize-workspace-volume'))
-spec = importlib.util.spec_from_loader(loader.name, loader)
-workspace = importlib.util.module_from_spec(spec)
-loader.exec_module(workspace)
+GUEST_LIBEXEC = ROOT / 'deployment/guest/files/usr/libexec/peerpod'
+sys.path.insert(0, str(GUEST_LIBEXEC))
+import workspace_block
+
+
+def load_script(name):
+    loader = importlib.machinery.SourceFileLoader(name, str(GUEST_LIBEXEC / name))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+workspace = load_script('initialize-workspace-volume')
+native = load_script('open-kata-workspace')
 
 
 class WorkspaceContract(unittest.TestCase):
@@ -63,6 +76,47 @@ class WorkspaceContract(unittest.TestCase):
                     workspace.require_disk_identity('vdb', 'd-test1')
             finally:
                 workspace.SYS_BLOCK = old
+
+
+    def test_native_blank_disk_with_initialization_disabled_fails_before_key_request(self):
+        with (mock.patch.object(native.subprocess, 'run', return_value=mock.Mock(returncode=1)),
+              mock.patch.object(native, 'run') as command):
+            with self.assertRaisesRegex(ValueError, 'initialization is disabled'):
+                native.open_volume(Path('/dev/sdb'), {'allow_initialize': False, 'key_uri': 'unused'})
+            command.assert_not_called()
+
+    def test_native_failed_open_leaves_startup_probe_pending(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            control = Path(tmp)
+            (control / 'request').write_text('8:0')
+            (control / 'workspace.toml').write_text('allow_initialize = false')
+            with (mock.patch.object(native, 'CONTROL', control),
+                  mock.patch.object(native, 'RUNTIME', control),
+                  mock.patch.object(native, 'run'),
+                  mock.patch.object(Path, 'resolve', return_value=Path('/sys/class/block/sda')),
+                  mock.patch.object(native, 'require_whole_disk', return_value=Path('/sys/class/block/sda')),
+                  mock.patch.object(native, 'open_volume', side_effect=ValueError('open failed'))):
+                with self.assertRaisesRegex(ValueError, 'open failed'):
+                    native.handoff()
+                self.assertFalse((control / 'ready').exists())
+
+    def test_native_mapping_checks_active_parameters_and_backing_disk(self):
+        status = ('  type: LUKS2\n  cipher: aes-xts-plain64\n'
+                  '  keysize: 512 [bits]\n  sector size: 4096 [bytes]\n')
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'dm-0/slaves').mkdir(parents=True)
+            (root / 'sdb/slaves').mkdir(parents=True)
+            (root / 'dm-0/slaves/sdb').symlink_to(root / 'sdb')
+            mapper = root / 'dm-0'
+            with (mock.patch.object(workspace_block.subprocess, 'check_output', return_value=status) as inspect,
+                  mock.patch.object(workspace_block, 'SYS_BLOCK', root)):
+                native.verify_mapper(mapper, Path('/dev/sdb'))
+                with self.assertRaisesRegex(ValueError, 'backed by'):
+                    native.verify_mapper(mapper, Path('/dev/sdc'))
+                inspect.return_value = status.replace('4096', '512')
+                with self.assertRaisesRegex(ValueError, '4096-byte sectors'):
+                    native.verify_mapper(mapper, Path('/dev/sdb'))
 
 
 if __name__ == '__main__':

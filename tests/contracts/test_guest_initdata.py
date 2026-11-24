@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 HELPERS = ROOT / 'deployment/guest/files/usr/local/libexec/openshell-guest'
@@ -29,19 +30,23 @@ def fixture(role):
     return {'aa.toml': aa, 'cdh.toml': cdh, 'policy.rego': 'package agent_policy\ndefault allow := false',
             'openshell-bootstrap.json': json.dumps(bootstrap)}
 
-def validate(data, materialized_mutation=None):
+def validate(data, materialized_mutation=None, native=False):
     with tempfile.TemporaryDirectory() as tmp:
         parent = Path(tmp)
         raw = ('version="0.1.0"\nalgorithm="sha384"\n[data]\n' + '\n'.join(json.dumps(k) + '=' + json.dumps(v) for k, v in data.items())).encode()
         (parent / 'initdata').write_bytes(base64.b64encode(gzip.compress(raw, mtime=0)))
         (parent / 'initdata.toml').write_bytes(raw)
         (parent / 'initdata.digest').write_text(hashlib.sha384(raw).hexdigest())
-        for k, v in data.items():
-            (parent / k).write_text(v)
+        if not native:
+            for k, v in data.items():
+                (parent / k).write_text(v)
         if materialized_mutation:
             materialized_mutation(parent)
-        guest_check.PARENT = parent
-        guest_check.main()
+        args = ["check-initdata", "--kata"] if native else ["check-initdata"]
+        with (mock.patch.object(guest_check, 'PARENT', parent),
+              mock.patch.object(guest_check, 'KATA_INITDATA', parent / 'initdata.toml'),
+              mock.patch.object(guest_check.sys, 'argv', args)):
+            guest_check.main()
         return {p.name: p.read_bytes() for p in parent.iterdir()}
 
 class GuestContract(unittest.TestCase):
@@ -102,8 +107,24 @@ class GuestContract(unittest.TestCase):
                                   'encryption_type="luks2"\nfilesystem_type="ext4"\nallow_initialize=true\ndisk_ids=["d-test123"]')
         self.assertEqual(validate(data)['workspace-required.env'], b'ENCRYPTED_VOLUMES_REQUIRED=true\n')
         data['workspace.toml'] = 'version="0.1.0"\nkey_uri="kbs:///default/workspace/wrong"'
-        with self.assertRaisesRegex(ValueError, 'not bound'):
+        with self.assertRaisesRegex(ValueError, 'invalid measured workspace'):
             validate(data)
+    def test_native_workspace_binds_owner_instead_of_disk_id(self):
+        data = fixture('workload')
+        body = json.loads(data['openshell-bootstrap.json'])
+        key = 'kbs:///default/workspace/' + 'c' * 64
+        body['resource_uris']['workspace-key'] = key
+        data['openshell-bootstrap.json'] = json.dumps(body)
+        common = (f'version="0.1.0"\nkey_uri="{key}"\nencryption_type="luks2"\n'
+                  'filesystem_type="ext4"\nallow_initialize=true\n')
+        data['workspace.toml'] = common + 'uid=1500\ngid=1600\n'
+        files = validate(data, native=True)
+        self.assertEqual(files['workspace.toml'], data['workspace.toml'].encode())
+        self.assertNotIn('workspace-required.env', files)
+        data['workspace.toml'] = common + 'disk_ids=["d-test123"]'
+        with self.assertRaisesRegex(ValueError, 'invalid measured workspace'):
+            validate(data, native=True)
+
     def test_supervisor_requires_server_ca_without_user_tls_keys(self):
         files = validate(fixture('supervisor'))
         refs = json.loads(files['openshell-bootstrap.json'])['resource_uris']

@@ -13,6 +13,7 @@ import tomllib
 from urllib.parse import urlsplit
 
 PARENT = Path("/run/peerpod")
+KATA_INITDATA = Path("/run/confidential-containers/initdata/initdata.toml")
 REQUIRED = ("aa.toml", "cdh.toml", "policy.rego", "openshell-bootstrap.json")
 WORKLOAD_REFS = {"boundary.json", "tls.crt", "tls.key"}
 SUPERVISOR_REFS = {
@@ -21,12 +22,22 @@ SUPERVISOR_REFS = {
 }
 
 
-def main():
+def peerpod_initdata():
     encoded = (PARENT / "initdata").read_bytes()
     # cloud-init's YAML block scalar appends a transport newline. Never trim
     # the decoded TOML: AA measures its exact bytes, including trailing lines.
     packed = base64.b64decode(encoded.rstrip(b"\r\n"), validate=True)
     raw = gzip.decompress(packed)
+    return raw
+
+
+def main():
+    native = sys.argv[1:] == ["--kata"]
+    if native:
+        raw = KATA_INITDATA.read_bytes()
+        PARENT.mkdir(exist_ok=True, mode=0o700)
+    else:
+        raw = peerpod_initdata()
     body = tomllib.loads(raw.decode("utf-8"))
     if body.get("version") != "0.1.0" or body.get("algorithm") != "sha384":
         raise ValueError("initdata version or digest algorithm is invalid")
@@ -36,19 +47,20 @@ def main():
     for name in REQUIRED:
         if not isinstance(data.get(name), str) or not data[name].strip():
             raise ValueError(f"missing required initdata entry: {name}")
-    measured_digest = hashlib.sha384(raw).hexdigest().encode("ascii")
-    if (PARENT / "initdata.digest").read_bytes().strip() != measured_digest:
-        raise ValueError("CAA initdata digest differs from exact TOML bytes")
-    if (PARENT / "initdata.toml").read_bytes() != raw:
-        raise ValueError("AA initdata.toml differs from exact TOML bytes")
-    for name in REQUIRED:
-        path = PARENT / name
-        if name == "openshell-bootstrap.json" and not path.exists():
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
-            with os.fdopen(fd, "wb") as out:
-                out.write(data[name].encode("utf-8"))
-        if (path).read_bytes() != data[name].encode("utf-8"):
-            raise ValueError(f"materialized {name} differs from initdata")
+    if not native:
+        measured_digest = hashlib.sha384(raw).hexdigest().encode("ascii")
+        if (PARENT / "initdata.digest").read_bytes().strip() != measured_digest:
+            raise ValueError("CAA initdata digest differs from exact TOML bytes")
+        if (PARENT / "initdata.toml").read_bytes() != raw:
+            raise ValueError("AA initdata.toml differs from exact TOML bytes")
+        for name in REQUIRED:
+            path = PARENT / name
+            if name == "openshell-bootstrap.json" and not path.exists():
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+                with os.fdopen(fd, "wb") as out:
+                    out.write(data[name].encode("utf-8"))
+            if (path).read_bytes() != data[name].encode("utf-8"):
+                raise ValueError(f"materialized {name} differs from initdata")
     aa = tomllib.loads(data["aa.toml"])
     cdh = tomllib.loads(data["cdh.toml"])
     aa_kbs = aa.get("token_configs", {}).get("kbs", {})
@@ -96,16 +108,21 @@ def main():
             raise ValueError("workspace key and measured workspace policy must occur together")
         if persistent:
             policy = tomllib.loads(policy_text)
+            if native:
+                valid_binding = all(type(policy.get(field)) is int and 0 <= policy[field] < 2**32 - 1
+                                    for field in ("uid", "gid"))
+            else:
+                disks = policy.get("disk_ids")
+                valid_binding = (isinstance(disks, list) and bool(disks) and
+                                 all(isinstance(disk, str) and re.fullmatch(r"d-[a-z0-9]+", disk)
+                                     for disk in disks) and disks == sorted(set(disks)))
             if (policy.get("version") != "0.1.0" or
-                not isinstance(policy.get("key_uri"), str) or
-                policy["key_uri"] != refs["workspace-key"] or
+                policy.get("key_uri") != refs["workspace-key"] or
                 policy.get("encryption_type") != "luks2" or
+                policy.get("filesystem_type") != "ext4" or
                 not isinstance(policy.get("allow_initialize"), bool) or
-                not isinstance(policy.get("disk_ids"), list) or not policy["disk_ids"] or
-                not all(isinstance(disk, str) and re.fullmatch(r"d-[a-z0-9]+", disk)
-                        for disk in policy["disk_ids"]) or
-                policy["disk_ids"] != sorted(set(policy["disk_ids"]))):
-                raise ValueError("workspace configuration is not bound to bootstrap references and disk identities")
+                not valid_binding):
+                raise ValueError("invalid measured workspace configuration")
             workspace_path = PARENT / "workspace.toml"
             if not workspace_path.exists():
                 fd = os.open(workspace_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
@@ -117,6 +134,8 @@ def main():
     else:
         if "workspace.toml" in data:
             raise ValueError("supervisor cannot carry a workspace key policy")
+    if native:
+        return
     env = PARENT / "workspace-required.env"
     if not env.exists():
         fd = os.open(env, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)

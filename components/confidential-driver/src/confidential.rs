@@ -125,6 +125,7 @@ impl GuestInitdata {
         workspace_key_uri: Option<&str>,
         allow_workspace_initialize: bool,
         generated_policy: Option<&str>,
+        native_workspace_owner: Option<(u32, u32)>,
     ) -> Result<RenderedInitdata, String> {
         let mut resources = BTreeMap::new();
         for key in keys {
@@ -176,23 +177,34 @@ impl GuestInitdata {
                     "workspace key URI does not match the namespace and Sandbox CR UID".to_string(),
                 );
             }
-            let disk_ids = store
-                .workspace_disk_ids(namespace, sandbox_resource_uid)
-                .map_err(|error| format!("read measured workspace disk binding: {error}"))?;
-            if generated_policy.is_some() && disk_ids.is_empty() {
-                return Err(
-                    "final workload initdata requires bound workspace cloud disk IDs".to_string(),
-                );
-            }
-            let config = toml::Value::try_from(serde_json::json!({
+            let mut config = json!({
                 "version": "0.1.0", "key_uri": uri, "allow_initialize": allow_workspace_initialize,
-                "encryption_type": "luks2", "filesystem_type": "ext4", "disk_ids": disk_ids,
-                "mounts": if generated_policy.is_some() {
-                    store.workspace_mounts(sandbox_id, namespace, sandbox_resource_uid)
+                "encryption_type": "luks2", "filesystem_type": "ext4",
+            });
+            if let Some((uid, gid)) = native_workspace_owner {
+                config["uid"] = json!(uid);
+                config["gid"] = json!(gid);
+            } else {
+                let disk_ids = store
+                    .workspace_disk_ids(namespace, sandbox_resource_uid)
+                    .map_err(|error| format!("read measured workspace disk binding: {error}"))?;
+                if generated_policy.is_some() && disk_ids.is_empty() {
+                    return Err(
+                        "final workload initdata requires bound workspace cloud disk IDs"
+                            .to_string(),
+                    );
+                }
+                config["disk_ids"] = json!(disk_ids);
+                config["mounts"] = if generated_policy.is_some() {
+                    store
+                        .workspace_mounts(sandbox_id, namespace, sandbox_resource_uid)
                         .map_err(|error| format!("read measured workspace mounts: {error}"))?
-                } else { json!({}) },
-            }))
-            .map_err(|error| format!("serialize measured workspace configuration: {error}"))?;
+                } else {
+                    json!({})
+                };
+            }
+            let config = toml::Value::try_from(config)
+                .map_err(|error| format!("serialize measured workspace configuration: {error}"))?;
             data.insert(
                 "workspace.toml".to_string(),
                 toml::Value::String(
@@ -390,6 +402,7 @@ mod tests {
                 Some(&workspace_uri),
                 true,
                 workload_policy.as_deref(),
+                None,
             )
             .expect("render workload");
         let workspace: toml::Value = toml::from_str(
@@ -403,6 +416,32 @@ mod tests {
             Some("d-workspace")
         );
         assert_eq!(workspace["key_uri"].as_str(), Some(workspace_uri.as_str()));
+        let native = source
+            .render(
+                &store,
+                BootstrapRole::Workload,
+                generation,
+                "sandbox-1",
+                "cr-uid-1",
+                attempt,
+                "sandbox",
+                WORKLOAD_KEYS,
+                Some(&workspace_uri),
+                true,
+                Some("package agent_policy"),
+                Some((1500, 1600)),
+            )
+            .expect("render native Kata workload");
+        let native: toml::Value = toml::from_str(
+            toml::from_str::<toml::Value>(&native.raw).unwrap()["data"]["workspace.toml"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(native["uid"].as_integer(), Some(1500));
+        assert_eq!(native["gid"].as_integer(), Some(1600));
+        assert!(native.get("disk_ids").is_none());
+        assert!(native.get("mounts").is_none());
         assert!(
             source
                 .render(
@@ -416,7 +455,8 @@ mod tests {
                     WORKLOAD_KEYS,
                     Some(&workspace_uri),
                     false,
-                    Some("package agent_policy\ndefault allow = false\n")
+                    Some("package agent_policy\ndefault allow = false\n"),
+                    None,
                 )
                 .is_err()
         );
@@ -437,7 +477,8 @@ mod tests {
                     WORKLOAD_KEYS,
                     Some(&not_bound),
                     false,
-                    Some("package agent_policy\ndefault allow = false\n")
+                    Some("package agent_policy\ndefault allow = false\n"),
+                    None,
                 )
                 .is_err()
         );
@@ -456,6 +497,7 @@ mod tests {
                 None,
                 false,
                 supervisor_policy.as_deref(),
+                None,
             )
             .expect("render supervisor");
         assert_ne!(workload.digest, supervisor.digest);
@@ -498,6 +540,7 @@ mod tests {
                 Some(&workspace_uri),
                 false,
                 None,
+                None,
             )
             .expect("render rotated workload");
         assert_ne!(workload.digest, rotated.digest);
@@ -521,6 +564,7 @@ mod tests {
                 WORKLOAD_KEYS,
                 None,
                 false,
+                None,
                 None,
             )
             .expect("render ephemeral workload");

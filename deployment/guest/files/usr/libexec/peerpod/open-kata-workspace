@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""Open the measured native workspace once for the Kata workload Pod VM."""
+import base64
+import json
+from pathlib import Path
+import subprocess
+import sys
+from tempfile import NamedTemporaryFile
+import time
+import tomllib
+
+from workspace_block import require_whole_disk, verify_mapper
+
+INITDATA = Path('/run/confidential-containers/initdata/initdata.toml')
+CDH_SOCKET = Path('/run/confidential-containers/cdh.sock')
+CDH_TOOL = '/usr/local/bin/ttrpc-cdh-tool'
+RUNTIME = Path('/run/peerpod')
+EPHEMERAL = Path('/run/kata-containers/sandbox/ephemeral')
+CONTROL = EPHEMERAL / 'openshell-volume-control'
+DATA = EPHEMERAL / 'openshell-volume-data'
+
+
+def run(*args, **kwargs):
+    result = subprocess.run(args, stderr=subprocess.PIPE, **kwargs)
+    if result.returncode:
+        raise ValueError(f"{args[0]}: {result.stderr.decode(errors='replace').strip()}")
+    return result.stdout
+
+
+def open_volume(device, policy):
+    # Replace initialization, open and mapper checks with CDH persistent volumes (guest-components #1648/#1715).
+    key_uri = policy['key_uri']
+    if subprocess.run(['cryptsetup', 'isLuks', device]).returncode == 1:
+        if not policy['allow_initialize']:
+            raise ValueError('workspace disk has no LUKS header and initialization is disabled')
+        encoded = run(CDH_TOOL, 'get-resource', '--resource-uri', key_uri, stdout=subprocess.PIPE)
+        run('/usr/libexec/peerpod/initialize-workspace-volume', '--local-block', device,
+            input=base64.b64decode(encoded.strip(), validate=True))
+    mapper = RUNTIME / 'workspace-mapper'
+    with NamedTemporaryFile(mode='w', dir=RUNTIME) as manifest:
+        json.dump({
+            'volume_type': 'block-device',
+            'mount_point': str(mapper),
+            'flags': [],
+            'options': {'devicePath': str(device), 'sourceType': 'encrypted',
+                        'targetType': 'device', 'encryptionType': 'luks2',
+                        'key': key_uri, 'mapperName': 'openshell-workspace'},
+        }, manifest)
+        manifest.flush()
+        run(CDH_TOOL, 'secure-mount', '--storage-path', manifest.name)
+    verify_mapper(mapper, device)
+    return mapper
+
+
+def handoff():
+    # Replace the sidecar handoff and emptyDir mount with Kata DAV (CoCo RFC #390).
+    request = CONTROL / 'request'
+    while not request.exists():
+        time.sleep(1)
+    run('/usr/local/libexec/openshell-guest/check-initdata', '--kata')
+    policy = tomllib.loads((RUNTIME / 'workspace.toml').read_text())
+    major, minor = (int(field, 16) for field in request.read_text().strip().split(':'))
+    block = require_whole_disk((Path('/sys/dev/block') / f'{major}:{minor}').resolve(strict=True))
+    mapper = open_volume(Path('/dev') / block.name, policy)
+    run('mount', '-t', 'ext4', '-o', 'nodev,nosuid', mapper, DATA)
+    (CONTROL / 'ready').touch()
+
+
+def main():
+    # Kata writes initdata before starting CDH.
+    while not INITDATA.exists() or not CDH_SOCKET.is_socket():
+        time.sleep(1)
+    data = tomllib.loads(INITDATA.read_text())['data']
+    if 'workspace.toml' in data and json.loads(data['openshell-bootstrap.json'])['role'] == 'workload':
+        handoff()
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+        sys.exit(f'workspace setup failed: {error}')

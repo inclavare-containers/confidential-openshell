@@ -10,7 +10,9 @@ Peer Pods start CAA's process-user-data, AA, CDH, Kata agent and APF using
 systemd. Local Kata starts `kata-containers.target` and the upstream vsock
 agent. The agent loads the measured role policy and starts AA and CDH from the
 initdata disk. Its initial OPA policy denies sandbox creation and policy
-replacement over RPC. Both paths use ttRPC for confidential guest services.
+replacement over RPC. Both paths use ttRPC for confidential guest services. The native workspace service
+uses the upstream `ttrpc-cdh-tool` built from the same guest-components commit
+in the locked toolchain and verified against its locked binary digest.
 
 CDH's native `image.work_dir` points to `/var/lib/confidential-containers/image`.
 The verified UKI's `systemd.volatile=state` keeps `/var` in guest memory. This gives
@@ -71,7 +73,7 @@ it is emitted with the image references.
 Actual TDX quote/CCEL verification and the configured platform policy remain
 required before accepting the image.
 
-For persistent workspaces, the driver adds measured `workspace.toml` with the
+For Peer Pod persistent workspaces, the driver adds measured `workspace.toml` with the
 stable KBS key URI and trusted cloud disk IDs. APF resolves and checks the disk
 identity. A fresh disk must be an unused, partition-free whole disk, entirely
 zero-filled and explicitly authorized for initialization on the first sandbox creation.
@@ -84,6 +86,10 @@ LUKS disks are never initialized or repaired. Upstream CDH SecureMount opens
 LUKS2, AES-XTS with a 512-bit key and 4096-byte sectors before mounting, including reused
 mappers. It enforces the requested read-only mode across the raw device, mapper and filesystem. CDH's ephemeral detached-header `sourceType=empty` is
 not used for retained disks. Stop/Start keeps the same ESSD, header and KBS key.
+
+Native Kata holds a Block PVC in a restartable init container. The guest service
+checks the active LUKS2 mapping before formatting or mounting ext4. See the
+[native workspace lifecycle and upstream replacement criteria](../baremetal/README.md#persistent-workspace).
 
 Image/reference changes require the [two-role deployment checks](../../docs/deployment.md#10-verify-both-confidential-roles),
 including sealed bootstrap, resource denials and encrypted workspace restart.

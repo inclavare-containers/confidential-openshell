@@ -10,6 +10,18 @@ system. Both backends use the same verified UKI and SquashFS root filesystem.
   server certificate must include its endpoint IP in the subjectAltName (SAN).
 - Guest services and containers share the Pod network. Egress rules apply to
   the entire PodVM. The in-guest broker constrains agent egress.
+- Persistent volumes use a transitional sidecar and guest service. Replace
+  the handoff when Kata delivers policy-bound devices, and replace guest
+  initialization and open when CDH supports the persistent volume lifecycle.
+  See the [CoCo RFC][volume-rfc] and guest-components [#1648][cdh1648] and
+  [#1715][cdh1715].
+- The workspace is the only supported workload block device. With Kata 4.4
+  and virtio-scsi, a second block device can fail the guest's SCSI scan during
+  container creation. Use Memory emptyDirs. Disk-backed emptyDirs (CoCo's
+  default `block-encrypted` mode) and additional Block PVCs are unsupported.
+- A local PV supports recovery on the same worker.
+- After workload Pod replacement or worker reboot, use Gateway stop/start
+  to authorize the replacement VMs, as with Peer Pods. See [Recovery](#recovery).
 - The platform policy accepts the VMM's TD HOB memory layout for the approved
   TDVF to process, as it does for dynamic ACPI data. CCEL replay authenticates
   the recorded digests. Individual memory ranges are outside this appraisal.
@@ -101,13 +113,15 @@ In `/etc/openshell-confidential/driver.env`, set the backend configuration:
 
 ```ini
 OPENSHELL_CONFIDENTIAL_RUNTIME_CLASS=kata-qemu-tdx
+OPENSHELL_K8S_WORKSPACE_STORAGE_CLASS=openshell-local
 ```
 
 Export the RuntimeClass setting above in the shell that runs the setup
 scripts. Trustee startup selects the platform references from it, and Gateway
 installation checks access to that RuntimeClass. Set
 `OPENSHELL_KATA_OCI_VERSION` in the same file to the OCI spec version emitted
-by the cluster runtime.
+by the cluster runtime. Use the name of your Block StorageClass if it differs from
+the [local example](#persistent-workspace).
 
 Start the bundled Trustee and prepare the images and Gateway:
 
@@ -131,6 +145,58 @@ whose resolver already trusts the registry needs no additional CA.
 bash deployment/peerpods/install-prerequisites.sh
 bash deployment/openshell/install.sh
 ```
+
+## Persistent workspace
+
+The driver binds the Block PVC to a PV before it opens the Pod scheduling
+gate. Use a StorageClass with immediate binding. For a single worker, the
+following static PV example uses an unused, zero-filled block device.
+Replace the worker name, device path and capacity before applying it.
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: openshell-local
+provisioner: kubernetes.io/no-provisioner
+volumeBindingMode: Immediate
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: openshell-workspace-1
+spec:
+  storageClassName: openshell-local
+  capacity:
+    storage: 2Gi
+  accessModes: [ReadWriteOnce]
+  volumeMode: Block
+  persistentVolumeReclaimPolicy: Retain
+  local:
+    path: /dev/disk/by-id/WORKSPACE_DISK
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values: [tdx-worker]
+```
+
+A restartable init container holds the device for the lifetime of the Pod.
+During normal Pod termination, kubelet signals it after the workload exits.
+Its TERM handler runs `sync` before Kata detaches the device. The configured
+default sandbox image must provide `/bin/sh`, `stat -c %t:%T`, `mv`, `sleep`,
+`sync` and `/usr/bin/test`.
+
+On first use, the guest initializes LUKS2 and creates ext4 with the measured
+sandbox UID and GID.
+On reopen, CDH uses the same sandbox key. The guest verifies the active
+mapping before mounting it for seed and agent. If opening fails, the startup
+probe times out and neither starts.
+
+The driver records the PV UID on the trusted system. With reclaim policy
+`Retain`, the storage owner disposes of the device after sandbox deletion.
 
 ## Workload network
 
@@ -169,6 +235,18 @@ bash deployment/openshell/start-services.sh
 bash deployment/openshell/login.sh
 ```
 
+## Recovery
+
+After Kubernetes replaces the workload Pod or the worker restarts, use the
+Gateway to authorize the new role guests and reopen the retained workspace:
+
+```bash
+openshell sandbox stop NAME
+openshell sandbox start NAME
+```
+
+If the driver already stopped the sandbox, use `start` alone.
+
 ## Updating the Kata boot references
 
 1. Inspect the Go shim configuration in the locked amd64 kata-deploy image.
@@ -194,3 +272,7 @@ bash deployment/openshell/login.sh
 [external]: ../../docs/deployment.md#existing-or-separately-deployed-trustee
 [hosts]: ../peerpods/registry-hosts.example.toml
 [first-agent]: ../../docs/first-agent.md
+[volume-rfc]:
+  https://github.com/confidential-containers/confidential-containers/pull/390
+[cdh1648]: https://github.com/confidential-containers/guest-components/pull/1648
+[cdh1715]: https://github.com/confidential-containers/guest-components/pull/1715

@@ -702,6 +702,17 @@ fn kubernetes_driver_volume_mount_to_k8s(
 // duplicated on disk.  The plan is to replace this with proper container
 // snapshotting so that only the diff from the base image is persisted.
 
+const NATIVE_RUNTIME_CLASS: &str = "kata-qemu-tdx";
+const NATIVE_WORKSPACE_DEVICE: &str = "/dev/openshell-workspace";
+const NATIVE_WORKSPACE_DATA: &str = "openshell-volume-data";
+const NATIVE_WORKSPACE_CONTROL: &str = "openshell-volume-control";
+const NATIVE_WORKSPACE_ATTACH: &str = "openshell-workspace-attach";
+const PUBLISH_NATIVE_WORKSPACE: &str = "trap 'exec sync' TERM
+stat -c '%t:%T' /dev/openshell-workspace > /control/request.tmp
+mv /control/request.tmp /control/request
+sleep infinity &
+wait";
+
 /// Volume name used for the workspace PVC in the pod spec.
 const WORKSPACE_VOLUME_NAME: &str = "workspace";
 
@@ -901,6 +912,7 @@ impl KubernetesComputeDriver {
         keys: &[&str],
         workspace_key_uri: Option<&str>,
         allow_workspace_initialize: bool,
+        workspace_owner: Option<(u32, u32)>,
         generated_policy: Option<&str>,
     ) -> Result<crate::confidential::RenderedInitdata, KubernetesDriverError> {
         let profile = self.confidential.as_ref();
@@ -918,6 +930,8 @@ impl KubernetesComputeDriver {
                 workspace_key_uri,
                 allow_workspace_initialize,
                 generated_policy,
+                workspace_owner
+                    .filter(|_| self.config.default_runtime_class_name == NATIVE_RUNTIME_CLASS),
             )
             .map_err(KubernetesDriverError::Precondition)
     }
@@ -937,6 +951,7 @@ impl KubernetesComputeDriver {
         keys: &[&str],
         workspace_key_uri: Option<&str>,
         allow_workspace_initialize: bool,
+        workspace_owner: Option<(u32, u32)>,
     ) -> Result<crate::confidential::RenderedInitdata, KubernetesDriverError> {
         use tokio::io::AsyncWriteExt as _;
         Self::validate_actual_pod_image_refs(pod)?;
@@ -997,7 +1012,9 @@ impl KubernetesComputeDriver {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        if workspace_key_uri.is_some() {
+        if workspace_key_uri.is_some()
+            && self.config.default_runtime_class_name != NATIVE_RUNTIME_CLASS
+        {
             let mounts = profile
                 .store
                 .workspace_mounts(sandbox_id, namespace, cr_uid)
@@ -1056,6 +1073,7 @@ impl KubernetesComputeDriver {
             keys,
             workspace_key_uri,
             allow_workspace_initialize,
+            workspace_owner,
             Some(&policy),
         )?;
         let updated = pods
@@ -1296,7 +1314,7 @@ impl KubernetesComputeDriver {
             })?;
         for claim_name in claims {
             // Record ownership before waiting for controller provisioning. The
-            // final measured document must name each actual retained cloud disk.
+            // final measured Peer Pod document must name each retained cloud disk.
             profile
                 .store
                 .record_workspace_volume(namespace, cr_uid, claim_name, None, None)
@@ -1335,16 +1353,21 @@ impl KubernetesComputeDriver {
                                 "workspace PV {pv_name} does not bind the exact PVC {namespace}/{claim_name} UID"
                             )));
                         }
-                        if let (Some(pv_uid), Some(disk_id)) = (
-                            pv.metadata.uid.filter(|uid| !uid.is_empty()),
-                            pv_spec
+                        if let Some(pv_uid) = pv.metadata.uid.filter(|uid| !uid.is_empty()) {
+                            if self.config.default_runtime_class_name == NATIVE_RUNTIME_CLASS
+                                && pv_spec.and_then(|spec| spec.volume_mode.as_deref()) == Some("Block")
+                            {
+                                return Ok::<_, KubernetesDriverError>((pv_uid, None));
+                            }
+                            if let Some(disk_id) = pv_spec
                                 .and_then(|spec| spec.csi.as_ref())
                                 .and_then(|csi| csi.volume_attributes.as_ref())
                                 .and_then(|attributes| attributes.get("cloud-volume-path"))
                                 .filter(|disk_id| !disk_id.is_empty())
-                                .cloned(),
-                        ) {
-                            return Ok::<_, KubernetesDriverError>((pv_uid, disk_id));
+                                .cloned()
+                            {
+                                return Ok((pv_uid, Some(disk_id)));
+                            }
                         }
                     }
                     tokio::time::sleep(STOP_INITIAL_POLL_INTERVAL).await;
@@ -1353,7 +1376,7 @@ impl KubernetesComputeDriver {
             .await
             .map_err(|_| {
                 KubernetesDriverError::Precondition(format!(
-                    "workspace PVC {claim_name} did not bind a cloud disk before bootstrap"
+                    "workspace PVC {claim_name} did not bind a workspace volume before bootstrap"
                 ))
             })??;
             let (pv_uid, disk_id) = bound;
@@ -1364,7 +1387,7 @@ impl KubernetesComputeDriver {
                     cr_uid,
                     claim_name,
                     Some(&pv_uid),
-                    Some(&disk_id),
+                    disk_id.as_deref(),
                 )
                 .map_err(|error| {
                     KubernetesDriverError::Precondition(format!(
@@ -3415,6 +3438,7 @@ impl KubernetesComputeDriver {
             None,
             false,
             None,
+            None,
         )?;
         let workload_initdata = self.render_confidential_initdata(
             BootstrapRole::Workload,
@@ -3426,6 +3450,7 @@ impl KubernetesComputeDriver {
             WORKLOAD_KEYS,
             workspace_key_uri.as_deref(),
             true,
+            Some((agent_uid, agent_gid)),
             None,
         )?;
         patch_dynamic_object_with_uid_retry(&sandbox_api.api, cr_name, cr_uid, |version| {
@@ -3682,6 +3707,7 @@ impl KubernetesComputeDriver {
                 &supervisor_keys,
                 None,
                 false,
+                None,
             )
             .await?;
         let workload_initdata = self
@@ -3698,6 +3724,7 @@ impl KubernetesComputeDriver {
                 WORKLOAD_KEYS,
                 workspace_key_uri.as_deref(),
                 allow_workspace_initialize,
+                Some((agent_uid, agent_gid)),
             )
             .await?;
         patch_dynamic_object_with_uid_retry(&sandbox_api.api, cr_name, cr_uid, |version| {
@@ -4300,6 +4327,7 @@ impl KubernetesComputeDriver {
             None,
             false,
             None,
+            None,
         )?;
         let workload_initdata = self.render_confidential_initdata(
             BootstrapRole::Workload,
@@ -4311,6 +4339,7 @@ impl KubernetesComputeDriver {
             WORKLOAD_KEYS,
             workspace_key_uri.as_deref(),
             false,
+            Some((trusted_launch.agent_uid, trusted_launch.agent_gid)),
             None,
         )?;
         // The lifecycle gate serializes local start/stop/delete. Kubernetes
@@ -7766,6 +7795,7 @@ fn apply_supervisor_sandbox_runtime_boundary(
 fn apply_workspace_persistence(
     pod_template: &mut serde_json::Value,
     image: &str,
+    attach_image: &str,
     image_pull_policy: Option<crate::KubernetesImagePullPolicy>,
     workspace_owner: (u32, u32),
 ) {
@@ -7773,29 +7803,43 @@ fn apply_workspace_persistence(
         return;
     };
 
-    // 1. Add workspace volume mount to the agent container
-    let containers = spec.get_mut("containers").and_then(|v| v.as_array_mut());
-    if let Some(containers) = containers {
-        let mut target_index = None;
-        for (i, c) in containers.iter().enumerate() {
-            if c.get("name").and_then(|v| v.as_str()) == Some("agent") {
-                target_index = Some(i);
-                break;
-            }
+    let native_block = spec
+        .get("runtimeClassName")
+        .and_then(serde_json::Value::as_str)
+        == Some(NATIVE_RUNTIME_CLASS);
+    let mount_name = if native_block {
+        let volumes = spec
+            .entry("volumes")
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut()
+            .expect("Pod volumes must be an array");
+        for name in [NATIVE_WORKSPACE_CONTROL, NATIVE_WORKSPACE_DATA] {
+            volumes.push(serde_json::json!({"name": name, "emptyDir": {"medium": "Memory"}}));
         }
-        let index = target_index.unwrap_or(0);
-
-        if let Some(container) = containers.get_mut(index).and_then(|v| v.as_object_mut()) {
-            let volume_mounts = container
-                .entry("volumeMounts")
-                .or_insert_with(|| serde_json::json!([]))
-                .as_array_mut();
-            if let Some(volume_mounts) = volume_mounts {
-                volume_mounts.push(serde_json::json!({
-                    "name": WORKSPACE_VOLUME_NAME,
-                    "mountPath": WORKSPACE_MOUNT_PATH
-                }));
-            }
+        NATIVE_WORKSPACE_DATA
+    } else {
+        WORKSPACE_VOLUME_NAME
+    };
+    let add_workspace = |container: &mut serde_json::Value, mount_path: &str| {
+        container
+            .as_object_mut()
+            .expect("container object")
+            .entry("volumeMounts")
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut()
+            .expect("container mounts must be an array")
+            .push(serde_json::json!({"name": mount_name, "mountPath": mount_path}));
+    };
+    if let Some(containers) = spec
+        .get_mut("containers")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        let index = containers
+            .iter()
+            .position(|c| c["name"] == "agent")
+            .unwrap_or(0);
+        if let Some(container) = containers.get_mut(index) {
+            add_workspace(container, WORKSPACE_MOUNT_PATH);
         }
     }
 
@@ -7818,13 +7862,36 @@ fn apply_workspace_persistence(
                 "allowPrivilegeEscalation": false,
                 "capabilities": {"drop": ["ALL"]}
             },
-            "volumeMounts": [
-                {"name": WORKSPACE_VOLUME_NAME, "mountPath": WORKSPACE_INIT_MOUNT_PATH},
-                {"name": SANDBOX_RUNTIME_VOLUME_NAME, "mountPath": SANDBOX_RUNTIME_MOUNT_PATH, "readOnly": true}
-            ]
+            "volumeMounts": []
         });
+        add_workspace(&mut init_spec, WORKSPACE_INIT_MOUNT_PATH);
+        init_spec["volumeMounts"].as_array_mut().unwrap().push(serde_json::json!({
+            "name": SANDBOX_RUNTIME_VOLUME_NAME, "mountPath": SANDBOX_RUNTIME_MOUNT_PATH, "readOnly": true
+        }));
         if let Some(policy) = image_pull_policy {
             init_spec["imagePullPolicy"] = serde_json::json!(policy.as_kubernetes_str());
+        }
+        if native_block {
+            // Keep the raw device attached for the whole Pod. Kata binds DATA
+            // into the seed and agent containers only after the guest opens it.
+            let mut attach = serde_json::json!({
+                "name": NATIVE_WORKSPACE_ATTACH,
+                "image": attach_image,
+                "command": ["/bin/sh", "-ec", PUBLISH_NATIVE_WORKSPACE],
+                "restartPolicy": "Always",
+                "securityContext": init_spec["securityContext"],
+                "volumeDevices": [{"name": WORKSPACE_VOLUME_NAME, "devicePath": NATIVE_WORKSPACE_DEVICE}],
+                "volumeMounts": [
+                    {"name": NATIVE_WORKSPACE_CONTROL, "mountPath": "/control"},
+                    {"name": NATIVE_WORKSPACE_DATA, "mountPath": "/state"}
+                ],
+                "startupProbe": {"exec": {"command": ["/usr/bin/test", "-f", "/control/ready"]},
+                                 "periodSeconds": 2, "failureThreshold": 150}
+            });
+            if let Some(policy) = image_pull_policy {
+                attach["imagePullPolicy"] = serde_json::json!(policy.as_kubernetes_str());
+            }
+            init_containers.push(attach);
         }
         init_containers.push(init_spec);
     }
@@ -7978,13 +8045,14 @@ fn sandbox_to_k8s_spec(
     }
 
     if inject_workspace {
-        root.insert(
-            "volumeClaimTemplates".to_string(),
-            default_workspace_volume_claim_templates(
-                params.workspace_default_storage_size,
-                params.workspace_storage_class,
-            ),
+        let mut claims = default_workspace_volume_claim_templates(
+            params.workspace_default_storage_size,
+            params.workspace_storage_class,
         );
+        if params.default_runtime_class_name == NATIVE_RUNTIME_CLASS {
+            claims[0]["spec"]["volumeMode"] = serde_json::json!("Block");
+        }
+        root.insert("volumeClaimTemplates".to_string(), claims);
     }
 
     // podTemplate is required by the Kubernetes CRD - ensure it's always present
@@ -8218,6 +8286,7 @@ fn sandbox_template_to_k8s_with_validated_config(
         apply_workspace_persistence(
             &mut result,
             image,
+            params.default_image,
             params.image_pull_policy,
             (params.sandbox_uid, params.sandbox_gid),
         );
@@ -9805,6 +9874,7 @@ mod tests {
                 WORKLOAD_KEYS,
                 None,
                 false,
+                None,
             )
             .await;
         let error = result
@@ -10511,6 +10581,27 @@ mod tests {
                         "apiVersion": "v1", "kind": "PersistentVolume",
                         "metadata": {"name": "workspace-pv", "uid": "pv-uid"},
                         "spec": {"claimRef": {"name": "workspace-pvc", "namespace": "openshell", "uid": "pvc-uid"}}
+                    }),
+                ),
+            ),
+            (
+                http::Method::GET,
+                PVC_PATH,
+                kube_test_response(http::StatusCode::OK, bound.clone()),
+            ),
+            (
+                http::Method::GET,
+                PV_PATH,
+                kube_test_response(
+                    http::StatusCode::OK,
+                    serde_json::json!({
+                        "apiVersion": "v1", "kind": "PersistentVolume",
+                        "metadata": {"name": "workspace-pv", "uid": "pv-uid"},
+                        "spec": {
+                            "claimRef": {"name": "workspace-pvc", "namespace": "openshell", "uid": "pvc-uid"},
+                            "csi": {"driver": "diskplugin.csi.alibabacloud.com", "volumeHandle": "pvc-logical-handle",
+                                "volumeAttributes": {"cloud-volume-path": ""}}
+                        }
                     }),
                 ),
             ),
@@ -13771,6 +13862,7 @@ mod tests {
         apply_workspace_persistence(
             &mut pod_template,
             "openshell/sandbox:latest",
+            "openshell/default:latest",
             Some(crate::KubernetesImagePullPolicy::IfNotPresent),
             (1000, 1000),
         );
@@ -13817,6 +13909,55 @@ mod tests {
     }
 
     #[test]
+    fn native_workspace_attaches_the_device_only_to_the_storage_container() {
+        let mut pod = serde_json::json!({
+            "spec": {"runtimeClassName": "kata-qemu-tdx", "containers": [{"name": "agent"}]}
+        });
+        apply_workspace_persistence(&mut pod, "user-image", "operator-image", None, (1000, 1000));
+        let spec = &pod["spec"];
+        let attach = &spec["initContainers"][0];
+        assert_eq!(attach["name"], NATIVE_WORKSPACE_ATTACH);
+        assert_eq!(attach["image"], "operator-image");
+        assert_eq!(attach["restartPolicy"], "Always");
+        assert_eq!(
+            attach["volumeDevices"][0]["devicePath"],
+            NATIVE_WORKSPACE_DEVICE
+        );
+        assert_eq!(attach["volumeMounts"][0]["mountPath"], "/control");
+        assert!(attach["volumeMounts"][0]["readOnly"].is_null());
+        assert_eq!(
+            attach["command"],
+            serde_json::json!([
+                "/bin/sh",
+                "-ec",
+                concat!(
+                    "trap 'exec sync' TERM\n",
+                    "stat -c '%t:%T' /dev/openshell-workspace > /control/request.tmp\n",
+                    "mv /control/request.tmp /control/request\n",
+                    "sleep infinity &\nwait",
+                )
+            ])
+        );
+        assert_eq!(
+            attach["startupProbe"]["exec"]["command"],
+            serde_json::json!(["/usr/bin/test", "-f", "/control/ready"])
+        );
+
+        let seed = &spec["initContainers"][1];
+        let agent = &spec["containers"][0];
+        assert_eq!(seed["name"], WORKSPACE_INIT_CONTAINER_NAME);
+        for consumer in [seed, agent] {
+            assert!(consumer["volumeDevices"].is_null());
+            assert_eq!(consumer["volumeMounts"][0]["name"], NATIVE_WORKSPACE_DATA);
+        }
+        assert_eq!(
+            seed["volumeMounts"][0]["mountPath"],
+            WORKSPACE_INIT_MOUNT_PATH
+        );
+        assert_eq!(agent["volumeMounts"][0]["mountPath"], WORKSPACE_MOUNT_PATH);
+    }
+
+    #[test]
     fn workspace_persistence_uses_same_image_as_agent() {
         let mut pod_template = serde_json::json!({
             "spec": {
@@ -13830,6 +13971,7 @@ mod tests {
         apply_workspace_persistence(
             &mut pod_template,
             "my-custom-image:v2",
+            "openshell/default:latest",
             Some(crate::KubernetesImagePullPolicy::IfNotPresent),
             (1000, 1000),
         );

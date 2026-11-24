@@ -35,6 +35,10 @@
         "ref": "ghcr.io/confidential-containers/guest-components/api-server-rest@sha256:71a1e8c417107ed74b96f8198d75846c3ff23f94d00d56ace2806f6927aed818",
         "binary_sha256": "86578451372019ef576b49317cd7e131ece4f89983c6bea046d1c88acd43d5b0",
         "archive": "api-server-rest.tar.xz"
+      },
+      "ttrpc-cdh-tool": {
+        "builder": "docker.io/library/rust@sha256:4c2fd73ef19c5ef9d54bee03b06b2839a392604fbfcd578ed948b71b37c1d7fb",
+        "binary_sha256": "22f80af0c8e9603dded17f19b45aed752f90e1887af266fb31c1d65dbbab2110"
       }
     }
   },

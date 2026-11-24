@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Initialize one measured, wholly blank workspace disk with an embedded LUKS2 header.
 
-APF supplies a CDH-released 32-byte key on stdin. Existing encrypted disks are
+The caller supplies a CDH-released 32-byte key on stdin. Existing encrypted disks are
 opened by upstream CDH instead; this helper never repairs or reformats them.
 """
 import array
@@ -13,6 +13,8 @@ import stat
 import subprocess
 import sys
 import tomllib
+
+from workspace_block import require_whole_disk, verify_mapper
 
 PARENT = Path('/run/peerpod')
 SYS_BLOCK = Path('/sys/class/block')
@@ -39,18 +41,19 @@ def validate_policy(policy, disk_id, fs_type, key_uri):
             policy.get('filesystem_type') != fs_type or
             policy.get('key_uri') != key_uri or
             not re.fullmatch(r'kbs:///default/workspace/[a-zA-Z0-9._~-]+', key_uri) or
-            not isinstance(ids, list) or not ids or
-            not all(isinstance(item, str) and re.fullmatch(r'd-[a-z0-9]+', item) for item in ids) or
-            ids != sorted(set(ids)) or disk_id not in ids):
+            (disk_id is not None and (
+                not isinstance(ids, list) or not ids or
+                not all(isinstance(item, str) and re.fullmatch(r'd-[a-z0-9]+', item) for item in ids) or
+                ids != sorted(set(ids)) or disk_id not in ids))):
         raise ValueError('workspace initialization does not match measured key and disk identities')
 
 
 def require_disk_identity(name, disk_id):
-    block = SYS_BLOCK / name
-    if (not block.is_dir() or (block / 'partition').exists() or
-            list((block / 'holders').iterdir()) or
-            any((child / 'partition').exists() for child in block.iterdir())):
+    block = require_whole_disk(SYS_BLOCK / name)
+    if any((block / 'holders').iterdir()):
         raise ValueError('workspace source must be an unused whole disk without partitions')
+    if disk_id is None:
+        return
     identities = []
     for relative in ('device/serial', 'serial', 'device/wwid', 'wwid'):
         path = block / relative
@@ -70,20 +73,27 @@ def run(*args, key=None, allowed=(0,)):
 
 
 def main():
-    if len(sys.argv) != 5 or os.geteuid() != 0:
-        raise ValueError('usage: initialize-workspace-volume DEVICE DISK_ID FS_TYPE KEY_URI')
-    device, disk_id, fs_type, key_uri = sys.argv[1:]
-    if (not re.fullmatch(r'/dev/(?:nvme[0-9]+n[0-9]+|vd[a-z]+|sd[a-z]+)', device) or
-            not re.fullmatch(r'd-[a-z0-9]+', disk_id)):
-        raise ValueError('invalid workspace whole-disk path or identity')
+    args = sys.argv[1:]
+    native = args[:1] == ['--local-block']
+    policy = tomllib.loads((PARENT / 'workspace.toml').read_text())
+    if native:
+        _, device = args
+        disk_id = None
+        fs_type, key_uri = policy['filesystem_type'], policy['key_uri']
+    else:
+        if len(args) != 4 or os.geteuid() != 0:
+            raise ValueError('usage: initialize-workspace-volume DEVICE DISK_ID FS_TYPE KEY_URI')
+        device, disk_id, fs_type, key_uri = args
+        if (not re.fullmatch(r'/dev/(?:nvme[0-9]+n[0-9]+|vd[a-z]+|sd[a-z]+)', device) or
+                not re.fullmatch(r'd-[a-z0-9]+', disk_id)):
+            raise ValueError('invalid workspace whole-disk path or identity')
     key = bytearray(sys.stdin.buffer.read(33))
     lock_fd = None
     try:
         if len(key) != 32:
             raise ValueError('workspace initializer requires exactly 32 key bytes')
-        validate_policy(tomllib.loads((PARENT / 'workspace.toml').read_text()),
-                        disk_id, fs_type, key_uri)
-        lock_fd = os.open(PARENT / ('workspace-init-' + disk_id + '.lock'),
+        validate_policy(policy, disk_id, fs_type, key_uri)
+        lock_fd = os.open(PARENT / ('workspace-init-' + (disk_id or Path(device).name) + '.lock'),
                           os.O_WRONLY | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
         if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
             raise ValueError('workspace initialization lock is not a regular file')
@@ -116,7 +126,12 @@ def main():
             '--key-file', '-', device, key=key)
         run('cryptsetup', 'luksOpen', '--key-file', '-', device, mapper, key=key)
         try:
-            run('mkfs', '-t', fs_type, '/dev/mapper/' + mapper)
+            mapping = Path('/dev/mapper') / mapper
+            if native:
+                verify_mapper(mapping, Path(device))
+                run('mkfs.ext4', '-E', f"root_owner={policy['uid']}:{policy['gid']}", mapping)
+            else:
+                run('mkfs', '-t', fs_type, mapping)
         finally:
             run('cryptsetup', 'luksClose', mapper)
     finally:
