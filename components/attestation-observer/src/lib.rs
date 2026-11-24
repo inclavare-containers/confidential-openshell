@@ -146,6 +146,39 @@ fn bounded_text(value: Option<&Value>) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn measured_initdata(evidence: &Value) -> Result<String, &'static str> {
+    // Trustee's TDX verifier uses a nonzero MRCONFIGID first and an AAEL
+    // InitData event when the platform leaves the register unset.
+    if let Some(digest) = evidence["quote"]["body"]["mr_config_id"].as_str()
+        && is_digest(digest)
+        && digest.bytes().any(|b| b != b'0')
+    {
+        return Ok(digest.to_owned());
+    }
+    let events = evidence["uefi_event_logs"]
+        .as_array()
+        .ok_or("missing event log")?;
+    let initdata = events
+        .iter()
+        .filter(|e| {
+            e["type_name"] == "EV_EVENT_TAG"
+                && e["details"]["unicode_name"] == "AAEL"
+                && e["details"]["data"]["operation"] == "InitData"
+        })
+        .collect::<Vec<_>>();
+    if initdata.len() != 1
+        || initdata[0]["details"]["data"]["domain"] != "github.com/confidential-containers"
+    {
+        return Err("ambiguous initdata");
+    }
+    initdata[0]["details"]["data"]["content"]["digest"]
+        .as_str()
+        .and_then(|s| s.strip_prefix("sha384:"))
+        .filter(|s| is_digest(s))
+        .map(str::to_owned)
+        .ok_or("invalid initdata digest")
+}
+
 /// Signature verification authenticates historical data, not a current credential.
 /// In particular, an expired EAR remains useful as a dated observation.
 pub fn summarize(token: &str, key: &DecodingKey, observed_at: u64) -> Result<Report, &'static str> {
@@ -172,28 +205,7 @@ pub fn summarize(token: &str, key: &DecodingKey, observed_at: u64) -> Result<Rep
         return Err("unexpected TEE");
     }
     let evidence = &cpu["ear_attester_claims"]["claims"];
-    let events = evidence["uefi_event_logs"]
-        .as_array()
-        .ok_or("missing event log")?;
-    let initdata = events
-        .iter()
-        .filter(|e| {
-            e["type_name"] == "EV_EVENT_TAG"
-                && e["details"]["unicode_name"] == "AAEL"
-                && e["details"]["data"]["operation"] == "InitData"
-        })
-        .collect::<Vec<_>>();
-    if initdata.len() != 1
-        || initdata[0]["details"]["data"]["domain"] != "github.com/confidential-containers"
-    {
-        return Err("ambiguous initdata");
-    }
-    let digest = initdata[0]["details"]["data"]["content"]["digest"]
-        .as_str()
-        .and_then(|s| s.strip_prefix("sha384:"))
-        .filter(|s| is_digest(s))
-        .ok_or("invalid initdata digest")?
-        .to_owned();
+    let digest = measured_initdata(evidence)?;
     let measurements = ["mr_td", "rtmr_0", "rtmr_1", "rtmr_2", "rtmr_3"]
         .into_iter()
         .filter_map(|name| {

@@ -35,6 +35,15 @@ fn historical_signature_and_unambiguous_measurement_required() {
     let report = summarize(&token, &public, 1000).unwrap(); // Expired but historical.
     assert_eq!(report.initdata_sha384, "a".repeat(96));
     assert_eq!(report.measurements.len(), 1);
+    let mut native = value.clone();
+    native["submods"]["cpu0"]["ear_attester_claims"]["claims"]["quote"]["body"]["mr_config_id"] =
+        json!("c".repeat(96));
+    assert_eq!(
+        summarize(&signed(&key, &native), &public, 1000)
+            .unwrap()
+            .initdata_sha384,
+        "c".repeat(96)
+    );
     assert!(!serde_json::to_string(&report).unwrap().contains(&token));
     assert!(
         summarize(

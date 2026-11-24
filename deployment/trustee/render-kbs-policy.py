@@ -18,11 +18,7 @@ HEX96 = re.compile(r"[0-9a-f]{96}\Z")
 GENERATION = re.compile(r"[a-z0-9-]{1,64}\Z")
 KEY = re.compile(r"[A-Za-z0-9_.-]+\Z")
 TEMPLATE = Path(__file__).resolve().parent.parent / "policy" / "kbs-sealed.rego"
-MARKER = "bindings := {}"
 AS_TEMPLATE = Path(__file__).resolve().parent.parent / "policy" / "tdx-podvm.rego"
-AS_MARKER = "approved_initdata := []"
-AS_EVENT_MARKER = "approved_initdata_events := {}"
-KBS_EVENT_MARKER = "approved_initdata_events := {}"
 REGORUS_MAX_COLUMN = 1024
 
 
@@ -174,21 +170,18 @@ def render(bindings_dir: Path, output: Path, as_output: Path, workspace_bindings
             if resource_path in bindings:
                 raise ValueError(f"duplicate binding: {resource_path}")
             bindings[resource_path] = binding
-    template = TEMPLATE.read_text(encoding="utf-8")
-    if template.count(MARKER) != 1:
-        raise ValueError("KBS policy template has no unique bindings marker")
-    policy = template.replace(MARKER, "bindings := " + json.dumps(bindings, sort_keys=True, indent=2))
-    as_template = AS_TEMPLATE.read_text(encoding="utf-8")
-    if as_template.count(AS_MARKER) != 1:
-        raise ValueError("AS policy template has no unique approved initdata marker")
+    native_kata = os.environ.get("OPENSHELL_CONFIDENTIAL_RUNTIME_CLASS") == "kata-qemu-tdx"
+    as_source = AS_TEMPLATE.with_name("tdx-kata.rego") if native_kata else AS_TEMPLATE
     active_digests = sorted({binding["initdata_sha384"] for binding in bindings.values()})
-    events = json.dumps({digest: initdata_event_sha384(digest) for digest in active_digests},
-                        sort_keys=True, indent=2)
-    if template.count(KBS_EVENT_MARKER) != 1 or as_template.count(AS_EVENT_MARKER) != 1:
-        raise ValueError("policy template has no unique initdata event marker")
-    policy = policy.replace(KBS_EVENT_MARKER, "approved_initdata_events := " + events)
-    as_policy = as_template.replace(AS_MARKER, "approved_initdata := " + json.dumps(active_digests, indent=2))
-    as_policy = as_policy.replace(AS_EVENT_MARKER, "approved_initdata_events := " + events)
+    policy = TEMPLATE.read_text() + "\nbindings := " + json.dumps(bindings, sort_keys=True, indent=2) + "\n"
+    as_policy = as_source.read_text() + "\napproved_initdata := " + json.dumps(active_digests, indent=2) + "\n"
+    if native_kata:
+        policy += "native_kata := true\n"
+    else:
+        events = {digest: initdata_event_sha384(digest) for digest in active_digests}
+        rule = "approved_initdata_events := " + json.dumps(events, sort_keys=True, indent=2) + "\n"
+        policy += rule
+        as_policy += rule
     require_supported_line_lengths(policy, "KBS policy")
     require_supported_line_lengths(as_policy, "AS policy")
     # The AS may see the new digest before KBS does. During publication the

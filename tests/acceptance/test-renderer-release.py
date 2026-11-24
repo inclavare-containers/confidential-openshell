@@ -32,7 +32,7 @@ def sha256(data):
 
 
 def assignment_json(policy, name):
-    tail = policy.split(name + " := ", 1)[1]
+    tail = policy.split("\n" + name + " := ", 1)[1]
     _, end = json.JSONDecoder().raw_decode(tail)
     return tail[:end]
 

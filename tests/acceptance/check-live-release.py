@@ -47,6 +47,9 @@ def verify_ear(token, public_key):
     evidence = cpu['ear_attester_claims']
     if evidence['tee'] != 'tdx' or not isinstance(cpu['ear_verifier_claims']['runtime_data'].get('tee-pubkey'), dict):
         raise ValueError('missing guest recipient key')
+    config_id = evidence['claims'].get('quote', {}).get('body', {}).get('mr_config_id', '')
+    if re.fullmatch('[0-9a-f]{96}', config_id) and config_id != '0' * 96:
+        return config_id
     events = [e.get('details', {}).get('data', {}) for e in evidence['claims']['uefi_event_logs']
               if e.get('type_name') == 'EV_EVENT_TAG' and e.get('details', {}).get('unicode_name') == 'AAEL'
               and e.get('details', {}).get('data', {}).get('operation') == 'InitData']

@@ -19,8 +19,8 @@ trust_claims := {
 }
 
 # Replaced only by the trusted binding renderer. Static templates deny release.
-approved_initdata := []
-approved_initdata_events := {}
+default approved_initdata := []
+default approved_initdata_events := {}
 
 reference_matches(name, digest) if {
 	regex.match("^[0-9a-f]{96}$", digest)

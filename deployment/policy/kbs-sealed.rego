@@ -2,10 +2,11 @@ package policy
 
 import rego.v1
 
-# The renderer replaces this object with validated, deployment-specific
+# The renderer appends rules for validated, deployment-specific
 # bindings. The checked-in template denies private resources by itself.
-bindings := {}
-approved_initdata_events := {}
+default bindings := {}
+default approved_initdata_events := {}
+default native_kata := false
 
 default allow := false
 
@@ -24,6 +25,7 @@ approved_tdx(appraisal) if {
 }
 
 measured_initdata(appraisal) := digest if {
+	not native_kata
 	logs := appraisal.ear_attester_claims.claims.uefi_event_logs
 	is_array(logs)
 	matches := [event |
@@ -43,6 +45,13 @@ measured_initdata(appraisal) := digest if {
 	count(only.digests) == 1
 	only.digests[0].alg == "SHA-384"
 	only.digests[0].digest == approved_initdata_events[digest]
+}
+
+measured_initdata(appraisal) := digest if {
+	native_kata
+	digest := appraisal.ear_attester_claims.claims.quote.body.mr_config_id
+	regex.match("^[0-9a-f]{96}$", digest)
+	not regex.match("^0{96}$", digest)
 }
 
 # Upstream KBS passes the plugin separately from three native path segments.

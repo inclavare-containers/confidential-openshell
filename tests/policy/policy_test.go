@@ -316,7 +316,7 @@ func evaluate(t *testing.T, module, query string, input, data map[string]any) an
 		refs := data["reference"].(map[string]any)
 		allowed, _ := json.Marshal(refs["AA.eventlog.InitData"])
 		events, _ := json.Marshal(refs["AA.eventlog.InitData.sha384"])
-		content = []byte(strings.ReplaceAll(strings.ReplaceAll(string(content), "approved_initdata := []", "approved_initdata := "+string(allowed)), "approved_initdata_events := {}", "approved_initdata_events := "+string(events)))
+		content = append(content, fmt.Sprintf("\napproved_initdata := %s\napproved_initdata_events := %s\n", allowed, events)...)
 	}
 	return evaluateContent(t, module, string(content), query, input, data)
 }
@@ -348,4 +348,59 @@ func policySource(module string) string {
 		return filepath.Clean(module)
 	}
 	return filepath.Join("../../deployment/policy", module)
+}
+
+func TestNativeKataAppraisal(t *testing.T) {
+	t.Setenv("OPENSHELL_CONFIDENTIAL_RUNTIME_CLASS", "kata-qemu-tdx")
+	bindings := t.TempDir()
+	id := digest("6")
+	resource := writeBinding(t, bindings, "workload", "g000000000000002a", "sandbox-1", "API_KEY", id)
+	kbs, as := renderSealedPolicies(t, bindings)
+	claims, refs := approvedEvidence()
+	body := quoteBody(claims)
+	body["mr_config_id"] = id
+	for _, field := range []string{"mr_td", "rtmr_1", "rtmr_2"} {
+		refs["measurement.kata."+field+".sha384"] = []any{body[field]}
+	}
+	events := []any{}
+	for i := 0; i < 16; i++ {
+		value := fmt.Sprintf("%096x", i+1)
+		kind, description := "EV_SEPARATOR", ""
+		switch i {
+		case 0:
+			kind, description = "EV_EFI_HANDOFF_TABLES2", "TdxTable"
+		case 10, 11, 12:
+			kind, description = "EV_PLATFORM_CONFIG_FLAGS", "ACPI DATA"
+		case 13:
+			kind = "EV_EFI_HANDOFF_TABLES"
+		default:
+			refs[fmt.Sprintf("measurement.kata.rtmr_0.event.%d.sha384", i)] = []any{value}
+		}
+		events = append(events, map[string]any{"index": 1, "type_name": kind, "details": map[string]any{"string": description}, "digests": []any{map[string]any{"alg": "SHA-384", "digest": value}}})
+	}
+	tdx := claims["tdx"].(map[string]any)
+	tdx["uefi_event_logs"] = events
+	check := func(want bool) {
+		t.Helper()
+		vector := evaluate(t, as, "data.policy.trust_claims", claims, map[string]any{"reference": refs})
+		token := map[string]any{"submods": map[string]any{"cpu0": map[string]any{
+			"ear_appraisal_policy_ids": []string{"openshell-tdx"}, "ear_status": "affirming",
+			"ear_trustworthiness_vector": vector, "ear_attester_claims": map[string]any{"tee": "tdx", "claims": tdx},
+		}}}
+		if got := evaluateBool(t, kbs, "data.policy.allow", token, resourceData(resource)); got != want {
+			t.Fatalf("KBS allow = %v, want %v (vector %v)", got, want, vector)
+		}
+	}
+	check(true)
+	hob := events[0].(map[string]any)
+	hob["digests"].([]any)[0].(map[string]any)["digest"] = digest("e")
+	check(true)
+	hob["details"] = map[string]any{"string": "other"}
+	check(false)
+	hob["details"] = map[string]any{"string": "TdxTable"}
+	body["mr_config_id"] = digest("9")
+	check(false)
+	body["mr_config_id"] = id
+	events[1].(map[string]any)["digests"].([]any)[0].(map[string]any)["digest"] = digest("d")
+	check(false)
 }
