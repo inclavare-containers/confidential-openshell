@@ -1,0 +1,8 @@
+[Unit]
+Description=Kata agent for local TDX guests
+After=systemd-udev-trigger.service
+Requires=dev-disk-by\x2did-virtio\x2dinitdata.device
+After=dev-disk-by\x2did-virtio\x2dinitdata.device
+
+[Service]
+ExecStart=/usr/local/bin/kata-agent --config /etc/openshell-kata-agent.toml

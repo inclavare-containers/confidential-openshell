@@ -1,0 +1,2 @@
+guest_components_procs = "confidential-data-hub"
+policy_file = "/etc/kata-opa/openshell-native.rego"

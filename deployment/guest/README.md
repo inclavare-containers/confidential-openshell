@@ -1,18 +1,16 @@
 # Upstream Ubuntu TDX guest
 
-The main profile uses the locked CAA main revision's Ubuntu mkosi image definitions,
+Both runtime backends use the locked CAA main revision's Ubuntu mkosi image definitions,
 production profile, UKI boot and SquashFS dm-verity root. Released CoCo guest
 components at the locked upstream commit provide the TDX AA and CDH. Kata agent 4.4.0 and pause remain
 unmodified released binaries. `deployment/artifacts.lock.json` pins source,
 OCI artifacts and binary hashes.
 
-The only compiled guest integrations are CAA's APF and process-user-data from
-the verified patch tree. The image reuses upstream systemd units; small drop-ins
-validate measured initdata, pass its exact TOML to native AA startup binding,
-and order CDH/Kata/APF startup. AA/CDH retain upstream automatic restart. Ubuntu `python3` supports the validator and
-workspace initializer; `systemd-timesyncd` with Alibaba NTP corrects the ECS RTC
-before KBS authentication. AA/CDH daemon sources are unchanged. The upstream
-container-facing REST path is disabled because this profile uses native ttRPC.
+Peer Pods start CAA's process-user-data, AA, CDH, Kata agent and APF using
+systemd. Local Kata starts `kata-containers.target` and the upstream vsock
+agent. The agent loads the measured role policy and starts AA and CDH from the
+initdata disk. Its initial OPA policy denies sandbox creation and policy
+replacement over RPC. Both paths use ttRPC for confidential guest services.
 
 CDH's native `image.work_dir` points to `/var/lib/confidential-containers/image`.
 The verified UKI's `systemd.volatile=state` keeps `/var` in guest memory. This gives
