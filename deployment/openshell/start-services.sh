@@ -20,9 +20,9 @@ done
 test -S /run/openshell-confidential/driver.sock
 systemctl enable --now openshell-confidential-gateway.service
 for attempt in $(seq 1 60); do
-  curl --noproxy '*' -fsS http://127.0.0.1:17671/readyz && break
+  curl -fsS http://127.0.0.1:17671/readyz && break
   sleep 1
 done
-curl --noproxy '*' -fsS http://127.0.0.1:17671/readyz
+curl -fsS http://127.0.0.1:17671/readyz
 python3 deployment/peerpods/workers.py --check-gateway
 printf '\nGateway ready: driver socket, local readiness and worker-to-Gateway TCP reachability passed.\n'

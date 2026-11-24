@@ -33,7 +33,7 @@ def worker_command(registry, ca, image, kbs_url, kbs_ca):
         'chmod 0644 /etc/openshell-confidential/kbs-ca.pem',
         'crictl --runtime-endpoint unix:///run/containerd/containerd.sock '
         '--image-endpoint unix:///run/containerd/containerd.sock pull ' + shlex.quote(image),
-        'code=$(curl --noproxy "*" --cacert /etc/openshell-confidential/kbs-ca.pem' +
+        'code=$(curl --cacert /etc/openshell-confidential/kbs-ca.pem' +
         ' --connect-timeout 10 --max-time 20 -sS -o /dev/null -w "%{http_code}" ' +
         shlex.quote(kbs_url.rstrip('/') + '/kbs/v0/resource/default/bootstrap/anonymous-check') + ')',
         '[[ $code == 401 || $code == 403 ]] || { echo "Worker KBS reachability/anonymous denial failed: HTTP $code" >&2; exit 1; }',

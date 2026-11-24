@@ -39,7 +39,7 @@ else
   "$registry_image"
 fi
 for attempt in $(seq 1 30); do
-  if curl --noproxy '*' "${tls_args[@]}" -fsS "https://${REGISTRY_ADDR}/v2/"; then
+  if curl "${tls_args[@]}" -fsS "https://${REGISTRY_ADDR}/v2/"; then
     printf '\nRegistry ready: https://%s\n' "$REGISTRY_ADDR"
     exit 0
   fi

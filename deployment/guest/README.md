@@ -22,7 +22,6 @@ Prepare the locked sources as described in [build preparation](../../docs/build.
 then run:
 
 ```sh
-export GOMAXPROCS=1
 export GOCACHE="$PWD/.local/go-build-guest"
 bash deployment/guest/build-image.sh
 ```

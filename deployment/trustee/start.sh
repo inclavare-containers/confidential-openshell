@@ -8,7 +8,7 @@ refs="$HANDOFF/outputs/$(jq -er .references "$HANDOFF/selection.json")"
 systemctl enable --now as.service
 systemctl enable --now kbs.service
 systemctl is-active --quiet as.service kbs.service
-code=$(curl --noproxy '*' --cacert "$KBS_CA" \
+code=$(curl --cacert "$KBS_CA" \
   --retry 30 --retry-connrefused --retry-delay 1 --retry-max-time 30 \
   --connect-timeout 5 --max-time 10 -sS -o /dev/null -w '%{http_code}' \
   "${KBS_URL}/kbs/v0/resource/default/bootstrap/anonymous-check")

@@ -15,7 +15,7 @@ import ssl
 import subprocess
 import time
 from urllib.error import HTTPError
-from urllib.request import HTTPRedirectHandler, HTTPSHandler, ProxyHandler, Request, build_opener
+from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
@@ -140,7 +140,7 @@ def main():
     client = json.loads(args.trustee_client.read_text())
     if not client['kbs_url'].startswith('https://'):
         raise ValueError('KBS must use HTTPS')
-    opener = build_opener(ProxyHandler({}), NoRedirect(), HTTPSHandler(context=ssl.create_default_context(cafile=client['ca_cert'])))
+    opener = build_opener(NoRedirect(), HTTPSHandler(context=ssl.create_default_context(cafile=client['ca_cert'])))
     public_key = serialization.load_pem_public_key(args.as_public_key.read_bytes())
     results, tokens = {}, {}
     deadline = time.monotonic() + args.timeout

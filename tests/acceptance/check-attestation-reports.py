@@ -150,7 +150,7 @@ def check(kbs_root, as_root, observer, cli=None):
             checks['invalid_observer_key_does_not_block_kbs_startup'] = True
             (area / 'as-public.pem').write_bytes(observer_public)
             checks['official_external_plugin_registered_missing_is_null'] = True
-            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=client.context))
+            opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=client.context))
             def anonymous(path, data=None):
                 req = urllib.request.Request(client.endpoint + '/kbs/v0/' + path, data=data, headers={'Content-Type': 'application/json'})
                 try:

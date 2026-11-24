@@ -66,7 +66,7 @@ class AdminClient:
             raise ValueError('KBS admin key must be a P-256 PEM private key')
         self.context = ssl.create_default_context(cafile=settings['ca_cert'])
         self.opener = urllib.request.build_opener(
-            urllib.request.ProxyHandler({}), NoRedirect(), urllib.request.HTTPSHandler(context=self.context))
+            NoRedirect(), urllib.request.HTTPSHandler(context=self.context))
         self.deadline = time.monotonic() + 120
 
     def request(self, method: str, path: str, body: bytes | None = None, *, json_body=False) -> bytes:

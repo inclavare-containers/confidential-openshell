@@ -103,7 +103,6 @@ impl Client {
         }
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let client = reqwest::Client::builder()
-            .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .tls_built_in_root_certs(false)
             .add_root_certificate(reqwest::Certificate::from_pem(&ca).map_err(|_| "invalid CA")?)

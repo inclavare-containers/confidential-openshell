@@ -115,7 +115,7 @@ def check(kbs_root, as_root):
                 raise RuntimeError('KBS did not become ready')
             result['checks']['admin_authentication'] = True
             url = client.endpoint + '/kbs/v0/resource/default/bootstrap/' + 'a' * 64
-            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=client.context))
+            opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=client.context))
             def get(token=None):
                 req = urllib.request.Request(url, headers={'Authorization': 'Bearer ' + token} if token else {})
                 try:

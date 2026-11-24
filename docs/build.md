@@ -40,13 +40,7 @@ Installs checksum-pinned Helm, kubectl, crane, GitHub CLI, ORAS and yq v4 and pr
 their versions. Ubuntu supplies the other tools and the Python YAML parser.
 
 Downloads need access to GitHub, GHCR, Docker registries and Go/Rust release
-servers. Standard command-scoped proxy variables are supported. Docker image
-downloads also need working daemon connectivity; configure it using Docker's
-[daemon proxy instructions](https://docs.docker.com/engine/daemon/proxy/) when needed.
-Guest builds pass the command's proxy variables to the tools build and mkosi
-container. Guest and CSI builds use host networking, so a proxy listening on the
-build host's loopback address is reachable. Proxy settings are not saved in the
-guest image.
+servers.
 
 ## Obtain complete fixed sources
 
