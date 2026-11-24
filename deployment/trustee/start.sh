@@ -4,7 +4,6 @@ Start the official AS/KBS containers, register selected references and verify an
 source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 require_root
 service_addresses
-refs="$HANDOFF/outputs/$(jq -er .references "$HANDOFF/selection.json")"
 systemctl enable --now as.service
 systemctl enable --now kbs.service
 systemctl is-active --quiet as.service kbs.service
@@ -15,6 +14,13 @@ code=$(curl --cacert "$KBS_CA" \
 [[ $code == 401 || $code == 403 ]] || die "KBS anonymous denial check failed: HTTP $code (expected 401 or 403)."
 python3 deployment/trustee/configure-client.py --url "$KBS_URL" --ca "$KBS_CA" \
   --admin-key /etc/openshell-confidential/trustee-admin.key
-python3 deployment/trustee/register-references.py \
-  --references "$refs" --references deployment/trustee/ecs-tdx-platform.references.json
+if [[ ${OPENSHELL_CONFIDENTIAL_RUNTIME_CLASS:-kata-remote} == kata-qemu-tdx ]]; then
+  python3 deployment/trustee/register-references.py \
+    --references "${KATA_GUEST_REFERENCES:?set KATA_GUEST_REFERENCES to the trusted guest-references.py output}" \
+    --references deployment/baremetal/kata-tdx-platform.references.json
+else
+  refs="$HANDOFF/outputs/$(jq -er .references "$HANDOFF/selection.json")"
+  python3 deployment/trustee/register-references.py \
+    --references "$refs" --references deployment/trustee/ecs-tdx-platform.references.json
+fi
 printf 'Trustee ready: AS active; references registered and read back; KBS HTTPS denies anonymous access (HTTP %s).\n' "$code"

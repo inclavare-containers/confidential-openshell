@@ -1,0 +1,14 @@
+deploymentMode: daemonset
+image:
+  reference: quay.io/kata-containers/kata-deploy@sha256:5cfdfd2de450eb9df56f6762546e8304771c8fa304ff6b447cf0a8df68d1440f
+snapshotter:
+  setup: [nydus]
+defaultShim:
+  amd64: qemu-tdx
+shims:
+  disableAll: true
+  qemu-tdx:
+    enabled: true
+    supportedArches: [amd64]
+    containerd:
+      snapshotter: nydus
