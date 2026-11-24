@@ -1,23 +1,31 @@
 # Deploy
 
-Deploy native OpenShell 0.1.9 with pinned CoCo components, Trustee, ACK and Intel TDX.
-Complete [build](build.md), including release installation, first. Run the commands
-below as root from `/opt/confidential-openshell` on the **trusted service host**.
-It hosts Gateway, driver and the private registry; Trustee can run here or on a
-separate trusted host. It may be your build
-machine, an on-premise host or a cloud VM; ACK does not determine its location.
+Install the [release](build.md) on the trusted service host. The same CLI,
+Gateway, confidential driver and Trustee serve either ACK Peer Pods or native
+Kata TDX VMs. Select one backend for the deployment.
+
+- **ACK Peer Pods**. Follow steps 1–10 below. The worker and the remote PodVMs
+  use the cloud resources provisioned in steps 3–5 and 8.
+- **Native Kata**. Use the
+  [bare-metal deployment guide](../deployment/baremetal/README.md) on your
+  existing Kubernetes cluster. It identifies the shared Trustee, registry and
+  Gateway steps. Keep the trusted services off the untrusted worker.
 
 Each `./cos` command runs one step and prints its purpose, progress,
-`OK`/`FAILED`, elapsed time, log path and next command. A failure stops the step.
-Use `./cos --help` to list commands and `./cos status` to inspect saved resources
-and previous command results.
+`OK`/`FAILED`, elapsed time, log path and next command. A failure stops the
+step. Use `./cos --help` to list commands and `./cos status` to inspect saved
+resources and previous command results.
 
 ## 1. Build and install the release
 
-Complete [the build guide](build.md#build-and-transfer). Keep the Git checkout for
-future builds; use the installed source for deployment.
+Complete [the build guide](build.md#build-and-transfer). Keep the Git checkout
+for future builds; use the installed source for deployment.
 
 ## 2. Configure the trusted service host
+
+On either backend, reserve about 150 GiB of free space on the filesystem
+holding genpolicy's temporary directory. This sizing was verified with the
+pinned Community image.
 
 ```bash
 ./cos host cloud-tools
@@ -29,13 +37,13 @@ Installs the pinned Alibaba Cloud CLI. Then configure the deployment:
 ./cos deploy configure
 ```
 
-Asks for the trusted host's **IPv4 reachable from the cloud**, checks the Alibaba
-CLI identity and saves the configuration. If credentials are needed, it opens the
-normal CLI credential setup. Existing valid profiles are reused.
-The region comes from your guest selection. The operator needs administration of
+Asks for the trusted host's **IPv4 reachable from the cloud**, checks the
+Alibaba CLI identity and saves the configuration. If credentials are needed, it
+opens the normal CLI credential setup. Existing valid profiles are reused. The
+region comes from your guest selection. The operator needs administration of
 ACK, ECS, VPC, RAM and OSS, including ECS Cloud Assistant commands on workers.
-Credentials remain on the trusted host. Use `--profile` followed by a CLI profile
-name when needed.
+Credentials remain on the trusted host. Use `--profile` followed by a CLI
+profile name when needed.
 
 Later steps automatically load the service address, profile, handoff and
 administrator kubeconfig, including in a new shell. State and private logs stay
@@ -44,8 +52,8 @@ under `/var/lib/openshell-confidential/operator/cluster-config`.
 The service address needs inbound TLS on TCP **5000** (registry), **8443** (KBS)
 and **9443** (Gateway). Configure ingress/firewall in the trusted host's own
 network; keep TLS termination and keys on this host. Outbound NAT alone does not
-provide inbound access. Cloud network preparation prints the egress IPs to permit.
-Gateway clients also need access to 9443.
+provide inbound access. Cloud network preparation prints the egress IPs to
+permit. Gateway clients also need access to 9443.
 
 ## 3. Create a new ACK cluster
 
@@ -56,19 +64,21 @@ OSS bucket is required.
 ./cos cluster create
 ```
 
-Creates a **paid ACK Pro cluster and pay-as-you-go worker**. It checks ECS inventory
-for the configured instance types, creates a dedicated VPC and worker/Pod vSwitches, and configures
-public API access, Terway NetworkPolicy, RRSA, storage add-ons, worker egress and
-Ubuntu 24.04/containerd. The default is one worker.
+Creates a **paid ACK Pro cluster and pay-as-you-go worker**. It checks ECS
+inventory for the configured instance types, creates a dedicated VPC and
+worker/Pod vSwitches, and configures public API access, Terway NetworkPolicy,
+RRSA, storage add-ons, worker egress and Ubuntu 24.04/containerd. The default is
+one worker. If the API server has an access control list, allow the trusted
+host's outbound IP address so its Kubernetes client can reach the API.
 
-Success prints cluster/VPC/vSwitch/security-group IDs and the current node state. These IDs
-are saved automatically; rerunning resumes the same deployment.
+Success prints cluster/VPC/vSwitch/security-group IDs and the current node
+state. These IDs are saved automatically; rerunning resumes the same deployment.
 
 The default VPC CIDR is `10.64.0.0/16`. Pass a different private CIDR with
 `--vpc-cidr` if planned network connections would overlap. Optional `--zone`
-selects a zone; `--name` chooses a resource-name prefix.
-The default Beijing `ecs.g9i.xlarge` profile uses **Zone I**; ordinary ECS availability
-in other zones does not imply TDX support.
+selects a zone; `--name` chooses a resource-name prefix. The example uses
+Beijing Zone I and `ecs.g9i.xlarge`. Select another TDX-capable zone and family
+as needed. Ordinary ECS availability in other zones does not imply TDX support.
 `--private-api` requires routed private access from this host to ACK.
 
 Continue with [step 4](#4-prepare-cloud-resources).
@@ -82,8 +92,8 @@ Skip step 3. This command lists existing clusters and asks which to use:
 ```
 
 Obtains an administrator kubeconfig and checks region, API access, RRSA and
-Terway NetworkPolicy. It retains the existing cluster, VPC, node pools and worker
-OS. Select the workers to configure in the later `workers select` step.
+Terway NetworkPolicy. It retains the existing cluster, VPC, node pools and
+worker OS. Select the workers to configure in the later `workers select` step.
 
 The [verified ACK configuration](../deployment/ack/ack.example.json) specifies
 the Kubernetes/containerd pair for Ubuntu 24.04 workers and OCI 1.3.0.
@@ -92,10 +102,10 @@ runtime. Worker configuration reads containerd's effective CRI configuration;
 schema 3 input and migrated schema 4 are both compatible.
 
 Workers need ECS Cloud Assistant. Deployment creates the peer-pod StorageClass
-`alicloud-disk-essd-peerpod`; no host `alicloud-disk-essd` StorageClass is required.
-Public API access must already be enabled unless you pass `--private-api` and
-have private routing.
-`--cluster-id` can provide an ID directly.
+`alicloud-disk-essd-peerpod`; no host `alicloud-disk-essd` StorageClass is
+required. Public API access must already be enabled unless you pass
+`--private-api` and have private routing. `--cluster-id` can provide an ID
+directly.
 
 Continue with step 4. The common steps add deployment-specific PodVM resources,
 identities and workloads while retaining the existing cluster network.
@@ -108,11 +118,11 @@ identities and workloads while retaining the existing cluster network.
 ./cos cloud network
 ```
 
-Creates a dedicated PodVM vSwitch/security group in ACK's VPC/worker zone, permits
-worker–PodVM tunnel traffic and inherits worker NAT/SNAT for guest egress.
-Success prints the vSwitch, security group and public egress IPs. Permit these
-cloud clients on the trusted host's ports from step 2. An existing cluster with
-routed egress can retain its route instead of SNAT.
+Creates a dedicated PodVM vSwitch/security group in ACK's VPC/worker zone,
+permits worker–PodVM tunnel traffic and inherits worker NAT/SNAT for guest
+egress. Success prints the vSwitch, security group and public egress IPs. Permit
+these cloud clients on the trusted host's ports from step 2. An existing cluster
+with routed egress can retain its route instead of SNAT.
 
 ### Guest image
 
@@ -121,12 +131,13 @@ routed egress can retain its route instead of SNAT.
 ```
 
 For a built guest, creates a private OSS import bucket, ensures ECS's standard
-import role, uploads the QCOW2 and waits for the image to become Available.
-A selected existing ImageID is checked directly, skipping bucket/import work.
-Success prints the ImageID and saves its binding to the release references.
-Both paths require Linux/x86_64, UEFI and NVMe support. The step also runs an ECS
-TDX launch **DryRun** with the selected image, instance type and PodVM network.
-It creates no VM and reports cloud-side launch errors before component installation.
+import role, uploads the QCOW2 and waits for the image to become Available. A
+selected existing ImageID is checked directly, skipping bucket/import work.
+Success prints the ImageID and saves its binding to the release references. Both
+paths require Linux/x86_64, UEFI and NVMe support. The step also runs an ECS TDX
+launch **DryRun** with the selected image, instance type and PodVM network. It
+creates no VM and reports cloud-side launch errors before component
+installation.
 
 ### Runtime identities
 
@@ -134,9 +145,9 @@ It creates no VM and reports cloud-side launch errors before component installat
 ./cos cloud identities
 ```
 
-Creates separate scoped CAA/controller and CSI RAM roles using RRSA, prints their
-ARNs and saves them for Helm values. Kubernetes receives no operator access keys.
-Generated names and IDs are passed between steps automatically.
+Creates separate scoped CAA/controller and CSI RAM roles using RRSA, prints
+their ARNs and saves them for Helm values. Kubernetes receives no operator
+access keys. Generated names and IDs are passed between steps automatically.
 
 ## 5. Select deployment workers
 
@@ -144,14 +155,14 @@ Generated names and IDs are passed between steps automatically.
 ./cos workers select
 ```
 
-Selects the new cluster's workers automatically. A single eligible worker is also
-selected automatically. With multiple workers in an existing cluster, lists their
-names and asks which numbered entries to use. It adds the upstream
-`node.kubernetes.io/worker` label and saves the selection for configuration steps.
-Kata and CAA run on nodes matching that upstream label; changing the saved
-selection does not remove existing worker labels.
-Later operations use ECS Cloud Assistant; no node-name placeholders, public worker
-IPs or SSH aliases are required.
+Selects the new cluster's workers automatically. A single eligible worker is
+also selected automatically. With multiple workers in an existing cluster, lists
+their names and asks which numbered entries to use. It adds the upstream
+`node.kubernetes.io/worker` label and saves the selection for configuration
+steps. Kata and CAA run on nodes matching that upstream label; changing the
+saved selection does not remove existing worker labels. Later operations use ECS
+Cloud Assistant; no node-name placeholders, public worker IPs or SSH aliases are
+required.
 
 ## 6. Install and start Trustee
 
@@ -183,31 +194,38 @@ Empty bindings deny resource release. Existing authorization state is not reset.
 ```
 
 Starts AS/KBS, verifies management authentication, then registers and reads back
-the selected image and bundled ECS platform references through KBS. Requires active services and anonymous HTTPS resource
-access to return 401 or 403. This proves readiness and denial; real TDX appraisal
-is checked in step 10.
+the selected guest and backend-specific platform references through KBS.
+Requires active services and anonymous HTTPS resource access to return 401 or
+403. This proves readiness and denial; real TDX appraisal is checked in step 10.
 
 ### Existing or separately deployed Trustee
 
 Skip the three local Trustee commands above. On the Trustee server, configure an
 admin public key and the endpoint ACLs shown in
-[the KBS configuration](../deployment/trustee/kbs-config.example.toml). Use a dedicated
-KBS resource policy and named AS `openshell-tdx_cpu` policy for this deployment. The driver
-manages these policies as a whole, so it must be their only writer. Configure
-the KBS `openshell-tdx` selector as shown in the example; AS adds `_cpu` to the
-selected policy-set name for CPU evidence. Existing deployments
-must install this selector before using the new guest initdata.
+[the KBS configuration](../deployment/trustee/kbs-config.example.toml). Use a
+dedicated KBS resource policy and named AS `openshell-tdx_cpu` policy for this
+deployment. The driver manages these policies as a whole, so it must be their
+only writer. Configure the KBS `openshell-tdx` selector as shown in the example;
+AS adds `_cpu` to the selected policy-set name for CPU evidence. Existing
+deployments must install this selector before using the new guest initdata.
 
-On the driver host, connect with your endpoint, public TLS CA and private management key:
+On the driver host, connect with your endpoint, public TLS CA and private
+management key:
 
 ```bash
 ./cos trustee connect --url https://trustee.example.com:8443 \
   --ca /path/to/trustee-ca.pem --admin-key /path/to/driver-admin.key
 HANDOFF=/var/lib/openshell-confidential/operator/handoff
+release_refs=$(jq -er .references "$HANDOFF/selection.json")
 python3 deployment/trustee/register-references.py \
-  --references "$HANDOFF/outputs/$(jq -er .references "$HANDOFF/selection.json")" \
+  --references "$HANDOFF/outputs/$release_refs" \
   --references deployment/trustee/ecs-tdx-platform.references.json
 ```
+
+For local Kata, use the generated `$KATA_GUEST_REFERENCES` and
+`deployment/baremetal/kata-tdx-platform.references.json` as the two
+`--references` arguments above. Select `kata-qemu-tdx` in the driver
+environment so its policy renderer publishes the matching profile.
 
 The connection command verifies authentication and saves the client settings.
 No Trustee storage mount or local service is required. AS remains behind KBS;
@@ -218,16 +236,17 @@ PoC Trustee certificate. These optional settings are saved with the deployment:
 
 ```bash
 ./cos deploy configure --registry-ca /path/to/registry-ca.pem \
-  --registry-cert /path/to/registry-chain.pem --registry-key /path/to/registry.key
+  --registry-cert /path/to/registry-chain.pem \
+  --registry-key /path/to/registry.key
 ```
 
 KBS and registry may have different CAs. The default PoC can continue sharing
 certificate material. For an existing public registry with a system-trusted
 certificate, use `--registry-addr REGISTRY --registry-ca ''` and skip
-`registry start`. Authenticate the publishing client as required by that registry;
-guests can pull from public repositories anonymously. Runtime images may come
-from different registries. Extra registry roots are optional and preserve any
-roots already configured in the base CDH initdata.
+`registry start`. Authenticate the publishing client as required by that
+registry; guests can pull from public repositories anonymously. Runtime images
+may come from different registries. Extra registry roots are optional and
+preserve any roots already configured in the base CDH initdata.
 
 ## 7. Prepare bootstrap and publish images
 
@@ -237,9 +256,9 @@ roots already configured in the base CDH initdata.
 ./cos deploy initdata
 ```
 
-Writes public deny-only base initdata using the saved KBS endpoint and independently
-configured KBS/registry CAs.
-The driver later creates the actual per-role, per-attempt bindings.
+Writes public deny-only base initdata using the saved KBS endpoint and
+independently configured KBS/registry CAs. The driver later creates the actual
+per-role, per-attempt bindings.
 
 ### Registry and images
 
@@ -254,9 +273,10 @@ Starts the TLS registry and checks HTTPS. Durable registry storage is under
 ./cos registry publish
 ```
 
-Publishes built images, mirrors all pinned upstream dependencies and the unchanged
-Community harness image, and mirrors the official kata-deploy image.
-The command records the destination digests for worker and gateway configuration.
+Publishes built images, mirrors all pinned upstream dependencies and the
+unchanged Community harness image, and mirrors the official kata-deploy image.
+The command records the destination digests for worker and gateway
+configuration.
 
 ### Worker trust
 
@@ -265,9 +285,9 @@ The command records the destination digests for worker and gateway configuration
 ```
 
 Installs the public CA and `hosts.toml` on selected workers through ECS Cloud
-Assistant, then performs a real CRI pull on every worker. Retains TLS verification
-and containerd's registry search paths. Also verifies worker-to-KBS HTTPS access
-and anonymous denial. Repeat after selecting additional workers.
+Assistant, then performs a real CRI pull on every worker. Retains TLS
+verification and containerd's registry search paths. Also verifies worker-to-KBS
+HTTPS access and anonymous denial. Repeat after selecting additional workers.
 
 ## 8. Install cluster components
 
@@ -277,8 +297,9 @@ and anonymous denial. Repeat after selecting additional workers.
 ./cos cluster dependencies
 ```
 
-Generates pinned manifests, installs Agent Sandbox and cert-manager and waits for
-readiness. Prints Pods/events and exits if the Agent Sandbox controller fails.
+Generates pinned manifests, installs Agent Sandbox and cert-manager and waits
+for readiness. Prints Pods/events and exits if the Agent Sandbox controller
+fails.
 
 ### Configuration
 
@@ -303,14 +324,15 @@ DaemonSets and controller/webhook deployments.
 ./cos workers configure
 ```
 
-Verifies the guest-pull, shared-filesystem, timeout and
-pause-image settings installed by kata-deploy.
-Sets the kubelet request timeout to the same 600 seconds: guest image pulls run
-inside container creation and otherwise inherit kubelet's shorter default deadline.
-Uses [ACK's custom kubelet arguments file](https://help.aliyun.com/en/ack/ack-managed-and-ack-dedicated/user-guide/customize-the-kubelet-configurations-of-a-node-pool), preserves other arguments and backs up
-changed files. Restarts kubelet when needed, waits for the node,
-reads back the effective kubelet setting and verifies a CRI pull. Marks `kata-remote` attachable.
-Run for newly selected workers; kata-deploy maintains the runtime settings across upgrades.
+Verifies the guest-pull, shared-filesystem, timeout and pause-image settings
+installed by kata-deploy. Sets the kubelet request timeout to the same 600
+seconds: guest image pulls run inside container creation and otherwise inherit
+kubelet's shorter default deadline. Uses
+[ACK's custom kubelet arguments file][acks-custom-kubelet-arguments-file],
+preserves other arguments and backs up changed files. Restarts kubelet when
+needed, waits for the node, reads back the effective kubelet setting and
+verifies a CRI pull. Marks `kata-remote` attachable. Run for newly selected
+workers; kata-deploy maintains the runtime settings across upgrades.
 
 ### Workspace CSI
 
@@ -320,8 +342,8 @@ Run for newly selected workers; kata-deploy maintains the runtime settings acros
 
 Installs the release chart and checks the combined controller/node DaemonSet.
 CSI keeps its upstream node-local records and recovers completed volumes through
-cloud tags and bootstrap configuration. It does not require a state PVC or a host
-StorageClass. Guest workspaces use the PeerPod class. Stop/Start retains a
+cloud tags and bootstrap configuration. It does not require a state PVC or a
+host StorageClass. Guest workspaces use the PeerPod class. Stop/Start retains a
 workspace; final deletion removes its owned disk.
 
 ## 9. Install and connect to OpenShell
@@ -357,20 +379,57 @@ Installation/readiness checks do not prove real attestation or all security
 boundaries. Before accepting a new image or deployment, run the
 [live acceptance procedure](live-acceptance.md), then check:
 
-| Check | Required result |
-| --- | --- |
-| Supervisor/workload attestation | Signed TDX appraisal matches selected image/platform references and current initdata |
-| KBS release | Current role/attempt/CR UID succeeds; invalid image, quote, policy or binding denies release |
-| Access/network boundaries | Anonymous/cross-sandbox access fails; private mounts and network denial hold |
-| Coding agent | Real model use, PTY reconnect and independently checked task results |
-| Stop/Start | Same CR UID, ESSD, LUKS UUID, key and files; new attempts revoke old bindings |
-| Encryption | Stopped detached workspace disk contains ciphertext |
-| Delete | Owned role VMs/disks and controller metadata disappear |
+<table>
+<thead>
+<tr>
+<th>Check</th>
+<th>Required result</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Supervisor/workload attestation</td>
+<td>Signed TDX appraisal matches selected image/platform references and
+current initdata</td>
+</tr>
+<tr>
+<td>KBS release</td>
+<td>Current role/attempt/CR UID succeeds; invalid image, quote, policy or
+binding denies release</td>
+</tr>
+<tr>
+<td>Access/network boundaries</td>
+<td>Anonymous/cross-sandbox access fails; private mounts and network
+denial hold</td>
+</tr>
+<tr>
+<td>Coding agent</td>
+<td>Real model use, PTY reconnect and independently checked task results</td>
+</tr>
+<tr>
+<td>Stop/Start</td>
+<td>Same CR UID, retained volume, LUKS UUID, key and files; new attempts
+revoke old bindings</td>
+</tr>
+<tr>
+<td>Encryption</td>
+<td>Stopped detached workspace disk contains ciphertext</td>
+</tr>
+<tr>
+<td>Delete</td>
+<td>Role VMs and sandbox-owned resources disappear; the storage
+administrator handles released Retain PVs</td>
+</tr>
+</tbody>
+</table>
 
-Keep private evidence outside source/releases. The development policy accepts TCB
-`UpToDate` and `OutOfDate`; record the actual status and choose production
+Keep private evidence outside source/releases. The development policy accepts
+TCB `UpToDate` and `OutOfDate`; record the actual status and choose production
 requirements separately. See [tests](../tests/README.md) and
 [architecture](architecture.md).
 
 For stopped release updates, rollback, backups and deployment retirement, follow
 [operations](operations.md). Preserve the release and resource identity checks.
+
+[acks-custom-kubelet-arguments-file]:
+  https://help.aliyun.com/en/ack/ack-managed-and-ack-dedicated/user-guide/customize-the-kubelet-configurations-of-a-node-pool

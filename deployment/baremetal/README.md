@@ -20,8 +20,8 @@ system. Both backends use the same verified UKI and SquashFS root filesystem.
   container creation. Use Memory emptyDirs. Disk-backed emptyDirs (CoCo's
   default `block-encrypted` mode) and additional Block PVCs are unsupported.
 - A local PV supports recovery on the same worker.
-- After workload Pod replacement or worker reboot, use Gateway stop/start
-  to authorize the replacement VMs, as with Peer Pods. See [Recovery](#recovery).
+- After workload Pod replacement or worker reboot, use Gateway stop/start to
+  authorize the replacement VMs, as with Peer Pods. See [Recovery](#recovery).
 - The platform policy accepts the VMM's TD HOB memory layout for the approved
   TDVF to process, as it does for dynamic ACPI data. CCEL replay authenticates
   the recorded digests. Individual memory ranges are outside this appraisal.
@@ -103,7 +103,13 @@ the TDVF MRTD and the static events in a sequence of 16 RTMR0 events. Slot 0
 has type `EV_EFI_HANDOFF_TABLES2` and description `TdxTable`. Trustee's
 default TDX policy also appraises firmware without pinning each RTMR0 event.
 
-For the bundled Trustee, install the [certificates and services][trustee].
+For the [bundled Trustee][trustee], prepare the certificates and services:
+
+```bash
+bash deployment/trustee/create-certificates.sh
+bash deployment/trustee/install.sh
+```
+
 For a separately managed Trustee, follow the [external Trustee steps][external]
 and register the native guest and platform references there.
 
@@ -116,14 +122,15 @@ OPENSHELL_CONFIDENTIAL_RUNTIME_CLASS=kata-qemu-tdx
 OPENSHELL_K8S_WORKSPACE_STORAGE_CLASS=openshell-local
 ```
 
-Export the RuntimeClass setting above in the shell that runs the setup
-scripts. Trustee startup selects the platform references from it, and Gateway
+Export the RuntimeClass setting above in the shell that runs the setup scripts.
+Trustee startup selects the platform references from it, and Gateway
 installation checks access to that RuntimeClass. Set
-`OPENSHELL_KATA_OCI_VERSION` in the same file to the OCI spec version emitted
-by the cluster runtime. Use the name of your Block StorageClass if it differs from
+`OPENSHELL_KATA_OCI_VERSION` in the same file to the OCI spec version emitted by
+the cluster runtime. Use the name of your Block StorageClass if it differs from
 the [local example](#persistent-workspace).
 
-Start the bundled Trustee and prepare the images and Gateway:
+Start the bundled Trustee, or skip the first command if using an external
+Trustee. Prepare the guest initdata and publish the images:
 
 ```bash
 bash deployment/trustee/start.sh
@@ -144,7 +151,11 @@ whose resolver already trusts the registry needs no additional CA.
 ```bash
 bash deployment/peerpods/install-prerequisites.sh
 bash deployment/openshell/install.sh
+bash deployment/openshell/start-services.sh
+bash deployment/openshell/login.sh
 ```
+
+Check supervisor-to-Gateway TLS connectivity before running a sandbox.
 
 ## Persistent workspace
 
@@ -227,13 +238,8 @@ spec:
         - {protocol: TCP, port: 5000} # Private registry
 ```
 
-Start the driver and Gateway, check supervisor-to-Gateway TLS connectivity,
-and follow the [first-agent walkthrough][first-agent].
-
-```bash
-bash deployment/openshell/start-services.sh
-bash deployment/openshell/login.sh
-```
+With storage and egress configured, follow the [first-agent
+walkthrough][first-agent] to create a sandbox.
 
 ## Recovery
 

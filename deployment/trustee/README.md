@@ -12,13 +12,13 @@ Install the two [units](units/) and the public configuration templates under
 entries. Preserve the existing CA, KBS server certificate and ES256 AS signer in
 `/etc/trustee/tls`; the configuration does not generate credentials.
 
-The driver uses authenticated management APIs for resources, resource policy,
-AS CPU policy and reference registration. It keeps its own state under
-`/var/lib/openshell-confidential/driver`; it does not mount or write Trustee storage.
-KBS may use any supported storage backend. The deployment requires exclusive
-management of its KBS resource policy and named AS `openshell-tdx_cpu` policy.
-The KBS selector `openshell-tdx` selects the `openshell-tdx` policy set; AS adds
-the `_cpu` TEE-class suffix when selecting its CPU policy.
+The driver uses authenticated management APIs for resources, resource policy, AS
+CPU policy and reference registration. It keeps its own state under
+`/var/lib/openshell-confidential/driver`; it does not mount or write Trustee
+storage. KBS may use any supported storage backend. The deployment requires
+exclusive management of its KBS resource policy and named AS `openshell-tdx_cpu`
+policy. The KBS selector `openshell-tdx` selects the `openshell-tdx` policy set;
+AS adds the `_cpu` TEE-class suffix when selecting its CPU policy.
 
 For the bundled deployment, `./cos trustee install` creates a P-256 management
 identity and configures KBS to verify its JWTs with scoped endpoint ACLs.
@@ -26,10 +26,10 @@ identity and configures KBS to verify its JWTs with scoped endpoint ACLs.
 registers and reads back the selected reference values through KBS.
 
 For a separately deployed Trustee, configure its management public key and ACLs
-using [the example](kbs-config.example.toml), then connect from the trusted driver
-host with `./cos trustee connect --url ... --ca ... --admin-key ...` as described
-in the [deployment runbook](../../docs/deployment.md#existing-or-separately-deployed-trustee).
-This does not start local AS/KBS containers. The private management key stays on T.
+using [the example](kbs-config.example.toml), then connect from the trusted
+driver host with `./cos trustee connect --url ... --ca ... --admin-key ...` as
+described in the [deployment runbook][deployment-runbook]. This does not start
+local AS/KBS containers. The private management key stays on T.
 
 The registrar verifies every reference by querying BuiltIn RVPS. It accepts
 public image/platform digests; current initdata authorization comes from
@@ -37,43 +37,68 @@ public image/platform digests; current initdata authorization comes from
 templates deny release until rendered. Registration does not enroll arbitrary
 measurements observed in a new guest.
 
-The [ECS platform map](ecs-tdx-platform.references.json) pins MRTD and the
-first three static RTMR0 event digests for the supported ECS firmware profile.
-RTMR0 also measures per-VM ACPI configuration, so its complete value is not a
-portable firmware reference.
-The image verifier derives RTMR1 as `SHA384(48 zero bytes || UKI Authenticode SHA384)`
-for this profile's single-UKI launch sequence and emits it with the image references.
-The policy requires exactly six ordered RTMR0 events: the three pinned static
-events followed by `EV_PLATFORM_CONFIG_FLAGS` for `etc/table-loader`,
-`etc/acpi/rsdp` and `etc/acpi/tables`, each with one SHA-384 digest. These three
-ACPI contents are explicitly accepted as untrusted VMM inputs handled by the
-approved TDVF and guest kernel; their contents are not individually approved
-reference values. All six digests must replay into the signed RTMR0 through
-the native verifier. Firmware identity, static event changes, reordered or
-extra events still fail appraisal. No new quote enrolls an observed RTMR0.
-This split follows the firmware-code and dynamic-configuration distinction in
-[Intel’s TDVF design guide](https://cdrdv2-public.intel.com/733585/tdx-virtual-firmware-design-guide-rev-004-20231206.pdf),
-sections 8.1 and 8.3.
+## ACK Peer Pods
+
+The [ECS platform map](ecs-tdx-platform.references.json) pins MRTD and the first
+three static RTMR0 event digests for the supported ECS firmware profile. RTMR0
+also measures per-VM ACPI configuration, so its complete value is not a portable
+firmware reference. The image verifier derives RTMR1 as
+`SHA384(48 zero bytes || UKI Authenticode SHA384)` for this profile's single-UKI
+launch sequence and emits it with the image references. The policy requires
+exactly six ordered RTMR0 events: the three pinned static events followed by
+`EV_PLATFORM_CONFIG_FLAGS` for `etc/table-loader`, `etc/acpi/rsdp` and
+`etc/acpi/tables`, each with one SHA-384 digest. These three ACPI contents are
+explicitly accepted as untrusted VMM inputs handled by the approved TDVF and
+guest kernel; their contents are not individually approved reference values. All
+six digests must replay into the signed RTMR0 through the native verifier.
+Firmware identity, static event changes, reordered or extra events still fail
+appraisal. No new quote enrolls an observed RTMR0. This split follows the
+firmware-code and dynamic-configuration distinction in
+[Intel’s TDVF design guide][intels-tdvf-design-guide], sections 8.1 and 8.3.
 
 [The CPU policy](../policy/tdx-podvm.rego) requires the exact UKI Authenticode
 measurement, ordered systemd section events, Linux's independently derived
-LoadOptions and combined initrd events, full RTMR2, and the approved ECS
-MRTD, static RTMR0 prefix and event layout, and derived RTMR1 profile. The UKI's measured cmdline binds the verified root's
-roothash. Upstream quote verification validates REPORTDATA and replays all four
-RTMRs. Current initdata must appear exactly once in register 4, with
-`digest_matches_event=true` and the SHA-384 of its complete canonical tagged
-AAEL event.
+LoadOptions and combined initrd events, full RTMR2, and the approved ECS MRTD,
+static RTMR0 prefix and event layout, and derived RTMR1 profile. The UKI's
+measured cmdline binds the verified root's roothash. Upstream quote verification
+validates REPORTDATA and replays all four RTMRs. Current initdata must appear
+exactly once in register 4, with `digest_matches_event=true` and the SHA-384 of
+its complete canonical tagged AAEL event.
+
+## Native Kata TDX
+
+Set `OPENSHELL_CONFIDENTIAL_RUNTIME_CLASS=kata-qemu-tdx` on T for reference
+registration and for the driver's policy renderer. Provide
+`KATA_GUEST_REFERENCES` from the
+[trusted boot reference procedure][trusted-boot-reference-procedure]. The
+[native CPU policy](../policy/tdx-kata.rego) checks TDVF MRTD, the UKI's RTMR1/2
+and the exact role initdata SHA-384 in MRCONFIGID. Of the 16 RTMR0 events it
+pins the static digests. Slot 0 identifies the TD HOB by type and description;
+like the dynamic ACPI and handoff inputs, its layout is supplied by the VMM and
+processed by the approved firmware. CCEL replay checks the event digests against
+the quoted registers.
+
+## Release to the current role
 
 [The KBS policy](../policy/kbs-sealed.rego) consumes upstream's native
 `plugin="resource"` and three-element resource-path array. It checks the signed
 EAR vector, non-debug TDX status, canonical initdata and the exact current
 per-role resource binding; workspace keys require the workload role. KBS trusts
 the configured AS signer trust root and rejects unendorsed header-supplied JWKs.
-Administrative APIs require the configured management identity. The PoC certificate
-script may share a CA; independently managed deployments can separate AS signing,
-KBS TLS and registry TLS material.
+Administrative APIs require the configured management identity. The PoC
+certificate script may share a CA; independently managed deployments can
+separate AS signing, KBS TLS and registry TLS material.
 
 Follow the [deployment runbook](../../docs/deployment.md) for installation and
-recovery; see the [backup set and recovery limits](../../docs/operations.md#recovery-limits). Policy-denial tests must identify the actual `PolicyDeny` error;
-an unrelated HTTP 500 is a failed test. Runtime credentials and state belong
-outside this checkout.
+recovery; see the
+[backup set and recovery limits](../../docs/operations.md#recovery-limits).
+Policy-denial tests must identify the actual `PolicyDeny` error; an unrelated
+HTTP 500 is a failed test. Runtime credentials and state belong outside this
+checkout.
+
+[deployment-runbook]:
+  ../../docs/deployment.md#existing-or-separately-deployed-trustee
+[intels-tdvf-design-guide]:
+  https://cdrdv2-public.intel.com/733585/tdx-virtual-firmware-design-guide-rev-004-20231206.pdf
+[trusted-boot-reference-procedure]:
+  ../baremetal/README.md#updating-the-kata-boot-references

@@ -18,8 +18,9 @@ and are excluded from the release.
 ./cos host packages
 ```
 
-Installs Ubuntu packages, including Python 3.12, Docker and compiler dependencies,
-then starts Docker. Success prints Python and Docker server versions.
+Installs Ubuntu packages, including Python 3.12, Docker and compiler
+dependencies, then starts Docker. Success prints Python and Docker server
+versions.
 
 ### Build toolchains
 
@@ -28,7 +29,8 @@ then starts Docker. Success prints Python and Docker server versions.
 ```
 
 Installs the pinned Rust 1.95.0 and Go 1.26.11 toolchains. These sources need
-newer compiler versions than Ubuntu 24.04 supplies. Matching versions are reused.
+newer compiler versions than Ubuntu 24.04 supplies. Matching versions are
+reused.
 
 ### Release tools
 
@@ -36,8 +38,9 @@ newer compiler versions than Ubuntu 24.04 supplies. Matching versions are reused
 ./cos host tools
 ```
 
-Installs checksum-pinned Helm, kubectl, crane, GitHub CLI, ORAS and yq v4 and prints
-their versions. Ubuntu supplies the other tools and the Python YAML parser.
+Installs checksum-pinned Helm, kubectl, crane, GitHub CLI, ORAS and yq v4 and
+prints their versions. Ubuntu supplies the other tools and the Python YAML
+parser.
 
 Downloads need access to GitHub, GHCR, Docker registries and Go/Rust release
 servers.
@@ -48,11 +51,12 @@ servers.
 ./cos build sources
 ```
 
-Initializes the pinned submodules, fetches the released Kata chart, prepares the patch queues and packages
-charts. Expect passed input checks and `Source trees and charts ready`.
-Prepared copies live under `.local/build-sources/`; `repos/` remains unchanged.
-A supplied checkout with initialized submodules needs no GitHub authentication
-for the remaining public inputs.
+Initializes the pinned submodules, fetches the released Kata chart, prepares the
+patch queues and packages charts. Expect passed input checks and
+`Source trees and charts ready`. Prepared copies live under
+`.local/build-sources/`; `repos/` remains unchanged. A supplied checkout with
+initialized submodules needs no GitHub authentication for the remaining public
+inputs.
 
 ## Build integration outputs
 
@@ -87,8 +91,9 @@ Builds the CSI image and `artifacts/charts/caa-csi-block-driver.tgz`.
 ./cos build controller
 ```
 
-Builds the Alibaba controller and writes `artifacts/images/peerpod-controller.tar`.
-Only its executable replaces the one in the pinned runtime image.
+Builds the Alibaba controller and writes
+`artifacts/images/peerpod-controller.tar`. Only its executable replaces the one
+in the pinned runtime image.
 
 OpenCode, Codex and Claude Code use the unchanged OpenShell Community image.
 There is no coding-agent image to build.
@@ -105,8 +110,8 @@ Downloads the locked test dependencies. Then run:
 ./cos build test
 ```
 
-Runs the [offline suites](../tests/README.md). These checks do not exercise cloud
-deployment or real TDX attestation.
+Runs the [offline suites](../tests/README.md). These checks do not exercise
+cloud deployment or real TDX attestation.
 
 ## Select the guest image
 
@@ -116,26 +121,28 @@ deployment or real TDX attestation.
 ./cos build guest --region cn-beijing
 ```
 
-The validated deployment uses **cn-beijing, Zone I, ecs.g9i.xlarge**.
-Region and zone are configurable; ECS validates the actual TDX launch parameters.
-This step builds the
-upstream Ubuntu UKI/verity image, verifies it, records its measurements and selects
-that exact build for the release. It prints the QCOW2, reference JSON and receipt
-paths; there is no receipt path to copy into another command.
-See [guest internals](../deployment/guest/README.md).
+The ACK example selects a TDX-capable instance family in Beijing Zone I. Choose
+a supported region and zone for your deployment. Region and zone are
+configurable; ECS validates the actual TDX launch parameters. This step builds
+the upstream Ubuntu UKI/verity image, verifies it, records its measurements and
+selects that exact build for the release. It prints the QCOW2, reference JSON
+and receipt paths; there is no receipt path to copy into another command. See
+[guest internals](../deployment/guest/README.md).
 
 ### Use an existing image instead
 
-Skip the guest build only when a publisher supplies a compatible image and matching
-references. Run:
+Skip the guest build only when a publisher supplies a compatible image and
+matching references. Run:
 
 ```bash
 ./cos build guest-existing --region cn-beijing
 ```
 
-It asks for the ECS ImageID, local reference JSON path and reference checksum
-obtained from the publisher, then verifies and records the selection. The image
-must support TDX AA/CDH, sealed bootstrap and encrypted workspaces.
+This option is for Peer Pods. Native Kata requires the verified QCOW2 as well as
+the matching references to prepare the UKI and raw system disk. The command asks
+for the ECS ImageID, local reference JSON path and reference checksum obtained
+from the publisher, then verifies and records the selection. The image must
+support TDX AA/CDH, sealed bootstrap and encrypted workspaces.
 
 ## Build and transfer
 
@@ -160,8 +167,8 @@ cd /opt/confidential-openshell
 ```
 
 Uses the saved build checksum, verifies the handoff, copies it into
-`/var/lib/openshell-confidential/operator/handoff` and installs deployment sources
-under `/opt/confidential-openshell`. The Git build checkout is retained.
+`/var/lib/openshell-confidential/operator/handoff` and installs deployment
+sources under `/opt/confidential-openshell`. The Git build checkout is retained.
 Continue with [deployment](deployment.md).
 
 ### Install on a separate trusted service host
@@ -177,11 +184,13 @@ On the Ubuntu 24.04 service host, from the copied source:
 cd /opt/confidential-openshell
 ```
 
-If the handoff is elsewhere, run `./cos release install --handoff` with its local
-directory as the argument; it asks for the checksum retained on the build host.
-This host needs no compiler toolchains or build caches and can be outside the cloud.
+If the handoff is elsewhere, run `./cos release install --handoff` with its
+local directory as the argument; it asks for the checksum retained on the build
+host. This host needs no compiler toolchains or build caches and can be outside
+the cloud.
 
 The [source](../deployment/build/sources.lock.json),
 [runtime](../deployment/runtime/artifacts.lock.json) and
 [guest](../deployment/artifacts.lock.json) locks define inputs. Real attestation
-and workspace checks follow [deployment](deployment.md#10-verify-both-confidential-roles).
+and workspace checks follow
+[deployment](deployment.md#10-verify-both-confidential-roles).
