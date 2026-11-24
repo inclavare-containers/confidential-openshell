@@ -7,11 +7,11 @@ User=openshell-gateway
 Group=openshell-gateway
 Environment=HOME=/var/lib/openshell-confidential
 Environment=KUBECONFIG=/etc/openshell-confidential/kubeconfig
+Environment=OPENSHELL_CONFIDENTIAL_RUNTIME_CLASS=kata-remote
 Environment=OPENSHELL_K8S_WORKSPACE_STORAGE_CLASS=alicloud-disk-essd-peerpod
 Environment=OPENSHELL_TELEMETRY_ENABLED=false
 EnvironmentFile=/etc/openshell-confidential/driver.env
 ExecStart=/usr/local/bin/openshell-driver-confidential-kubernetes \
-  --confidential-runtime-class kata-remote \
   --runtime-bootstrap-grace-seconds 900 \
   --guest-initdata-base /etc/openshell-confidential/guest-initdata-base.toml \
   --confidential-client-tls-ca /var/lib/openshell-confidential/tls/ca.crt \

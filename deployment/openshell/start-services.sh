@@ -24,5 +24,7 @@ for attempt in $(seq 1 60); do
   sleep 1
 done
 curl -fsS http://127.0.0.1:17671/readyz
-python3 deployment/peerpods/workers.py --check-gateway
-printf '\nGateway ready: driver socket, local readiness and worker-to-Gateway TCP reachability passed.\n'
+if [[ ${OPENSHELL_CONFIDENTIAL_RUNTIME_CLASS:-kata-remote} == kata-remote ]]; then
+  python3 deployment/peerpods/workers.py --check-gateway
+fi
+printf 'Gateway and confidential driver are ready.\n'

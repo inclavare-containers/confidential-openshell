@@ -45,7 +45,7 @@ chown root:openshell-gateway "$GATEWAY_KUBECONFIG"
 chmod 0640 "$GATEWAY_KUBECONFIG"
 for check in \
   'get persistentvolumeclaims -n openshell' \
-  'get runtimeclass/kata-remote' \
+  "get runtimeclass/${OPENSHELL_CONFIDENTIAL_RUNTIME_CLASS:-kata-remote}" \
   'get services -n openshell' \
   'create services -n openshell' \
   'delete services -n openshell'; do

@@ -119,6 +119,16 @@ class TrustedLaunchTests(unittest.TestCase):
             'requests': {'kata.peerpods.io/vm': '1'}, 'limits': {'kata.peerpods.io/vm': '1'}}
         return expected, actual
 
+    def test_native_kata_preserves_container_resource_requests(self):
+        expected, actual = self.pair()
+        for pod in (expected, actual):
+            pod['spec']['runtimeClassName'] = 'kata-qemu-tdx'
+            pod['spec']['containers'][0]['resources'] = {'requests': {'memory': '2Gi'}}
+        policy._trusted_policy_pod(expected, actual)
+        actual['spec']['containers'][0]['resources']['requests']['memory'] = '4Gi'
+        with self.assertRaises(policy.PolicyError):
+            policy._trusted_policy_pod(expected, actual)
+
     def test_defaults_and_placement_do_not_change_trusted_execution(self):
         expected, actual = self.pair()
         self.assertNotIn('supplementalGroupsPolicy', expected['spec']['securityContext'])

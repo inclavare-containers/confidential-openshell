@@ -18,6 +18,11 @@ Gateway database to change this display. After upgrading the gateway and driver,
 `enable_sandbox_updates = true` in `[openshell.gateway]` of the installed
 `/etc/openshell-confidential/gateway.toml` and restart the gateway.
 
+Set `OPENSHELL_CONFIDENTIAL_RUNTIME_CLASS` when installing the restricted
+kubeconfig and in `/etc/openshell-confidential/driver.env`. The Gateway uses
+one backend for both roles. The default is `kata-remote` for Peer Pods.
+Select `kata-qemu-tdx` for local TDX guests.
+
 Follow the [sequential deployment runbook](../../docs/deployment.md) for
 installation and checks. Edit private operator copies outside
 the checkout; keep credentials and runtime state out of this directory.

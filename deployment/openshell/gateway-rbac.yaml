@@ -50,7 +50,7 @@ metadata:
 rules:
   - apiGroups: [node.k8s.io]
     resources: [runtimeclasses]
-    resourceNames: [kata-remote]
+    resourceNames: [kata-remote, kata-qemu-tdx]
     verbs: [get]
   - apiGroups: [""]
     resources: [persistentvolumes, nodes, namespaces]

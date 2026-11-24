@@ -135,11 +135,12 @@ def _trusted_policy_pod(expected: dict, admitted: dict) -> dict:
             raise PolicyError("admitted Pod changed trusted labels")
     trusted = _default_pod(expected)
     actual = _default_pod(admitted)
-    # PeerPods replaces container resource accounting with its VM resource.
-    for container in trusted["spec"].get("containers", []) + trusted["spec"].get("initContainers", []):
-        container["resources"] = {}
-    trusted["spec"]["containers"][0]["resources"] = {
-        "requests": {"kata.peerpods.io/vm": "1"}, "limits": {"kata.peerpods.io/vm": "1"}}
+    if trusted["spec"].get("runtimeClassName") != "kata-qemu-tdx":
+        # PeerPods replaces container resource accounting with its VM resource.
+        for container in trusted["spec"].get("containers", []) + trusted["spec"].get("initContainers", []):
+            container["resources"] = {}
+        trusted["spec"]["containers"][0]["resources"] = {
+            "requests": {"kata.peerpods.io/vm": "1"}, "limits": {"kata.peerpods.io/vm": "1"}}
     if trusted["spec"] != actual["spec"]:
         # Do not print the diff: it can contain user-supplied command arguments.
         raise PolicyError("admitted Pod execution differs from trusted launch intent")
