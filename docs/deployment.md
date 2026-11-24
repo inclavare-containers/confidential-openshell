@@ -85,7 +85,8 @@ Obtains an administrator kubeconfig and checks region, API access, RRSA and
 Terway NetworkPolicy. It retains the existing cluster, VPC, node pools and worker
 OS. Select the workers to configure in the later `workers select` step.
 
-The validated example uses Ubuntu 24.04, containerd 2.3.4 and OCI 1.3.0.
+The [verified ACK configuration](../deployment/ack/ack.example.json) specifies
+the Kubernetes/containerd pair for Ubuntu 24.04 workers and OCI 1.3.0.
 Set `OPENSHELL_KATA_OCI_VERSION` in the driver environment to match another
 runtime. Worker configuration reads containerd's effective CRI configuration;
 schema 3 input and migrated schema 4 are both compatible.

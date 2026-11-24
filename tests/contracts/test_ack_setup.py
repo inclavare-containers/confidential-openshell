@@ -59,7 +59,7 @@ class CloudFixture:
                                        'issuer': 'https://issuer.example,https://kubernetes.default.svc'}}
         self.nodes = {'items': [{'metadata': {'name': 'worker', 'labels': {'topology.kubernetes.io/zone': 'cn-beijing-i'}},
                                 'status': {'features': {'supplementalGroupsPolicy': True},
-                                           'nodeInfo': {'containerRuntimeVersion': 'containerd://2.3.4',
+                                           'nodeInfo': {'containerRuntimeVersion': 'containerd://' + self.config['containerd_version'],
                                                         'osImage': 'Ubuntu 24.04.3 LTS',
                                                         'operatingSystem': 'linux', 'architecture': 'amd64'},
                                            'conditions': [{'type': 'Ready', 'status': 'True'}]}}]}

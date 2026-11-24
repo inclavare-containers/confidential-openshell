@@ -69,5 +69,6 @@ disable it before deletion. State identifies generated resources. Shared import
 roles and existing-cluster resources are retained resources.
 
 Follow [operations](../../docs/operations.md#retire-owned-resources) for the ordered
-cleanup of dedicated resources and exact-ID readback. Beijing Zone I with
-ecs.g9i.xlarge and containerd 2.3.4 is the validated configuration.
+cleanup of dedicated resources and exact-ID readback. The [example configuration](ack.example.json) specifies the verified
+Kubernetes/containerd pair. Select a TDX-capable instance family and an
+available zone for your region.
